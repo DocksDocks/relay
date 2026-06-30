@@ -1,0 +1,27 @@
+{
+  "name": "session-relay",
+  "version": "0.1.0",
+  "description": "Cross-session, cross-project agent message bus (Claude Code + Codex). A SessionStart hook auto-registers each session and drains its inbox; an MCP server (bus) exposes whoami/register/roster/send/inbox over a shared on-disk store keyed by session id; and a relay CLI wakes an idle target via headless `claude -p --resume` / `codex exec resume`. Skills + hooks + MCP on Codex.",
+  "author": {
+    "name": "Eduardo Marquez"
+  },
+  "homepage": "https://github.com/DocksDocks/docks",
+  "repository": "https://github.com/DocksDocks/docks",
+  "license": "MIT",
+  "keywords": [
+    "multi-agent",
+    "sessions",
+    "mcp",
+    "message-bus",
+    "cross-project",
+    "codex"
+  ],
+  "skills": "./skills/",
+  "hooks": "./hooks/codex-hooks.json",
+  "mcpServers": "./.codex-plugin/bus.mcp.json",
+  "interface": {
+    "displayName": "session-relay",
+    "shortDescription": "Cross-session/cross-project agent message bus (Claude Code + Codex).",
+    "category": "Productivity"
+  }
+}

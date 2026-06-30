@@ -11,7 +11,12 @@
 import * as store from '../lib/store.mjs';
 
 const PROTOCOL = '2025-06-18';
-const projectDir = process.env.RELAY_PROJECT_DIR || process.env.CLAUDE_PROJECT_DIR || process.cwd();
+// Resolve the project dir for self-id. Claude substitutes ${CLAUDE_PROJECT_DIR}
+// in the manifest env; Codex config is static, so an unsubstituted "${...}" (or
+// empty) is treated as absent and we fall back to the launch cwd — which Codex
+// sets to the session's project dir, matching the dir its hook recorded.
+const clean = (v) => (v && !v.includes('${') ? v : null);
+const projectDir = clean(process.env.RELAY_PROJECT_DIR) || clean(process.env.CLAUDE_PROJECT_DIR) || process.cwd();
 const log = (...a) => process.stderr.write(`[session-relay/bus] ${a.join(' ')}\n`);
 const selfId = () => store.idForDir(projectDir);
 
