@@ -9,6 +9,7 @@
 // set in the plugin manifest) via the cwd->id marker the SessionStart hook
 // writes — the MCP protocol never hands a server the host's session id.
 import * as store from '../lib/store.mjs';
+import { discover } from '../lib/discover.mjs';
 
 const PROTOCOL = '2025-06-18';
 // Resolve the project dir for self-id. Claude substitutes ${CLAUDE_PROJECT_DIR}
@@ -63,6 +64,18 @@ const TOOLS = [
     description: 'Read and clear this session\'s pending messages (each: from, body, ts).',
     inputSchema: { type: 'object', properties: {}, additionalProperties: false },
   },
+  {
+    name: 'discover',
+    description: "Find other agent sessions running RIGHT NOW (Claude or Codex) by scanning the on-disk session stores — works even for sessions that never registered on the bus. Returns candidates ranked by recency (sessions in this same project dir first), each with {tool, id, cwd, name, registered, ageSec, active}. Use this to auto-locate \"my other session\" without being handed an id; then send()+wake it, or wake an unregistered one directly with its id/dir/tool.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        activeWithinMin: { type: 'number', description: 'Only sessions whose last activity is within this many minutes (default 60).' },
+        tool: { type: 'string', enum: ['claude', 'codex'], description: 'Restrict to one tool.' },
+      },
+      additionalProperties: false,
+    },
+  },
 ];
 
 const text = (obj, isError = false) => ({
@@ -104,6 +117,19 @@ function callTool(name, args = {}) {
       const messages = store.drain(id);
       return text({ count: messages.length, messages });
     }
+    case 'discover': {
+      const sessions = discover({
+        activeWithinMin: typeof args.activeWithinMin === 'number' ? args.activeWithinMin : 60,
+        tool: args.tool || null,
+        excludeId: selfId(),
+        cwd: projectDir,
+      });
+      return text({
+        count: sessions.length,
+        sessions,
+        note: 'Ranked by recency (this project dir first). To reach one: send() then wake it via relay.mjs; for an unregistered session pass its id/dir/tool to `relay.mjs wake`.',
+      });
+    }
     default:
       throw { code: -32602, message: `Unknown tool: ${name}` };
   }
@@ -120,7 +146,7 @@ function handle(msg) {
       protocolVersion: params?.protocolVersion || PROTOCOL,
       capabilities: { tools: {} },
       serverInfo: { name: 'session-relay-bus', version: '0.1.0' },
-      instructions: 'Cross-session message bus. Tools: whoami, register, roster, send, inbox.',
+      instructions: 'Cross-session message bus. Tools: whoami, register, roster, send, inbox, discover.',
     });
   }
   if (method === 'notifications/initialized') return; // notification — no response

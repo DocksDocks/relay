@@ -4,11 +4,17 @@
 // skill (via Bash) or by a human. All commands are local; `wake` is the only one
 // that spawns a process.
 //
+//   relay.mjs discover [--within <min>] [--tool claude|codex] [--exclude <id>] [--cwd <path>] [--json]
 //   relay.mjs list
 //   relay.mjs register <name> --id <uuid> [--dir <path>] [--tool claude|codex]
-//   relay.mjs send <to> <message...>
+//   relay.mjs send <to> <message...>            (or: send --id <id> <message...>)
 //   relay.mjs inbox <nameOrId>
 //   relay.mjs wake <nameOrId> [--dry] [message...]
+//   relay.mjs wake --id <id> --dir <cwd> --tool <claude|codex> [message...]   (unregistered target)
+//
+// `discover` scans the live Claude + Codex session stores and lists sessions
+// running now (newest first) — even ones that never joined the bus — so the
+// agent can auto-resolve "my other session" without being handed an id.
 //
 // `wake` is TOOL-AWARE: it dispatches on the target's registered tool —
 //   claude → `claude -p "<nudge>" --resume <id> --output-format json`
@@ -19,6 +25,7 @@
 // in. `--dry` prints the command it would run instead of spawning (used by tests).
 import { spawnSync } from 'node:child_process';
 import * as store from '../../../../lib/store.mjs';
+import { discover } from '../../../../lib/discover.mjs';
 
 const argv = process.argv.slice(2);
 const cmd = argv[0];
@@ -28,19 +35,58 @@ function flag(name, fallback = null) {
   const i = argv.indexOf(`--${name}`);
   return i >= 0 && argv[i + 1] ? argv[i + 1] : fallback;
 }
-// positional args excluding flags + their values
+// Valueless boolean flags — they do NOT consume the following token.
+const BOOL_FLAGS = new Set(['dry', 'json']);
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+// positional args excluding flags + their values; a bare `--` ends option parsing.
 function positionals(from) {
   const out = [];
   for (let i = from; i < argv.length; i += 1) {
-    if (argv[i].startsWith('--')) { i += 1; continue; }
-    out.push(argv[i]);
+    const a = argv[i];
+    if (a === '--') break; // end-of-options: everything after is the verbatim message
+    if (a.startsWith('--')) {
+      if (!BOOL_FLAGS.has(a.slice(2))) i += 1; // value flags also skip their value
+      continue;
+    }
+    out.push(a);
   }
   return out;
+}
+// Message after an explicit `--` separator, verbatim (so a message may itself
+// contain --flags without being mis-parsed); null when there is no separator.
+function messageAfterSep() {
+  const i = argv.indexOf('--');
+  return i >= 0 ? argv.slice(i + 1).join(' ') : null;
+}
+// A target built straight from flags — addresses a discovered session that was
+// never registered on the bus. Returns null when no --id is given. The id MUST be
+// a session UUID: both tools mint UUIDs, and this keeps an attacker-planted,
+// flag-shaped id (e.g. "--config=…") off the spawned doorbell's argv.
+function explicitTarget() {
+  const id = flag('id');
+  if (!id) return null;
+  if (!UUID_RE.test(id)) die(`--id must be a session UUID, got: ${id}`);
+  return { id, dir: flag('dir') || process.cwd(), tool: flag('tool') || 'claude', name: null };
 }
 
 const DEFAULT_NUDGE = 'You have new session-relay mail. Use the session-relay skill: call inbox to read your pending messages and act on them.';
 
 switch (cmd) {
+  case 'discover': {
+    const within = Number(flag('within', '60'));
+    const rows = discover({
+      activeWithinMin: Number.isFinite(within) ? within : 60,
+      tool: flag('tool'),
+      excludeId: flag('exclude'),
+      cwd: flag('cwd'),
+    });
+    if (argv.includes('--json')) { console.log(JSON.stringify(rows, null, 2)); break; }
+    if (!rows.length) { console.log(`(no active sessions in the last ${flag('within', '60')} min)`); break; }
+    for (const r of rows) {
+      console.log(`[${r.tool.padEnd(6)}] ${r.id}  ${r.cwd || '?'}  ${r.ageSec}s ago${r.name ? `  (${r.name})` : ''}${r.registered ? '' : '  [unregistered]'}`);
+    }
+    break;
+  }
   case 'list': {
     const rows = store.roster();
     if (!rows.length) { console.log('(no sessions registered)'); break; }
@@ -56,11 +102,12 @@ switch (cmd) {
     break;
   }
   case 'send': {
-    const [to, ...rest] = positionals(1);
-    const body = rest.join(' ');
-    if (!to || !body) die('usage: relay.mjs send <to> <message...>');
-    const target = store.resolve(to);
-    if (!target) die(`unknown recipient: ${to} (run: relay.mjs list)`);
+    const explicit = explicitTarget();
+    const rest = positionals(1);
+    const to = explicit ? null : rest[0];
+    const body = messageAfterSep() ?? (explicit ? rest : rest.slice(1)).join(' ');
+    const target = explicit || (to ? store.resolve(to) : null);
+    if (!target || !body) die('usage: relay.mjs send <to> [--] <message...>  (or: send --id <id> [--] <message...>)');
     store.enqueue(target.id, { from: null, fromName: 'cli', to: target.id, toName: target.name, body });
     console.log(`queued -> ${target.name || target.id}`);
     break;
@@ -75,12 +122,13 @@ switch (cmd) {
     break;
   }
   case 'wake': {
-    const [who, ...rest] = positionals(1);
-    if (!who) die('usage: relay.mjs wake <nameOrId> [--dry] [message...]');
-    const target = store.resolve(who);
-    if (!target) die(`unknown session: ${who} (run: relay.mjs list)`);
-    if (!target.id || !target.dir) die(`session ${who} is missing id/dir in the registry`);
-    const message = rest.join(' ') || DEFAULT_NUDGE;
+    const explicit = explicitTarget();
+    const rest = positionals(1);
+    const who = explicit ? null : rest[0];
+    const message = (messageAfterSep() ?? (explicit ? rest : rest.slice(1)).join(' ')) || DEFAULT_NUDGE;
+    const target = explicit || (who ? store.resolve(who) : null);
+    if (!target) die('usage: relay.mjs wake <nameOrId> [message...]  |  wake --id <id> --dir <cwd> --tool <claude|codex> [message...]');
+    if (!target.id || !target.dir) die('target missing id/dir (for an unregistered session pass --dir)');
     const tool = target.tool || 'claude';
     // Per-tool headless-resume doorbell, run from the target's project dir.
     const doorbell = tool === 'codex'
@@ -97,5 +145,5 @@ switch (cmd) {
     process.exit(r.status ?? 0);
   }
   default:
-    die('usage: relay.mjs list | register <name> --id <uuid> [--dir <path>] | send <to> <msg> | inbox <who> | wake <who> [msg]');
+    die('usage: relay.mjs discover [--within min] [--tool t] | list | register <name> --id <uuid> [--dir <path>] | send <to> <msg> | inbox <who> | wake <who> [msg]');
 }

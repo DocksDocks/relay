@@ -70,9 +70,9 @@ check('initialize negotiates protocol + serverInfo', () => {
   assert.equal(res.get(1).result.serverInfo.name, 'session-relay-bus');
   assert.ok(res.get(1).result.capabilities.tools);
 });
-check('tools/list returns the 5 bus tools', () => {
+check('tools/list returns the 6 bus tools', () => {
   const names = res.get(2).result.tools.map((t) => t.name).sort();
-  assert.deepEqual(names, ['inbox', 'register', 'roster', 'send', 'whoami']);
+  assert.deepEqual(names, ['discover', 'inbox', 'register', 'roster', 'send', 'whoami']);
 });
 check('whoami resolves this session from the cwd marker', () => {
   const me = toolJSON(res.get(3));
@@ -159,6 +159,112 @@ check('wake dispatches the claude doorbell for a claude target', () => {
   assert.equal(d.tool, 'claude');
   assert.equal(d.cmd, 'claude');
   assert.ok(d.args.includes('--resume') && d.args.includes(idA));
+});
+
+// --- v3: discover live sessions by scanning the raw on-disk session stores ---
+const { discover } = await import('../lib/discover.mjs');
+const cRoot = path.join(HOME, 'claude-projects');
+const xRoot = path.join(HOME, 'codex-sessions');
+process.env.RELAY_CLAUDE_PROJECTS = cRoot;
+process.env.RELAY_CODEX_SESSIONS = xRoot;
+
+// Claude fixture: <root>/<encoded-cwd>/<id>.jsonl — the real cwd has underscores,
+// so decoding it from the dashed dir name would mangle it; it MUST come from content.
+const realCwd = '/home/user/projects/my_app';
+const cProj = path.join(cRoot, realCwd.replace(/[^a-zA-Z0-9]/g, '-'));
+fs.mkdirSync(cProj, { recursive: true });
+const cId = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
+const cFile = path.join(cProj, `${cId}.jsonl`);
+fs.writeFileSync(cFile, `${[
+  JSON.stringify({ type: 'last-prompt', sessionId: cId }),       // first line: no cwd
+  JSON.stringify({ type: 'user', cwd: realCwd, message: 'hi' }), // cwd lives here
+].join('\n')}\n`);
+
+// Codex fixture: <root>/YYYY/MM/DD/rollout-…-<uuid>.jsonl — first line session_meta.
+const xDir = path.join(xRoot, '2026', '06', '30');
+fs.mkdirSync(xDir, { recursive: true });
+const xId = '019f0000-0000-7000-8000-000000000000';
+const xCwd = '/tmp/codex-proj';
+const xFile = path.join(xDir, `rollout-2026-06-30T00-00-00-${xId}.jsonl`);
+fs.writeFileSync(xFile, `${JSON.stringify({ timestamp: 't', type: 'session_meta', payload: { id: xId, cwd: xCwd } })}\n`);
+
+check('discover reads the Claude cwd from file CONTENT, not the lossy dir name', () => {
+  const c = discover({ activeWithinMin: 60 }).find((r) => r.id === cId);
+  assert.ok(c, 'claude session found');
+  assert.equal(c.tool, 'claude');
+  assert.equal(c.cwd, realCwd); // underscores preserved → proves content read
+});
+check('discover finds the Codex session via its session_meta line', () => {
+  const x = discover({ activeWithinMin: 60 }).find((r) => r.id === xId);
+  assert.ok(x, 'codex session found');
+  assert.equal(x.tool, 'codex');
+  assert.equal(x.cwd, xCwd);
+});
+check('discover ranks the most recently active session first', () => {
+  const now = Date.now();
+  fs.utimesSync(cFile, new Date(now - 30_000), new Date(now - 30_000));
+  fs.utimesSync(xFile, new Date(now - 5_000), new Date(now - 5_000));
+  assert.equal(discover({ activeWithinMin: 60 })[0].id, xId); // codex newer → first
+});
+check('discover excludes the caller’s own id', () => {
+  assert.ok(!discover({ activeWithinMin: 60, excludeId: xId }).some((r) => r.id === xId));
+});
+check('discover drops sessions older than the liveness window', () => {
+  const old = Date.now() - 3 * 3600_000; // 3h ago
+  fs.utimesSync(cFile, new Date(old), new Date(old));
+  assert.ok(!discover({ activeWithinMin: 60 }).some((r) => r.id === cId)); // 1h window
+});
+check('discover tool filter restricts to one runtime', () => {
+  const rows = discover({ activeWithinMin: 600, tool: 'codex' });
+  assert.ok(rows.length && rows.every((r) => r.tool === 'codex'));
+  assert.ok(rows.some((r) => r.id === xId));
+});
+check('discover attaches the registry name for a registered session', () => {
+  store.register({ id: xId, dir: xCwd, name: 'codex-live', tool: 'codex' });
+  const x = discover({ activeWithinMin: 600 }).find((r) => r.id === xId);
+  assert.equal(x.name, 'codex-live');
+  assert.equal(x.registered, true);
+});
+const resD = runBus(dirA, [
+  { jsonrpc: '2.0', id: 1, method: 'initialize', params: {} },
+  { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'discover', arguments: { activeWithinMin: 600 } } },
+]);
+check('discover tool works end-to-end over the MCP bus', () => {
+  const d = toolJSON(resD.get(2));
+  assert.ok(Array.isArray(d.sessions) && typeof d.count === 'number');
+  assert.ok(d.sessions.some((s) => s.id === xId));
+});
+check('relay.mjs wake --id targets an unregistered discovered session', () => {
+  const d = JSON.parse(spawnSync('node', [RELAY, 'wake', '--id', xId, '--dir', xCwd, '--tool', 'codex', '--dry', 'ping'],
+    { encoding: 'utf8', env: { ...process.env, SESSION_RELAY_HOME: HOME } }).stdout);
+  assert.equal(d.tool, 'codex');
+  assert.deepEqual(d.args.slice(0, 3), ['exec', 'resume', xId]);
+  assert.equal(d.cwd, xCwd);
+  assert.ok(d.args.includes('ping'));
+});
+
+// --- v3 hardening (from the adversarial verification pass) ---
+const badProj = path.join(cRoot, '-tmp-evil');
+fs.mkdirSync(badProj, { recursive: true });
+fs.writeFileSync(path.join(badProj, '--config=evil.jsonl'), `${JSON.stringify({ cwd: '/evil' })}\n`); // non-UUID id
+fs.mkdirSync(path.join(badProj, 'notafile.jsonl'), { recursive: true });                             // dir named *.jsonl
+check('discover drops a non-UUID (planted, flag-shaped) session id', () => {
+  const rows = discover({ activeWithinMin: 600 });
+  assert.ok(rows.every((r) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(r.id)));
+});
+check('discover ignores a directory whose name ends in .jsonl', () => {
+  assert.ok(!discover({ activeWithinMin: 600 }).some((r) => r.id === 'notafile'));
+});
+check('wake rejects a non-UUID --id (no option injection into the doorbell)', () => {
+  const r = spawnSync('node', [RELAY, 'wake', '--id', '--config=evil', '--dir', xCwd, '--tool', 'codex', '--dry'],
+    { encoding: 'utf8', env: { ...process.env, SESSION_RELAY_HOME: HOME } });
+  assert.notEqual(r.status, 0);
+  assert.ok(/must be a session UUID/i.test(r.stderr));
+});
+check('wake preserves a --flag-bearing message after a `--` separator', () => {
+  const d = JSON.parse(spawnSync('node', [RELAY, 'wake', '--id', xId, '--dir', xCwd, '--tool', 'codex', '--dry', '--', 'deploy with --force now'],
+    { encoding: 'utf8', env: { ...process.env, SESSION_RELAY_HOME: HOME } }).stdout);
+  assert.ok(d.args.includes('deploy with --force now'));
 });
 
 fs.rmSync(HOME, { recursive: true, force: true });
