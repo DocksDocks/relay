@@ -24,6 +24,7 @@
 // conversation found"); Codex is resumed from the dir its session was recorded
 // in. `--dry` prints the command it would run instead of spawning (used by tests).
 import { spawnSync } from 'node:child_process';
+import fs from 'node:fs';
 import * as store from '../../../../lib/store.mjs';
 import { discover } from '../../../../lib/discover.mjs';
 
@@ -138,6 +139,10 @@ switch (cmd) {
       console.log(JSON.stringify({ tool, cmd: doorbell.cmd, args: doorbell.args, cwd: target.dir }));
       break;
     }
+    // Never resume into a cwd that no longer exists: a stale/moved registration
+    // would otherwise resume from an unexpected dir (and Codex widens its sandbox
+    // writable roots to the caller cwd). Refuse rather than spawn blindly.
+    if (!fs.existsSync(target.dir)) die(`target dir does not exist: ${target.dir} — stale/moved session; re-register or pass the current --dir before waking.`);
     const r = spawnSync(doorbell.cmd, doorbell.args, { cwd: target.dir, encoding: 'utf8' });
     if (r.error) die(`failed to spawn ${doorbell.cmd}: ${r.error.message}`);
     if (r.stdout) process.stdout.write(r.stdout.endsWith('\n') ? r.stdout : `${r.stdout}\n`);
