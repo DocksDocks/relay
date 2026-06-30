@@ -24,7 +24,9 @@
   "mcpServers": {
     "bus": {
       "command": "node",
-      "args": ["${CLAUDE_PLUGIN_ROOT}/mcp/bus.mjs"],
+      "args": [
+        "${CLAUDE_PLUGIN_ROOT}/mcp/bus.mjs"
+      ],
       "env": {
         "RELAY_PROJECT_DIR": "${CLAUDE_PROJECT_DIR}"
       }
