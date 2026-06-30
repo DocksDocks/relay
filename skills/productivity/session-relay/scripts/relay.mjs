@@ -5,15 +5,18 @@
 // that spawns a process.
 //
 //   relay.mjs list
-//   relay.mjs register <name> --id <uuid> [--dir <path>]
+//   relay.mjs register <name> --id <uuid> [--dir <path>] [--tool claude|codex]
 //   relay.mjs send <to> <message...>
 //   relay.mjs inbox <nameOrId>
-//   relay.mjs wake <nameOrId> [message...]
+//   relay.mjs wake <nameOrId> [--dry] [message...]
 //
-// `wake` runs `claude -p "<nudge>" --resume <id> --output-format json` from the
-// target's registered project dir. That cwd is REQUIRED: Claude Code scopes
-// session-id lookup to the project dir + its git worktrees, so resuming from the
-// wrong dir returns "No conversation found with session ID".
+// `wake` is TOOL-AWARE: it dispatches on the target's registered tool —
+//   claude → `claude -p "<nudge>" --resume <id> --output-format json`
+//   codex  → `codex exec resume <id> "<nudge>" --json`
+// run from the target's registered project dir. That cwd matters: Claude scopes
+// session-id lookup to the project dir (resuming elsewhere returns "No
+// conversation found"); Codex is resumed from the dir its session was recorded
+// in. `--dry` prints the command it would run instead of spawning (used by tests).
 import { spawnSync } from 'node:child_process';
 import * as store from '../../../../lib/store.mjs';
 
@@ -41,15 +44,15 @@ switch (cmd) {
   case 'list': {
     const rows = store.roster();
     if (!rows.length) { console.log('(no sessions registered)'); break; }
-    for (const r of rows) console.log(`${(r.name || '(unnamed)').padEnd(16)} ${r.id}  ${r.dir || '?'}  ${r.lastSeen || ''}`);
+    for (const r of rows) console.log(`${(r.name || '(unnamed)').padEnd(16)} [${(r.tool || 'claude').padEnd(6)}] ${r.id}  ${r.dir || '?'}  ${r.lastSeen || ''}`);
     break;
   }
   case 'register': {
     const name = positionals(1)[0];
     const id = flag('id');
-    if (!name || !id) die('usage: relay.mjs register <name> --id <uuid> [--dir <path>]');
-    const entry = store.register({ id, name, dir: flag('dir') || process.cwd() });
-    console.log(`registered ${entry.name} -> ${entry.id} @ ${entry.dir}`);
+    if (!name || !id) die('usage: relay.mjs register <name> --id <uuid> [--dir <path>] [--tool claude|codex]');
+    const entry = store.register({ id, name, dir: flag('dir') || process.cwd(), tool: flag('tool') });
+    console.log(`registered ${entry.name} [${entry.tool}] -> ${entry.id} @ ${entry.dir}`);
     break;
   }
   case 'send': {
@@ -73,14 +76,22 @@ switch (cmd) {
   }
   case 'wake': {
     const [who, ...rest] = positionals(1);
-    if (!who) die('usage: relay.mjs wake <nameOrId> [message...]');
+    if (!who) die('usage: relay.mjs wake <nameOrId> [--dry] [message...]');
     const target = store.resolve(who);
     if (!target) die(`unknown session: ${who} (run: relay.mjs list)`);
     if (!target.id || !target.dir) die(`session ${who} is missing id/dir in the registry`);
     const message = rest.join(' ') || DEFAULT_NUDGE;
-    const r = spawnSync('claude', ['-p', message, '--resume', target.id, '--output-format', 'json'],
-      { cwd: target.dir, encoding: 'utf8' });
-    if (r.error) die(`failed to spawn claude: ${r.error.message}`);
+    const tool = target.tool || 'claude';
+    // Per-tool headless-resume doorbell, run from the target's project dir.
+    const doorbell = tool === 'codex'
+      ? { cmd: 'codex', args: ['exec', 'resume', target.id, message, '--json'] }
+      : { cmd: 'claude', args: ['-p', message, '--resume', target.id, '--output-format', 'json'] };
+    if (argv.includes('--dry')) {
+      console.log(JSON.stringify({ tool, cmd: doorbell.cmd, args: doorbell.args, cwd: target.dir }));
+      break;
+    }
+    const r = spawnSync(doorbell.cmd, doorbell.args, { cwd: target.dir, encoding: 'utf8' });
+    if (r.error) die(`failed to spawn ${doorbell.cmd}: ${r.error.message}`);
     if (r.stdout) process.stdout.write(r.stdout.endsWith('\n') ? r.stdout : `${r.stdout}\n`);
     if (r.stderr) process.stderr.write(r.stderr);
     process.exit(r.status ?? 0);

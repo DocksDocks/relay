@@ -14,6 +14,7 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PLUGIN = path.resolve(HERE, '..');
 const BUS = path.join(PLUGIN, 'mcp/bus.mjs');
 const HOOK = path.join(PLUGIN, 'hooks/session-start.mjs');
+const RELAY = path.join(PLUGIN, 'skills/productivity/session-relay/scripts/relay.mjs');
 
 const HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'session-relay-test-'));
 process.env.SESSION_RELAY_HOME = HOME;
@@ -127,6 +128,37 @@ const res3 = runBus(dirA, [
 ]);
 check('send to an unknown recipient returns isError', () => {
   assert.equal(res3.get(2).result.isError, true);
+});
+
+// --- v2: tool field + tool-aware doorbell dispatch + neutral home ---
+const dirC = path.join(HOME, 'proj-c');
+const idC = '33333333-3333-3333-3333-333333333333';
+store.register({ id: idC, dir: dirC, name: 'codex-C', tool: 'codex' });
+check('registry carries a tool field (codex tagged; default claude)', () => {
+  assert.equal(store.resolve('codex-C').tool, 'codex');
+  assert.equal(store.resolve('agent-A').tool, 'claude');
+});
+check('AGENT_RELAY_HOME takes precedence over SESSION_RELAY_HOME', () => {
+  const saved = process.env.AGENT_RELAY_HOME;
+  process.env.AGENT_RELAY_HOME = '/tmp/agent-relay-precedence';
+  const h = store.homeDir();
+  if (saved === undefined) delete process.env.AGENT_RELAY_HOME; else process.env.AGENT_RELAY_HOME = saved;
+  assert.equal(h, '/tmp/agent-relay-precedence');
+});
+const relayDry = (who) => JSON.parse(spawnSync('node', [RELAY, 'wake', who, '--dry'],
+  { encoding: 'utf8', env: { ...process.env, SESSION_RELAY_HOME: HOME } }).stdout);
+check('wake dispatches the codex doorbell for a codex target', () => {
+  const d = relayDry('codex-C');
+  assert.equal(d.tool, 'codex');
+  assert.equal(d.cmd, 'codex');
+  assert.deepEqual(d.args.slice(0, 3), ['exec', 'resume', idC]);
+  assert.equal(d.cwd, dirC);
+});
+check('wake dispatches the claude doorbell for a claude target', () => {
+  const d = relayDry('agent-A');
+  assert.equal(d.tool, 'claude');
+  assert.equal(d.cmd, 'claude');
+  assert.ok(d.args.includes('--resume') && d.args.includes(idA));
 });
 
 fs.rmSync(HOME, { recursive: true, force: true });
