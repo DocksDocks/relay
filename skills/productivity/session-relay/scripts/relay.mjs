@@ -131,10 +131,17 @@ switch (cmd) {
     if (!target) die('usage: relay.mjs wake <nameOrId> [message...]  |  wake --id <id> --dir <cwd> --tool <claude|codex> [message...]');
     if (!target.id || !target.dir) die('target missing id/dir (for an unregistered session pass --dir)');
     const tool = target.tool || 'claude';
-    // Per-tool headless-resume doorbell, run from the target's project dir.
+    // A registered target's id also lands on the spawned CLI's argv. explicitTarget()
+    // already UUID-gates an --id; gate the resolved-name path too, so a planted,
+    // flag-shaped id in the registry can't become an option.
+    if (!UUID_RE.test(target.id)) die(`refusing to wake: target id is not a session UUID: ${target.id}`);
+    // Per-tool headless-resume doorbell, run from the target's project dir. The
+    // untrusted message goes AFTER a `--` end-of-options marker so a dash-leading
+    // body can't be parsed as a flag on the child (both CLIs take the prompt as a
+    // trailing positional; commander and clap both honor `--`).
     const doorbell = tool === 'codex'
-      ? { cmd: 'codex', args: ['exec', 'resume', target.id, message, '--json'] }
-      : { cmd: 'claude', args: ['-p', message, '--resume', target.id, '--output-format', 'json'] };
+      ? { cmd: 'codex', args: ['exec', 'resume', target.id, '--json', '--', message] }
+      : { cmd: 'claude', args: ['-p', '--resume', target.id, '--output-format', 'json', '--', message] };
     if (argv.includes('--dry')) {
       console.log(JSON.stringify({ tool, cmd: doorbell.cmd, args: doorbell.args, cwd: target.dir }));
       break;

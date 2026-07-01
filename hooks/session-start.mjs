@@ -26,8 +26,13 @@ process.stdin.on('end', () => {
       store.register({ id, dir, tool });
       const msgs = store.drain(id);
       if (msgs.length) {
+        // Untrusted writers control both the body and the sender name, so defuse
+        // the fence delimiter in each: a body/name containing </session-relay-mail>
+        // would otherwise close the block early and smuggle text out past it, where
+        // the reading agent reads it as trusted prose.
+        const defuse = (s) => String(s).replace(/<\/?session-relay-mail>/gi, '[session-relay-mail]');
         const lines = msgs
-          .map((m) => `- from ${m.fromName || m.from || 'unknown'} (${m.ts}): ${m.body}`)
+          .map((m) => `- from ${defuse(m.fromName || m.from || 'unknown')} (${m.ts}): ${defuse(m.body)}`)
           .join('\n');
         // Structurally fence the mail: bodies come from other (untrusted) writers,
         // so label the block as data, not instructions, rather than relying on the
