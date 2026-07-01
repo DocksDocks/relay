@@ -121,18 +121,38 @@ pub fn uuid_v4() -> String {
     )
 }
 
-/// ISO-8601 UTC with millisecond precision — matches Node's Date#toISOString.
-pub fn iso_now() -> String {
-    let d = SystemTime::now()
+pub fn now_ms() -> i64 {
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap_or(Duration::ZERO);
-    let secs = d.as_secs() as i64;
-    let millis = d.subsec_millis();
+        .unwrap_or(Duration::ZERO)
+        .as_millis() as i64
+}
+
+/// ISO-8601 UTC with millisecond precision — matches Node's Date#toISOString.
+pub fn iso_from_unix_ms(ms: i64) -> String {
+    let secs = ms.div_euclid(1000);
+    let millis = ms.rem_euclid(1000);
     let days = secs.div_euclid(86_400);
     let rem = secs.rem_euclid(86_400);
     let (h, mi, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
     let (y, mo, da) = civil_from_days(days);
     format!("{y:04}-{mo:02}-{da:02}T{h:02}:{mi:02}:{s:02}.{millis:03}Z")
+}
+
+pub fn iso_now() -> String {
+    iso_from_unix_ms(now_ms())
+}
+
+/// Session ids must be UUID-shaped — both tools mint UUIDs, so a non-UUID id
+/// is a planted/garbage value (and this keeps ids off doorbell argv as
+/// injectable options). Mirrors the Node UUID_RE (case-insensitive).
+pub fn is_uuid(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 36
+        && b.iter().enumerate().all(|(i, c)| match i {
+            8 | 13 | 18 | 23 => *c == b'-',
+            _ => c.is_ascii_hexdigit(),
+        })
 }
 
 /// Days-since-epoch -> (year, month, day). Howard Hinnant's civil_from_days.
@@ -208,7 +228,7 @@ pub struct Entry {
 }
 
 impl Entry {
-    fn to_json(&self) -> JsonValue {
+    pub fn to_json(&self) -> JsonValue {
         let mut m: HashMap<String, JsonValue> = HashMap::new();
         m.insert("id".into(), JsonValue::from(self.id.clone()));
         m.insert(
