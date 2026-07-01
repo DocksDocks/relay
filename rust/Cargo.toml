@@ -1,0 +1,20 @@
+[package]
+name = "relay"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "session-relay: cross-session/cross-tool agent message bus, single static binary"
+publish = false
+
+[dependencies]
+tinyjson = "2.5"
+rustix = { version = "1.1", features = ["fs"] }
+
+# Size-optimized static binary (min-sized-rust, all stable-channel).
+# codegen-units=1 is also a prerequisite for the reproducible-rebuild check.
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

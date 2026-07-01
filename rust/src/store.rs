@@ -1,0 +1,466 @@
+// store.rs — shared on-disk state for the session-relay bus (port of lib/store.mjs).
+// Holds three things, all under one fixed home so every component agrees:
+//   registry.json      id -> { id, dir, name, tool, lastSeen } + a name -> id index
+//   mailbox/<id>.jsonl one append-only inbox per recipient session id
+//   markers/<cwd>      the session id last registered for a project dir
+//
+// Home is a FIXED, TOOL-NEUTRAL path (~/.agent-relay, never under the plugin
+// root — the install dir is replaced on every plugin update). Override with
+// AGENT_RELAY_HOME; SESSION_RELAY_HOME is a back-compat alias.
+//
+// Cross-process safety: every mutation runs under a kernel flock(2) on
+// <home>/.lock (rustix; auto-released on crash — no stale-reclaim dance).
+// The v1 Node store used a mkdir-mutex where `.lock` was a DIRECTORY; a
+// leftover dir is migrated (removed) on first lock acquisition. Registry and
+// marker writes are atomic (tmp + rename); mailbox appends serialize under
+// the same lock.
+
+use rustix::fs::{FlockOperation, flock};
+use std::collections::HashMap;
+use std::fs;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tinyjson::JsonValue;
+
+pub fn home_dir() -> PathBuf {
+    for var in ["AGENT_RELAY_HOME", "SESSION_RELAY_HOME"] {
+        if let Ok(v) = std::env::var(var) {
+            if !v.is_empty() {
+                return PathBuf::from(v);
+            }
+        }
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    Path::new(&home).join(".agent-relay")
+}
+
+fn registry_path() -> PathBuf {
+    home_dir().join("registry.json")
+}
+fn mailbox_path(id: &str) -> PathBuf {
+    home_dir()
+        .join("mailbox")
+        .join(format!("{}.jsonl", sanitize(id)))
+}
+fn marker_path(dir: &str) -> PathBuf {
+    home_dir().join("markers").join(encode_dir(dir))
+}
+fn lock_path() -> PathBuf {
+    home_dir().join(".lock")
+}
+
+/// Filesystem-safe key for a project dir — mirrors Claude Code's own scheme
+/// (every non-alphanumeric char becomes '-').
+pub fn encode_dir(dir: &str) -> String {
+    let abs = std::path::absolute(dir).unwrap_or_else(|_| PathBuf::from(dir));
+    abs.to_string_lossy()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
+}
+
+/// Path-traversal defense for recipient ids used as mailbox filenames.
+pub fn sanitize(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+fn ensure_dirs() -> Result<(), String> {
+    for d in ["mailbox", "markers"] {
+        fs::create_dir_all(home_dir().join(d)).map_err(|e| format!("mkdir {d}: {e}"))?;
+    }
+    Ok(())
+}
+
+fn random_hex(n_bytes: usize) -> String {
+    let mut buf = vec![0u8; n_bytes];
+    // /dev/urandom exists on every unix target we ship (linux-musl, apple-darwin);
+    // rustix::rand::getrandom is Linux-only, so std + the device file it is.
+    let mut f = fs::File::open("/dev/urandom").expect("open /dev/urandom");
+    f.read_exact(&mut buf).expect("read /dev/urandom");
+    use std::fmt::Write as _;
+    buf.iter()
+        .fold(String::with_capacity(n_bytes * 2), |mut s, b| {
+            let _ = write!(s, "{b:02x}");
+            s
+        })
+}
+
+pub fn uuid_v4() -> String {
+    let mut b = vec![0u8; 16];
+    let mut f = fs::File::open("/dev/urandom").expect("open /dev/urandom");
+    f.read_exact(&mut b).expect("read /dev/urandom");
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        b[0],
+        b[1],
+        b[2],
+        b[3],
+        b[4],
+        b[5],
+        b[6],
+        b[7],
+        b[8],
+        b[9],
+        b[10],
+        b[11],
+        b[12],
+        b[13],
+        b[14],
+        b[15]
+    )
+}
+
+/// ISO-8601 UTC with millisecond precision — matches Node's Date#toISOString.
+pub fn iso_now() -> String {
+    let d = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO);
+    let secs = d.as_secs() as i64;
+    let millis = d.subsec_millis();
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    let (h, mi, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    let (y, mo, da) = civil_from_days(days);
+    format!("{y:04}-{mo:02}-{da:02}T{h:02}:{mi:02}:{s:02}.{millis:03}Z")
+}
+
+/// Days-since-epoch -> (year, month, day). Howard Hinnant's civil_from_days.
+pub fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+fn atomic_write(file: &Path, text: &str) -> Result<(), String> {
+    let tmp = PathBuf::from(format!(
+        "{}.{}.{}.tmp",
+        file.display(),
+        std::process::id(),
+        random_hex(4)
+    ));
+    fs::write(&tmp, text).map_err(|e| format!("write {}: {e}", tmp.display()))?;
+    fs::rename(&tmp, file).map_err(|e| format!("rename to {}: {e}", file.display()))
+}
+
+/// Run `f` holding an exclusive kernel flock on <home>/.lock.
+/// Fail-fast contract preserved from the Node store: give up after 3s of
+/// live contention. Crashed holders need no reclaim — the kernel releases.
+pub fn with_lock<T>(f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    ensure_dirs()?;
+    let lock = lock_path();
+    // Migration: the v1 mkdir-mutex left `.lock` as a DIRECTORY. After the
+    // one-commit flip every store toucher is this binary, so a dir here is by
+    // definition abandoned — remove it so open() below doesn't fail EISDIR.
+    if let Ok(md) = fs::metadata(&lock) {
+        if md.is_dir() {
+            let _ = fs::remove_dir(&lock);
+        }
+    }
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false) // a lock file's content is irrelevant; never clobber it
+        .open(&lock)
+        .map_err(|e| format!("open lock {}: {e}", lock.display()))?;
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        match flock(&file, FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => break,
+            Err(e) if e == rustix::io::Errno::AGAIN || e == rustix::io::Errno::INTR => {
+                if Instant::now() > deadline {
+                    return Err("session-relay: lock busy (held > 3s)".to_string());
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(e) => return Err(format!("flock {}: {e}", lock.display())),
+        }
+    }
+    let out = f();
+    let _ = flock(&file, FlockOperation::Unlock); // belt; close releases anyway
+    out
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Entry {
+    pub id: String,
+    pub dir: Option<String>,
+    pub name: Option<String>,
+    pub tool: String,
+    pub last_seen: String,
+}
+
+impl Entry {
+    fn to_json(&self) -> JsonValue {
+        let mut m: HashMap<String, JsonValue> = HashMap::new();
+        m.insert("id".into(), JsonValue::from(self.id.clone()));
+        m.insert(
+            "dir".into(),
+            self.dir
+                .clone()
+                .map(JsonValue::from)
+                .unwrap_or(JsonValue::from(())),
+        );
+        m.insert(
+            "name".into(),
+            self.name
+                .clone()
+                .map(JsonValue::from)
+                .unwrap_or(JsonValue::from(())),
+        );
+        m.insert("tool".into(), JsonValue::from(self.tool.clone()));
+        m.insert("lastSeen".into(), JsonValue::from(self.last_seen.clone()));
+        JsonValue::from(m)
+    }
+
+    fn from_json(v: &JsonValue) -> Option<Entry> {
+        let obj: &HashMap<String, JsonValue> = v.get()?;
+        let s = |k: &str| -> Option<String> { obj.get(k)?.get::<String>().cloned() };
+        Some(Entry {
+            id: s("id")?,
+            dir: s("dir"),
+            name: s("name"),
+            tool: s("tool").unwrap_or_else(|| "claude".to_string()),
+            last_seen: s("lastSeen").unwrap_or_default(),
+        })
+    }
+}
+
+type Registry = (HashMap<String, JsonValue>, HashMap<String, JsonValue>);
+
+// Any read/parse failure yields an empty registry — mirrors readJSON(file, fallback).
+fn read_registry() -> Registry {
+    let mut agents = HashMap::new();
+    let mut names = HashMap::new();
+    if let Ok(raw) = fs::read_to_string(registry_path()) {
+        if let Ok(v) = raw.parse::<JsonValue>() {
+            if let Some(obj) = v.get::<HashMap<String, JsonValue>>() {
+                if let Some(a) = obj
+                    .get("agents")
+                    .and_then(|x| x.get::<HashMap<String, JsonValue>>())
+                {
+                    agents = a.clone();
+                }
+                if let Some(n) = obj
+                    .get("names")
+                    .and_then(|x| x.get::<HashMap<String, JsonValue>>())
+                {
+                    names = n.clone();
+                }
+            }
+        }
+    }
+    (agents, names)
+}
+
+fn write_registry(
+    agents: HashMap<String, JsonValue>,
+    names: HashMap<String, JsonValue>,
+) -> Result<(), String> {
+    let mut root: HashMap<String, JsonValue> = HashMap::new();
+    root.insert("agents".into(), JsonValue::from(agents));
+    root.insert("names".into(), JsonValue::from(names));
+    let text = JsonValue::from(root)
+        .format() // pretty, 2-space — same shape JSON.stringify(reg, null, 2) wrote
+        .map_err(|e| format!("registry serialize: {e}"))?;
+    atomic_write(&registry_path(), &text)
+}
+
+/// Upsert a session. Missing fields are preserved from any prior entry, so the
+/// hook (id + dir, no name) and a later register(name) compose cleanly.
+pub fn register(
+    id: &str,
+    dir: Option<&str>,
+    name: Option<&str>,
+    tool: Option<&str>,
+) -> Result<Entry, String> {
+    if id.is_empty() {
+        return Err("register requires an id".to_string());
+    }
+    with_lock(|| {
+        let (mut agents, mut names) = read_registry();
+        let prev = agents.get(id).and_then(Entry::from_json);
+        let entry = Entry {
+            id: id.to_string(),
+            dir: dir
+                .map(|d| {
+                    std::path::absolute(d)
+                        .unwrap_or_else(|_| PathBuf::from(d))
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .or_else(|| prev.as_ref().and_then(|p| p.dir.clone())),
+            name: name
+                .map(str::to_string)
+                .or_else(|| prev.as_ref().and_then(|p| p.name.clone())),
+            tool: tool
+                .map(str::to_string)
+                .or_else(|| prev.as_ref().map(|p| p.tool.clone()))
+                .unwrap_or_else(|| "claude".to_string()),
+            last_seen: iso_now(),
+        };
+        agents.insert(id.to_string(), entry.to_json());
+        if let Some(n) = &entry.name {
+            // drop a renamed alias: any other name bound to this id
+            names.retain(|k, v| !(v.get::<String>().map(|s| s == id).unwrap_or(false) && k != n));
+            names.insert(n.clone(), JsonValue::from(id.to_string()));
+        }
+        write_registry(agents, names)?;
+        Ok(entry)
+    })
+}
+
+pub fn roster() -> Vec<Entry> {
+    let (agents, _) = read_registry();
+    let mut out: Vec<Entry> = agents.values().filter_map(Entry::from_json).collect();
+    out.sort_by(|a, b| {
+        let ka = a.name.as_deref().unwrap_or(&a.id);
+        let kb = b.name.as_deref().unwrap_or(&b.id);
+        ka.cmp(kb)
+    });
+    out
+}
+
+/// Resolve a target given either a friendly name or a raw session id.
+pub fn resolve(name_or_id: &str) -> Option<Entry> {
+    if name_or_id.is_empty() {
+        return None;
+    }
+    let (agents, names) = read_registry();
+    if let Some(e) = agents.get(name_or_id).and_then(Entry::from_json) {
+        return Some(e);
+    }
+    let id = names.get(name_or_id)?.get::<String>()?.clone();
+    agents.get(&id).and_then(Entry::from_json)
+}
+
+pub fn set_marker(dir: &str, id: &str) -> Result<(), String> {
+    with_lock(|| atomic_write(&marker_path(dir), &format!("{id}\n")))
+}
+
+pub fn id_for_dir(dir: &str) -> Option<String> {
+    let raw = fs::read_to_string(marker_path(dir)).ok()?;
+    let t = raw.trim();
+    if t.is_empty() {
+        None
+    } else {
+        Some(t.to_string())
+    }
+}
+
+/// Append one message. Generated id/ts can be overridden by keys in `msg`
+/// (same semantics as the JS object spread in the Node store).
+pub fn enqueue(recipient_id: &str, msg: &HashMap<String, JsonValue>) -> Result<(), String> {
+    with_lock(|| {
+        let mut m: HashMap<String, JsonValue> = HashMap::new();
+        m.insert("id".into(), JsonValue::from(uuid_v4()));
+        m.insert("ts".into(), JsonValue::from(iso_now()));
+        for (k, v) in msg {
+            m.insert(k.clone(), v.clone());
+        }
+        let line = JsonValue::from(m)
+            .stringify()
+            .map_err(|e| format!("message serialize: {e}"))?;
+        let path = mailbox_path(recipient_id);
+        use std::io::Write;
+        let mut f = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|e| format!("open mailbox {}: {e}", path.display()))?;
+        f.write_all(format!("{line}\n").as_bytes())
+            .map_err(|e| format!("append mailbox: {e}"))?;
+        Ok(())
+    })
+}
+
+fn parse_lines(raw: &str) -> Vec<JsonValue> {
+    raw.split('\n')
+        .filter(|l| !l.is_empty())
+        .filter_map(|l| l.parse::<JsonValue>().ok())
+        .collect()
+}
+
+/// Read AND clear a recipient's inbox in one locked step.
+pub fn drain(recipient_id: &str) -> Result<Vec<JsonValue>, String> {
+    with_lock(|| {
+        let path = mailbox_path(recipient_id);
+        let raw = match fs::read_to_string(&path) {
+            Ok(r) => r,
+            Err(_) => return Ok(Vec::new()),
+        };
+        let msgs = parse_lines(&raw);
+        let _ = fs::remove_file(&path);
+        Ok(msgs)
+    })
+}
+
+pub fn peek(recipient_id: &str) -> Vec<JsonValue> {
+    fs::read_to_string(mailbox_path(recipient_id))
+        .map(|raw| parse_lines(&raw))
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_maps_traversal_to_dashes() {
+        assert_eq!(
+            sanitize("../../etc/passwd"),
+            ".._.._etc_passwd".replace('_', "-")
+        );
+        assert_eq!(sanitize("ok-1.2_x"), "ok-1.2_x");
+        assert_eq!(sanitize("a/b\\c:d"), "a-b-c-d");
+    }
+
+    #[test]
+    fn encode_dir_collapses_non_alnum() {
+        let e = encode_dir("/tmp/some dir/x");
+        assert!(e.starts_with("-tmp-some-dir"));
+        assert!(e.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'));
+    }
+
+    #[test]
+    fn civil_from_days_known_dates() {
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        assert_eq!(civil_from_days(19_723), (2024, 1, 1));
+        assert_eq!(civil_from_days(-1), (1969, 12, 31));
+    }
+
+    #[test]
+    fn iso_now_shape() {
+        let s = iso_now();
+        assert_eq!(s.len(), 24);
+        assert!(s.ends_with('Z'));
+        assert_eq!(&s[4..5], "-");
+        assert_eq!(&s[10..11], "T");
+        assert_eq!(&s[19..20], ".");
+    }
+
+    #[test]
+    fn uuid_v4_shape() {
+        let u = uuid_v4();
+        assert_eq!(u.len(), 36);
+        assert_eq!(&u[14..15], "4");
+        assert!(matches!(&u[19..20], "8" | "9" | "a" | "b"));
+    }
+}
