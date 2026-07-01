@@ -6,6 +6,7 @@
 //   relay register <name> --id <uuid> [--dir <path>] [--tool claude|codex]
 //   relay send <to> [--] <message...>            (or: send --id <id> [--] <message...>)
 //   relay inbox <nameOrId>
+//   relay peek <nameOrId>                        (read-only: inbox without draining)
 //   relay wake <nameOrId> [--dry] [message...]
 //   relay wake --id <id> --dir <cwd> --tool <claude|codex> [message...]
 //
@@ -267,6 +268,26 @@ pub fn run(cmd: &str, raw: Vec<String>) -> ! {
             );
             std::process::exit(0);
         }
+        "peek" => {
+            let pos = args.positionals(1);
+            let Some(who) = pos.first() else {
+                die("usage: relay peek <nameOrId>");
+            };
+            let Some(target) = store::resolve(who) else {
+                die(&format!("unknown session: {who}"));
+            };
+            let msgs = store::peek(&target.id);
+            let mut out: HashMap<String, JsonValue> = HashMap::new();
+            out.insert("count".into(), JsonValue::from(msgs.len() as f64));
+            out.insert("messages".into(), JsonValue::from(msgs));
+            println!(
+                "{}",
+                JsonValue::from(out)
+                    .format()
+                    .unwrap_or_else(|_| "{}".into())
+            );
+            std::process::exit(0);
+        }
         "wake" => {
             let explicit = explicit_target(&args);
             let rest = args.positionals(1);
@@ -379,7 +400,7 @@ pub fn run(cmd: &str, raw: Vec<String>) -> ! {
             std::process::exit(out.status.code().unwrap_or(0));
         }
         _ => die(
-            "usage: relay discover [--within min] [--tool t] | list | register <name> --id <uuid> [--dir <path>] | send <to> <msg> | inbox <who> | wake <who> [msg]",
+            "usage: relay discover [--within min] [--tool t] | list | register <name> --id <uuid> [--dir <path>] | send <to> <msg> | inbox <who> | peek <who> | wake <who> [msg]",
         ),
     }
 }

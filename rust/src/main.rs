@@ -1,7 +1,7 @@
 // relay — session-relay's single binary. One executable, multi-call:
 //   relay bus                      MCP stdio server (manifest entry)
 //   relay hook [codex]             SessionStart hook (register + drain inbox)
-//   relay discover|list|register|send|inbox|wake   the CLI / doorbell
+//   relay discover|list|register|send|inbox|peek|wake   the CLI / doorbell
 //   relay __stress …               hidden test helper (cross-process lock race)
 
 use std::collections::HashMap;
@@ -12,7 +12,7 @@ fn main() {
     match argv.first().map(String::as_str) {
         Some("bus") => relay::bus::run(),
         Some("hook") => relay::hook::run(argv.get(1).map(String::as_str)),
-        Some(cmd @ ("discover" | "list" | "register" | "send" | "inbox" | "wake")) => {
+        Some(cmd @ ("discover" | "list" | "register" | "send" | "inbox" | "peek" | "wake")) => {
             relay::cli::run(cmd, argv.clone())
         }
         // __stress <recipient-id> <who> <k> — mirrors test/selftest.mjs's
@@ -39,7 +39,7 @@ fn main() {
             }
         }
         _ => die(
-            "usage: relay bus | hook [codex] | discover [--within min] [--tool t] | list | register <name> --id <uuid> [--dir <path>] | send <to> [--] <msg> | inbox <who> | wake <who> [msg]",
+            "usage: relay bus | hook [codex] | discover [--within min] [--tool t] | list | register <name> --id <uuid> [--dir <path>] | send <to> [--] <msg> | inbox <who> | peek <who> | wake <who> [msg]",
         ),
     }
 }

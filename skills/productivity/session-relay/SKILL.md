@@ -5,8 +5,8 @@ user-invocable: true
 allowed-tools: Bash, Read
 metadata:
   pattern: tool-wrapper
-  updated: "2026-06-30"
-  content_hash: "0ff2b1aae9df8f714dd62e91fe3a7a110cee851a937733eca556df4b4442502d"
+  updated: "2026-07-01"
+  content_hash: "269a2d6f7b67ca43d72f83ff1e5e556eaa5c09c6bdb501b2728d9f9a2000a6ee"
 ---
 
 # Session relay
@@ -28,8 +28,8 @@ The Claude doorbell (`claude -p --resume <id>`) MUST run from the recipient's ow
 | Bus MCP server | `whoami` / `register` / `roster` / `send` / `inbox` / `discover` tools over the shared store | namespaced `mcp__plugin_session-relay_bus__*` |
 | Shared store | registry (`id → dir + name + tool`) + one JSONL inbox per recipient | `~/.agent-relay/` (override: `AGENT_RELAY_HOME`) |
 | SessionStart hook | auto-registers each session (Claude **or** Codex) and injects pending mail on start/resume | runs automatically |
-| Live discovery | `discover` scans the raw Claude + Codex session stores → sessions running now, even ones that never joined the bus | `discover` tool / `relay.mjs discover` |
-| Doorbell | tool-aware: `claude -p --resume` **or** `codex exec resume` — wakes an idle recipient so it drains its inbox now | Bash, or the bundled `scripts/relay.mjs` |
+| Live discovery | `discover` scans the raw Claude + Codex session stores → sessions running now, even ones that never joined the bus | `discover` tool / `bin/relay discover` |
+| Doorbell | tool-aware: `claude -p --resume` **or** `codex exec resume` — wakes an idle recipient so it drains its inbox now | Bash, or the bundled `bin/relay` |
 
 Delivery is **pull + event**, never a live push: a recipient sees mail when it calls `inbox`, or at its next SessionStart. `send` alone reaches an *idle* session only after you wake it.
 
@@ -37,13 +37,13 @@ Delivery is **pull + event**, never a live push: a recipient sees mail when it c
 
 When the user says "talk to / check / message my other session" without giving an id, don't ask for one — find it:
 
-1. Call `discover` (or `node <plugin>/skills/productivity/session-relay/scripts/relay.mjs discover`). It scans the live Claude + Codex session stores and returns sessions active now, newest first, each `{tool, id, cwd, name, registered, ageSec}` — **including sessions that never joined the bus** (the session-id↔cwd map a doorbell needs is read straight off disk).
+1. Call `discover` (or `<plugin>/bin/relay discover`). It scans the live Claude + Codex session stores and returns sessions active now, newest first, each `{tool, id, cwd, name, registered, ageSec}` — **including sessions that never joined the bus** (the session-id↔cwd map a doorbell needs is read straight off disk).
 2. **Auto-pick** the most recent active candidate; prefer one whose `cwd` matches the project the user means. Only when two are similarly fresh and you genuinely can't tell which they mean, show the short list and ask.
 3. Connect with the tool-aware doorbell:
    - **registered** target → `send` then `wake <name>`.
    - **unregistered** target (no bus membership, so no inbox-drain hook) → wake it directly with the message inline — its resume prompt carries your text even without the hook. Put the message after a `--` so any dashes in it aren't parsed as flags:
      ```bash
-     node <plugin>/skills/productivity/session-relay/scripts/relay.mjs wake --id <id> --dir <cwd> --tool <claude|codex> -- "<message>"
+     <plugin>/bin/relay wake --id <id> --dir <cwd> --tool <claude|codex> -- "<message>"
      ```
 
 ## Send a message to another session
@@ -56,7 +56,7 @@ When the user says "talk to / check / message my other session" without giving a
 cd "<recipient_dir>" && claude -p "You have session-relay mail; use the session-relay skill and call inbox to read it." --resume <recipient_id> --output-format json
 ```
 
-The woken session's SessionStart hook injects the mail; with `-p` it processes it and the JSON `.result` is its reply. The bundled CLI does the same: `node <plugin>/skills/productivity/session-relay/scripts/relay.mjs wake <name>`.
+The woken session's SessionStart hook injects the mail; with `-p` it processes it and the JSON `.result` is its reply. The bundled CLI does the same: `<plugin>/bin/relay wake <name>`.
 
 ## Receive
 
@@ -69,11 +69,11 @@ By default a session is registered only by its id. Call `register` with `{ name:
 
 ## Cross-tool (Claude Code ⇄ Codex)
 
-Both tools share **one** store and registry; every entry carries a `tool` field set by its SessionStart hook, and `roster`/`list` shows it. The send path is identical — only the doorbell differs, and `relay.mjs wake <name>` picks the right one automatically from the target's `tool`.
+Both tools share **one** store and registry; every entry carries a `tool` field set by its SessionStart hook, and `roster`/`list` shows it. The send path is identical — only the doorbell differs, and `bin/relay wake <name>` picks the right one automatically from the target's `tool`.
 
 - **Codex registers itself** via the session-relay Codex plugin's SessionStart hook (same `{session_id, cwd, source}` contract as Claude). No manual step.
 - **Codex doorbell:** `codex exec resume <id> "<nudge>" --json`. The id is the Codex thread id (it surfaces in the `thread.started` event and the rollout filename) and equals the hook's `session_id`. Unlike Claude, `codex exec resume` is **not** cwd-scoped.
-- **Install on Codex:** add the `session-relay` plugin from the Codex marketplace (ships the skill + the SessionStart hook). For the bus tools inside Codex, rely on the plugin's MCP wiring or run `codex mcp add bus -- node <plugin>/mcp/bus.mjs`. A Codex agent can also send with no MCP at all: `node <plugin>/skills/productivity/session-relay/scripts/relay.mjs send <to> "<msg>"`.
+- **Install on Codex:** add the `session-relay` plugin from the Codex marketplace (ships the skill + the SessionStart hook). For the bus tools inside Codex, rely on the plugin's MCP wiring or run `codex mcp add bus -- <plugin>/bin/relay bus`. A Codex agent can also send with no MCP at all: `<plugin>/bin/relay send <to> "<msg>"`.
 
 ## Pick the transport deliberately
 
@@ -94,7 +94,7 @@ cd /any/where && claude -p "ping" --resume 2222...-...  # → No conversation fo
 
 ```bash
 # Resolve the recipient's dir from roster, then resume from there.
-cd "$(node relay.mjs list | awk '$1=="agent-B"{print $3}')" \
+cd "$(<plugin>/bin/relay list | awk '$1=="agent-B"{print $4}')" \
   && claude -p "ping" --resume 2222...-... --output-format json | jq -r .result
 ```
 
