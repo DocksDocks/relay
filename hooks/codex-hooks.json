@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/session-start.mjs\" codex",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/relay\" hook codex",
             "statusMessage": "session-relay: registering + draining inbox"
           }
         ]

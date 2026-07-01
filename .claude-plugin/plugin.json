@@ -23,9 +23,9 @@
   "hooks": "./hooks/hooks.json",
   "mcpServers": {
     "bus": {
-      "command": "node",
+      "command": "${CLAUDE_PLUGIN_ROOT}/bin/relay",
       "args": [
-        "${CLAUDE_PLUGIN_ROOT}/mcp/bus.mjs"
+        "bus"
       ],
       "env": {
         "RELAY_PROJECT_DIR": "${CLAUDE_PROJECT_DIR}"

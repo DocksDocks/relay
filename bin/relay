@@ -1,0 +1,10 @@
+#!/bin/sh
+# relay — arch-dispatch launcher for the session-relay Rust binary.
+d=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+case "$(uname -sm)" in
+  'Darwin arm64')  exec "$d/relay-aarch64-apple-darwin" "$@" ;;
+  'Darwin x86_64') exec "$d/relay-x86_64-apple-darwin" "$@" ;;
+  'Linux aarch64') exec "$d/relay-aarch64-unknown-linux-musl" "$@" ;;
+  'Linux x86_64')  exec "$d/relay-x86_64-unknown-linux-musl" "$@" ;;
+  *) echo "session-relay: unsupported platform $(uname -sm)" >&2; exit 1 ;;
+esac

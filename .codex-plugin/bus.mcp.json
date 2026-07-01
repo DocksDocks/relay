@@ -1,8 +1,8 @@
 {
   "mcpServers": {
     "bus": {
-      "command": "node",
-      "args": ["${CLAUDE_PLUGIN_ROOT}/mcp/bus.mjs"]
+      "command": "${PLUGIN_ROOT}/bin/relay",
+      "args": ["bus"]
     }
   }
 }
