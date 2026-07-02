@@ -5,7 +5,10 @@
 // 0.142.5) that records every client JSON-RPC message to a JSONL file and
 // answers just enough of the protocol for `relay watch` to complete a delivery:
 //   initialize → result; thread/resume → thread stub; thread/inject_items → {};
-//   turn/start → turn stub + a turn/started notification.
+//   turn/start → turn stub + turn/started, then an mcpServer/elicitation/request
+//   for the bus server (MCP tool calls elicit approval from the connected
+//   client regardless of approvalPolicy — live-verified); turn/completed is
+//   emitted only after the client answers, mirroring the real wedge.
 // Usage: node fake-app-server.mjs <socket-path> <frames-out.jsonl>
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -69,6 +72,11 @@ const server = net.createServer((c) => {
       try { msg = JSON.parse(f.payload.toString('utf8')); } catch { continue; }
       fs.appendFileSync(framesFile, `${JSON.stringify(msg)}\n`);
       if (msg.id === undefined) continue; // notification (e.g. initialized)
+      if (msg.method === undefined) {
+        // response to OUR elicitation request → the turn may finish
+        if (msg.id === 990) c.write(encodeText(JSON.stringify({ method: 'turn/completed', params: { turnId: 'turn-1' } })));
+        continue;
+      }
       const reply = (result) => c.write(encodeText(JSON.stringify({ id: msg.id, result })));
       switch (msg.method) {
         case 'initialize': reply({ userAgent: 'fake-app-server/1.0' }); break;
@@ -77,6 +85,7 @@ const server = net.createServer((c) => {
         case 'turn/start':
           reply({ turn: { id: 'turn-1', status: 'inProgress' } });
           c.write(encodeText(JSON.stringify({ method: 'turn/started', params: { turnId: 'turn-1', threadId: msg.params?.threadId ?? null } })));
+          c.write(encodeText(JSON.stringify({ id: 990, method: 'mcpServer/elicitation/request', params: { threadId: msg.params?.threadId ?? null, turnId: 'turn-1', serverName: 'bus', mode: 'form', _meta: { codex_approval_kind: 'mcp_tool_call' } } })));
           break;
         default: reply({});
       }

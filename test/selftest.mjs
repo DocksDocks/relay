@@ -46,7 +46,7 @@ const HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'session-relay-test-'));
 // (proves SESSION_RELAY_HOME still works), host discovery/store vars scrubbed.
 function envFor(extra = {}) {
   const env = { ...process.env };
-  for (const k of ['AGENT_RELAY_HOME', 'RELAY_CLAUDE_PROJECTS', 'RELAY_CODEX_SESSIONS', 'CLAUDE_CONFIG_DIR', 'CODEX_HOME', 'RELAY_NO_WATCH', 'RELAY_APP_SERVER', 'RELAY_TURN_SETTLE_MS']) delete env[k];
+  for (const k of ['AGENT_RELAY_HOME', 'RELAY_CLAUDE_PROJECTS', 'RELAY_CODEX_SESSIONS', 'CLAUDE_CONFIG_DIR', 'CODEX_HOME', 'RELAY_NO_WATCH', 'RELAY_APP_SERVER', 'RELAY_TURN_SETTLE_MS', 'RELAY_TURN_WAIT_MS']) delete env[k];
   return { ...env, SESSION_RELAY_HOME: HOME, ...extra };
 }
 const relay = (args, opts = {}) => spawnSync(BIN, args, { encoding: 'utf8', input: opts.input, env: envFor(opts.env) });
@@ -467,10 +467,10 @@ check('watch --once injects fenced mail into the app-server thread and drains th
   assert.ok(!fr.some((f) => f.method === 'turn/start'), 'no turn without --auto-turn');
   assert.equal(peek('codex-W').count, 0, 'mailbox drained after a successful push');
 });
-check('watch --auto-turn starts a turn with the neutral nudge and never-approvals', () => {
+check('watch --auto-turn starts a turn with the neutral nudge, answers the bus elicitation, stays until turn end', () => {
   fs.writeFileSync(framesFile, '');
   assert.equal(relay(['send', 'codex-W', '--', 'second push']).status, 0);
-  const r = relay(['watch', 'codex-W', '--server', sock, '--once', '--auto-turn'], { env: { RELAY_TURN_SETTLE_MS: '50' } });
+  const r = relay(['watch', 'codex-W', '--server', sock, '--once', '--auto-turn'], { env: { RELAY_TURN_SETTLE_MS: '50', RELAY_TURN_WAIT_MS: '8000' } });
   assert.equal(r.status, 0, `watch exited ${r.status}: ${r.stderr}`);
   const fr = readFrames();
   const turn = fr.find((f) => f.method === 'turn/start');
@@ -479,6 +479,9 @@ check('watch --auto-turn starts a turn with the neutral nudge and never-approval
   assert.ok(/session-relay mail/i.test(turn.params.input[0].text), 'turn carries the neutral doorbell nudge');
   assert.ok(!turn.params.input[0].text.includes('second push'), 'mail content never rides in the turn input');
   assert.ok(fr.findIndex((f) => f.method === 'thread/inject_items') < fr.indexOf(turn), 'inject precedes the turn');
+  const answer = fr.find((f) => f.id === 990 && f.result);
+  assert.ok(answer, 'watch answered the mcpServer/elicitation/request (a detached client wedges the turn)');
+  assert.equal(answer.result.action, 'accept', 'the relay bus server is accepted');
 });
 check('watch routes a claude target to the wake doorbell fallback (--dry)', () => {
   assert.equal(relay(['send', 'agent-A', '--', 'claude-bound']).status, 0);

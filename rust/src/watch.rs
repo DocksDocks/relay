@@ -13,6 +13,14 @@
 //     unattended. The `jsonrpc` field is omitted on the wire.
 //   - a `turn/start` issued immediately after inject_items wedges the turn:
 //     wait RELAY_TURN_SETTLE_MS (default 5000) between the two.
+//   - `approvalPolicy: "never"` auto-rejects shell approvals, but an MCP tool
+//     call raises an `mcpServer/elicitation/request` server->client REQUEST
+//     that MUST be answered (`{action: "accept"|"decline"}`) or the turn wedges
+//     on `waitingOnApproval` forever (live-reproduced 2026-07-02). So after
+//     `turn/start`, watch stays attached until `turn/completed`, accepting
+//     elicitations for the relay's own `bus` server (store-local tools only)
+//     and declining every other server — a declined call fails cleanly and the
+//     turn continues.
 // Delivery: default = inject_items with the UNTRUSTED-DATA fence (mail waits
 // for the thread's next turn); --auto-turn additionally starts a turn carrying
 // the neutral doorbell nudge (never mail content — the guardian refuses
@@ -31,6 +39,7 @@ use tinyjson::JsonValue;
 
 const POLL_MS: u64 = 2000;
 const DEFAULT_SETTLE_MS: u64 = 5000;
+const DEFAULT_TURN_WAIT_MS: u64 = 300_000;
 const RPC_TIMEOUT_SECS: u64 = 20;
 
 fn die(msg: &str) -> ! {
@@ -241,10 +250,30 @@ fn deliver(
     if auto_turn {
         std::thread::sleep(Duration::from_millis(settle_ms));
         ws.request(3, "turn/start", turn_params(thread_id))?;
-        // The turn runs server-side; seeing turn/started is enough to detach.
-        let _ = ws.wait_for_method("turn/started", 30_000);
+        // Stay attached: MCP tool calls elicit approval from the CONNECTED
+        // client no matter the approvalPolicy; detaching here wedges the turn.
+        let wait_ms: u64 = std::env::var("RELAY_TURN_WAIT_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_TURN_WAIT_MS);
+        if !ws.pump_turn(wait_ms)? {
+            eprintln!(
+                "[relay watch] turn on {thread_id} still running after {wait_ms}ms — detaching (a later MCP call may wedge it)"
+            );
+        }
     }
     Ok(())
+}
+
+// Approve only the relay's own bus server (whoami/register/roster/send/inbox/
+// discover — store-local, no shell, no file access); everything else is
+// declined so the turn fails that call cleanly instead of wedging.
+fn elicitation_action(server_name: &str) -> &'static str {
+    if server_name == "bus" {
+        "accept"
+    } else {
+        "decline"
+    }
 }
 
 // Doorbell fallback via self-exec: `wake` lives in cli::run, which never
@@ -582,7 +611,12 @@ impl WsConn {
         }
     }
 
-    fn wait_for_method(&mut self, name: &str, ms: u64) -> Result<bool, String> {
+    // Pump the event stream until the turn ends. Ok(true) = turn/completed or
+    // turn/failed seen; Ok(false) = still running at the deadline. Server->
+    // client `mcpServer/elicitation/request`s are answered per
+    // `elicitation_action`; other server requests are left alone (unknown
+    // response schemas — answering blind is worse than the caller's timeout).
+    fn pump_turn(&mut self, ms: u64) -> Result<bool, String> {
         let deadline = Instant::now() + Duration::from_millis(ms);
         loop {
             if Instant::now() > deadline {
@@ -597,12 +631,30 @@ impl WsConn {
             let Some(o) = v.get::<HashMap<String, JsonValue>>() else {
                 continue;
             };
-            if o.get("method")
-                .and_then(|m| m.get::<String>().cloned())
-                .as_deref()
-                == Some(name)
-            {
-                return Ok(true);
+            let method = o.get("method").and_then(|m| m.get::<String>().cloned());
+            match method.as_deref() {
+                Some("turn/completed") | Some("turn/failed") => return Ok(true),
+                Some("mcpServer/elicitation/request") => {
+                    let Some(req_id) = o.get("id").cloned() else {
+                        continue; // notification form: nothing to answer
+                    };
+                    let server_name = o
+                        .get("params")
+                        .and_then(|p| p.get::<HashMap<String, JsonValue>>())
+                        .and_then(|p| p.get("serverName"))
+                        .and_then(|s| s.get::<String>().cloned())
+                        .unwrap_or_default();
+                    let action = elicitation_action(&server_name);
+                    let msg = sobj(vec![
+                        ("id", req_id),
+                        (
+                            "result",
+                            sobj(vec![("action", JsonValue::from(action.to_string()))]),
+                        ),
+                    ]);
+                    self.send_frame(0x1, msg.stringify().map_err(|e| format!("{e}"))?.as_bytes())?;
+                }
+                _ => {}
             }
         }
     }
@@ -639,6 +691,13 @@ mod tests {
             assert_eq!(used, f.len());
         }
         assert!(parse_frame(&[0x81]).is_none()); // incomplete header
+    }
+
+    #[test]
+    fn elicitations_accept_only_the_relay_bus_server() {
+        assert_eq!(elicitation_action("bus"), "accept");
+        assert_eq!(elicitation_action("codex_apps"), "decline");
+        assert_eq!(elicitation_action(""), "decline");
     }
 
     #[test]
