@@ -11,6 +11,18 @@
           }
         ]
       }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/bin/relay",
+            "args": ["hook", "--event", "prompt"],
+            "statusMessage": "session-relay: checking inbox"
+          }
+        ]
+      }
     ]
   }
 }

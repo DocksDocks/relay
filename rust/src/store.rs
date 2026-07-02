@@ -38,7 +38,7 @@ pub fn home_dir() -> PathBuf {
 fn registry_path() -> PathBuf {
     home_dir().join("registry.json")
 }
-fn mailbox_path(id: &str) -> PathBuf {
+pub(crate) fn mailbox_path(id: &str) -> PathBuf {
     home_dir()
         .join("mailbox")
         .join(format!("{}.jsonl", sanitize(id)))

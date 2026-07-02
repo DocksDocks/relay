@@ -27,11 +27,11 @@ fn die(msg: &str) -> ! {
     std::process::exit(1);
 }
 
-struct Args(Vec<String>);
+pub(crate) struct Args(pub(crate) Vec<String>);
 
 impl Args {
     // --name <value>; an empty value counts as absent (Node truthiness parity).
-    fn flag(&self, name: &str) -> Option<&str> {
+    pub(crate) fn flag(&self, name: &str) -> Option<&str> {
         let key = format!("--{name}");
         let i = self.0.iter().position(|a| *a == key)?;
         self.0
@@ -43,7 +43,7 @@ impl Args {
         self.0.iter().any(|a| a == &format!("--{name}"))
     }
     // positional args excluding flags + their values; a bare `--` ends option parsing.
-    fn positionals(&self, from: usize) -> Vec<&str> {
+    pub(crate) fn positionals(&self, from: usize) -> Vec<&str> {
         let mut out = Vec::new();
         let mut i = from;
         while i < self.0.len() {
