@@ -46,7 +46,7 @@ const HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'session-relay-test-'));
 // (proves SESSION_RELAY_HOME still works), host discovery/store vars scrubbed.
 function envFor(extra = {}) {
   const env = { ...process.env };
-  for (const k of ['AGENT_RELAY_HOME', 'RELAY_CLAUDE_PROJECTS', 'RELAY_CODEX_SESSIONS', 'CLAUDE_CONFIG_DIR', 'CODEX_HOME', 'RELAY_NO_WATCH', 'RELAY_APP_SERVER', 'RELAY_TURN_SETTLE_MS', 'RELAY_TURN_WAIT_MS']) delete env[k];
+  for (const k of ['AGENT_RELAY_HOME', 'RELAY_CLAUDE_PROJECTS', 'RELAY_CODEX_SESSIONS', 'CLAUDE_CONFIG_DIR', 'CODEX_HOME', 'RELAY_NO_WATCH', 'RELAY_APP_SERVER', 'RELAY_TURN_SETTLE_MS', 'RELAY_TURN_WAIT_MS', 'RELAY_SPAWN_CMD_CLAUDE', 'RELAY_SPAWN_CMD_CODEX', 'STUB_RELAY_BIN', 'STUB_TOOL']) delete env[k];
   return { ...env, SESSION_RELAY_HOME: HOME, ...extra };
 }
 const relay = (args, opts = {}) => spawnSync(BIN, args, { encoding: 'utf8', input: opts.input, env: envFor(opts.env) });
@@ -501,6 +501,68 @@ check('watch re-enqueues mail when the app-server is unreachable (--once exits 1
   assert.equal(relayJSON(['inbox', 'codex-W']).messages[0].body, 'must survive');
 });
 fakeSrv.kill();
+
+// --- relay spawn: birth a new session via a fake child (no real claude/codex
+// in CI). The stub plays the child: it derives its session id the way the real
+// tool would (parse --session-id = claude pre-mint path; mint one = codex
+// marker-watch path) and performs the birth self-registration by re-invoking
+// the SAME relay binary's hook verb — exactly what a real child's SessionStart
+// hook does. ---
+const stub = path.join(HOME, 'fake-child');
+fs.writeFileSync(stub, `#!/usr/bin/env node
+const { spawnSync } = require('node:child_process');
+const i = process.argv.indexOf('--session-id');
+const id = i >= 0 ? process.argv[i + 1] : require('node:crypto').randomUUID();
+const evt = JSON.stringify({ session_id: id, cwd: process.cwd(), hook_event_name: 'SessionStart', source: 'startup' });
+const hookArgs = process.env.STUB_TOOL === 'codex' ? ['hook', 'codex'] : ['hook'];
+spawnSync(process.env.STUB_RELAY_BIN, hookArgs, { input: evt, env: process.env });
+`, { mode: 0o755 });
+
+check('spawn --dry resolves the claude argv, default-tool note, and reply-loop prompt', () => {
+  const dirS = path.join(HOME, 'proj-s0');
+  fs.mkdirSync(dirS, { recursive: true });
+  const r = relay(['spawn', dirS, '--reply-to', 'agent-A', '--dry', '--', 'do X']);
+  assert.equal(r.status, 0, `spawn --dry exited ${r.status}: ${r.stderr}`);
+  assert.ok(/defaulting to claude/i.test(r.stderr), 'no --tool prints the default note');
+  const d = JSON.parse(r.stdout);
+  assert.equal(d.tool, 'claude');
+  assert.ok(d.args.includes('-p') && d.args.includes('--session-id'), 'headless + pre-minted id');
+  assert.deepEqual(d.args.slice(d.args.indexOf('--permission-mode'), d.args.indexOf('--permission-mode') + 2), ['--permission-mode', 'auto']);
+  assert.ok(!d.args.some((a) => a.includes('output-format')), 'detached child gets no output-format flag');
+  assert.ok(d.prompt.includes('send "agent-A" -- ') && d.prompt.trimEnd().endsWith('do X'), 'prompt carries the abs-relay reply command and the task');
+  assert.ok(d.prompt.includes('separate git branch'), 'guardrail rules ride in the prompt');
+  assert.equal(d.cwd, fs.realpathSync(dirS));
+});
+check('spawn births a claude child via the pre-mint path and registers its name', () => {
+  const dirS = path.join(HOME, 'proj-s1');
+  fs.mkdirSync(dirS, { recursive: true });
+  const r = relay(['spawn', dirS, '--tool', 'claude', '--name', 'w1', '--reply-to', 'agent-A', '--timeout', '5', '--', 'task one'],
+    { env: { RELAY_SPAWN_CMD_CLAUDE: stub, STUB_RELAY_BIN: BIN } });
+  assert.equal(r.status, 0, `spawn exited ${r.status}: ${r.stderr}`);
+  assert.ok(/^spawned w1 \([0-9a-f-]{36}\)/.test(r.stdout), `birth line: ${r.stdout}`);
+  assert.equal(relay(['send', 'w1', '--', 'hello worker']).status, 0);
+  assert.equal(peek('w1').count, 1, 'named worker is a routable bus target');
+});
+check('spawn births a codex child via the marker-watch path (no pre-set id flag)', () => {
+  const dirS = path.join(HOME, 'proj-s2');
+  fs.mkdirSync(dirS, { recursive: true });
+  const r = relay(['spawn', dirS, '--tool', 'codex', '--name', 'w2', '--reply-to', 'agent-A', '--timeout', '5', '--', 'task two'],
+    { env: { RELAY_SPAWN_CMD_CODEX: stub, STUB_RELAY_BIN: BIN, STUB_TOOL: 'codex' } });
+  assert.equal(r.status, 0, `spawn exited ${r.status}: ${r.stderr}`);
+  const dry = relayJSON(['wake', 'w2', '--dry']);
+  assert.equal(dry.tool, 'codex', 'marker-watch birth registered the codex tool');
+  assert.equal(dry.cwd, dirS);
+});
+check('spawn timeout names the child stderr log when no birth arrives', () => {
+  const dirS = path.join(HOME, 'proj-s3');
+  fs.mkdirSync(dirS, { recursive: true });
+  const noop = path.join(HOME, 'noop-child');
+  fs.writeFileSync(noop, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+  const r = relay(['spawn', dirS, '--tool', 'claude', '--reply-to', 'agent-A', '--timeout', '1', '--', 'never registers'],
+    { env: { RELAY_SPAWN_CMD_CLAUDE: noop } });
+  assert.notEqual(r.status, 0, 'no birth within timeout is a failure');
+  assert.ok(/spawn-logs.*\.stderr/.test(r.stderr), 'timeout message names the stderr log path');
+});
 
 fs.rmSync(HOME, { recursive: true, force: true });
 console.log(`\nPASS: session-relay self-test — ${passed} checks (binary: ${path.relative(PLUGIN, BIN)})`);

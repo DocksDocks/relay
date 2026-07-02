@@ -17,6 +17,7 @@ fn main() {
             relay::cli::run(cmd, argv.clone())
         }
         Some("watch") => relay::watch::run(argv.clone()),
+        Some("spawn") => relay::spawn::run(argv.clone()),
         // __stress <recipient-id> <who> <k> — mirrors test/selftest.mjs's
         // stress worker: race k enqueues against k register upserts, plus one
         // unique-id register per iteration so a lost read-modify-write shows
@@ -41,7 +42,7 @@ fn main() {
             }
         }
         _ => die(
-            "usage: relay bus | hook [codex] [--event prompt] | discover [--within min] [--tool t] | list | register <name> --id <uuid> [--dir <path>] | send <to> [--] <msg> | inbox <who> | peek <who> | wake <who> [msg] | watch <who>...|--all [--server <sock>] [--auto-turn] [--once]",
+            "usage: relay bus | hook [codex] [--event prompt] | discover [--within min] [--tool t] | list | register <name> --id <uuid> [--dir <path>] | send <to> [--] <msg> | inbox <who> | peek <who> | wake <who> [msg] | watch <who>...|--all [--server <sock>] [--auto-turn] [--once] | spawn <dir> [--tool t] [--name n] [--] <task>",
         ),
     }
 }

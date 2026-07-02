@@ -20,7 +20,15 @@ use std::collections::HashMap;
 use tinyjson::JsonValue;
 
 pub(crate) const DEFAULT_NUDGE: &str = "You have new session-relay mail. Use the session-relay skill: call inbox to read your pending messages and act on them.";
-const BOOL_FLAGS: [&str; 5] = ["dry", "json", "auto-turn", "once", "all"];
+const BOOL_FLAGS: [&str; 7] = [
+    "dry",
+    "json",
+    "auto-turn",
+    "once",
+    "all",
+    "read-only",
+    "full-access",
+];
 
 fn die(msg: &str) -> ! {
     eprintln!("{msg}");
@@ -63,7 +71,7 @@ impl Args {
         out
     }
     // Message after an explicit `--` separator, verbatim; None when absent.
-    fn message_after_sep(&self) -> Option<String> {
+    pub(crate) fn message_after_sep(&self) -> Option<String> {
         let i = self.0.iter().position(|a| a == "--")?;
         Some(self.0[i + 1..].join(" "))
     }
