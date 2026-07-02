@@ -6,7 +6,7 @@ allowed-tools: Bash, Read
 metadata:
   pattern: tool-wrapper
   updated: "2026-07-02"
-  content_hash: "d193271a1ee013e9f93ad5e2ecb51008d64054fb91497dab4efad50353ac61d8"
+  content_hash: "a8131a85d358b4c54a6b3db1c5be34e8b8bb2d6c54ff103de00cc6e653ce9e1f"
 ---
 
 # Session relay
@@ -110,6 +110,37 @@ codex --remote unix://$HOME/.codex-app.sock              # optional: attach the 
   login — `--auto-turn` and doorbell turns draw from the same subscription usage
   pool as typing interactively; no API key is involved or ever exported.
 
+## Spawn a new full-context worker session (`relay spawn`)
+
+A native subagent runs inside THIS session and project. When the work belongs in
+ANOTHER project — with that project's CLAUDE.md/AGENTS.md, skills, and plugins —
+birth a real, resumable session there instead:
+
+```bash
+<plugin>/bin/relay spawn <dir> --tool claude|codex --name worker1 [--reply-to <me>] -- "<first task>"
+```
+
+- **Ask the tool first.** When the user didn't specify `--tool`, ask via the native
+  question UI (Claude `AskUserQuestion` / Codex `ask_user_question`) before invoking
+  the CLI; the bare CLI defaults to `claude` with a printed note.
+- The child launches detached; spawn returns as soon as the child's own SessionStart
+  hook registers it on the bus (typically <1s), long before the task finishes. Its
+  first prompt carries a standing prefix: report results/questions to `--reply-to`
+  (default: this session's bus name) via the absolute relay binary path — so the
+  reply loop works even in a project where session-relay isn't installed.
+- **Permissions (symmetric):** default = Claude `--permission-mode auto` / Codex
+  `--sandbox workspace-write`; `--read-only` opts down (plan / read-only);
+  `--full-access` opts up (bypassPermissions / danger-full-access). Guardrail rules
+  ride in every child's prompt regardless: separate git branch only, no
+  live/production mutations, ask the parent before destructive ops.
+- Continue the conversation with `send worker1` + `relay wake worker1` — the id is
+  durable and resumable; the process being one-shot is expected.
+- On birth timeout, the error names the child's stderr log
+  (`~/.agent-relay/spawn-logs/<id>.stderr`) — read it before retrying.
+- **Billing:** every spawned child is a full agent session on your subscription
+  (Claude OAuth / ChatGPT login) — heavier than a wake; spawn deliberately, never
+  in loops.
+
 ## Pick the transport deliberately
 
 | Need | Use | Not |
@@ -149,7 +180,7 @@ cd "$(<plugin>/bin/relay list | awk '$1=="agent-B"{print $4}')" \
 - The only bus tools: `whoami`, `register`, `roster`, `send`, `inbox`, `discover`. If the tools aren't available, the plugin isn't enabled here.
 - `discover` infers liveness from session-file recency (mtime), not a live handshake — a just-idle session can still appear; a long-dead one won't (it falls outside the window).
 - There is no live session-to-session socket. Even `relay watch` is queue + push-into-thread: mail always lands in the shared store first, and only Codex-under-app-server targets take a push — Claude live delivery is the Monitor watch or the next prompt.
-- `relay watch` flags: `--server`, `--tool`, `--auto-turn`, `--once`, `--all`, `--dry`, `--id`. Do not invent others; there is no `--interval` or daemon mode config.
+- `relay watch` flags: `--server`, `--tool`, `--auto-turn`, `--once`, `--all`, `--dry`, `--id`. `relay spawn` flags: `--tool`, `--name`, `--reply-to`, `--timeout`, `--read-only`, `--full-access`, `--dry`. Do not invent others; there is no `--interval`, `--wait`, or daemon-mode config.
 
 ## Success criteria
 
