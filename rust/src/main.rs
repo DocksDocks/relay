@@ -2,6 +2,7 @@
 //   relay bus                      MCP stdio server (manifest entry)
 //   relay hook [codex] [--event prompt]   SessionStart/UserPromptSubmit hook (register + drain inbox)
 //   relay discover|list|register|send|inbox|peek|wake   the CLI / doorbell
+//   relay watch …                  poll mailboxes, push into live Codex threads via app-server
 //   relay __stress …               hidden test helper (cross-process lock race)
 
 use std::collections::HashMap;
@@ -15,6 +16,7 @@ fn main() {
         Some(cmd @ ("discover" | "list" | "register" | "send" | "inbox" | "peek" | "wake")) => {
             relay::cli::run(cmd, argv.clone())
         }
+        Some("watch") => relay::watch::run(argv.clone()),
         // __stress <recipient-id> <who> <k> — mirrors test/selftest.mjs's
         // stress worker: race k enqueues against k register upserts, plus one
         // unique-id register per iteration so a lost read-modify-write shows
@@ -39,7 +41,7 @@ fn main() {
             }
         }
         _ => die(
-            "usage: relay bus | hook [codex] [--event prompt] | discover [--within min] [--tool t] | list | register <name> --id <uuid> [--dir <path>] | send <to> [--] <msg> | inbox <who> | peek <who> | wake <who> [msg]",
+            "usage: relay bus | hook [codex] [--event prompt] | discover [--within min] [--tool t] | list | register <name> --id <uuid> [--dir <path>] | send <to> [--] <msg> | inbox <who> | peek <who> | wake <who> [msg] | watch <who>...|--all [--server <sock>] [--auto-turn] [--once]",
         ),
     }
 }

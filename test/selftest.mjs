@@ -11,7 +11,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -46,7 +46,7 @@ const HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'session-relay-test-'));
 // (proves SESSION_RELAY_HOME still works), host discovery/store vars scrubbed.
 function envFor(extra = {}) {
   const env = { ...process.env };
-  for (const k of ['AGENT_RELAY_HOME', 'RELAY_CLAUDE_PROJECTS', 'RELAY_CODEX_SESSIONS', 'CLAUDE_CONFIG_DIR', 'CODEX_HOME', 'RELAY_NO_WATCH']) delete env[k];
+  for (const k of ['AGENT_RELAY_HOME', 'RELAY_CLAUDE_PROJECTS', 'RELAY_CODEX_SESSIONS', 'CLAUDE_CONFIG_DIR', 'CODEX_HOME', 'RELAY_NO_WATCH', 'RELAY_APP_SERVER', 'RELAY_TURN_SETTLE_MS']) delete env[k];
   return { ...env, SESSION_RELAY_HOME: HOME, ...extra };
 }
 const relay = (args, opts = {}) => spawnSync(BIN, args, { encoding: 'utf8', input: opts.input, env: envFor(opts.env) });
@@ -437,6 +437,67 @@ check('RELAY_NO_WATCH=1 suppresses the nudge (empty inbox → empty stdout)', ()
   assert.equal(r.status, 0);
   assert.equal(r.stdout, '');
 });
+
+// --- relay watch: push delivery into a live Codex thread via a (fake)
+// app-server — WS-over-unix-socket, frames recorded to a JSONL file ---
+const sock = path.join(HOME, 'app.sock');
+const framesFile = path.join(HOME, 'frames.jsonl');
+fs.writeFileSync(framesFile, '');
+const fakeSrv = spawn(process.execPath, [path.join(HERE, 'fake-app-server.mjs'), sock, framesFile], { stdio: 'ignore' });
+const sleep = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+for (let i = 0; i < 150 && !fs.existsSync(sock); i += 1) sleep(20);
+assert.ok(fs.existsSync(sock), 'fake app-server came up');
+const idW = '55555555-5555-5555-5555-555555555555';
+const dirW = path.join(HOME, 'proj-w');
+fs.mkdirSync(dirW, { recursive: true });
+relay(['register', 'codex-W', '--id', idW, '--dir', dirW, '--tool', 'codex']);
+const readFrames = () => fs.readFileSync(framesFile, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
+
+check('watch --once injects fenced mail into the app-server thread and drains the mailbox', () => {
+  assert.equal(relay(['send', 'codex-W', '--', 'watch push test']).status, 0);
+  const r = relay(['watch', 'codex-W', '--server', sock, '--once']);
+  assert.equal(r.status, 0, `watch exited ${r.status}: ${r.stderr}`);
+  const fr = readFrames();
+  const resume = fr.find((f) => f.method === 'thread/resume');
+  assert.ok(resume && resume.params.threadId === idW, 'thread/resume targets the mailbox id');
+  const inject = fr.find((f) => f.method === 'thread/inject_items');
+  const text = inject.params.items[0].content[0].text;
+  assert.ok(text.includes('<session-relay-mail>') && /untrusted/i.test(text), 'mail rides inside the UNTRUSTED-DATA fence');
+  assert.ok(text.includes('watch push test'), 'body delivered verbatim inside the fence');
+  assert.ok(!fr.some((f) => f.method === 'turn/start'), 'no turn without --auto-turn');
+  assert.equal(peek('codex-W').count, 0, 'mailbox drained after a successful push');
+});
+check('watch --auto-turn starts a turn with the neutral nudge and never-approvals', () => {
+  fs.writeFileSync(framesFile, '');
+  assert.equal(relay(['send', 'codex-W', '--', 'second push']).status, 0);
+  const r = relay(['watch', 'codex-W', '--server', sock, '--once', '--auto-turn'], { env: { RELAY_TURN_SETTLE_MS: '50' } });
+  assert.equal(r.status, 0, `watch exited ${r.status}: ${r.stderr}`);
+  const fr = readFrames();
+  const turn = fr.find((f) => f.method === 'turn/start');
+  assert.ok(turn, 'turn/start sent');
+  assert.equal(turn.params.approvalPolicy, 'never');
+  assert.ok(/session-relay mail/i.test(turn.params.input[0].text), 'turn carries the neutral doorbell nudge');
+  assert.ok(!turn.params.input[0].text.includes('second push'), 'mail content never rides in the turn input');
+  assert.ok(fr.findIndex((f) => f.method === 'thread/inject_items') < fr.indexOf(turn), 'inject precedes the turn');
+});
+check('watch routes a claude target to the wake doorbell fallback (--dry)', () => {
+  assert.equal(relay(['send', 'agent-A', '--', 'claude-bound']).status, 0);
+  const r = relay(['watch', 'agent-A', '--server', sock, '--once', '--dry']);
+  assert.equal(r.status, 0, `watch exited ${r.status}: ${r.stderr}`);
+  const line = JSON.parse(r.stdout.trim());
+  assert.equal(line.action, 'wake-fallback');
+  assert.equal(line.id, idA);
+  assert.equal(line.tool, 'claude');
+  relayJSON(['inbox', 'agent-A']); // drain: dry mode never touches the mailbox
+});
+check('watch re-enqueues mail when the app-server is unreachable (--once exits 1)', () => {
+  assert.equal(relay(['send', 'codex-W', '--', 'must survive']).status, 0);
+  const r = relay(['watch', 'codex-W', '--server', path.join(HOME, 'no-such.sock'), '--once']);
+  assert.notEqual(r.status, 0, 'unreachable server is a failure in --once mode');
+  assert.equal(peek('codex-W').count, 1, 'mail re-enqueued after the failed push');
+  assert.equal(relayJSON(['inbox', 'codex-W']).messages[0].body, 'must survive');
+});
+fakeSrv.kill();
 
 fs.rmSync(HOME, { recursive: true, force: true });
 console.log(`\nPASS: session-relay self-test — ${passed} checks (binary: ${path.relative(PLUGIN, BIN)})`);

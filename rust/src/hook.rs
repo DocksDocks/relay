@@ -56,7 +56,7 @@ fn parse_invocation(args: &[String]) -> (&'static str, HookEvent) {
 // fence delimiter in each: a body/name containing </session-relay-mail> would
 // otherwise close the block early and smuggle text out past it, where the
 // reading agent reads it as trusted prose. Case-insensitive, both forms.
-fn defuse(s: &str) -> String {
+pub(crate) fn defuse(s: &str) -> String {
     // ASCII-only patterns, so match bytes case-insensitively in place — never
     // index the original with offsets from a to_lowercase() copy (lowercasing
     // can change byte lengths for non-ASCII and misalign on untrusted input).
@@ -97,8 +97,9 @@ pub fn run(args: &[String]) -> ! {
 }
 
 // Structurally fence the mail: bodies come from other (untrusted) writers,
-// so label the block as data, not instructions.
-fn mail_block(msgs: &[JsonValue]) -> String {
+// so label the block as data, not instructions. Shared with `relay watch`,
+// which injects the same fenced form into live Codex threads.
+pub(crate) fn mail_block(msgs: &[JsonValue]) -> String {
     let lines: Vec<String> = msgs
         .iter()
         .map(|m| {

@@ -19,8 +19,8 @@ use crate::store;
 use std::collections::HashMap;
 use tinyjson::JsonValue;
 
-const DEFAULT_NUDGE: &str = "You have new session-relay mail. Use the session-relay skill: call inbox to read your pending messages and act on them.";
-const BOOL_FLAGS: [&str; 2] = ["dry", "json"];
+pub(crate) const DEFAULT_NUDGE: &str = "You have new session-relay mail. Use the session-relay skill: call inbox to read your pending messages and act on them.";
+const BOOL_FLAGS: [&str; 5] = ["dry", "json", "auto-turn", "once", "all"];
 
 fn die(msg: &str) -> ! {
     eprintln!("{msg}");
@@ -39,7 +39,7 @@ impl Args {
             .map(String::as_str)
             .filter(|v| !v.is_empty())
     }
-    fn has(&self, name: &str) -> bool {
+    pub(crate) fn has(&self, name: &str) -> bool {
         self.0.iter().any(|a| a == &format!("--{name}"))
     }
     // positional args excluding flags + their values; a bare `--` ends option parsing.
