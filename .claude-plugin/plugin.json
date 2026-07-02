@@ -20,7 +20,6 @@
   "skills": [
     "./skills/productivity"
   ],
-  "hooks": "./hooks/hooks.json",
   "mcpServers": {
     "bus": {
       "command": "${CLAUDE_PLUGIN_ROOT}/bin/relay",
