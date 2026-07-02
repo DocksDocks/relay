@@ -1,8 +1,6 @@
 {
-  "mcpServers": {
-    "bus": {
-      "command": "${PLUGIN_ROOT}/bin/relay",
-      "args": ["bus"]
-    }
+  "bus": {
+    "command": "sh",
+    "args": ["-c", "[ -n \"$PLUGIN_ROOT\" ] && [ -x \"$PLUGIN_ROOT/bin/relay\" ] && exec \"$PLUGIN_ROOT/bin/relay\" bus; p=$(ls -td -- \"$HOME\"/.codex/plugins/cache/*/session-relay/*/bin/relay 2>/dev/null | head -n1); [ -n \"$p\" ] || { echo 'session-relay: bin/relay not found (no PLUGIN_ROOT env, nothing under ~/.codex/plugins/cache)' >&2; exit 1; }; exec \"$p\" bus"]
   }
 }
