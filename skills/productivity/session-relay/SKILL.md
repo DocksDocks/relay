@@ -5,8 +5,8 @@ user-invocable: true
 allowed-tools: Bash, Read
 metadata:
   pattern: tool-wrapper
-  updated: "2026-07-01"
-  content_hash: "269a2d6f7b67ca43d72f83ff1e5e556eaa5c09c6bdb501b2728d9f9a2000a6ee"
+  updated: "2026-07-02"
+  content_hash: "d193271a1ee013e9f93ad5e2ecb51008d64054fb91497dab4efad50353ac61d8"
 ---
 
 # Session relay
@@ -27,11 +27,19 @@ The Claude doorbell (`claude -p --resume <id>`) MUST run from the recipient's ow
 |---|---|---|
 | Bus MCP server | `whoami` / `register` / `roster` / `send` / `inbox` / `discover` tools over the shared store | namespaced `mcp__plugin_session-relay_bus__*` |
 | Shared store | registry (`id → dir + name + tool`) + one JSONL inbox per recipient | `~/.agent-relay/` (override: `AGENT_RELAY_HOME`) |
-| SessionStart hook | auto-registers each session (Claude **or** Codex) and injects pending mail on start/resume | runs automatically |
+| SessionStart hook | auto-registers each session (Claude **or** Codex) and injects pending mail on start/resume; on Claude it also nudges the agent to arm a Monitor watch on its own mailbox | runs automatically |
+| UserPromptSubmit hook | drains pending mail into context on every user turn (both tools) — a live session sees mail without being woken | runs automatically |
 | Live discovery | `discover` scans the raw Claude + Codex session stores → sessions running now, even ones that never joined the bus | `discover` tool / `bin/relay discover` |
 | Doorbell | tool-aware: `claude -p --resume` **or** `codex exec resume` — wakes an idle recipient so it drains its inbox now | Bash, or the bundled `bin/relay` |
+| `relay watch` | polls mailboxes and pushes mail into a LIVE Codex thread hosted under `codex app-server` — zero keystrokes on the receiving side; non-reachable targets fall back to the doorbell | `bin/relay watch` |
 
-Delivery is **pull + event**, never a live push: a recipient sees mail when it calls `inbox`, or at its next SessionStart. `send` alone reaches an *idle* session only after you wake it.
+Delivery matrix — how mail reaches a recipient in each state:
+
+| Recipient state | Claude | Codex |
+|---|---|---|
+| idle | doorbell (`relay wake`) | doorbell (`relay wake`) |
+| live, between turns | Monitor mailbox watch / next prompt | next prompt (UserPromptSubmit drain) |
+| live, zero-keystroke push | Monitor mailbox watch | `relay watch` + `codex app-server` |
 
 ## Auto-resolve: find the running session
 
@@ -75,6 +83,33 @@ Both tools share **one** store and registry; every entry carries a `tool` field 
 - **Codex doorbell:** `codex exec resume <id> "<nudge>" --json`. The id is the Codex thread id (it surfaces in the `thread.started` event and the rollout filename) and equals the hook's `session_id`. Unlike Claude, `codex exec resume` is **not** cwd-scoped.
 - **Install on Codex:** add the `session-relay` plugin from the Codex marketplace (ships the skill + the SessionStart hook). For the bus tools inside Codex, rely on the plugin's MCP wiring or run `codex mcp add bus -- <plugin>/bin/relay bus`. A Codex agent can also send with no MCP at all: `<plugin>/bin/relay send <to> "<msg>"`.
 
+## Zero-keystroke push into a live Codex thread (`relay watch`)
+
+The plain Codex TUI cannot be injected into; `codex app-server` is the
+maintainer-endorsed automation seam. Host (or attach) the target thread under an
+app-server on a unix socket, then let `relay watch` deliver:
+
+```bash
+codex app-server --listen unix://$HOME/.codex-app.sock   # socket must live under $HOME, not /tmp
+codex --remote unix://$HOME/.codex-app.sock              # optional: attach the normal TUI to the same server
+<plugin>/bin/relay watch <name>... --server $HOME/.codex-app.sock          # or --all; or RELAY_APP_SERVER env
+```
+
+- **Default mode** injects the fenced mail into the thread's history
+  (`thread/inject_items`) — it persists durably and surfaces at the thread's next
+  turn; an attached TUI shows it live. No turn is started, so it costs nothing.
+- **`--auto-turn`** additionally starts a turn carrying the neutral doorbell nudge
+  (never mail content), `approvalPolicy: never`. Watch stays attached until the
+  turn completes because MCP tool calls elicit approval from the connected client
+  regardless of that policy: it accepts elicitations for the relay's own `bus`
+  server only (store-local tools) and declines every other server.
+- Targets that aren't app-server-reachable (Claude sessions, no `--server`,
+  socket down) fall back to the `relay wake` doorbell; mail is re-enqueued if a
+  push fails mid-flight. `--once` does a single poll+deliver+exit (cron/tests).
+- **Billing:** app-server turns run the local codex engine under your ChatGPT
+  login — `--auto-turn` and doorbell turns draw from the same subscription usage
+  pool as typing interactively; no API key is involved or ever exported.
+
 ## Pick the transport deliberately
 
 | Need | Use | Not |
@@ -113,7 +148,8 @@ cd "$(<plugin>/bin/relay list | awk '$1=="agent-B"{print $4}')" \
 - The only Claude CLI flags this skill uses: `-p`/`--print`, `--resume`, `--session-id`, `--fork-session`, `--output-format json`. The Codex doorbell is `codex exec resume <id>` with `--json`. Do not invent others.
 - The only bus tools: `whoami`, `register`, `roster`, `send`, `inbox`, `discover`. If the tools aren't available, the plugin isn't enabled here.
 - `discover` infers liveness from session-file recency (mtime), not a live handshake — a just-idle session can still appear; a long-dead one won't (it falls outside the window).
-- There is no live session-to-session socket. If you're about to claim two sessions "chat in real time", stop — it's queue + wake.
+- There is no live session-to-session socket. Even `relay watch` is queue + push-into-thread: mail always lands in the shared store first, and only Codex-under-app-server targets take a push — Claude live delivery is the Monitor watch or the next prompt.
+- `relay watch` flags: `--server`, `--tool`, `--auto-turn`, `--once`, `--all`, `--dry`, `--id`. Do not invent others; there is no `--interval` or daemon mode config.
 
 ## Success criteria
 
