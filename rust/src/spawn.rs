@@ -61,14 +61,20 @@ fn perm_args(tool: &str, read_only: bool, full_access: bool) -> [String; 2] {
 
 // The child's first prompt: standing bus-worker prefix + verbatim guardrail
 // rules + the task. `abs_relay` makes the reply loop work even in a project
-// with no session-relay installed — spawn IS that binary.
-fn build_prompt(reply_to: &str, abs_relay: &str, task: &str) -> String {
+// with no session-relay installed — spawn IS that binary. A pre-minted id
+// (claude only) is baked in as `--from` so the reply stays attributed to the
+// worker even when the shared-dir marker has moved on; codex workers learn
+// theirs from the identity line the hook injects at session start.
+fn build_prompt(reply_to: &str, abs_relay: &str, premint: Option<&str>, task: &str) -> String {
+    let from = premint
+        .map(|id| format!("--from {id} "))
+        .unwrap_or_default();
     format!(
         r#"You are a session-relay bus worker spawned by "{reply_to}". You are running in a
 fresh session in this project — its CLAUDE.md/AGENTS.md, skills, and plugins apply.
 When you finish, or if you need a decision, report to "{reply_to}" over the bus.
 PRIMARY (works even if session-relay isn't installed in this project) — run:
-  {abs_relay} send "{reply_to}" -- "<your message>"
+  {abs_relay} send "{reply_to}" {from}-- "<your message>"
 (that is the absolute path to the relay binary that spawned you). If this project has
 session-relay installed, the session-relay skill's send tool works too.
 
@@ -191,11 +197,11 @@ pub fn run(raw: Vec<String>) -> ! {
         .ok()
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|| "relay".to_string());
-    let prompt = build_prompt(&reply_to, &abs_relay, &task);
 
     // Claude accepts a pre-minted id (watch for exactly it); codex has no
     // pre-set-id flag, so birth is detected by the dir marker changing.
     let premint = (tool != "codex").then(store::uuid_v4);
+    let prompt = build_prompt(&reply_to, &abs_relay, premint.as_deref(), &task);
     let perm = perm_args(&tool, read_only, full_access);
     let skip_git_check = tool == "codex" && !dir.join(".git").exists();
     let cmd = child_cmd(&tool);
@@ -320,13 +326,20 @@ mod tests {
 
     #[test]
     fn prompt_carries_reply_target_abs_relay_and_all_guardrails() {
-        let p = build_prompt("boss", "/opt/bin/relay", "do the thing");
+        let p = build_prompt("boss", "/opt/bin/relay", None, "do the thing");
         assert!(p.contains(r#"report to "boss" over the bus"#));
         assert!(p.contains(r#"/opt/bin/relay send "boss" -- "#));
+        assert!(!p.contains("--from"));
         assert!(p.contains("separate git branch"));
         assert!(p.contains("Never modify live/production systems"));
         assert!(p.contains("Destructive or irreversible operations require asking"));
         assert!(p.trim_end().ends_with("do the thing"));
+    }
+
+    #[test]
+    fn prompt_bakes_the_preminted_id_into_the_reply_command_as_from() {
+        let p = build_prompt("boss", "/opt/bin/relay", Some("u-7"), "t");
+        assert!(p.contains(r#"/opt/bin/relay send "boss" --from u-7 -- "#));
     }
 
     #[test]

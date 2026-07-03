@@ -50,7 +50,8 @@ const TOOLS_JSON: &str = r#"[
       "type": "object",
       "properties": {
         "to": { "type": "string", "description": "Recipient friendly name or session id (see roster)." },
-        "body": { "type": "string", "description": "Message text." }
+        "body": { "type": "string", "description": "Message text." },
+        "from": { "type": "string", "description": "Your own registered session id or name (see the identity line injected at session start). Pass it whenever this project dir may host more than one session — the dir-marker fallback mis-attributes the sender in shared dirs." }
       },
       "required": ["to", "body"],
       "additionalProperties": false
@@ -59,7 +60,13 @@ const TOOLS_JSON: &str = r#"[
   {
     "name": "inbox",
     "description": "Read and clear this session's pending messages (each: from, body, ts).",
-    "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false }
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Your own registered session id or name (see the identity line injected at session start). Pass it whenever this project dir may host more than one session — the dir-marker fallback can drain another session's mailbox." }
+      },
+      "additionalProperties": false
+    }
   },
   {
     "name": "discover",
@@ -217,14 +224,30 @@ fn call_tool(
                     true,
                 ));
             };
-            let from_id = self_id();
-            let from = from_id.as_deref().and_then(store::resolve);
+            // Explicit sender identity (the (b) handshake): validated against
+            // the registry so a typo can't forge or silently mis-attribute.
+            // Absent -> the dir-marker fallback (correct for single-session dirs).
+            let (from_id, from_name) = match arg_str(args, "from") {
+                Some(f) => {
+                    let Some(e) = store::resolve(&f) else {
+                        return Ok(text(
+                            js(format!(
+                                "Unknown \"from\" identity \"{f}\" — pass your own registered session id or name (see the identity line injected at session start, or roster)."
+                            )),
+                            true,
+                        ));
+                    };
+                    (Some(e.id), e.name)
+                }
+                None => {
+                    let id = self_id();
+                    let name = id.as_deref().and_then(store::resolve).and_then(|e| e.name);
+                    (id, name)
+                }
+            };
             let mut msg: HashMap<String, JsonValue> = HashMap::new();
-            msg.insert("from".into(), from_id.clone().map(js).unwrap_or_else(jnull));
-            msg.insert(
-                "fromName".into(),
-                from.and_then(|f| f.name).map(js).unwrap_or_else(jnull),
-            );
+            msg.insert("from".into(), from_id.map(js).unwrap_or_else(jnull));
+            msg.insert("fromName".into(), from_name.map(js).unwrap_or_else(jnull));
             msg.insert("to".into(), js(target.id.clone()));
             msg.insert(
                 "toName".into(),
@@ -252,6 +275,26 @@ fn call_tool(
             ))
         }
         "inbox" => {
+            // Same handshake as send's `from`: an explicit id keeps a shared
+            // dir's sessions from draining each other's mail via the marker.
+            if let Some(who) = arg_str(args, "id") {
+                let Some(e) = store::resolve(&who) else {
+                    return Ok(text(
+                        js(format!(
+                            "Unknown inbox identity \"{who}\" — pass your own registered session id or name (see the identity line injected at session start, or roster)."
+                        )),
+                        true,
+                    ));
+                };
+                let messages = store::drain(&e.id).map_err(ToolErr::Soft)?;
+                return Ok(text(
+                    obj(vec![
+                        ("count", JsonValue::from(messages.len() as f64)),
+                        ("messages", JsonValue::from(messages)),
+                    ]),
+                    false,
+                ));
+            }
             let Some(id) = self_id() else {
                 return Ok(text(
                     obj(vec![

@@ -426,16 +426,92 @@ check('claude SessionStart with an empty inbox still nudges a Monitor watch on t
   const ctx = JSON.parse(r.stdout).hookSpecificOutput.additionalContext;
   assert.ok(/monitor/i.test(ctx), 'nudge names the Monitor tool');
   assert.ok(ctx.includes(`${idP}.jsonl`), 'nudge carries the exact mailbox path');
+  assert.ok(ctx.includes(`bus id is ${idP}`), 'identity line rides along');
 });
-check('codex SessionStart with an empty inbox emits nothing (no Monitor to arm)', () => {
+check('codex SessionStart with an empty inbox emits only the identity line (no Monitor to arm)', () => {
   const r = hookArgs(['codex'], { session_id: idP, cwd: dirP, source: 'startup' });
   assert.equal(r.status, 0);
-  assert.equal(r.stdout, '');
+  const ctx = JSON.parse(r.stdout).hookSpecificOutput.additionalContext;
+  assert.ok(ctx.includes(`bus id is ${idP}`), 'identity line present');
+  assert.ok(!ctx.includes('session-relay-mail') && !/monitor/i.test(ctx), 'nothing but identity');
 });
-check('RELAY_NO_WATCH=1 suppresses the nudge (empty inbox → empty stdout)', () => {
+check('RELAY_NO_WATCH=1 suppresses the nudge but keeps the identity line', () => {
   const r = hookArgs([], { session_id: idP, cwd: dirP, source: 'startup' }, { RELAY_NO_WATCH: '1' });
   assert.equal(r.status, 0);
-  assert.equal(r.stdout, '');
+  const ctx = JSON.parse(r.stdout).hookSpecificOutput.additionalContext;
+  assert.ok(!ctx.includes(`${idP}.jsonl`), 'no Monitor nudge');
+  assert.ok(ctx.includes(`bus id is ${idP}`), 'identity survives RELAY_NO_WATCH');
+});
+
+// --- per-session identity: two sessions sharing ONE dir. The cwd marker can
+// only point at the last hook-runner, so identity must ride the handshake —
+// the hook's identity line in, explicit from/id params back out ---
+const dirS = path.join(HOME, 'proj-shared');
+fs.mkdirSync(dirS, { recursive: true });
+const idAlice = '88888888-8888-8888-8888-888888888888';
+const idBob = '99999999-9999-9999-9999-999999999999';
+check('two sessions register against one shared dir (marker ends on the later one)', () => {
+  assert.equal(runHook({ session_id: idAlice, cwd: dirS, source: 'startup' }).status, 0);
+  assert.equal(relay(['register', 'alice', '--id', idAlice, '--dir', dirS]).status, 0);
+  assert.equal(runHook({ session_id: idBob, cwd: dirS, source: 'startup' }).status, 0);
+  assert.equal(relay(['register', 'bob', '--id', idBob, '--dir', dirS]).status, 0);
+});
+check("SessionStart identity line names each session's OWN id, not the marker owner's", () => {
+  const a = runHook({ session_id: idAlice, cwd: dirS, source: 'resume' });
+  assert.ok(JSON.parse(a.stdout).hookSpecificOutput.additionalContext.includes(`bus id is ${idAlice}`));
+  const b = runHook({ session_id: idBob, cwd: dirS, source: 'resume' });
+  assert.ok(JSON.parse(b.stdout).hookSpecificOutput.additionalContext.includes(`bus id is ${idBob}`));
+});
+const initReq = { jsonrpc: '2.0', id: 1, method: 'initialize', params: {} };
+const busShared = (name, args) => runBus(dirS, [initReq,
+  { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name, arguments: args } }]).get(2);
+check('bus send WITHOUT from in a shared dir is attributed to the marker owner (the gap from is for)', () => {
+  busShared('send', { to: 'agent-B', body: 'anon hello' });
+  assert.equal(peek('agent-B').messages.at(-1).fromName, 'bob');
+  relay(['inbox', 'agent-B']); // drain the residue
+});
+check('bus send with from:"alice" overrides the marker attribution', () => {
+  const r = busShared('send', { to: 'bob', from: 'alice', body: 'from alice' });
+  assert.equal(JSON.parse(r.result.content[0].text).ok, true);
+  const mail = peek('bob');
+  assert.equal(mail.messages[0].from, idAlice);
+  assert.equal(mail.messages[0].fromName, 'alice');
+});
+check('bus inbox WITHOUT id still drains the marker owner (fallback intact)', () => {
+  const box = JSON.parse(busShared('inbox', {}).result.content[0].text);
+  assert.equal(box.count, 1);
+  assert.equal(box.messages[0].body, 'from alice');
+  assert.equal(peek('bob').count, 0);
+});
+check('bus send with an unknown from is isError and enqueues nothing', () => {
+  const r = busShared('send', { to: 'bob', from: 'ghost', body: 'x' });
+  assert.equal(r.result.isError, true);
+  assert.equal(peek('bob').count, 0);
+});
+check('bus inbox with id:"alice" drains alice even while the marker points at bob', () => {
+  assert.equal(relay(['send', '--id', idAlice, '--', 'for alice']).status, 0);
+  const box = JSON.parse(busShared('inbox', { id: 'alice' }).result.content[0].text);
+  assert.equal(box.count, 1);
+  assert.equal(box.messages[0].body, 'for alice');
+  assert.equal(peek('alice').count, 0);
+});
+check('bus inbox with an unknown id is isError', () => {
+  assert.equal(busShared('inbox', { id: 'ghost' }).result.isError, true);
+});
+check('CLI send --from stamps the sender; the drained mail trailer names the RECIPIENT own id', () => {
+  assert.equal(relay(['send', '--id', idBob, '--from', 'alice', '--', 'cli hello']).status, 0);
+  const mail = peek('bob');
+  assert.equal(mail.messages[0].from, idAlice);
+  assert.equal(mail.messages[0].fromName, 'alice');
+  const r = runHook({ session_id: idBob, cwd: dirS, source: 'resume' });
+  const ctx = JSON.parse(r.stdout).hookSpecificOutput.additionalContext;
+  assert.ok(ctx.includes('cli hello'), 'mail delivered');
+  assert.ok(ctx.includes(`from:"${idBob}"`), 'reply trailer carries the recipient id, not the marker owner');
+});
+check('CLI send with an unknown --from dies without queueing', () => {
+  const r = relay(['send', '--id', idBob, '--from', 'ghost', '--', 'x']);
+  assert.notEqual(r.status, 0);
+  assert.equal(peek('bob').count, 0);
 });
 
 // --- relay watch: push delivery into a live Codex thread via a (fake)
@@ -529,7 +605,8 @@ check('spawn --dry resolves the claude argv, default-tool note, and reply-loop p
   assert.ok(d.args.includes('-p') && d.args.includes('--session-id'), 'headless + pre-minted id');
   assert.deepEqual(d.args.slice(d.args.indexOf('--permission-mode'), d.args.indexOf('--permission-mode') + 2), ['--permission-mode', 'auto']);
   assert.ok(!d.args.some((a) => a.includes('output-format')), 'detached child gets no output-format flag');
-  assert.ok(d.prompt.includes('send "agent-A" -- ') && d.prompt.trimEnd().endsWith('do X'), 'prompt carries the abs-relay reply command and the task');
+  const premint = d.args[d.args.indexOf('--session-id') + 1];
+  assert.ok(d.prompt.includes(`send "agent-A" --from ${premint} -- `) && d.prompt.trimEnd().endsWith('do X'), 'prompt carries the abs-relay reply command (with the pre-minted --from) and the task');
   assert.ok(d.prompt.includes('separate git branch'), 'guardrail rules ride in the prompt');
   assert.equal(d.cwd, fs.realpathSync(dirS));
 });

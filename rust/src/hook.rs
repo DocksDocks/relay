@@ -98,8 +98,11 @@ pub fn run(args: &[String]) -> ! {
 
 // Structurally fence the mail: bodies come from other (untrusted) writers,
 // so label the block as data, not instructions. Shared with `relay watch`,
-// which injects the same fenced form into live Codex threads.
-pub(crate) fn mail_block(msgs: &[JsonValue]) -> String {
+// which injects the same fenced form into live Codex threads. `recipient_id`
+// names the reader's OWN bus id in the reply guidance — in a shared dir the
+// marker may belong to another session, so the reply must carry an explicit
+// `from` (the (b) identity handshake).
+pub(crate) fn mail_block(msgs: &[JsonValue], recipient_id: &str) -> String {
     let lines: Vec<String> = msgs
         .iter()
         .map(|m| {
@@ -124,26 +127,38 @@ pub(crate) fn mail_block(msgs: &[JsonValue]) -> String {
         "<session-relay-mail>".to_string(),
         lines.join("\n"),
         "</session-relay-mail>".to_string(),
-        "To reply, use the session-relay skill and send to the sender.".to_string(),
+        format!(
+            "To reply, use the session-relay skill and send to the sender, passing from:\"{recipient_id}\" (this session's own bus id) so attribution survives shared-directory markers."
+        ),
     ]
     .join("\n")
 }
 
 // The emit decision for every (tool, event, inbox, RELAY_NO_WATCH) cell, kept
 // pure so the matrix is unit-testable. None ⇒ the hook writes nothing: a
-// no-mail prompt turn must add zero context, and only claude+SessionStart
-// carries the Monitor-arm nudge (Codex has no Monitor; re-nudging on every
-// prompt would be waste).
+// no-mail prompt turn must add zero context (watch.rs relies on this), and
+// only claude+SessionStart carries the Monitor-arm nudge (Codex has no
+// Monitor; re-nudging on every prompt would be waste). EVERY SessionStart
+// (both tools, incl. resume/compact re-fires — compaction-robust, live-
+// verified 2026-07-03) carries the identity line: the (b) handshake that
+// lets an agent pass its own id back to send/inbox instead of trusting the
+// shared-directory marker.
 fn render_context(
     tool: &str,
     event: HookEvent,
     msgs: &[JsonValue],
     no_watch: bool,
     mailbox_path: &str,
+    self_id: &str,
 ) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
     if !msgs.is_empty() {
-        parts.push(mail_block(msgs));
+        parts.push(mail_block(msgs, self_id));
+    }
+    if event == HookEvent::SessionStart {
+        parts.push(format!(
+            "Session-relay identity: this session's bus id is {self_id}. In a directory hosting more than one session, pass from:\"{self_id}\" to the bus send tool (or --from {self_id} to the relay CLI) and id:\"{self_id}\" to inbox — otherwise the shared directory marker may attribute you as another session."
+        ));
     }
     if tool == "claude" && event == HookEvent::SessionStart && !no_watch {
         parts.push(format!(
@@ -186,7 +201,8 @@ fn inner(tool: &str, event: HookEvent, input: &str) -> Result<(), String> {
     let msgs = store::drain(&id)?;
     let no_watch = std::env::var("RELAY_NO_WATCH").as_deref() == Ok("1");
     let mailbox = store::mailbox_path(&id).to_string_lossy().into_owned();
-    let Some(additional_context) = render_context(tool, event, &msgs, no_watch, &mailbox) else {
+    let Some(additional_context) = render_context(tool, event, &msgs, no_watch, &mailbox, &id)
+    else {
         return Ok(());
     };
 
@@ -245,6 +261,7 @@ mod tests {
     }
 
     const MBOX: &str = "/tmp/relay-store/mailbox/x.jsonl";
+    const SELF: &str = "11111111-2222-4333-8444-555555555555";
 
     #[test]
     fn parse_invocation_composes_tool_tag_and_event_flag() {
@@ -267,44 +284,76 @@ mod tests {
     }
 
     #[test]
-    fn prompt_event_delivers_mail_without_nudge_as_userpromptsubmit() {
-        let out =
-            render_context("claude", HookEvent::Prompt, &[msg("a", "hi")], false, MBOX).unwrap();
+    fn prompt_event_delivers_mail_without_nudge_or_identity_as_userpromptsubmit() {
+        let out = render_context(
+            "claude",
+            HookEvent::Prompt,
+            &[msg("a", "hi")],
+            false,
+            MBOX,
+            SELF,
+        )
+        .unwrap();
         assert!(out.contains("hi"));
         assert!(!out.contains(MBOX));
+        assert!(!out.contains("Session-relay identity"));
         assert_eq!(HookEvent::Prompt.name(), "UserPromptSubmit");
     }
 
     #[test]
     fn prompt_event_with_empty_inbox_emits_nothing() {
-        assert!(render_context("claude", HookEvent::Prompt, &[], false, MBOX).is_none());
-        assert!(render_context("codex", HookEvent::Prompt, &[], false, MBOX).is_none());
+        assert!(render_context("claude", HookEvent::Prompt, &[], false, MBOX, SELF).is_none());
+        assert!(render_context("codex", HookEvent::Prompt, &[], false, MBOX, SELF).is_none());
     }
 
     #[test]
-    fn claude_sessionstart_with_empty_inbox_still_nudges_the_monitor() {
-        let out = render_context("claude", HookEvent::SessionStart, &[], false, MBOX).unwrap();
+    fn claude_sessionstart_with_empty_inbox_nudges_the_monitor_and_names_identity() {
+        let out =
+            render_context("claude", HookEvent::SessionStart, &[], false, MBOX, SELF).unwrap();
         assert!(out.contains(MBOX));
         assert!(out.contains("tail -n0 -F"));
+        assert!(out.contains(&format!("bus id is {SELF}")));
     }
 
     #[test]
-    fn codex_sessionstart_with_empty_inbox_emits_nothing() {
-        assert!(render_context("codex", HookEvent::SessionStart, &[], false, MBOX).is_none());
+    fn codex_sessionstart_with_empty_inbox_emits_only_the_identity_line() {
+        let out = render_context("codex", HookEvent::SessionStart, &[], false, MBOX, SELF).unwrap();
+        assert!(out.contains(&format!("bus id is {SELF}")));
+        assert!(!out.contains(MBOX));
+        assert!(!out.contains("session-relay-mail"));
     }
 
     #[test]
-    fn no_watch_drops_the_nudge_but_keeps_mail() {
+    fn mail_trailer_names_the_recipients_own_id_for_the_reply() {
+        let out = render_context(
+            "codex",
+            HookEvent::Prompt,
+            &[msg("a", "hi")],
+            false,
+            MBOX,
+            SELF,
+        )
+        .unwrap();
+        assert!(out.contains(&format!("from:\"{SELF}\"")));
+    }
+
+    #[test]
+    fn no_watch_drops_the_nudge_but_keeps_mail_and_identity() {
         let out = render_context(
             "claude",
             HookEvent::SessionStart,
             &[msg("a", "hi")],
             true,
             MBOX,
+            SELF,
         )
         .unwrap();
         assert!(out.contains("hi"));
         assert!(!out.contains(MBOX));
-        assert!(render_context("claude", HookEvent::SessionStart, &[], true, MBOX).is_none());
+        assert!(out.contains(&format!("bus id is {SELF}")));
+        let empty = render_context("claude", HookEvent::SessionStart, &[], true, MBOX, SELF)
+            .expect("identity line survives RELAY_NO_WATCH");
+        assert!(!empty.contains(MBOX));
+        assert!(empty.contains(&format!("bus id is {SELF}")));
     }
 }

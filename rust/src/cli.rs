@@ -237,9 +237,23 @@ pub fn run(cmd: &str, raw: Vec<String>) -> ! {
                     "usage: relay send <to> [--] <message...>  (or: send --id <id> [--] <message...>)",
                 );
             };
+            // --from names the sender's own registered session (id or name):
+            // the CLI otherwise has no identity and mail lands as "cli".
+            let (from_id, from_name) = match args.flag("from") {
+                Some(f) => {
+                    let Some(sender) = store::resolve(f) else {
+                        die(&format!("unknown --from identity: {f}"));
+                    };
+                    (
+                        JsonValue::from(sender.id),
+                        JsonValue::from(sender.name.unwrap_or_else(|| "cli".to_string())),
+                    )
+                }
+                None => (JsonValue::from(()), JsonValue::from("cli".to_string())),
+            };
             let mut msg: HashMap<String, JsonValue> = HashMap::new();
-            msg.insert("from".into(), JsonValue::from(()));
-            msg.insert("fromName".into(), JsonValue::from("cli".to_string()));
+            msg.insert("from".into(), from_id);
+            msg.insert("fromName".into(), from_name);
             msg.insert("to".into(), JsonValue::from(target.id.clone()));
             msg.insert(
                 "toName".into(),

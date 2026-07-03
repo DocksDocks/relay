@@ -193,7 +193,7 @@ fn push_target(
     if msgs.is_empty() {
         return Ok(0);
     }
-    let block = hook::mail_block(&msgs);
+    let block = hook::mail_block(&msgs, &t.id);
     match deliver(server, &t.id, &block, auto_turn, settle_ms) {
         Ok(()) => {
             println!(
