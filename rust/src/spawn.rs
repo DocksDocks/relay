@@ -80,21 +80,50 @@ fn append_model_effort_args(
     }
 }
 
+// Availability probe behind the codex-first default: true when the codex
+// command (or its RELAY_SPAWN_CMD_CODEX override) resolves to an executable.
+fn is_executable(p: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    p.metadata()
+        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+fn codex_available() -> bool {
+    let cmd = child_cmd("codex");
+    if cmd.contains('/') {
+        return is_executable(std::path::Path::new(&cmd));
+    }
+    std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).any(|d| is_executable(&d.join(&cmd))))
+        .unwrap_or(false)
+}
+
+// Tool resolution: --tool flag > RELAY_SPAWN_TOOL env > codex when its CLI is
+// available > claude. Either fallback prints a note naming the choice.
 fn resolve_spawn_tool(
     explicit: Option<&str>,
     env_default: Option<String>,
-) -> Result<(String, bool), String> {
+    codex_present: bool,
+) -> Result<(String, Option<&'static str>), String> {
     match explicit {
-        Some(t @ ("claude" | "codex")) => Ok((t.to_string(), false)),
+        Some(t @ ("claude" | "codex")) => Ok((t.to_string(), None)),
         Some(other) => Err(format!(
             "unknown --tool: {other} (valid values: claude|codex)"
         )),
         None => match env_default.as_deref() {
-            Some(t @ ("claude" | "codex")) => Ok((t.to_string(), false)),
+            Some(t @ ("claude" | "codex")) => Ok((t.to_string(), None)),
             Some(other) => Err(format!(
                 "unknown RELAY_SPAWN_TOOL: {other} (valid values: claude|codex)"
             )),
-            None => Ok(("claude".to_string(), true)),
+            None if codex_present => Ok((
+                "codex".to_string(),
+                Some("[relay spawn] no --tool given — codex available, defaulting to codex"),
+            )),
+            None => Ok((
+                "claude".to_string(),
+                Some("[relay spawn] no --tool given — codex not found, defaulting to claude"),
+            )),
         },
     }
 }
@@ -208,11 +237,14 @@ pub fn run(raw: Vec<String>) -> ! {
         .filter(|t| !t.is_empty())
         .unwrap_or_else(|| die(USAGE));
 
-    let (tool, defaulted_to_claude) =
-        resolve_spawn_tool(args.flag("tool"), std::env::var("RELAY_SPAWN_TOOL").ok())
-            .unwrap_or_else(|e| die(&e));
-    if defaulted_to_claude {
-        eprintln!("[relay spawn] no --tool given — defaulting to claude");
+    let (tool, default_note) = resolve_spawn_tool(
+        args.flag("tool"),
+        std::env::var("RELAY_SPAWN_TOOL").ok(),
+        codex_available(),
+    )
+    .unwrap_or_else(|e| die(&e));
+    if let Some(note) = default_note {
+        eprintln!("{note}");
     }
     let model = args.flag("model");
     let effort = args.flag("effort");
@@ -498,30 +530,32 @@ mod tests {
     }
 
     #[test]
-    fn spawn_tool_resolution_prefers_flag_then_env_then_claude_note() {
+    fn spawn_tool_resolution_prefers_flag_then_env_then_availability() {
         assert_eq!(
-            resolve_spawn_tool(Some("claude"), Some("codex".to_string())).unwrap(),
-            ("claude".to_string(), false)
+            resolve_spawn_tool(Some("claude"), Some("codex".to_string()), true).unwrap(),
+            ("claude".to_string(), None)
         );
         assert_eq!(
-            resolve_spawn_tool(None, Some("codex".to_string())).unwrap(),
-            ("codex".to_string(), false)
+            resolve_spawn_tool(None, Some("claude".to_string()), true).unwrap(),
+            ("claude".to_string(), None)
         );
-        assert_eq!(
-            resolve_spawn_tool(None, None).unwrap(),
-            ("claude".to_string(), true)
-        );
+        let (tool, note) = resolve_spawn_tool(None, None, true).unwrap();
+        assert_eq!(tool, "codex");
+        assert!(note.unwrap().contains("defaulting to codex"));
+        let (tool, note) = resolve_spawn_tool(None, None, false).unwrap();
+        assert_eq!(tool, "claude");
+        assert!(note.unwrap().contains("defaulting to claude"));
     }
 
     #[test]
     fn spawn_tool_resolution_rejects_invalid_flag_or_env() {
         assert!(
-            resolve_spawn_tool(Some("zed"), None)
+            resolve_spawn_tool(Some("zed"), None, true)
                 .unwrap_err()
                 .contains("valid values: claude|codex")
         );
         assert!(
-            resolve_spawn_tool(None, Some("zed".to_string()))
+            resolve_spawn_tool(None, Some("zed".to_string()), false)
                 .unwrap_err()
                 .contains("RELAY_SPAWN_TOOL")
         );

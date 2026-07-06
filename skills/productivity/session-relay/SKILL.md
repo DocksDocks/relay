@@ -6,7 +6,7 @@ allowed-tools: Bash, Read
 metadata:
   pattern: tool-wrapper
   updated: "2026-07-06"
-  content_hash: "29caad47fe2f9ba214aafbe7243175221a9c1dd13eeffac71c459d5ce645093d"
+  content_hash: "ba9e8a2a8aad16e5af080824655e229faa717963d96fc4abd64f42e87a323427"
 ---
 
 # Session relay
@@ -146,7 +146,8 @@ birth a real, resumable session there instead:
 - **Pick the tool from standing preference first.** If `RELAY_SPAWN_TOOL`, user
   config, or session memory names `claude` or `codex`, use that tool without asking.
   Ask via the native question UI only when no preference is discoverable; the bare
-  CLI defaults to `claude` with a printed note.
+  CLI defaults to `codex` when the codex CLI is installed, else `claude` — a
+  printed note names the choice either way.
 - **Model discipline:** pass `--model`/`--effort` every time. As of 2026-07, use
   `--model opus --effort max` for a Claude child or `--model gpt-5.5 --effort
   xhigh` for a Codex child unless the user's current tier list says otherwise.

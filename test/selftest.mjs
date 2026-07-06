@@ -604,12 +604,13 @@ const hookArgs = process.env.STUB_TOOL === 'codex' ? ['hook', 'codex'] : ['hook'
 spawnSync(process.env.STUB_RELAY_BIN, hookArgs, { input: evt, env: process.env });
 `, { mode: 0o755 });
 
-check('spawn --dry resolves the claude argv, default-tool note, and reply-loop prompt', () => {
+check('spawn --dry falls back to claude when codex is absent, and keeps the reply-loop prompt', () => {
   const dirS = path.join(HOME, 'proj-s0');
   fs.mkdirSync(dirS, { recursive: true });
-  const r = relay(['spawn', dirS, '--reply-to', 'agent-A', '--dry', '--', 'do X']);
+  // PATH with no codex → availability probe fails → claude fallback note.
+  const r = relay(['spawn', dirS, '--reply-to', 'agent-A', '--dry', '--', 'do X'], { env: { PATH: '/nonexistent' } });
   assert.equal(r.status, 0, `spawn --dry exited ${r.status}: ${r.stderr}`);
-  assert.ok(/defaulting to claude/i.test(r.stderr), 'no --tool prints the default note');
+  assert.ok(/codex not found, defaulting to claude/i.test(r.stderr), 'no --tool + no codex prints the claude fallback note');
   assert.ok(/no --model given/i.test(r.stderr), 'no --model prints the model pin note');
   const d = JSON.parse(r.stdout);
   assert.equal(d.tool, 'claude');
@@ -634,13 +635,24 @@ check('spawn --dry maps --model/--effort for claude and codex children', () => {
   assert.deepEqual(codex.args.slice(0, 7), ['exec', '--sandbox', 'workspace-write', '-m', 'gpt-5.5', '-c', 'model_reasoning_effort=xhigh']);
   assert.ok(codex.args.indexOf('--') > 6, 'codex model flags stay before the prompt fence');
 });
+check('spawn --dry defaults to codex when its CLI is available', () => {
+  const dirS = path.join(HOME, 'proj-s0-codex-default');
+  fs.mkdirSync(dirS, { recursive: true });
+  // RELAY_SPAWN_CMD_CODEX pointing at an executable satisfies the probe.
+  const r = relay(['spawn', dirS, '--model', 'gpt-5.5', '--effort', 'xhigh', '--reply-to', 'agent-A', '--dry', '--', 'do X'], { env: { RELAY_SPAWN_CMD_CODEX: stub } });
+  assert.equal(r.status, 0, `spawn --dry exited ${r.status}: ${r.stderr}`);
+  assert.ok(/codex available, defaulting to codex/i.test(r.stderr), 'no --tool + codex present prints the codex default note');
+  const d = JSON.parse(r.stdout);
+  assert.equal(d.tool, 'codex');
+  assert.equal(d.cmd, stub);
+});
 check('spawn --dry honors RELAY_SPAWN_TOOL and rejects invalid values', () => {
   const dirS = path.join(HOME, 'proj-s0-env');
   fs.mkdirSync(dirS, { recursive: true });
 
   const r = relay(['spawn', dirS, '--model', 'gpt-5.5', '--effort', 'xhigh', '--reply-to', 'agent-A', '--dry', '--', 'do X'], { env: { RELAY_SPAWN_TOOL: 'codex' } });
   assert.equal(r.status, 0, `spawn env default exited ${r.status}: ${r.stderr}`);
-  assert.ok(!/defaulting to claude/i.test(r.stderr), 'env default does not print the claude default note');
+  assert.ok(!/defaulting to/i.test(r.stderr), 'env default does not print any fallback note');
   assert.equal(JSON.parse(r.stdout).tool, 'codex');
 
   const bad = relay(['spawn', dirS, '--reply-to', 'agent-A', '--dry', '--', 'do X'], { env: { RELAY_SPAWN_TOOL: 'bogus' } });
