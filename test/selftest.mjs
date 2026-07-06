@@ -46,7 +46,7 @@ const HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'session-relay-test-'));
 // (proves SESSION_RELAY_HOME still works), host discovery/store vars scrubbed.
 function envFor(extra = {}) {
   const env = { ...process.env };
-  for (const k of ['AGENT_RELAY_HOME', 'RELAY_CLAUDE_PROJECTS', 'RELAY_CODEX_SESSIONS', 'CLAUDE_CONFIG_DIR', 'CODEX_HOME', 'RELAY_NO_WATCH', 'RELAY_APP_SERVER', 'RELAY_TURN_SETTLE_MS', 'RELAY_TURN_WAIT_MS', 'RELAY_SPAWN_CMD_CLAUDE', 'RELAY_SPAWN_CMD_CODEX', 'STUB_RELAY_BIN', 'STUB_TOOL']) delete env[k];
+  for (const k of ['AGENT_RELAY_HOME', 'RELAY_CLAUDE_PROJECTS', 'RELAY_CODEX_SESSIONS', 'CLAUDE_CONFIG_DIR', 'CODEX_HOME', 'RELAY_NO_WATCH', 'RELAY_APP_SERVER', 'RELAY_TURN_SETTLE_MS', 'RELAY_TURN_WAIT_MS', 'RELAY_SPAWN_CMD_CLAUDE', 'RELAY_SPAWN_CMD_CODEX', 'RELAY_SPAWN_TOOL', 'STUB_RELAY_BIN', 'STUB_TOOL']) delete env[k];
   return { ...env, SESSION_RELAY_HOME: HOME, ...extra };
 }
 const relay = (args, opts = {}) => spawnSync(BIN, args, { encoding: 'utf8', input: opts.input, env: envFor(opts.env) });
@@ -210,6 +210,16 @@ check('wake dispatches the claude doorbell for a claude target', () => {
   assert.equal(d.tool, 'claude');
   assert.equal(d.cmd, 'claude');
   assert.ok(d.args.includes('--resume') && d.args.includes(idA));
+});
+check('wake --dry maps --model/--effort for codex and claude targets', () => {
+  const c = relayJSON(['wake', 'codex-C', '--model', 'gpt-5.5', '--effort', 'xhigh', '--dry']);
+  assert.deepEqual(c.args.slice(0, 7), ['exec', 'resume', idC, '-m', 'gpt-5.5', '-c', 'model_reasoning_effort=xhigh']);
+  assert.ok(c.args.indexOf('--') > 6, 'codex model flags stay before the prompt fence');
+
+  const a = relayJSON(['wake', 'agent-A', '--model', 'opus', '--effort', 'max', '--dry']);
+  const resume = a.args.indexOf('--resume');
+  assert.deepEqual(a.args.slice(resume, resume + 7), ['--resume', idA, '--model', 'opus', '--effort', 'max', '--output-format']);
+  assert.ok(a.args.indexOf('--') > resume + 6, 'claude model flags stay before the prompt fence');
 });
 
 // --- discover: live sessions from the raw on-disk session stores ---
@@ -600,6 +610,7 @@ check('spawn --dry resolves the claude argv, default-tool note, and reply-loop p
   const r = relay(['spawn', dirS, '--reply-to', 'agent-A', '--dry', '--', 'do X']);
   assert.equal(r.status, 0, `spawn --dry exited ${r.status}: ${r.stderr}`);
   assert.ok(/defaulting to claude/i.test(r.stderr), 'no --tool prints the default note');
+  assert.ok(/no --model given/i.test(r.stderr), 'no --model prints the model pin note');
   const d = JSON.parse(r.stdout);
   assert.equal(d.tool, 'claude');
   assert.ok(d.args.includes('-p') && d.args.includes('--session-id'), 'headless + pre-minted id');
@@ -609,6 +620,32 @@ check('spawn --dry resolves the claude argv, default-tool note, and reply-loop p
   assert.ok(d.prompt.includes(`send "agent-A" --from ${premint} -- `) && d.prompt.trimEnd().endsWith('do X'), 'prompt carries the abs-relay reply command (with the pre-minted --from) and the task');
   assert.ok(d.prompt.includes('separate git branch'), 'guardrail rules ride in the prompt');
   assert.equal(d.cwd, fs.realpathSync(dirS));
+});
+check('spawn --dry maps --model/--effort for claude and codex children', () => {
+  const dirS = path.join(HOME, 'proj-s0-models');
+  fs.mkdirSync(dirS, { recursive: true });
+
+  const claude = relayJSON(['spawn', dirS, '--tool', 'claude', '--model', 'opus', '--effort', 'max', '--reply-to', 'agent-A', '--dry', '--', 'do X']);
+  const perm = claude.args.indexOf('--permission-mode');
+  assert.deepEqual(claude.args.slice(perm, perm + 6), ['--permission-mode', 'auto', '--model', 'opus', '--effort', 'max']);
+  assert.ok(claude.args.indexOf('--') > perm + 5, 'claude model flags stay before the prompt fence');
+
+  const codex = relayJSON(['spawn', dirS, '--tool', 'codex', '--model', 'gpt-5.5', '--effort', 'xhigh', '--reply-to', 'agent-A', '--dry', '--', 'do Y']);
+  assert.deepEqual(codex.args.slice(0, 7), ['exec', '--sandbox', 'workspace-write', '-m', 'gpt-5.5', '-c', 'model_reasoning_effort=xhigh']);
+  assert.ok(codex.args.indexOf('--') > 6, 'codex model flags stay before the prompt fence');
+});
+check('spawn --dry honors RELAY_SPAWN_TOOL and rejects invalid values', () => {
+  const dirS = path.join(HOME, 'proj-s0-env');
+  fs.mkdirSync(dirS, { recursive: true });
+
+  const r = relay(['spawn', dirS, '--model', 'gpt-5.5', '--effort', 'xhigh', '--reply-to', 'agent-A', '--dry', '--', 'do X'], { env: { RELAY_SPAWN_TOOL: 'codex' } });
+  assert.equal(r.status, 0, `spawn env default exited ${r.status}: ${r.stderr}`);
+  assert.ok(!/defaulting to claude/i.test(r.stderr), 'env default does not print the claude default note');
+  assert.equal(JSON.parse(r.stdout).tool, 'codex');
+
+  const bad = relay(['spawn', dirS, '--reply-to', 'agent-A', '--dry', '--', 'do X'], { env: { RELAY_SPAWN_TOOL: 'bogus' } });
+  assert.notEqual(bad.status, 0, 'invalid RELAY_SPAWN_TOOL is rejected');
+  assert.ok(/valid values: claude\|codex/i.test(bad.stderr), 'invalid env error names the valid values');
 });
 check('spawn births a claude child via the pre-mint path and registers its name', () => {
   const dirS = path.join(HOME, 'proj-s1');
