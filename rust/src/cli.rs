@@ -7,12 +7,13 @@
 //   relay send <to> [--] <message...>            (or: send --id <id> [--] <message...>)
 //   relay inbox <nameOrId>
 //   relay peek <nameOrId>                        (read-only: inbox without draining)
-//   relay wake <nameOrId> [--dry] [message...]
-//   relay wake --id <id> --dir <cwd> --tool <claude|codex> [message...]
+//   relay wake <nameOrId> [--model <m>] [--effort <e>] [--dry] [message...]
+//   relay wake --id <id> --dir <cwd> --tool <claude|codex> [--model <m>] [--effort <e>] [message...]
 //
-// `wake` is TOOL-AWARE: claude → `claude -p --resume <id> --output-format json -- <nudge>`,
-// codex → `codex exec resume <id> --json -- <nudge>`, run from the target's
-// registered project dir. `--dry` prints the command instead of spawning.
+// `wake` is TOOL-AWARE: claude → `claude -p --resume <id> [--model m] [--effort e] --output-format json -- <nudge>`,
+// codex → `codex exec resume <id> [-m m] [-c model_reasoning_effort=e] --json -- <nudge>`,
+// run from the target's registered project dir. `--dry` prints the command
+// instead of spawning.
 
 use crate::discover;
 use crate::store;
@@ -117,6 +118,43 @@ fn cwd_string() -> String {
     std::env::current_dir()
         .map(|d| d.to_string_lossy().into_owned())
         .unwrap_or_else(|_| ".".to_string())
+}
+
+fn doorbell_args(
+    tool: &str,
+    id: &str,
+    message: &str,
+    model: Option<&str>,
+    effort: Option<&str>,
+) -> (String, Vec<String>) {
+    let mut cargs = if tool == "codex" {
+        vec!["exec".into(), "resume".into(), id.into()]
+    } else {
+        vec!["-p".into(), "--resume".into(), id.into()]
+    };
+    if let Some(model) = model {
+        cargs.push(if tool == "codex" { "-m" } else { "--model" }.into());
+        cargs.push(model.into());
+    }
+    if let Some(effort) = effort {
+        if tool == "codex" {
+            cargs.push("-c".into());
+            cargs.push(format!("model_reasoning_effort={effort}"));
+        } else {
+            cargs.push("--effort".into());
+            cargs.push(effort.into());
+        }
+    }
+    if tool == "codex" {
+        cargs.push("--json".into());
+    } else {
+        cargs.push("--output-format".into());
+        cargs.push("json".into());
+    }
+    cargs.push("--".into());
+    cargs.push(message.into());
+    let cmd = if tool == "codex" { "codex" } else { "claude" };
+    (cmd.into(), cargs)
 }
 
 pub fn run(cmd: &str, raw: Vec<String>) -> ! {
@@ -334,7 +372,7 @@ pub fn run(cmd: &str, raw: Vec<String>) -> ! {
             });
             let Some(target) = target else {
                 die(
-                    "usage: relay wake <nameOrId> [message...]  |  wake --id <id> --dir <cwd> --tool <claude|codex> [message...]",
+                    "usage: relay wake <nameOrId> [--model <m>] [--effort <e>] [message...]  |  wake --id <id> --dir <cwd> --tool <claude|codex> [--model <m>] [--effort <e>] [message...]",
                 );
             };
             let Some(dir) = target.dir.clone().filter(|d| !d.is_empty()) else {
@@ -354,29 +392,18 @@ pub fn run(cmd: &str, raw: Vec<String>) -> ! {
             // dir. The untrusted message goes AFTER a `--` end-of-options
             // marker so a dash-leading body can't be parsed as a flag on the
             // child (both CLIs take the prompt as a trailing positional).
-            let (cmd, cargs): (&str, Vec<&str>) = if target.tool == "codex" {
-                (
-                    "codex",
-                    vec!["exec", "resume", &target.id, "--json", "--", &message],
-                )
-            } else {
-                (
-                    "claude",
-                    vec![
-                        "-p",
-                        "--resume",
-                        &target.id,
-                        "--output-format",
-                        "json",
-                        "--",
-                        &message,
-                    ],
-                )
-            };
+            let model = args.flag("model");
+            let effort = args.flag("effort");
+            if model.is_none() {
+                eprintln!(
+                    "[relay wake] no --model given — pass --model/--effort to pin a deliberate doorbell model"
+                );
+            }
+            let (cmd, cargs) = doorbell_args(&target.tool, &target.id, &message, model, effort);
             if args.has("dry") {
                 let mut m: HashMap<String, JsonValue> = HashMap::new();
                 m.insert("tool".into(), JsonValue::from(target.tool.clone()));
-                m.insert("cmd".into(), JsonValue::from(cmd.to_string()));
+                m.insert("cmd".into(), JsonValue::from(cmd.clone()));
                 m.insert(
                     "args".into(),
                     JsonValue::from(
@@ -403,7 +430,7 @@ pub fn run(cmd: &str, raw: Vec<String>) -> ! {
                     "target dir does not exist: {dir} — stale/moved session; re-register or pass the current --dir before waking."
                 ));
             }
-            let out = std::process::Command::new(cmd)
+            let out = std::process::Command::new(&cmd)
                 .args(&cargs)
                 .current_dir(&dir)
                 .output()
@@ -422,7 +449,81 @@ pub fn run(cmd: &str, raw: Vec<String>) -> ! {
             std::process::exit(out.status.code().unwrap_or(0));
         }
         _ => die(
-            "usage: relay discover [--within min] [--tool t] | list | register <name> --id <uuid> [--dir <path>] | send <to> <msg> | inbox <who> | peek <who> | wake <who> [msg]",
+            "usage: relay discover [--within min] [--tool t] | list | register <name> --id <uuid> [--dir <path>] | send <to> <msg> | inbox <who> | peek <who> | wake <who> [--model m] [--effort e] [msg]",
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn strings(xs: &[&str]) -> Vec<String> {
+        xs.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn wake_argv_no_flags_match_existing_shapes() {
+        let (cmd, args) = doorbell_args("codex", "u-1", "ping", None, None);
+        assert_eq!(cmd, "codex");
+        assert_eq!(
+            args,
+            strings(&["exec", "resume", "u-1", "--json", "--", "ping"])
+        );
+
+        let (cmd, args) = doorbell_args("claude", "u-1", "ping", None, None);
+        assert_eq!(cmd, "claude");
+        assert_eq!(
+            args,
+            strings(&[
+                "-p",
+                "--resume",
+                "u-1",
+                "--output-format",
+                "json",
+                "--",
+                "ping"
+            ])
+        );
+    }
+
+    #[test]
+    fn wake_argv_maps_model_and_effort_per_tool_after_resume_id() {
+        let (cmd, args) = doorbell_args("codex", "u-1", "ping", Some("gpt-5.5"), Some("xhigh"));
+        assert_eq!(cmd, "codex");
+        assert_eq!(
+            args,
+            strings(&[
+                "exec",
+                "resume",
+                "u-1",
+                "-m",
+                "gpt-5.5",
+                "-c",
+                "model_reasoning_effort=xhigh",
+                "--json",
+                "--",
+                "ping"
+            ])
+        );
+
+        let (cmd, args) = doorbell_args("claude", "u-1", "ping", Some("opus"), Some("max"));
+        assert_eq!(cmd, "claude");
+        assert_eq!(
+            args,
+            strings(&[
+                "-p",
+                "--resume",
+                "u-1",
+                "--model",
+                "opus",
+                "--effort",
+                "max",
+                "--output-format",
+                "json",
+                "--",
+                "ping"
+            ])
+        );
     }
 }

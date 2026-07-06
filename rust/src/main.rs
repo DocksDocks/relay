@@ -42,7 +42,7 @@ fn main() {
             }
         }
         _ => die(
-            "usage: relay bus | hook [codex] [--event prompt] | discover [--within min] [--tool t] | list | register <name> --id <uuid> [--dir <path>] | send <to> [--] <msg> | inbox <who> | peek <who> | wake <who> [msg] | watch <who>...|--all [--server <sock>] [--auto-turn] [--once] | spawn <dir> [--tool t] [--name n] [--] <task>",
+            "usage: relay bus | hook [codex] [--event prompt] | discover [--within min] [--tool t] | list | register <name> --id <uuid> [--dir <path>] | send <to> [--] <msg> | inbox <who> | peek <who> | wake <who> [--model m] [--effort e] [msg] | watch <who>...|--all [--server <sock>] [--auto-turn] [--once] | spawn <dir> [--tool t] [--model m] [--effort e] [--name n] [--] <task>",
         ),
     }
 }

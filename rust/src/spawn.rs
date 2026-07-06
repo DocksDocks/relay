@@ -34,7 +34,7 @@ fn die(msg: &str) -> ! {
     std::process::exit(1);
 }
 
-const USAGE: &str = "usage: relay spawn <dir> [--tool claude|codex] [--name <busName>] [--reply-to <nameOrId>] [--timeout <sec>] [--read-only] [--full-access] [--dry] [--] <first task>";
+const USAGE: &str = "usage: relay spawn <dir> [--tool claude|codex] [--model <m>] [--effort <e>] [--name <busName>] [--reply-to <nameOrId>] [--timeout <sec>] [--read-only] [--full-access] [--dry] [--] <first task>";
 
 // Symmetric per-tool permission mapping. NEVER a --dangerously-* variant.
 fn perm_args(tool: &str, read_only: bool, full_access: bool) -> [String; 2] {
@@ -56,6 +56,46 @@ fn perm_args(tool: &str, read_only: bool, full_access: bool) -> [String; 2] {
             "auto"
         };
         ["--permission-mode".into(), mode.into()]
+    }
+}
+
+fn append_model_effort_args(
+    a: &mut Vec<String>,
+    tool: &str,
+    model: Option<&str>,
+    effort: Option<&str>,
+) {
+    if let Some(model) = model {
+        a.push(if tool == "codex" { "-m" } else { "--model" }.into());
+        a.push(model.into());
+    }
+    if let Some(effort) = effort {
+        if tool == "codex" {
+            a.push("-c".into());
+            a.push(format!("model_reasoning_effort={effort}"));
+        } else {
+            a.push("--effort".into());
+            a.push(effort.into());
+        }
+    }
+}
+
+fn resolve_spawn_tool(
+    explicit: Option<&str>,
+    env_default: Option<String>,
+) -> Result<(String, bool), String> {
+    match explicit {
+        Some(t @ ("claude" | "codex")) => Ok((t.to_string(), false)),
+        Some(other) => Err(format!(
+            "unknown --tool: {other} (valid values: claude|codex)"
+        )),
+        None => match env_default.as_deref() {
+            Some(t @ ("claude" | "codex")) => Ok((t.to_string(), false)),
+            Some(other) => Err(format!(
+                "unknown RELAY_SPAWN_TOOL: {other} (valid values: claude|codex)"
+            )),
+            None => Ok(("claude".to_string(), true)),
+        },
     }
 }
 
@@ -100,12 +140,15 @@ fn child_args(
     perm: &[String; 2],
     premint: Option<&str>,
     skip_git_check: bool,
+    model: Option<&str>,
+    effort: Option<&str>,
     prompt: &str,
 ) -> Vec<String> {
     let mut a: Vec<String> = Vec::new();
     if tool == "codex" {
         a.push("exec".into());
         a.extend(perm.iter().cloned());
+        append_model_effort_args(&mut a, tool, model, effort);
         if skip_git_check {
             a.push("--skip-git-repo-check".into());
         }
@@ -116,6 +159,7 @@ fn child_args(
             a.push(id.into());
         }
         a.extend(perm.iter().cloned());
+        append_model_effort_args(&mut a, tool, model, effort);
     }
     a.push("--".into());
     a.push(prompt.into());
@@ -164,14 +208,19 @@ pub fn run(raw: Vec<String>) -> ! {
         .filter(|t| !t.is_empty())
         .unwrap_or_else(|| die(USAGE));
 
-    let tool = match args.flag("tool") {
-        Some(t @ ("claude" | "codex")) => t.to_string(),
-        Some(other) => die(&format!("unknown --tool: {other} (claude|codex)")),
-        None => {
-            eprintln!("[relay spawn] no --tool given — defaulting to claude");
-            "claude".to_string()
-        }
-    };
+    let (tool, defaulted_to_claude) =
+        resolve_spawn_tool(args.flag("tool"), std::env::var("RELAY_SPAWN_TOOL").ok())
+            .unwrap_or_else(|e| die(&e));
+    if defaulted_to_claude {
+        eprintln!("[relay spawn] no --tool given — defaulting to claude");
+    }
+    let model = args.flag("model");
+    let effort = args.flag("effort");
+    if model.is_none() {
+        eprintln!(
+            "[relay spawn] no --model given — pass --model/--effort to pin a deliberate worker model"
+        );
+    }
     let read_only = args.has("read-only");
     let full_access = args.has("full-access");
     if read_only && full_access {
@@ -205,7 +254,15 @@ pub fn run(raw: Vec<String>) -> ! {
     let perm = perm_args(&tool, read_only, full_access);
     let skip_git_check = tool == "codex" && !dir.join(".git").exists();
     let cmd = child_cmd(&tool);
-    let cargs = child_args(&tool, &perm, premint.as_deref(), skip_git_check, &prompt);
+    let cargs = child_args(
+        &tool,
+        &perm,
+        premint.as_deref(),
+        skip_git_check,
+        model,
+        effort,
+        &prompt,
+    );
 
     if args.has("dry") {
         let mut m: std::collections::HashMap<String, tinyjson::JsonValue> =
@@ -345,9 +402,27 @@ mod tests {
     #[test]
     fn claude_argv_premints_id_and_never_sets_output_format() {
         let perm = perm_args("claude", false, false);
-        let a = child_args("claude", &perm, Some("u-1"), false, "-rf looks like a flag");
-        assert_eq!(a[0], "-p");
-        assert_eq!(&a[1..3], ["--session-id", "u-1"]);
+        let a = child_args(
+            "claude",
+            &perm,
+            Some("u-1"),
+            false,
+            None,
+            None,
+            "-rf looks like a flag",
+        );
+        assert_eq!(
+            a,
+            [
+                "-p",
+                "--session-id",
+                "u-1",
+                "--permission-mode",
+                "auto",
+                "--",
+                "-rf looks like a flag"
+            ]
+        );
         assert!(a.contains(&"--permission-mode".to_string()));
         assert!(!a.iter().any(|x| x.contains("output-format")));
         let sep = a.iter().position(|x| x == "--").unwrap();
@@ -358,11 +433,97 @@ mod tests {
     #[test]
     fn codex_argv_adds_git_bypass_only_when_asked() {
         let perm = perm_args("codex", false, false);
-        let with = child_args("codex", &perm, None, true, "t");
+        let with = child_args("codex", &perm, None, true, None, None, "t");
         assert_eq!(with[0], "exec");
         assert!(with.contains(&"--skip-git-repo-check".to_string()));
-        let without = child_args("codex", &perm, None, false, "t");
+        let without = child_args("codex", &perm, None, false, None, None, "t");
         assert!(!without.contains(&"--skip-git-repo-check".to_string()));
         assert!(!without.iter().any(|x| x == "--json"));
+    }
+
+    #[test]
+    fn child_argv_maps_model_and_effort_per_tool_before_prompt_fence() {
+        let claude_perm = perm_args("claude", false, false);
+        let claude = child_args(
+            "claude",
+            &claude_perm,
+            Some("u-1"),
+            false,
+            Some("opus"),
+            Some("max"),
+            "t",
+        );
+        assert_eq!(
+            claude,
+            [
+                "-p",
+                "--session-id",
+                "u-1",
+                "--permission-mode",
+                "auto",
+                "--model",
+                "opus",
+                "--effort",
+                "max",
+                "--",
+                "t"
+            ]
+        );
+
+        let codex_perm = perm_args("codex", false, false);
+        let codex = child_args(
+            "codex",
+            &codex_perm,
+            None,
+            true,
+            Some("gpt-5.5"),
+            Some("xhigh"),
+            "t",
+        );
+        assert_eq!(
+            codex,
+            [
+                "exec",
+                "--sandbox",
+                "workspace-write",
+                "-m",
+                "gpt-5.5",
+                "-c",
+                "model_reasoning_effort=xhigh",
+                "--skip-git-repo-check",
+                "--",
+                "t"
+            ]
+        );
+    }
+
+    #[test]
+    fn spawn_tool_resolution_prefers_flag_then_env_then_claude_note() {
+        assert_eq!(
+            resolve_spawn_tool(Some("claude"), Some("codex".to_string())).unwrap(),
+            ("claude".to_string(), false)
+        );
+        assert_eq!(
+            resolve_spawn_tool(None, Some("codex".to_string())).unwrap(),
+            ("codex".to_string(), false)
+        );
+        assert_eq!(
+            resolve_spawn_tool(None, None).unwrap(),
+            ("claude".to_string(), true)
+        );
+    }
+
+    #[test]
+    fn spawn_tool_resolution_rejects_invalid_flag_or_env() {
+        assert!(
+            resolve_spawn_tool(Some("zed"), None)
+                .unwrap_err()
+                .contains("valid values: claude|codex")
+        );
+        assert!(
+            resolve_spawn_tool(None, Some("zed".to_string()))
+                .unwrap_err()
+                .contains("RELAY_SPAWN_TOOL")
+        );
     }
 }
