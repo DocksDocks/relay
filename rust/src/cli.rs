@@ -669,7 +669,10 @@ mod tests {
 
     #[test]
     fn parser_ignores_invalid_utf8_stdout() {
-        assert_eq!(wake_usage_line("claude", b"{\"type\":\"result\"}\xff"), None);
+        assert_eq!(
+            wake_usage_line("claude", b"{\"type\":\"result\"}\xff"),
+            None
+        );
     }
 
     #[test]
