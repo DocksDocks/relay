@@ -46,10 +46,11 @@ const HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'session-relay-test-'));
 // (proves SESSION_RELAY_HOME still works), host discovery/store vars scrubbed.
 function envFor(extra = {}) {
   const env = { ...process.env };
-  for (const k of ['AGENT_RELAY_HOME', 'RELAY_CLAUDE_PROJECTS', 'RELAY_CODEX_SESSIONS', 'CLAUDE_CONFIG_DIR', 'CODEX_HOME', 'RELAY_NO_WATCH', 'RELAY_APP_SERVER', 'RELAY_TURN_SETTLE_MS', 'RELAY_TURN_WAIT_MS', 'RELAY_SPAWN_CMD_CLAUDE', 'RELAY_SPAWN_CMD_CODEX', 'RELAY_SPAWN_TOOL', 'STUB_RELAY_BIN', 'STUB_TOOL']) delete env[k];
+  for (const k of ['AGENT_RELAY_HOME', 'RELAY_CLAUDE_PROJECTS', 'RELAY_CODEX_SESSIONS', 'CLAUDE_CONFIG_DIR', 'CODEX_HOME', 'RELAY_NO_WATCH', 'RELAY_APP_SERVER', 'RELAY_TURN_SETTLE_MS', 'RELAY_TURN_WAIT_MS', 'RELAY_SPAWN_CMD_CLAUDE', 'RELAY_SPAWN_CMD_CODEX', 'RELAY_WAKE_CMD_CLAUDE', 'RELAY_WAKE_CMD_CODEX', 'RELAY_SPAWN_TOOL', 'STUB_RELAY_BIN', 'STUB_TOOL']) delete env[k];
   return { ...env, SESSION_RELAY_HOME: HOME, ...extra };
 }
 const relay = (args, opts = {}) => spawnSync(BIN, args, { encoding: 'utf8', input: opts.input, env: envFor(opts.env) });
+const relayBytes = (args, opts = {}) => spawnSync(BIN, args, { input: opts.input, env: envFor(opts.env) });
 const relayJSON = (args, opts = {}) => {
   const r = relay(args, opts);
   if (r.status !== 0) throw new Error(`relay ${args[0]} exited ${r.status}: ${r.stderr}`);
@@ -178,6 +179,7 @@ check('send to an unknown recipient returns isError', () => {
 // --- tool field + tool-aware doorbell dispatch + home precedence ---
 const dirC = path.join(HOME, 'proj-c');
 const idC = '33333333-3333-3333-3333-333333333333';
+fs.mkdirSync(dirC, { recursive: true });
 relay(['register', 'codex-C', '--id', idC, '--dir', dirC, '--tool', 'codex']);
 check('registry carries a tool field (codex tagged; default claude)', () => {
   const { agents } = toolJSON(runBus(dirA, [
@@ -220,6 +222,59 @@ check('wake --dry maps --model/--effort for codex and claude targets', () => {
   const resume = a.args.indexOf('--resume');
   assert.deepEqual(a.args.slice(resume, resume + 7), ['--resume', idA, '--model', 'opus', '--effort', 'max', '--output-format']);
   assert.ok(a.args.indexOf('--') > resume + 6, 'claude model flags stay before the prompt fence');
+});
+
+// --- wake usage visibility: stubs exercise the doorbell seam without billing real tools ---
+const wakeStub = path.join(HOME, 'fake-wake');
+fs.writeFileSync(wakeStub, `#!/usr/bin/env node
+const fs = require('node:fs');
+const file = process.env.WAKE_STUB_FILE;
+if (file) process.stdout.write(fs.readFileSync(file));
+else process.stdout.write(process.env.WAKE_STUB_STDOUT || '');
+if (process.env.WAKE_STUB_STDERR) process.stderr.write(process.env.WAKE_STUB_STDERR);
+process.exit(Number(process.env.WAKE_STUB_STATUS || 0));
+`, { mode: 0o755 });
+const fixtureDir = path.join(HERE, 'fixtures');
+const claudeUsageFixture = path.join(fixtureDir, 'wake-usage-claude.json');
+const codexUsageFixture = path.join(fixtureDir, 'wake-usage-codex.json');
+const noNewlineFixture = path.join(HOME, 'wake-no-newline.json');
+fs.writeFileSync(noNewlineFixture, '{"type":"result","total_cost_usd":1.25,"usage":{"input_tokens":7,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":3}}');
+
+check('wake prints claude usage to stderr and keeps fixture stdout byte-identical', () => {
+  const fixture = fs.readFileSync(claudeUsageFixture);
+  const r = relayBytes(['wake', 'agent-A', '--model', 'opus', '--effort', 'max'], {
+    env: { RELAY_WAKE_CMD_CLAUDE: wakeStub, WAKE_STUB_FILE: claudeUsageFixture },
+  });
+  assert.equal(r.status, 0, `wake exited ${r.status}: ${r.stderr}`);
+  assert.deepEqual(r.stdout, fixture);
+  assert.match(r.stderr.toString('utf8'), /\[relay wake\] claude: 45682 in \(45603 cached\) \/ 4 out, \$0\.0142089/);
+});
+check('wake prints codex usage to stderr and keeps fixture stdout byte-identical', () => {
+  const fixture = fs.readFileSync(codexUsageFixture);
+  const r = relayBytes(['wake', 'codex-C', '--model', 'gpt-5.5', '--effort', 'xhigh'], {
+    env: { RELAY_WAKE_CMD_CODEX: wakeStub, WAKE_STUB_FILE: codexUsageFixture },
+  });
+  assert.equal(r.status, 0, `wake exited ${r.status}: ${r.stderr}`);
+  assert.deepEqual(r.stdout, fixture);
+  assert.match(r.stderr.toString('utf8'), /\[relay wake\] codex: 47400 in \(12032 cached\) \/ 10 out/);
+});
+check('wake preserves no-trailing-newline stdout while still reporting usage', () => {
+  const fixture = fs.readFileSync(noNewlineFixture);
+  assert.notEqual(fixture.at(-1), 0x0a, 'fixture intentionally has no trailing newline');
+  const r = relayBytes(['wake', 'agent-A', '--model', 'opus', '--effort', 'max'], {
+    env: { RELAY_WAKE_CMD_CLAUDE: wakeStub, WAKE_STUB_FILE: noNewlineFixture },
+  });
+  assert.equal(r.status, 0, `wake exited ${r.status}: ${r.stderr}`);
+  assert.deepEqual(r.stdout, fixture);
+  assert.match(r.stderr.toString('utf8'), /\[relay wake\] claude: 7 in \/ 3 out, \$1\.25/);
+});
+check('wake omits usage on garbage stdout and preserves the child exit code', () => {
+  const r = relayBytes(['wake', 'agent-A', '--model', 'opus', '--effort', 'max'], {
+    env: { RELAY_WAKE_CMD_CLAUDE: wakeStub, WAKE_STUB_STDOUT: 'not json', WAKE_STUB_STATUS: '7' },
+  });
+  assert.equal(r.status, 7);
+  assert.deepEqual(r.stdout, Buffer.from('not json'));
+  assert.doesNotMatch(r.stderr.toString('utf8'), /\[relay wake\]/);
 });
 
 // --- discover: live sessions from the raw on-disk session stores ---
