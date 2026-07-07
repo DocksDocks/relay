@@ -6,7 +6,7 @@ allowed-tools: Bash, Read
 metadata:
   pattern: tool-wrapper
   updated: "2026-07-06"
-  content_hash: "ba9e8a2a8aad16e5af080824655e229faa717963d96fc4abd64f42e87a323427"
+  content_hash: "40291ff3088047a8d61605037cfdb35c601df9ac5d72a1cbe55f6e6e75fea4a9"
 ---
 
 # Session relay
@@ -44,6 +44,46 @@ Delivery matrix — how mail reaches a recipient in each state:
 | idle | doorbell (`relay wake`) | doorbell (`relay wake`) |
 | live, between turns | Monitor mailbox watch / next prompt | next prompt (UserPromptSubmit drain) |
 | live, zero-keystroke push | Monitor mailbox watch | `relay watch` + `codex app-server` |
+
+## Token discipline
+
+Relay wakes and spawns bill the target tool's subscription. Keep the bus cheap
+by choosing the smallest paid turn that still fits the job.
+
+1. **Tier the wake model by purpose.** Ack-only or inbox-drain wakes should use a
+   cheap tier, such as Claude `--model sonnet --effort low` or Codex `--effort
+   low` as of 2026-07. Decision-making wakes should use the deliberate tier,
+   such as Claude `--model opus --effort max` or Codex `--model gpt-5.5
+   --effort xhigh` as of 2026-07. Check the current local tier list before
+   copying dated examples.
+2. **Never doorbell the main interactive session.** Workers should reply via
+   `send`, a local file write that drains on the next user turn or Monitor
+   watch. A headless wake of a long main session can reprocess its full
+   transcript.
+3. **Fresh spawn beats waking a long transcript.** Use `wake` when the existing
+   context is needed; use a fresh short-lived `spawn` for a new task so the boot
+   cost stays roughly fixed.
+4. **Scope every wake nudge.** End wake prompts with a hard stop such as "reply
+   over the bus and stop - do not start new work". There is no CLI turn cap; the
+   prompt is the cap.
+5. **Batch sends, wake once.** `send` is cheap; each wake pays boot plus
+   transcript cost. Queue related messages first, then ring one doorbell.
+
+### BAD
+
+```bash
+# Repeatedly wakes the main session and leaves the turn open-ended.
+relay wake main --model opus --effort max -- "Any updates?"
+relay wake main --model opus --effort max -- "Also check CI."
+```
+
+### GOOD
+
+```bash
+relay send worker -- "CI finished. Review the failed test and reply over the bus."
+relay send worker -- "Scope: report findings only; do not start new work."
+relay wake worker --model sonnet --effort low -- "Drain your inbox, reply over the bus, and stop - do not start new work."
+```
 
 ## Auto-resolve: find the running session
 
