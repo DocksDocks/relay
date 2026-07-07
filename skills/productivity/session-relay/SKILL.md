@@ -6,7 +6,7 @@ allowed-tools: Bash, Read
 metadata:
   pattern: tool-wrapper
   updated: "2026-07-06"
-  content_hash: "40291ff3088047a8d61605037cfdb35c601df9ac5d72a1cbe55f6e6e75fea4a9"
+  content_hash: "9341eab360e3206d8ff53ebd2649ec6020b981c0dfe74d4bcb84a6c6e6a5c11b"
 ---
 
 # Session relay
@@ -68,6 +68,12 @@ by choosing the smallest paid turn that still fits the job.
    prompt is the cap.
 5. **Batch sends, wake once.** `send` is cheap; each wake pays boot plus
    transcript cost. Queue related messages first, then ring one doorbell.
+
+Lean boot was measured 2026-07 and deliberately does NOT ship as a flag: Claude
+`--strict-mcp-config` / `--setting-sources user` cut under 0.5% of boot input;
+Codex `--ignore-user-config` cut ~41% but silently drops the session-relay hook
+itself — the child never registers on the bus. Do not add config-skipping flags
+to relay children or wakes.
 
 ### BAD
 
