@@ -18,6 +18,7 @@
 use crate::discover;
 use crate::store;
 use std::collections::HashMap;
+use std::io::Write;
 use tinyjson::JsonValue;
 
 pub(crate) const DEFAULT_NUDGE: &str = "You have new session-relay mail. Use the session-relay skill: call inbox to read your pending messages and act on them.";
@@ -120,6 +121,24 @@ fn cwd_string() -> String {
         .unwrap_or_else(|_| ".".to_string())
 }
 
+fn wake_cmd(tool: &str) -> String {
+    let var = if tool == "codex" {
+        "RELAY_WAKE_CMD_CODEX"
+    } else {
+        "RELAY_WAKE_CMD_CLAUDE"
+    };
+    std::env::var(var)
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| {
+            if tool == "codex" {
+                "codex".to_string()
+            } else {
+                "claude".to_string()
+            }
+        })
+}
+
 fn doorbell_args(
     tool: &str,
     id: &str,
@@ -153,8 +172,95 @@ fn doorbell_args(
     }
     cargs.push("--".into());
     cargs.push(message.into());
-    let cmd = if tool == "codex" { "codex" } else { "claude" };
-    (cmd.into(), cargs)
+    (wake_cmd(tool), cargs)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct WakeUsage {
+    input_tokens: u64,
+    cached_input_tokens: Option<u64>,
+    output_tokens: u64,
+    cost_usd: Option<String>,
+}
+
+impl WakeUsage {
+    fn render(&self, tool: &str) -> String {
+        let mut line = format!("[relay wake] {tool}: {} in", self.input_tokens);
+        if let Some(cached) = self.cached_input_tokens.filter(|n| *n > 0) {
+            line.push_str(&format!(" ({cached} cached)"));
+        }
+        line.push_str(&format!(" / {} out", self.output_tokens));
+        if let Some(cost) = &self.cost_usd {
+            line.push_str(&format!(", ${cost}"));
+        }
+        line
+    }
+}
+
+fn obj(v: &JsonValue) -> Option<&HashMap<String, JsonValue>> {
+    v.get::<HashMap<String, JsonValue>>()
+}
+
+fn str_field<'a>(o: &'a HashMap<String, JsonValue>, k: &str) -> Option<&'a str> {
+    o.get(k)?.get::<String>().map(String::as_str)
+}
+
+fn num_field(o: &HashMap<String, JsonValue>, k: &str) -> Option<u64> {
+    let n = o.get(k)?.get::<f64>().copied()?;
+    (n.is_finite() && n >= 0.0).then_some(n as u64)
+}
+
+fn cost_field(o: &HashMap<String, JsonValue>, k: &str) -> Option<String> {
+    let n = o.get(k)?.get::<f64>().copied()?;
+    (n.is_finite() && n >= 0.0).then_some(n.to_string())
+}
+
+fn claude_usage(root: &HashMap<String, JsonValue>) -> Option<WakeUsage> {
+    if str_field(root, "type")? != "result" {
+        return None;
+    }
+    let usage = root.get("usage").and_then(obj)?;
+    let prompt = num_field(usage, "input_tokens")?;
+    let cache_read = num_field(usage, "cache_read_input_tokens");
+    let cache_create = num_field(usage, "cache_creation_input_tokens").unwrap_or(0);
+    Some(WakeUsage {
+        input_tokens: prompt + cache_read.unwrap_or(0) + cache_create,
+        cached_input_tokens: cache_read,
+        output_tokens: num_field(usage, "output_tokens")?,
+        cost_usd: cost_field(root, "total_cost_usd"),
+    })
+}
+
+fn codex_usage_line(stdout: &str) -> Option<WakeUsage> {
+    for line in stdout.lines() {
+        let root = line.parse::<JsonValue>().ok()?;
+        let root = obj(&root)?;
+        if str_field(root, "type") != Some("turn.completed") {
+            continue;
+        }
+        let usage = root.get("usage").and_then(obj)?;
+        let visible_output = num_field(usage, "output_tokens")?;
+        let reasoning_output = num_field(usage, "reasoning_output_tokens").unwrap_or(0);
+        return Some(WakeUsage {
+            input_tokens: num_field(usage, "input_tokens")?,
+            cached_input_tokens: num_field(usage, "cached_input_tokens"),
+            output_tokens: visible_output + reasoning_output,
+            cost_usd: None,
+        });
+    }
+    None
+}
+
+fn wake_usage_line(tool: &str, stdout: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(stdout).ok()?;
+    let usage = if tool == "codex" {
+        codex_usage_line(text)?
+    } else {
+        let root = text.parse::<JsonValue>().ok()?;
+        let root = obj(&root)?;
+        claude_usage(root)?
+    };
+    Some(usage.render(tool))
 }
 
 pub fn run(cmd: &str, raw: Vec<String>) -> ! {
@@ -435,16 +541,14 @@ pub fn run(cmd: &str, raw: Vec<String>) -> ! {
                 .current_dir(&dir)
                 .output()
                 .unwrap_or_else(|e| die(&format!("failed to spawn {cmd}: {e}")));
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            if !stdout.is_empty() {
-                if stdout.ends_with('\n') {
-                    print!("{stdout}");
-                } else {
-                    println!("{stdout}");
-                }
+            if !out.stdout.is_empty() {
+                let _ = std::io::stdout().write_all(&out.stdout);
             }
             if !out.stderr.is_empty() {
                 eprint!("{}", String::from_utf8_lossy(&out.stderr));
+            }
+            if let Some(line) = wake_usage_line(&target.tool, &out.stdout) {
+                eprintln!("{line}");
             }
             std::process::exit(out.status.code().unwrap_or(0));
         }
@@ -525,5 +629,51 @@ mod tests {
                 "ping"
             ])
         );
+    }
+
+    #[test]
+    fn parses_claude_fixture_usage_line() {
+        let line = wake_usage_line(
+            "claude",
+            include_str!("../../test/fixtures/wake-usage-claude.json").as_bytes(),
+        );
+        assert_eq!(
+            line,
+            Some("[relay wake] claude: 45682 in (45603 cached) / 4 out, $0.0142089".to_string())
+        );
+    }
+
+    #[test]
+    fn parses_codex_fixture_usage_line() {
+        let line = wake_usage_line(
+            "codex",
+            include_str!("../../test/fixtures/wake-usage-codex.json").as_bytes(),
+        );
+        assert_eq!(
+            line,
+            Some("[relay wake] codex: 47400 in (12032 cached) / 10 out".to_string())
+        );
+    }
+
+    #[test]
+    fn parser_accepts_no_trailing_newline_payload() {
+        let line = wake_usage_line(
+            "claude",
+            br#"{"type":"result","total_cost_usd":1.25,"usage":{"input_tokens":7,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":3}}"#,
+        );
+        assert_eq!(
+            line,
+            Some("[relay wake] claude: 7 in / 3 out, $1.25".to_string())
+        );
+    }
+
+    #[test]
+    fn parser_ignores_invalid_utf8_stdout() {
+        assert_eq!(wake_usage_line("claude", b"{\"type\":\"result\"}\xff"), None);
+    }
+
+    #[test]
+    fn parser_ignores_garbage_stdout() {
+        assert_eq!(wake_usage_line("codex", b"not json"), None);
     }
 }
