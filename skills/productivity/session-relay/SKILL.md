@@ -5,8 +5,8 @@ user-invocable: true
 allowed-tools: Bash, Read
 metadata:
   pattern: tool-wrapper
-  updated: "2026-07-06"
-  content_hash: "9341eab360e3206d8ff53ebd2649ec6020b981c0dfe74d4bcb84a6c6e6a5c11b"
+  updated: "2026-07-09"
+  content_hash: "d3b9b25f35e4e0ecebd483421ac2c24f0fd6356920d3b843a501887c8a80a9ba"
 ---
 
 # Session relay
@@ -22,7 +22,7 @@ The Claude doorbell (`claude -p --resume <id>`) MUST run from the recipient's ow
 </constraint>
 
 <constraint>
-Relay children and doorbell wakes run unattended and can reprocess full transcripts. ALWAYS pin `--model`/`--effort` on `relay spawn` and `relay wake`; never use Fable or another top interactive default for a relay child or wake. Current examples as of 2026-07: Claude `--model opus --effort max`, Codex `--model gpt-5.5 --effort xhigh`; check your own tier list before copying them.
+Relay children and doorbell wakes run unattended and can reprocess full transcripts. ALWAYS pin `--model`/`--effort` on `relay spawn` and `relay wake`; never use Fable or another top interactive default for a relay child or wake. Current examples as of 2026-07: Claude `--model opus --effort max`, Codex `--model gpt-5.6-sol --effort xhigh`; check your own tier list before copying them.
 </constraint>
 
 ## How it fits together
@@ -53,7 +53,7 @@ by choosing the smallest paid turn that still fits the job.
 1. **Tier the wake model by purpose.** Ack-only or inbox-drain wakes should use a
    cheap tier, such as Claude `--model sonnet --effort low` or Codex `--effort
    low` as of 2026-07. Decision-making wakes should use the deliberate tier,
-   such as Claude `--model opus --effort max` or Codex `--model gpt-5.5
+   such as Claude `--model opus --effort max` or Codex `--model gpt-5.6-sol
    --effort xhigh` as of 2026-07. Check the current local tier list before
    copying dated examples.
 2. **Never doorbell the main interactive session.** Workers should reply via
@@ -195,7 +195,7 @@ birth a real, resumable session there instead:
   CLI defaults to `codex` when the codex CLI is installed, else `claude` — a
   printed note names the choice either way.
 - **Model discipline:** pass `--model`/`--effort` every time. As of 2026-07, use
-  `--model opus --effort max` for a Claude child or `--model gpt-5.5 --effort
+  `--model opus --effort max` for a Claude child or `--model gpt-5.6-sol --effort
   xhigh` for a Codex child unless the user's current tier list says otherwise.
 - The child launches detached; spawn returns as soon as the child's own SessionStart
   hook registers it on the bus (typically <1s), long before the task finishes. Its
@@ -223,7 +223,7 @@ the plan and the final verdict; workers edit only their assigned sections.
 1. Create or open the plan via plan-manager. Add `## Debate` with `### [a-team]`
    and `### [b-team]`, then state the exact question.
 2. Spawn `a-team` first, usually Codex:
-   `<plugin>/bin/relay spawn <dir> --tool codex --model gpt-5.5 --effort xhigh --name a-team --reply-to <me> -- "<question + absolute plan path + edit ONLY ### [a-team]>"`
+   `<plugin>/bin/relay spawn <dir> --tool codex --model gpt-5.6-sol --effort xhigh --name a-team --reply-to <me> -- "<question + absolute plan path + edit ONLY ### [a-team]>"`
 3. After `a-team` reports over the bus, spawn `b-team`, usually Claude:
    `<plugin>/bin/relay spawn <dir> --tool claude --model opus --effort max --name b-team --reply-to <me> -- "<same question + absolute plan path + edit ONLY ### [b-team]>"`
 4. Run exactly two sequential rounds over the bus: round 1 is `a-team` position

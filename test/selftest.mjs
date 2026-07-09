@@ -214,8 +214,8 @@ check('wake dispatches the claude doorbell for a claude target', () => {
   assert.ok(d.args.includes('--resume') && d.args.includes(idA));
 });
 check('wake --dry maps --model/--effort for codex and claude targets', () => {
-  const c = relayJSON(['wake', 'codex-C', '--model', 'gpt-5.5', '--effort', 'xhigh', '--dry']);
-  assert.deepEqual(c.args.slice(0, 7), ['exec', 'resume', idC, '-m', 'gpt-5.5', '-c', 'model_reasoning_effort=xhigh']);
+  const c = relayJSON(['wake', 'codex-C', '--model', 'gpt-5.6-sol', '--effort', 'xhigh', '--dry']);
+  assert.deepEqual(c.args.slice(0, 7), ['exec', 'resume', idC, '-m', 'gpt-5.6-sol', '-c', 'model_reasoning_effort=xhigh']);
   assert.ok(c.args.indexOf('--') > 6, 'codex model flags stay before the prompt fence');
 
   const a = relayJSON(['wake', 'agent-A', '--model', 'opus', '--effort', 'max', '--dry']);
@@ -251,7 +251,7 @@ check('wake prints claude usage to stderr and keeps fixture stdout byte-identica
 });
 check('wake prints codex usage to stderr and keeps fixture stdout byte-identical', () => {
   const fixture = fs.readFileSync(codexUsageFixture);
-  const r = relayBytes(['wake', 'codex-C', '--model', 'gpt-5.5', '--effort', 'xhigh'], {
+  const r = relayBytes(['wake', 'codex-C', '--model', 'gpt-5.6-sol', '--effort', 'xhigh'], {
     env: { RELAY_WAKE_CMD_CODEX: wakeStub, WAKE_STUB_FILE: codexUsageFixture },
   });
   assert.equal(r.status, 0, `wake exited ${r.status}: ${r.stderr}`);
@@ -686,15 +686,15 @@ check('spawn --dry maps --model/--effort for claude and codex children', () => {
   assert.deepEqual(claude.args.slice(perm, perm + 6), ['--permission-mode', 'auto', '--model', 'opus', '--effort', 'max']);
   assert.ok(claude.args.indexOf('--') > perm + 5, 'claude model flags stay before the prompt fence');
 
-  const codex = relayJSON(['spawn', dirS, '--tool', 'codex', '--model', 'gpt-5.5', '--effort', 'xhigh', '--reply-to', 'agent-A', '--dry', '--', 'do Y']);
-  assert.deepEqual(codex.args.slice(0, 7), ['exec', '--sandbox', 'workspace-write', '-m', 'gpt-5.5', '-c', 'model_reasoning_effort=xhigh']);
+  const codex = relayJSON(['spawn', dirS, '--tool', 'codex', '--model', 'gpt-5.6-sol', '--effort', 'xhigh', '--reply-to', 'agent-A', '--dry', '--', 'do Y']);
+  assert.deepEqual(codex.args.slice(0, 7), ['exec', '--sandbox', 'workspace-write', '-m', 'gpt-5.6-sol', '-c', 'model_reasoning_effort=xhigh']);
   assert.ok(codex.args.indexOf('--') > 6, 'codex model flags stay before the prompt fence');
 });
 check('spawn --dry defaults to codex when its CLI is available', () => {
   const dirS = path.join(HOME, 'proj-s0-codex-default');
   fs.mkdirSync(dirS, { recursive: true });
   // RELAY_SPAWN_CMD_CODEX pointing at an executable satisfies the probe.
-  const r = relay(['spawn', dirS, '--model', 'gpt-5.5', '--effort', 'xhigh', '--reply-to', 'agent-A', '--dry', '--', 'do X'], { env: { RELAY_SPAWN_CMD_CODEX: stub } });
+  const r = relay(['spawn', dirS, '--model', 'gpt-5.6-sol', '--effort', 'xhigh', '--reply-to', 'agent-A', '--dry', '--', 'do X'], { env: { RELAY_SPAWN_CMD_CODEX: stub } });
   assert.equal(r.status, 0, `spawn --dry exited ${r.status}: ${r.stderr}`);
   assert.ok(/codex available, defaulting to codex/i.test(r.stderr), 'no --tool + codex present prints the codex default note');
   const d = JSON.parse(r.stdout);
@@ -705,7 +705,7 @@ check('spawn --dry honors RELAY_SPAWN_TOOL and rejects invalid values', () => {
   const dirS = path.join(HOME, 'proj-s0-env');
   fs.mkdirSync(dirS, { recursive: true });
 
-  const r = relay(['spawn', dirS, '--model', 'gpt-5.5', '--effort', 'xhigh', '--reply-to', 'agent-A', '--dry', '--', 'do X'], { env: { RELAY_SPAWN_TOOL: 'codex' } });
+  const r = relay(['spawn', dirS, '--model', 'gpt-5.6-sol', '--effort', 'xhigh', '--reply-to', 'agent-A', '--dry', '--', 'do X'], { env: { RELAY_SPAWN_TOOL: 'codex' } });
   assert.equal(r.status, 0, `spawn env default exited ${r.status}: ${r.stderr}`);
   assert.ok(!/defaulting to/i.test(r.stderr), 'env default does not print any fallback note');
   assert.equal(JSON.parse(r.stdout).tool, 'codex');
