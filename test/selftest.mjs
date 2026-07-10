@@ -711,7 +711,68 @@ const ageGcSession = (home, session) => {
 const runGcBus = (home, dir, env = {}) => {
   const r = gcRun(home, ['bus'], { input: '', env: { RELAY_PROJECT_DIR: dir, ...env } });
   assert.equal(r.status, 0, `GC bus exited ${r.status}: ${r.stderr}`);
+  return r;
 };
+const makeGcSurfaceDirs = (home, omit = []) => {
+  for (const directory of ['mailbox', 'markers', 'watchers', 'locks', 'spawn-logs']) {
+    if (!omit.includes(directory)) fs.mkdirSync(path.join(home, directory), { recursive: true });
+  }
+};
+
+check('GC refuses a symlinked surface without touching its target or permissions', () => {
+  const home = fs.mkdtempSync(path.join(HOME, 'gc-symlink-external-'));
+  const external = fs.mkdtempSync(path.join(HOME, 'gc-external-'));
+  fs.chmodSync(external, 0o755);
+  const victim = path.join(external, 'foreign.lock');
+  fs.writeFileSync(victim, 'foreign\n');
+  makeGcSurfaceDirs(home, ['watchers']);
+  fs.symlinkSync(external, path.join(home, 'watchers'));
+  const modeBefore = fs.statSync(external).mode & 0o777;
+
+  const r = runGcBus(home, home);
+
+  assert.match(r.stderr, /refusing GC: relay surface directory watchers/);
+  assert.equal(fs.existsSync(victim), true, 'external target survives the full bus entry path');
+  assert.equal(fs.statSync(external).mode & 0o777, modeBefore, 'external mode is unchanged');
+  assert.equal(fs.existsSync(path.join(home, '.lock')), false, 'GC refused before creating its lock');
+});
+
+check('GC leaves aged foreign non-UUID files untouched in every surface directory', () => {
+  const home = fs.mkdtempSync(path.join(HOME, 'gc-foreign-'));
+  makeGcSurfaceDirs(home);
+  const foreign = [
+    path.join(home, 'mailbox', 'notes.jsonl'),
+    path.join(home, 'markers', 'not-a-relay-marker'),
+    path.join(home, 'watchers', 'notes.lock'),
+    path.join(home, 'watchers', 'notes.progress'),
+    path.join(home, 'locks', 'resume-notes.lock'),
+    path.join(home, 'spawn-logs', 'notes.stderr'),
+  ];
+  for (const file of foreign) {
+    fs.writeFileSync(file, 'not-a-uuid\n');
+    fs.utimesSync(file, gcOld, gcOld);
+  }
+
+  runGcBus(home, home);
+
+  assert.ok(foreign.every((file) => fs.existsSync(file)), 'foreign files survive in all surfaces');
+});
+
+check('GC cannot follow a mailbox-directory symlink to delete a victim file', () => {
+  const home = fs.mkdtempSync(path.join(HOME, 'gc-victim-'));
+  const future = path.join(home, 'future');
+  fs.mkdirSync(future);
+  makeGcSurfaceDirs(home, ['mailbox']);
+  fs.symlinkSync(future, path.join(home, 'mailbox'));
+  const victim = path.join(future, '42424242-4242-4242-8242-424242424242.jsonl');
+  fs.writeFileSync(victim, 'victim\n');
+  fs.utimesSync(victim, gcOld, gcOld);
+
+  const r = runGcBus(home, home);
+
+  assert.match(r.stderr, /refusing GC: relay surface directory mailbox/);
+  assert.equal(fs.existsSync(victim), true, 'victim survives the path-check/use layout');
+});
 
 check('GC removes exactly aged registered/orphan surfaces and preserves young state', () => {
   const home = fs.mkdtempSync(path.join(HOME, 'gc-exact-'));
