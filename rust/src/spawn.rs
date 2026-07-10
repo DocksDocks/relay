@@ -21,6 +21,7 @@
 
 use crate::cli::Args;
 use crate::store;
+use rustix::fs::{FlockOperation, flock};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
@@ -82,18 +83,22 @@ pub fn run_log_writer(id: &str) -> ! {
     if !store::is_uuid(id) {
         die("spawn log writer requires a UUID");
     }
-    let _pump_liveness = store::acquire_spawn_pump_lock()
-        .unwrap_or_else(|e| die(&format!("acquire spawn-pump liveness lock: {e}")));
     let dir = store::home_dir().join("spawn-logs");
     fs::create_dir_all(&dir).unwrap_or_else(|e| die(&format!("create spawn-log dir: {e}")));
     let path = dir.join(format!("{}.stderr", store::sanitize(id)));
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .open(&path)
-        .unwrap_or_else(|e| die(&format!("open spawn log {}: {e}", path.display())));
+    let mut file = store::with_lock(|| {
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|e| format!("open spawn log {}: {e}", path.display()))?;
+        flock(&file, FlockOperation::LockShared)
+            .map_err(|e| format!("flock spawn log {}: {e}", path.display()))?;
+        Ok(file)
+    })
+    .unwrap_or_else(|e| die(&e));
     file.seek(SeekFrom::End(0))
         .unwrap_or_else(|e| die(&format!("seek spawn log {}: {e}", path.display())));
 

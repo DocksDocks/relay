@@ -68,10 +68,6 @@ fn lock_path() -> PathBuf {
     home_dir().join(".lock")
 }
 
-fn spawn_pump_lock_path() -> PathBuf {
-    home_dir().join("locks").join("spawn-pump.lock")
-}
-
 pub fn watcher_lock_path(id: &str) -> PathBuf {
     home_dir()
         .join("watchers")
@@ -192,10 +188,6 @@ pub struct HeldLock {
     metadata: LockMetadata,
 }
 
-pub struct HeldSpawnPumpLock {
-    _file: fs::File,
-}
-
 impl HeldLock {
     pub fn metadata(&self) -> &LockMetadata {
         &self.metadata
@@ -303,22 +295,6 @@ pub fn acquire_resume_lock(id: &str, tool: &str) -> Result<HeldLock, LockAcquire
         LockMetadata::new(tool, "resume"),
         Duration::ZERO,
     )
-}
-
-/// Hold a shared liveness lock for the lifetime of a spawn-log pump. GC probes
-/// this lock exclusively while holding the store lock, so a pump either becomes
-/// visible before a sweep or waits to start writing until the sweep finishes.
-pub fn acquire_spawn_pump_lock() -> Result<HeldSpawnPumpLock, String> {
-    with_lock(|| {
-        let path = spawn_pump_lock_path();
-        let file = open_lock(&path, true)
-            .map_err(|e| format!("open spawn-pump lock {}: {e}", path.display()))?;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
-            .map_err(|e| format!("chmod {}: {e}", path.display()))?;
-        flock(&file, FlockOperation::LockShared)
-            .map_err(|e| format!("flock spawn-pump lock {}: {e}", path.display()))?;
-        Ok(HeldSpawnPumpLock { _file: file })
-    })
 }
 
 pub fn lock_status(path: &Path) -> LockStatus {
@@ -617,6 +593,12 @@ struct GcSurface {
     mtime_nsec: i128,
 }
 
+#[derive(Default)]
+struct GcInventory {
+    surfaces: Vec<(Option<String>, String, GcSurface)>,
+    fresh_unknown_markers: HashMap<String, GcSurface>,
+}
+
 fn gc_days() -> Result<u64, String> {
     match std::env::var("AGENT_RELAY_GC_DAYS") {
         Ok(raw) if !raw.is_empty() => raw
@@ -752,10 +734,20 @@ fn stat_regular_surface_at(dir: &OwnedFd, name: &str) -> Result<Option<rustix::f
         .then_some(stat))
 }
 
-fn known_gc_surfaces(
-    dirs: &[GcSurfaceDir],
-) -> Result<Vec<(Option<String>, String, GcSurface)>, String> {
-    let mut surfaces = Vec::new();
+fn gc_surface(directory: &'static str, name: String, stat: &rustix::fs::Stat) -> GcSurface {
+    GcSurface {
+        directory,
+        name,
+        dev: i128::from(stat.st_dev),
+        ino: i128::from(stat.st_ino),
+        size: i128::from(stat.st_size),
+        mtime: i128::from(stat.st_mtime),
+        mtime_nsec: i128::from(stat.st_mtime_nsec),
+    }
+}
+
+fn known_gc_surfaces(dirs: &[GcSurfaceDir], cutoff: SystemTime) -> Result<GcInventory, String> {
+    let mut inventory = GcInventory::default();
     for surface_dir in dirs {
         let directory = surface_dir.name;
         let entries = Dir::read_from(&surface_dir.fd)
@@ -765,48 +757,48 @@ fn known_gc_surfaces(
             let Some(name) = entry.file_name().to_str().ok().map(str::to_string) else {
                 continue;
             };
-            let (id, stat) = if directory == "markers" {
-                // Marker ownership is content-based. An unreadable marker is
-                // preserved as unknown rather than denying the whole sweep.
-                let Some((mut file, stat)) = (match open_regular_at(&surface_dir.fd, &name) {
-                    Ok(file) => file,
-                    Err(_) => continue,
-                }) else {
-                    continue;
-                };
-                let mut raw = String::new();
-                if file.read_to_string(&mut raw).is_err() {
-                    continue;
-                }
-                let id = raw.trim();
-                if !is_uuid(id) {
-                    continue;
-                }
-                (Some(id.to_string()), stat)
-            } else {
-                // Foreign names are never opened or statted. Classification
-                // must precede all filesystem inspection to avoid GC denial.
-                let Some(id) = gc_surface_id(directory, &name) else {
-                    continue;
-                };
+            if directory == "markers" {
                 let Some(stat) = stat_regular_surface_at(&surface_dir.fd, &name)? else {
                     continue;
                 };
-                (Some(id), stat)
+                let surface = gc_surface(directory, name.clone(), &stat);
+                let mut raw = String::new();
+                let marker_id = match open_regular_at(&surface_dir.fd, &name) {
+                    Ok(Some((mut file, _))) => file
+                        .read_to_string(&mut raw)
+                        .ok()
+                        .and_then(|_| is_uuid(raw.trim()).then(|| raw.trim().to_string())),
+                    _ => None,
+                };
+                if let Some(id) = marker_id {
+                    inventory.surfaces.push((
+                        Some(id),
+                        format!("orphan:{directory}:{name}"),
+                        surface,
+                    ));
+                } else if !surface_is_old(&surface, cutoff) {
+                    // A fresh marker whose owner cannot be read must still
+                    // participate in all-surfaces-old via its encoded cwd.
+                    inventory.fresh_unknown_markers.insert(name, surface);
+                }
+                continue;
+            }
+            // Foreign names are never opened or statted. Classification must
+            // precede all filesystem inspection to avoid GC denial.
+            let Some(id) = gc_surface_id(directory, &name) else {
+                continue;
             };
-            let surface = GcSurface {
-                directory,
-                name: name.clone(),
-                dev: i128::from(stat.st_dev),
-                ino: i128::from(stat.st_ino),
-                size: i128::from(stat.st_size),
-                mtime: i128::from(stat.st_mtime),
-                mtime_nsec: i128::from(stat.st_mtime_nsec),
+            let Some(stat) = stat_regular_surface_at(&surface_dir.fd, &name)? else {
+                continue;
             };
-            surfaces.push((id, format!("orphan:{directory}:{name}"), surface));
+            inventory.surfaces.push((
+                Some(id),
+                format!("orphan:{directory}:{name}"),
+                gc_surface(directory, name, &stat),
+            ));
         }
     }
-    Ok(surfaces)
+    Ok(inventory)
 }
 
 fn surface_is_old(surface: &GcSurface, cutoff: SystemTime) -> bool {
@@ -866,6 +858,24 @@ fn lock_status_at(dir: Option<&GcSurfaceDir>, name: &str) -> LockStatus {
         Err(e) if e == rustix::io::Errno::AGAIN => LockStatus::Live,
         Err(_) => LockStatus::Unknown,
     }
+}
+
+fn acquire_gc_spawn_log_guard(dir: Option<&GcSurfaceDir>, name: &str) -> Option<OwnedFd> {
+    let dir = dir?;
+    let fd = openat(
+        &dir.fd,
+        name,
+        OFlags::RDWR | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .ok()?;
+    let stat = fstat(&fd).ok()?;
+    if !FileType::from_raw_mode(stat.st_mode).is_file() {
+        return None;
+    }
+    flock(&fd, FlockOperation::NonBlockingLockExclusive)
+        .ok()
+        .map(|()| fd)
 }
 
 fn read_text_at(root_fd: &OwnedFd, name: &str) -> Result<Option<String>, String> {
@@ -1052,6 +1062,7 @@ pub fn gc(now: SystemTime, self_id: Option<&str>) -> Result<usize, String> {
 
         let registry_raw = read_text_at(&root_fd, "registry.json")?;
         let (mut agents, mut names) = parse_registry(registry_raw.as_deref());
+        let inventory = known_gc_surfaces(&surface_dirs, cutoff)?;
         let mut candidates: HashMap<String, GcCandidate> = HashMap::new();
         for (registry_key, value) in &agents {
             let Some(entry) = Entry::from_json(value) else {
@@ -1065,14 +1076,17 @@ pub fn gc(now: SystemTime, self_id: Option<&str>) -> Result<usize, String> {
                 .or_default();
             candidate.id = Some(registry_key.clone());
             candidate.registry_key = Some(registry_key.clone());
+            if let Some(dir) = entry.dir.as_deref() {
+                if let Some(marker) = inventory.fresh_unknown_markers.get(&encode_dir(dir)) {
+                    candidate.surfaces.push(marker.clone());
+                }
+            }
             candidate.last_seen = Some(entry.last_seen);
         }
-        for (id, orphan_key, surface) in known_gc_surfaces(&surface_dirs)? {
+        for (id, orphan_key, surface) in inventory.surfaces {
             add_gc_surface(&mut candidates, id, orphan_key, surface);
         }
 
-        let spawn_pump_status =
-            lock_status_at(gc_surface_dir(&surface_dirs, "locks"), "spawn-pump.lock");
         let mut eligible = Vec::new();
         for (key, candidate) in &candidates {
             if candidate
@@ -1096,14 +1110,6 @@ pub fn gc(now: SystemTime, self_id: Option<&str>) -> Result<usize, String> {
             {
                 continue;
             }
-            if candidate
-                .surfaces
-                .iter()
-                .any(|surface| surface.directory == "spawn-logs")
-                && matches!(spawn_pump_status, LockStatus::Live | LockStatus::Unknown)
-            {
-                continue;
-            }
             if let Some(id) = candidate.id.as_deref() {
                 let watcher = format!("{id}.lock");
                 let resume = format!("resume-{id}.lock");
@@ -1122,8 +1128,22 @@ pub fn gc(now: SystemTime, self_id: Option<&str>) -> Result<usize, String> {
 
         let mut removed_files = 0;
         let mut removed_registry_ids = HashSet::new();
-        for key in &eligible {
+        'candidate: for key in &eligible {
             let candidate = &candidates[key];
+            let mut spawn_log_guards = Vec::new();
+            for surface in candidate
+                .surfaces
+                .iter()
+                .filter(|surface| surface.directory == "spawn-logs")
+            {
+                let Some(guard) = acquire_gc_spawn_log_guard(
+                    gc_surface_dir(&surface_dirs, "spawn-logs"),
+                    &surface.name,
+                ) else {
+                    continue 'candidate;
+                };
+                spawn_log_guards.push(guard);
+            }
             // All-or-nothing preflight: a surface that became fresh or was
             // replaced since enumeration preserves the whole candidate.
             if !candidate_surfaces_still_eligible(&surface_dirs, candidate, cutoff)? {
@@ -1137,6 +1157,7 @@ pub fn gc(now: SystemTime, self_id: Option<&str>) -> Result<usize, String> {
             if let Some(registry_key) = &candidate.registry_key {
                 removed_registry_ids.insert(registry_key.clone());
             }
+            drop(spawn_log_guards);
         }
 
         // Registry is last: an interrupted sweep leaves visible entries that
@@ -1364,8 +1385,10 @@ mod tests {
         )
         .expect("open fixture root");
         let dirs = open_gc_surface_dirs(&root_fd).expect("open fixture surfaces");
-        let (_, _, surface) = known_gc_surfaces(&dirs)
+        let cutoff = SystemTime::now() + Duration::from_secs(60);
+        let (_, _, surface) = known_gc_surfaces(&dirs, cutoff)
             .expect("enumerate fixture")
+            .surfaces
             .into_iter()
             .find(|(surface_id, _, _)| surface_id.as_deref() == Some(id))
             .expect("find spawn surface");
@@ -1374,7 +1397,6 @@ mod tests {
             surfaces: vec![surface],
             ..GcCandidate::default()
         };
-        let cutoff = SystemTime::now() + Duration::from_secs(60);
         assert!(candidate_surfaces_still_eligible(&dirs, &candidate, cutoff).unwrap());
 
         fs::OpenOptions::new()

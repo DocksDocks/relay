@@ -763,6 +763,24 @@ check('GC ignores unreadable aged foreign files and still collects eligible rela
   assert.equal(fs.existsSync(path.join(home, 'gc-stamp')), true, 'completed sweep writes its stamp');
 });
 
+check('GC fails closed on a fresh unreadable marker for an otherwise-aged session', () => {
+  const home = fs.mkdtempSync(path.join(HOME, 'gc-fresh-marker-'));
+  const held = seedGcSession(home, 'held', '47474747-4747-4747-8747-474747474747');
+  const invoker = seedGcSession(home, 'invoker', '48484848-4848-4848-8848-484848484848');
+  ageGcSession(home, held);
+  const marker = path.join(home, 'markers', gcMarkerName(held.dir));
+  const fresh = new Date();
+  fs.utimesSync(marker, fresh, fresh);
+  fs.chmodSync(marker, 0o000);
+  fs.rmSync(path.join(home, 'gc-stamp'), { force: true });
+
+  runGcBus(home, invoker.dir);
+
+  assert.ok(held.paths.every((file) => fs.existsSync(file)), 'fresh unknown marker preserves the full session');
+  const registry = JSON.parse(fs.readFileSync(path.join(home, 'registry.json'), 'utf8'));
+  assert.ok(registry.agents[held.id], 'fresh unknown marker preserves the registry entry');
+});
+
 check('GC cannot follow a mailbox-directory symlink to delete a victim file', () => {
   const home = fs.mkdtempSync(path.join(HOME, 'gc-victim-'));
   const future = path.join(home, 'future');
@@ -830,24 +848,58 @@ check('GC preserves an aged session while its watcher lock is held', () => {
   }
 });
 
-check('GC preserves an aged candidate while a spawn-log pump holds its liveness lock', () => {
+check('a live per-log pump protects only its candidate while GC collects an unrelated aged log', () => {
   const home = fs.mkdtempSync(path.join(HOME, 'gc-spawn-pump-'));
   const held = seedGcSession(home, 'held', '44444444-4444-4444-8444-444444444444');
+  const collected = seedGcSession(home, 'collected', '46464646-4646-4646-8646-464646464646');
   const invoker = seedGcSession(home, 'invoker', '45454545-4545-4545-8545-454545454545');
-  const pumpId = '46464646-4646-4646-8646-464646464646';
   ageGcSession(home, held);
+  ageGcSession(home, collected);
+  const heldLog = path.join(home, 'spawn-logs', `${held.id}.stderr`);
+  fs.rmSync(heldLog);
   fs.rmSync(path.join(home, 'gc-stamp'), { force: true });
-  const pump = spawn(BIN, ['__spawn-log-writer', pumpId], {
+  const pump = spawn(BIN, ['__spawn-log-writer', held.id], {
     env: gcEnv(home),
     stdio: ['pipe', 'ignore', 'ignore'],
   });
   try {
     waitFor(
-      () => pump.exitCode === null && fs.existsSync(path.join(home, 'spawn-logs', `${pumpId}.stderr`)),
-      'spawn-pump liveness lock',
+      () => pump.exitCode === null && fs.existsSync(heldLog),
+      'per-log pump liveness lock',
     );
+    fs.utimesSync(heldLog, gcOld, gcOld);
     runGcBus(home, invoker.dir);
     assert.ok(held.paths.every((file) => fs.existsSync(file)), 'pump-held candidate survives intact');
+    assert.ok(collected.paths.every((file) => !fs.existsSync(file)), 'unrelated aged candidate is collected');
+  } finally {
+    pump.stdin.end();
+    pump.kill('SIGKILL');
+  }
+});
+
+check('spawn-log pump lock follows a provisional log rename to the born session name', () => {
+  const home = fs.mkdtempSync(path.join(HOME, 'gc-spawn-rename-'));
+  const born = seedGcSession(home, 'born', '49494949-4949-4949-8949-494949494949');
+  const invoker = seedGcSession(home, 'invoker', '51515151-5151-4151-8151-515151515151');
+  const provisionalId = '52525252-5252-4252-8252-525252525252';
+  const bornLog = path.join(home, 'spawn-logs', `${born.id}.stderr`);
+  const provisionalLog = path.join(home, 'spawn-logs', `${provisionalId}.stderr`);
+  ageGcSession(home, born);
+  fs.rmSync(bornLog);
+  fs.rmSync(path.join(home, 'gc-stamp'), { force: true });
+  const pump = spawn(BIN, ['__spawn-log-writer', provisionalId], {
+    env: gcEnv(home),
+    stdio: ['pipe', 'ignore', 'ignore'],
+  });
+  try {
+    waitFor(
+      () => pump.exitCode === null && fs.existsSync(provisionalLog),
+      'provisional per-log pump lock',
+    );
+    fs.renameSync(provisionalLog, bornLog);
+    fs.utimesSync(bornLog, gcOld, gcOld);
+    runGcBus(home, invoker.dir);
+    assert.ok(born.paths.every((file) => fs.existsSync(file)), 'renamed pump-held candidate survives intact');
   } finally {
     pump.stdin.end();
     pump.kill('SIGKILL');
