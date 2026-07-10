@@ -678,6 +678,15 @@ pub fn peek(recipient_id: &str) -> Vec<JsonValue> {
         .unwrap_or_default()
 }
 
+/// The watch poll loop only needs presence, not parsed messages. Avoid reading
+/// and allocating the entire mailbox every tick; the eventual drain remains
+/// the authority for parsing and clearing it.
+pub fn mailbox_has_content(recipient_id: &str) -> bool {
+    fs::metadata(mailbox_path(recipient_id))
+        .map(|metadata| metadata.len() > 0)
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

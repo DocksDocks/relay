@@ -45,6 +45,8 @@ const DEFAULT_SETTLE_MS: u64 = 5000;
 const DEFAULT_TURN_WAIT_MS: u64 = 300_000;
 const RPC_TIMEOUT_SECS: u64 = 20;
 const WAKE_RETRY_MAX_MS: u64 = 30_000;
+const FOLLOW_READ_BUFFER_BYTES: usize = 64 * 1024;
+const MAX_FOLLOW_PENDING_BYTES: usize = 8 * 1024 * 1024;
 
 fn die(msg: &str) -> ! {
     eprintln!("{msg}");
@@ -68,6 +70,7 @@ struct FollowFile {
     dev: u64,
     ino: u64,
     pending: Vec<u8>,
+    dropping_overlong: bool,
     prefix_hash: Sha256,
     snapshot: FileSnapshot,
 }
@@ -232,8 +235,7 @@ pub fn run(raw: Vec<String>) -> ! {
             if let Err(e) = store::update_watcher_progress(&t.id) {
                 eprintln!("[relay watch] progress update for {} failed: {e}", t.id);
             }
-            let pending = store::peek(&t.id);
-            if pending.is_empty() {
+            if !store::mailbox_has_content(&t.id) {
                 woken.remove(&t.id);
                 wake_retries.remove(&t.id);
                 continue;
@@ -300,18 +302,40 @@ pub fn run(raw: Vec<String>) -> ! {
 }
 
 fn read_follow_bytes(state: &mut FollowFile, out: &mut impl Write) -> Result<(), String> {
-    let mut added = Vec::new();
-    state
-        .file
-        .read_to_end(&mut added)
-        .map_err(|e| format!("read followed mailbox: {e}"))?;
-    state.prefix_hash.update(&added);
-    state.pending.extend_from_slice(&added);
-    while let Some(end) = state.pending.iter().position(|b| *b == b'\n') {
-        let line: Vec<u8> = state.pending.drain(..=end).collect();
-        out.write_all(&line)
-            .and_then(|()| out.flush())
-            .map_err(|e| format!("write followed mailbox line: {e}"))?;
+    let mut added = [0_u8; FOLLOW_READ_BUFFER_BYTES];
+    loop {
+        let read = state
+            .file
+            .read(&mut added)
+            .map_err(|e| format!("read followed mailbox: {e}"))?;
+        if read == 0 {
+            break;
+        }
+        state.prefix_hash.update(&added[..read]);
+        for byte in &added[..read] {
+            if state.dropping_overlong {
+                if *byte == b'\n' {
+                    state.dropping_overlong = false;
+                }
+                continue;
+            }
+            if *byte == b'\n' {
+                out.write_all(&state.pending)
+                    .and_then(|()| out.write_all(b"\n"))
+                    .and_then(|()| out.flush())
+                    .map_err(|e| format!("write followed mailbox line: {e}"))?;
+                state.pending.clear();
+            } else if state.pending.len() < MAX_FOLLOW_PENDING_BYTES {
+                state.pending.push(*byte);
+            } else {
+                state.pending.clear();
+                state.dropping_overlong = true;
+                eprintln!(
+                    "[relay watch] followed mailbox record exceeded {} bytes; dropping through newline",
+                    MAX_FOLLOW_PENDING_BYTES
+                );
+            }
+        }
     }
     let metadata = state
         .file
@@ -400,6 +424,7 @@ fn open_follow_file(path: &Path, skip_existing: bool) -> Result<FollowFile, Stri
         dev: metadata.dev(),
         ino: metadata.ino(),
         pending: Vec::new(),
+        dropping_overlong: false,
         prefix_hash,
         snapshot: FileSnapshot::from_metadata(&metadata),
     })
@@ -438,6 +463,7 @@ fn follow_mailbox(id: &str) -> ! {
                             .seek(SeekFrom::Start(0))
                             .unwrap_or_else(|e| die(&format!("reset followed mailbox: {e}")));
                         current.pending.clear();
+                        current.dropping_overlong = false;
                         current.prefix_hash = Sha256::new();
                     }
                 }
@@ -1054,5 +1080,34 @@ mod tests {
             .unwrap();
         assert_eq!(text, DEFAULT_NUDGE);
         assert!(!text.contains("session-relay-mail")); // nudge, never mail content
+    }
+
+    #[test]
+    fn follow_drops_an_overlong_incomplete_record_then_resumes() {
+        let dir = std::env::temp_dir().join(format!("relay-follow-{}", store::uuid_v4()));
+        std::fs::create_dir_all(&dir).expect("create fixture dir");
+        let path = dir.join("mailbox.jsonl");
+        std::fs::write(&path, vec![b'x'; MAX_FOLLOW_PENDING_BYTES + 1])
+            .expect("write overlong record");
+
+        let mut state = open_follow_file(&path, false).expect("open fixture");
+        let mut out = Vec::new();
+        read_follow_bytes(&mut state, &mut out).expect("read overlong record");
+        assert!(state.dropping_overlong);
+        assert!(state.pending.is_empty());
+        assert!(out.is_empty());
+
+        let mut append = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("reopen fixture");
+        append.write_all(b"\nresumed\n").expect("finish fixture");
+        read_follow_bytes(&mut state, &mut out).expect("resume after overlong record");
+        assert!(!state.dropping_overlong);
+        assert!(state.pending.is_empty());
+        assert_eq!(out, b"resumed\n");
+
+        std::fs::remove_file(path).expect("remove fixture file");
+        std::fs::remove_dir(dir).expect("remove fixture dir");
     }
 }
