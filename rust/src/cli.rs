@@ -122,6 +122,23 @@ fn cwd_string() -> String {
         .unwrap_or_else(|_| ".".to_string())
 }
 
+fn lock_age(path: &std::path::Path) -> String {
+    let Ok(age) = std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .and_then(|t| t.elapsed().map_err(std::io::Error::other))
+    else {
+        return "unknown time".to_string();
+    };
+    let seconds = age.as_secs();
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 3600 {
+        format!("{}m", seconds / 60)
+    } else {
+        format!("{}h", seconds / 3600)
+    }
+}
+
 fn wake_cmd(tool: &str) -> String {
     let var = if tool == "codex" {
         "RELAY_WAKE_CMD_CODEX"
@@ -537,6 +554,25 @@ pub fn run(cmd: &str, raw: Vec<String>) -> ! {
                     "target dir does not exist: {dir} — stale/moved session; re-register or pass the current --dir before waking."
                 ));
             }
+            let resume_path = store::resume_lock_path(&target.id);
+            let _resume_guard = match store::acquire_resume_lock(&target.id, &target.tool) {
+                Ok(guard) => guard,
+                Err(store::LockAcquireError::Busy(metadata)) => {
+                    let addressee = target.name.as_deref().unwrap_or(&target.id);
+                    let pid = metadata
+                        .as_ref()
+                        .map(|m| m.pid.to_string())
+                        .unwrap_or_else(|| "unknown".to_string());
+                    eprintln!(
+                        "wake refused: resume already running for {addressee} (pid {pid}, started {} ago)",
+                        lock_age(&resume_path)
+                    );
+                    std::process::exit(3);
+                }
+                Err(store::LockAcquireError::Io(e)) => {
+                    die(&format!("cannot acquire wake resume lock: {e}"));
+                }
+            };
             let out = std::process::Command::new(&cmd)
                 .args(&cargs)
                 .current_dir(&dir)
