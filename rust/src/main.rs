@@ -3,6 +3,7 @@
 //   relay hook [codex] [--event prompt]   SessionStart/UserPromptSubmit hook (register + drain inbox)
 //   relay discover|list|register|send|inbox|peek|wake|doctor   CLI / doorbell / health
 //   relay watch …                  poll mailboxes, push into live Codex threads via app-server
+//   relay __spawn-log-writer <id>  hidden bounded stderr pump for detached spawn
 //   relay __stress …               hidden test helper (cross-process lock race)
 
 use std::collections::HashMap;
@@ -19,6 +20,12 @@ fn main() {
         ) => relay::cli::run(cmd, argv.clone()),
         Some("watch") => relay::watch::run(argv.clone()),
         Some("spawn") => relay::spawn::run(argv.clone()),
+        Some("__spawn-log-writer") => {
+            let Some(id) = argv.get(1) else {
+                die("usage: relay __spawn-log-writer <uuid>");
+            };
+            relay::spawn::run_log_writer(id);
+        }
         // __stress <recipient-id> <who> <k> — mirrors test/selftest.mjs's
         // stress worker: race k enqueues against k register upserts, plus one
         // unique-id register per iteration so a lost read-modify-write shows

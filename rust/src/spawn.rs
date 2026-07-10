@@ -22,12 +22,16 @@
 use crate::cli::Args;
 use crate::store;
 use std::fs;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
 const BIRTH_POLL_MS: u64 = 250;
+const SPAWN_LOG_MAX_BYTES: u64 = 4 * 1024 * 1024;
+const SPAWN_LOG_RETAIN_BYTES: u64 = 3 * 1024 * 1024;
+const SPAWN_LOG_BUFFER_BYTES: usize = 64 * 1024;
 
 fn die(msg: &str) -> ! {
     eprintln!("{msg}");
@@ -50,6 +54,64 @@ fn elapsed(started: Instant) -> String {
     } else {
         format!("{:.1}s", elapsed.as_secs_f64())
     }
+}
+
+fn compact_spawn_log(file: &mut fs::File) -> Result<(), String> {
+    let len = file
+        .seek(SeekFrom::End(0))
+        .map_err(|e| format!("seek spawn log: {e}"))?;
+    if len <= SPAWN_LOG_MAX_BYTES {
+        return Ok(());
+    }
+    let retain = len.min(SPAWN_LOG_RETAIN_BYTES);
+    file.seek(SeekFrom::End(-(retain as i64)))
+        .map_err(|e| format!("seek spawn log tail: {e}"))?;
+    let mut tail = vec![0_u8; retain as usize];
+    file.read_exact(&mut tail)
+        .map_err(|e| format!("read spawn log tail: {e}"))?;
+    file.seek(SeekFrom::Start(0))
+        .and_then(|_| file.write_all(&tail))
+        .and_then(|()| file.set_len(retain))
+        .and_then(|()| file.seek(SeekFrom::End(0)).map(|_| ()))
+        .map_err(|e| format!("compact spawn log: {e}"))
+}
+
+/// Hidden stderr pump used by `relay spawn`. It is a separate process so the
+/// pipe keeps draining after the parent relay returns at birth registration.
+pub fn run_log_writer(id: &str) -> ! {
+    if !store::is_uuid(id) {
+        die("spawn log writer requires a UUID");
+    }
+    let dir = store::home_dir().join("spawn-logs");
+    fs::create_dir_all(&dir).unwrap_or_else(|e| die(&format!("create spawn-log dir: {e}")));
+    let path = dir.join(format!("{}.stderr", store::sanitize(id)));
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+        .unwrap_or_else(|e| die(&format!("open spawn log {}: {e}", path.display())));
+    file.seek(SeekFrom::End(0))
+        .unwrap_or_else(|e| die(&format!("seek spawn log {}: {e}", path.display())));
+
+    let stdin = std::io::stdin();
+    let mut input = stdin.lock();
+    let mut buffer = [0_u8; SPAWN_LOG_BUFFER_BYTES];
+    loop {
+        let read = input
+            .read(&mut buffer)
+            .unwrap_or_else(|e| die(&format!("read spawn stderr: {e}")));
+        if read == 0 {
+            break;
+        }
+        file.write_all(&buffer[..read])
+            .unwrap_or_else(|e| die(&format!("write spawn log {}: {e}", path.display())));
+        compact_spawn_log(&mut file).unwrap_or_else(|e| die(&e));
+    }
+    file.flush()
+        .unwrap_or_else(|e| die(&format!("flush spawn log {}: {e}", path.display())));
+    std::process::exit(0);
 }
 
 // Symmetric per-tool permission mapping. NEVER a --dangerously-* variant.
@@ -340,16 +402,29 @@ pub fn run(raw: Vec<String>) -> ! {
     // auth failure) stays diagnosable; stdout/stdin are null by design.
     let log_dir = store::home_dir().join("spawn-logs");
     let _ = fs::create_dir_all(&log_dir);
-    let log_path = log_dir.join(format!(
-        "{}.stderr",
-        premint.clone().unwrap_or_else(store::uuid_v4)
-    ));
-    let log_file = fs::File::create(&log_path).unwrap_or_else(|e| {
+    let log_id = premint.clone().unwrap_or_else(store::uuid_v4);
+    let log_path = log_dir.join(format!("{log_id}.stderr"));
+    // Synchronous create/truncate means this spawn can never inherit stale
+    // content, even if the pump process is delayed before opening the path.
+    fs::File::create(&log_path).unwrap_or_else(|e| {
         die(&format!(
             "cannot create spawn log {}: {e}",
             log_path.display()
         ))
     });
+    let relay_exe = std::env::current_exe().unwrap_or_else(|_| "relay".into());
+    let mut log_writer = Command::new(relay_exe)
+        .arg("__spawn-log-writer")
+        .arg(&log_id)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap_or_else(|e| die(&format!("cannot launch spawn log writer: {e}")));
+    let log_stdin = log_writer
+        .stdin
+        .take()
+        .unwrap_or_else(|| die("spawn log writer stdin unavailable"));
 
     let marker_before = store::id_for_dir(&dir_s);
     let mut command = Command::new(&cmd);
@@ -358,12 +433,13 @@ pub fn run(raw: Vec<String>) -> ! {
         .current_dir(&dir)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::from(log_file))
+        .stderr(Stdio::from(log_stdin))
         .process_group(0);
     let launched_at = Instant::now();
     let mut child = command
         .spawn()
         .unwrap_or_else(|e| die(&format!("failed to launch {cmd}: {e}")));
+    drop(command); // close the parent's duplicate stderr-pipe writer
 
     // Birth watch: the child's SessionStart hook registers it on the bus.
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
@@ -382,6 +458,7 @@ pub fn run(raw: Vec<String>) -> ! {
         }
         match child.try_wait() {
             Ok(Some(status)) => {
+                let _ = log_writer.wait();
                 eprintln!(
                     "child exited before birth registration (status {}) — see {}",
                     exit_code(&status),
@@ -404,6 +481,15 @@ pub fn run(raw: Vec<String>) -> ! {
             log_path.display()
         ));
     };
+    if id != log_id {
+        let born_path = log_dir.join(format!("{id}.stderr"));
+        match fs::rename(&log_path, &born_path) {
+            Ok(()) => {}
+            Err(e) => {
+                eprintln!("[relay spawn] cannot associate spawn log with born session {id}: {e}")
+            }
+        }
+    }
     let display = if let Some(name) = args.flag("name") {
         store::register(&id, Some(&dir_s), Some(name), Some(&tool)).unwrap_or_else(|e| die(&e));
         name.to_string()
@@ -421,6 +507,7 @@ pub fn run(raw: Vec<String>) -> ! {
     let status = child
         .wait()
         .unwrap_or_else(|e| die(&format!("cannot wait for child: {e}")));
+    let _ = log_writer.wait();
     let duration = elapsed(launched_at);
     if status.success() {
         println!("spawned {display}; first turn complete; {duration}");
@@ -434,6 +521,31 @@ pub fn run(raw: Vec<String>) -> ! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spawn_log_compaction_keeps_the_newest_tail() {
+        let path = std::env::temp_dir().join(format!("relay-spawn-log-{}", store::uuid_v4()));
+        let mut file = fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("create spawn-log fixture");
+        file.write_all(&vec![b'x'; SPAWN_LOG_MAX_BYTES as usize])
+            .expect("write prefix");
+        file.write_all(b"newest-tail-marker").expect("write marker");
+        compact_spawn_log(&mut file).expect("compact fixture");
+        assert_eq!(
+            file.metadata().expect("stat fixture").len(),
+            SPAWN_LOG_RETAIN_BYTES
+        );
+        file.seek(SeekFrom::End(-18)).expect("seek marker");
+        let mut marker = String::new();
+        file.read_to_string(&mut marker).expect("read marker");
+        assert_eq!(marker, "newest-tail-marker");
+        drop(file);
+        fs::remove_file(path).expect("remove fixture");
+    }
 
     #[test]
     fn perm_mapping_is_symmetric_across_tools() {
