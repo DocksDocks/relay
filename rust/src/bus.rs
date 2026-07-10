@@ -265,6 +265,10 @@ fn call_tool(
                         target.dir.clone().map(js).unwrap_or_else(jnull),
                     ),
                     (
+                        "recipient_watch",
+                        js(store::watcher_status(&target.id).as_str()),
+                    ),
+                    (
                         "hint",
                         js(format!(
                             "Recipient reads this via inbox() or on its next SessionStart. To wake an idle recipient now: <plugin>/bin/relay wake {addressee}"

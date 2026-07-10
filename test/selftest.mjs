@@ -490,7 +490,7 @@ check('claude SessionStart with an empty inbox still nudges a Monitor watch on t
   const r = hookArgs([], { session_id: idP, cwd: dirP, source: 'resume' });
   const ctx = JSON.parse(r.stdout).hookSpecificOutput.additionalContext;
   assert.ok(/monitor/i.test(ctx), 'nudge names the Monitor tool');
-  assert.ok(ctx.includes(`${idP}.jsonl`), 'nudge carries the exact mailbox path');
+  assert.ok(ctx.includes(`watch --follow ${idP}`), 'nudge carries the unified watcher command for this session');
   assert.ok(ctx.includes(`bus id is ${idP}`), 'identity line rides along');
 });
 check('codex SessionStart with an empty inbox emits only the identity line (no Monitor to arm)', () => {
@@ -504,7 +504,7 @@ check('RELAY_NO_WATCH=1 suppresses the nudge but keeps the identity line', () =>
   const r = hookArgs([], { session_id: idP, cwd: dirP, source: 'startup' }, { RELAY_NO_WATCH: '1' });
   assert.equal(r.status, 0);
   const ctx = JSON.parse(r.stdout).hookSpecificOutput.additionalContext;
-  assert.ok(!ctx.includes(`${idP}.jsonl`), 'no Monitor nudge');
+  assert.ok(!ctx.includes(`watch --follow ${idP}`), 'no Monitor nudge');
   assert.ok(ctx.includes(`bus id is ${idP}`), 'identity survives RELAY_NO_WATCH');
 });
 

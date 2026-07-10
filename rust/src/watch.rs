@@ -32,8 +32,10 @@ use crate::cli::{Args, DEFAULT_NUDGE};
 use crate::hook;
 use crate::store;
 use std::collections::{HashMap, HashSet};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tinyjson::JsonValue;
 
@@ -57,6 +59,13 @@ struct Target {
 enum Mode {
     Push,
     Wake,
+}
+
+struct FollowFile {
+    file: std::fs::File,
+    dev: u64,
+    ino: u64,
+    pending: Vec<u8>,
 }
 
 // Reachability: only a codex session hosted under an app-server can take a
@@ -114,6 +123,18 @@ fn resolve_targets(args: &Args, server: Option<&str>) -> Vec<Target> {
 
 pub fn run(raw: Vec<String>) -> ! {
     let args = Args(raw);
+    if let Some(id) = args.flag("follow") {
+        if !store::is_uuid(id) {
+            die(&format!("--follow must be a session UUID, got: {id}"));
+        }
+        if args.has("all") || args.has("once") || args.flag("server").is_some() {
+            die("--follow cannot be combined with --all, --once, or --server");
+        }
+        let tool = args.flag("tool").unwrap_or("claude");
+        let _guard = store::acquire_watcher_lock(id, tool, "follow")
+            .unwrap_or_else(|e| die(&format!("cannot follow {id}: {e}")));
+        follow_mailbox(id);
+    }
     let server = args.flag("server").map(str::to_string).or_else(|| {
         std::env::var("RELAY_APP_SERVER")
             .ok()
@@ -134,12 +155,38 @@ pub fn run(raw: Vec<String>) -> ! {
         );
     }
 
+    let mut guards = Vec::new();
+    let mut active_targets = Vec::new();
+    for target in targets {
+        if dry {
+            active_targets.push(target);
+            continue;
+        }
+        let mode = if once { "once" } else { "doorbell" };
+        match store::acquire_watcher_lock(&target.id, &target.tool, mode) {
+            Ok(guard) => {
+                guards.push(guard);
+                active_targets.push(target);
+            }
+            Err(store::LockAcquireError::Busy(_)) if args.has("all") => {
+                eprintln!("[relay watch] skipping {}: watcher already live", target.id);
+            }
+            Err(e) => die(&format!("cannot watch {}: {e}", target.id)),
+        }
+    }
+    if active_targets.is_empty() {
+        std::process::exit(0);
+    }
+
     // A woken target keeps its mail until its own hook drains it — don't
     // re-ring the doorbell every poll tick while that is in flight.
     let mut woken: HashSet<String> = HashSet::new();
     let mut had_error = false;
     loop {
-        for t in &targets {
+        for t in &active_targets {
+            if let Err(e) = store::update_watcher_progress(&t.id) {
+                eprintln!("[relay watch] progress update for {} failed: {e}", t.id);
+            }
             let pending = store::peek(&t.id);
             if pending.is_empty() {
                 woken.remove(&t.id);
@@ -166,6 +213,89 @@ pub fn run(raw: Vec<String>) -> ! {
         }
         if once {
             std::process::exit(if had_error { 1 } else { 0 });
+        }
+        std::thread::sleep(Duration::from_millis(POLL_MS));
+    }
+}
+
+fn read_follow_bytes(state: &mut FollowFile, out: &mut impl Write) -> Result<(), String> {
+    let mut added = Vec::new();
+    state
+        .file
+        .read_to_end(&mut added)
+        .map_err(|e| format!("read followed mailbox: {e}"))?;
+    state.pending.extend_from_slice(&added);
+    while let Some(end) = state.pending.iter().position(|b| *b == b'\n') {
+        let line: Vec<u8> = state.pending.drain(..=end).collect();
+        out.write_all(&line)
+            .and_then(|()| out.flush())
+            .map_err(|e| format!("write followed mailbox line: {e}"))?;
+    }
+    Ok(())
+}
+
+fn open_follow_file(path: &Path, skip_existing: bool) -> Result<FollowFile, String> {
+    let mut file = std::fs::File::open(path)
+        .map_err(|e| format!("open followed mailbox {}: {e}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|e| format!("stat followed mailbox {}: {e}", path.display()))?;
+    if skip_existing {
+        file.seek(SeekFrom::End(0))
+            .map_err(|e| format!("seek followed mailbox {}: {e}", path.display()))?;
+    }
+    Ok(FollowFile {
+        file,
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+        pending: Vec::new(),
+    })
+}
+
+fn follow_mailbox(id: &str) -> ! {
+    let path: PathBuf = store::mailbox_path(id);
+    let mut skip_first_open = path.exists();
+    let mut state: Option<FollowFile> = None;
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    loop {
+        if let Err(e) = store::update_watcher_progress(id) {
+            eprintln!("[relay watch] progress update for {id} failed: {e}");
+        }
+        match std::fs::metadata(&path) {
+            Ok(metadata) => {
+                let replaced = state
+                    .as_ref()
+                    .map(|s| s.dev != metadata.dev() || s.ino != metadata.ino())
+                    .unwrap_or(true);
+                if replaced {
+                    match open_follow_file(&path, skip_first_open) {
+                        Ok(opened) => {
+                            state = Some(opened);
+                            skip_first_open = false;
+                        }
+                        Err(e) => eprintln!("[relay watch] {e}"),
+                    }
+                } else if let Some(current) = state.as_mut() {
+                    let offset = current.file.stream_position().unwrap_or(0);
+                    if metadata.len() < offset {
+                        current.file.seek(SeekFrom::Start(0)).ok();
+                        current.pending.clear();
+                    }
+                }
+                if let Some(current) = state.as_mut() {
+                    if let Err(e) = read_follow_bytes(current, &mut out) {
+                        eprintln!("[relay watch] {e}");
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if let Some(current) = state.as_mut() {
+                    let _ = read_follow_bytes(current, &mut out);
+                }
+                state = None;
+            }
+            Err(e) => eprintln!("[relay watch] stat {}: {e}", path.display()),
         }
         std::thread::sleep(Duration::from_millis(POLL_MS));
     }

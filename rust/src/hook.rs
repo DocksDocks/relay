@@ -86,6 +86,26 @@ fn str_of(m: &HashMap<String, JsonValue>, key: &str) -> Option<String> {
         .cloned()
 }
 
+fn shell_word(value: &str) -> String {
+    if !value.is_empty()
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'_' | b'-'))
+    {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', "'\"'\"'"))
+    }
+}
+
+pub(crate) fn watcher_command(relay_exe: &str, id: &str) -> String {
+    format!(
+        "{} watch --follow {}",
+        shell_word(relay_exe),
+        shell_word(id)
+    )
+}
+
 pub fn run(args: &[String]) -> ! {
     let (tool, event) = parse_invocation(args);
     let mut input = String::new();
@@ -148,7 +168,7 @@ fn render_context(
     event: HookEvent,
     msgs: &[JsonValue],
     no_watch: bool,
-    mailbox_path: &str,
+    watch_command: &str,
     self_id: &str,
 ) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
@@ -162,7 +182,7 @@ fn render_context(
     }
     if tool == "claude" && event == HookEvent::SessionStart && !no_watch {
         parts.push(format!(
-            "If a background file-watch/Monitor tool is available and you have not already armed one this session, arm a persistent watch on {mailbox_path} (e.g. tail -n0 -F {mailbox_path}) so new session-relay mail surfaces mid-session without waiting for the next user turn; if no such tool exists, ignore this line."
+            "If a background file-watch/Monitor tool is available and you have not already armed one this session, run `{watch_command}` as a persistent watch so new session-relay mail surfaces mid-session without waiting for the next user turn; if no such tool exists, ignore this line."
         ));
     }
     if parts.is_empty() {
@@ -200,9 +220,11 @@ fn inner(tool: &str, event: HookEvent, input: &str) -> Result<(), String> {
     store::register(&id, Some(&dir), None, Some(tool))?;
     let msgs = store::drain(&id)?;
     let no_watch = std::env::var("RELAY_NO_WATCH").as_deref() == Ok("1");
-    let mailbox = store::mailbox_path(&id).to_string_lossy().into_owned();
-    let Some(additional_context) = render_context(tool, event, &msgs, no_watch, &mailbox, &id)
-    else {
+    let relay_exe = std::env::current_exe()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "relay".to_string());
+    let watch = watcher_command(&relay_exe, &id);
+    let Some(additional_context) = render_context(tool, event, &msgs, no_watch, &watch, &id) else {
         return Ok(());
     };
 
@@ -226,7 +248,7 @@ fn inner(tool: &str, event: HookEvent, input: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{HookEvent, defuse, parse_invocation, render_context};
+    use super::{HookEvent, defuse, parse_invocation, render_context, watcher_command};
     use std::collections::HashMap;
     use tinyjson::JsonValue;
 
@@ -260,7 +282,7 @@ mod tests {
         v.iter().map(|s| s.to_string()).collect()
     }
 
-    const MBOX: &str = "/tmp/relay-store/mailbox/x.jsonl";
+    const WATCH: &str = "/opt/relay watch --follow 11111111-2222-4333-8444-555555555555";
     const SELF: &str = "11111111-2222-4333-8444-555555555555";
 
     #[test]
@@ -290,36 +312,37 @@ mod tests {
             HookEvent::Prompt,
             &[msg("a", "hi")],
             false,
-            MBOX,
+            WATCH,
             SELF,
         )
         .unwrap();
         assert!(out.contains("hi"));
-        assert!(!out.contains(MBOX));
+        assert!(!out.contains(WATCH));
         assert!(!out.contains("Session-relay identity"));
         assert_eq!(HookEvent::Prompt.name(), "UserPromptSubmit");
     }
 
     #[test]
     fn prompt_event_with_empty_inbox_emits_nothing() {
-        assert!(render_context("claude", HookEvent::Prompt, &[], false, MBOX, SELF).is_none());
-        assert!(render_context("codex", HookEvent::Prompt, &[], false, MBOX, SELF).is_none());
+        assert!(render_context("claude", HookEvent::Prompt, &[], false, WATCH, SELF).is_none());
+        assert!(render_context("codex", HookEvent::Prompt, &[], false, WATCH, SELF).is_none());
     }
 
     #[test]
     fn claude_sessionstart_with_empty_inbox_nudges_the_monitor_and_names_identity() {
         let out =
-            render_context("claude", HookEvent::SessionStart, &[], false, MBOX, SELF).unwrap();
-        assert!(out.contains(MBOX));
-        assert!(out.contains("tail -n0 -F"));
+            render_context("claude", HookEvent::SessionStart, &[], false, WATCH, SELF).unwrap();
+        assert!(out.contains(WATCH));
+        assert!(out.contains("watch --follow"));
         assert!(out.contains(&format!("bus id is {SELF}")));
     }
 
     #[test]
     fn codex_sessionstart_with_empty_inbox_emits_only_the_identity_line() {
-        let out = render_context("codex", HookEvent::SessionStart, &[], false, MBOX, SELF).unwrap();
+        let out =
+            render_context("codex", HookEvent::SessionStart, &[], false, WATCH, SELF).unwrap();
         assert!(out.contains(&format!("bus id is {SELF}")));
-        assert!(!out.contains(MBOX));
+        assert!(!out.contains(WATCH));
         assert!(!out.contains("session-relay-mail"));
     }
 
@@ -330,7 +353,7 @@ mod tests {
             HookEvent::Prompt,
             &[msg("a", "hi")],
             false,
-            MBOX,
+            WATCH,
             SELF,
         )
         .unwrap();
@@ -344,16 +367,28 @@ mod tests {
             HookEvent::SessionStart,
             &[msg("a", "hi")],
             true,
-            MBOX,
+            WATCH,
             SELF,
         )
         .unwrap();
         assert!(out.contains("hi"));
-        assert!(!out.contains(MBOX));
+        assert!(!out.contains(WATCH));
         assert!(out.contains(&format!("bus id is {SELF}")));
-        let empty = render_context("claude", HookEvent::SessionStart, &[], true, MBOX, SELF)
+        let empty = render_context("claude", HookEvent::SessionStart, &[], true, WATCH, SELF)
             .expect("identity line survives RELAY_NO_WATCH");
-        assert!(!empty.contains(MBOX));
+        assert!(!empty.contains(WATCH));
         assert!(empty.contains(&format!("bus id is {SELF}")));
+    }
+
+    #[test]
+    fn watcher_command_quotes_shell_words_without_exposing_the_id_as_an_option() {
+        assert_eq!(
+            watcher_command("/opt/relay bin/relay", SELF),
+            format!("'/opt/relay bin/relay' watch --follow {SELF}")
+        );
+        assert_eq!(
+            watcher_command("relay", "--bad id"),
+            "relay watch --follow '--bad id'"
+        );
     }
 }
