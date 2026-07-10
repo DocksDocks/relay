@@ -18,10 +18,14 @@
 use rustix::fs::{FlockOperation, flock};
 use std::collections::HashMap;
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tinyjson::JsonValue;
+
+const WATCH_LOCK_RETRY: Duration = Duration::from_secs(2);
+pub const WATCH_PROGRESS_STALE_MS: i64 = 300_000;
 
 pub fn home_dir() -> PathBuf {
     for var in ["AGENT_RELAY_HOME", "SESSION_RELAY_HOME"] {
@@ -50,6 +54,24 @@ fn lock_path() -> PathBuf {
     home_dir().join(".lock")
 }
 
+pub fn watcher_lock_path(id: &str) -> PathBuf {
+    home_dir()
+        .join("watchers")
+        .join(format!("{}.lock", sanitize(id)))
+}
+
+pub fn watcher_progress_path(id: &str) -> PathBuf {
+    home_dir()
+        .join("watchers")
+        .join(format!("{}.progress", sanitize(id)))
+}
+
+pub fn resume_lock_path(id: &str) -> PathBuf {
+    home_dir()
+        .join("locks")
+        .join(format!("resume-{}.lock", sanitize(id)))
+}
+
 /// Filesystem-safe key for a project dir — mirrors Claude Code's own scheme
 /// (every non-alphanumeric char becomes '-').
 pub fn encode_dir(dir: &str) -> String {
@@ -74,10 +96,231 @@ pub fn sanitize(s: &str) -> String {
 }
 
 fn ensure_dirs() -> Result<(), String> {
-    for d in ["mailbox", "markers"] {
-        fs::create_dir_all(home_dir().join(d)).map_err(|e| format!("mkdir {d}: {e}"))?;
+    for d in ["mailbox", "markers", "watchers", "locks"] {
+        let path = home_dir().join(d);
+        fs::create_dir_all(&path).map_err(|e| format!("mkdir {d}: {e}"))?;
+        if matches!(d, "watchers" | "locks") {
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+                .map_err(|e| format!("chmod {}: {e}", path.display()))?;
+        }
     }
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LockStatus {
+    Never,
+    Live,
+    Dead,
+    Unknown,
+}
+
+impl LockStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Never => "never",
+            Self::Live => "live",
+            Self::Dead => "dead",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LockMetadata {
+    pub pid: u32,
+    pub started_at: String,
+    pub tool: String,
+    pub mode: String,
+}
+
+impl LockMetadata {
+    fn new(tool: &str, mode: &str) -> Self {
+        Self {
+            pid: std::process::id(),
+            started_at: iso_now(),
+            tool: tool.to_string(),
+            mode: mode.to_string(),
+        }
+    }
+
+    fn to_json(&self) -> JsonValue {
+        let mut m = HashMap::new();
+        m.insert("pid".to_string(), JsonValue::from(self.pid as f64));
+        m.insert(
+            "started_at".to_string(),
+            JsonValue::from(self.started_at.clone()),
+        );
+        m.insert("tool".to_string(), JsonValue::from(self.tool.clone()));
+        m.insert("mode".to_string(), JsonValue::from(self.mode.clone()));
+        JsonValue::from(m)
+    }
+
+    fn from_json(value: &JsonValue) -> Option<Self> {
+        let o = value.get::<HashMap<String, JsonValue>>()?;
+        let pid = o.get("pid")?.get::<f64>().copied()?;
+        let string = |key: &str| o.get(key)?.get::<String>().cloned();
+        Some(Self {
+            pid: (pid.is_finite() && pid >= 0.0 && pid <= u32::MAX as f64)
+                .then_some(pid as u32)?,
+            started_at: string("started_at")?,
+            tool: string("tool")?,
+            mode: string("mode")?,
+        })
+    }
+}
+
+pub struct HeldLock {
+    _file: fs::File,
+    metadata: LockMetadata,
+}
+
+impl HeldLock {
+    pub fn metadata(&self) -> &LockMetadata {
+        &self.metadata
+    }
+}
+
+#[derive(Debug)]
+pub enum LockAcquireError {
+    Busy(Option<LockMetadata>),
+    Io(String),
+}
+
+impl std::fmt::Display for LockAcquireError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Busy(_) => write!(f, "lock already held"),
+            Self::Io(e) => f.write_str(e),
+        }
+    }
+}
+
+fn open_lock(path: &Path, create: bool) -> Result<fs::File, std::io::Error> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true).mode(0o600);
+    if create {
+        options.create(true);
+    }
+    options.open(path)
+}
+
+fn read_lock_metadata_file(file: &mut fs::File) -> Option<LockMetadata> {
+    let mut raw = String::new();
+    file.seek(SeekFrom::Start(0)).ok()?;
+    file.read_to_string(&mut raw).ok()?;
+    LockMetadata::from_json(&raw.parse().ok()?)
+}
+
+pub fn read_lock_metadata(path: &Path) -> Option<LockMetadata> {
+    let mut file = open_lock(path, false).ok()?;
+    read_lock_metadata_file(&mut file)
+}
+
+fn acquire_lock(
+    path: &Path,
+    metadata: LockMetadata,
+    retry_for: Duration,
+) -> Result<HeldLock, LockAcquireError> {
+    ensure_dirs().map_err(LockAcquireError::Io)?;
+    let mut file = open_lock(path, true)
+        .map_err(|e| LockAcquireError::Io(format!("open lock {}: {e}", path.display())))?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        .map_err(|e| LockAcquireError::Io(format!("chmod {}: {e}", path.display())))?;
+    let deadline = Instant::now() + retry_for;
+    loop {
+        match flock(&file, FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => break,
+            Err(e) if e == rustix::io::Errno::AGAIN || e == rustix::io::Errno::INTR => {
+                if Instant::now() >= deadline {
+                    return Err(LockAcquireError::Busy(read_lock_metadata_file(
+                        &mut file,
+                    )));
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(e) => {
+                return Err(LockAcquireError::Io(format!(
+                    "flock {}: {e}",
+                    path.display()
+                )));
+            }
+        }
+    }
+    let encoded = metadata
+        .to_json()
+        .stringify()
+        .map_err(|e| LockAcquireError::Io(format!("lock metadata serialize: {e}")))?;
+    file.set_len(0)
+        .and_then(|()| file.seek(SeekFrom::Start(0)).map(|_| ()))
+        .and_then(|()| file.write_all(encoded.as_bytes()))
+        .and_then(|()| file.flush())
+        .map_err(|e| {
+            let _ = flock(&file, FlockOperation::Unlock);
+            LockAcquireError::Io(format!("write lock metadata {}: {e}", path.display()))
+        })?;
+    Ok(HeldLock {
+        _file: file,
+        metadata,
+    })
+}
+
+pub fn acquire_watcher_lock(
+    id: &str,
+    tool: &str,
+    mode: &str,
+) -> Result<HeldLock, LockAcquireError> {
+    acquire_lock(
+        &watcher_lock_path(id),
+        LockMetadata::new(tool, mode),
+        WATCH_LOCK_RETRY,
+    )
+}
+
+pub fn acquire_resume_lock(id: &str, tool: &str) -> Result<HeldLock, LockAcquireError> {
+    acquire_lock(
+        &resume_lock_path(id),
+        LockMetadata::new(tool, "resume"),
+        Duration::ZERO,
+    )
+}
+
+pub fn lock_status(path: &Path) -> LockStatus {
+    let file = match open_lock(path, false) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return LockStatus::Never,
+        Err(_) => return LockStatus::Unknown,
+    };
+    match flock(&file, FlockOperation::NonBlockingLockExclusive) {
+        Ok(()) => {
+            let _ = flock(&file, FlockOperation::Unlock);
+            LockStatus::Dead
+        }
+        Err(e) if e == rustix::io::Errno::AGAIN => LockStatus::Live,
+        Err(_) => LockStatus::Unknown,
+    }
+}
+
+pub fn watcher_status(id: &str) -> LockStatus {
+    lock_status(&watcher_lock_path(id))
+}
+
+pub fn resume_status(id: &str) -> LockStatus {
+    lock_status(&resume_lock_path(id))
+}
+
+pub fn update_watcher_progress(id: &str) -> Result<(), String> {
+    ensure_dirs()?;
+    let path = watcher_progress_path(id);
+    atomic_write(&path, &format!("{}\n", now_ms()))?;
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+        .map_err(|e| format!("chmod {}: {e}", path.display()))
+}
+
+pub fn watcher_progress_age_ms(id: &str) -> Option<i64> {
+    let raw = fs::read_to_string(watcher_progress_path(id)).ok()?;
+    let written: i64 = raw.trim().parse().ok()?;
+    Some(now_ms().saturating_sub(written).max(0))
 }
 
 fn random_hex(n_bytes: usize) -> String {
