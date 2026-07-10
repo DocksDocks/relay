@@ -22,7 +22,7 @@ use std::io::Write;
 use tinyjson::JsonValue;
 
 pub(crate) const DEFAULT_NUDGE: &str = "You have new session-relay mail. Use the session-relay skill: call inbox to read your pending messages and act on them.";
-const BOOL_FLAGS: [&str; 7] = [
+const BOOL_FLAGS: [&str; 8] = [
     "dry",
     "json",
     "auto-turn",
@@ -30,6 +30,7 @@ const BOOL_FLAGS: [&str; 7] = [
     "all",
     "read-only",
     "full-access",
+    "watch",
 ];
 
 fn die(msg: &str) -> ! {

@@ -22,8 +22,8 @@
 use crate::cli::Args;
 use crate::store;
 use std::fs;
-use std::os::unix::process::CommandExt;
-use std::process::{Command, Stdio};
+use std::os::unix::process::{CommandExt, ExitStatusExt};
+use std::process::{Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
@@ -34,7 +34,23 @@ fn die(msg: &str) -> ! {
     std::process::exit(1);
 }
 
-const USAGE: &str = "usage: relay spawn <dir> [--tool claude|codex] [--model <m>] [--effort <e>] [--name <busName>] [--reply-to <nameOrId>] [--timeout <sec>] [--read-only] [--full-access] [--dry] [--] <first task>";
+const USAGE: &str = "usage: relay spawn <dir> [--tool claude|codex] [--model <m>] [--effort <e>] [--name <busName>] [--reply-to <nameOrId>] [--timeout <sec>] [--read-only] [--full-access] [--watch] [--dry] [--] <first task>";
+
+fn exit_code(status: &ExitStatus) -> i32 {
+    status
+        .code()
+        .or_else(|| status.signal().map(|signal| 128 + signal))
+        .unwrap_or(1)
+}
+
+fn elapsed(started: Instant) -> String {
+    let elapsed = started.elapsed();
+    if elapsed < Duration::from_secs(1) {
+        format!("{}ms", elapsed.as_millis())
+    } else {
+        format!("{:.1}s", elapsed.as_secs_f64())
+    }
+}
 
 // Symmetric per-tool permission mapping. NEVER a --dangerously-* variant.
 fn perm_args(tool: &str, read_only: bool, full_access: bool) -> [String; 2] {
@@ -255,6 +271,7 @@ pub fn run(raw: Vec<String>) -> ! {
     }
     let read_only = args.has("read-only");
     let full_access = args.has("full-access");
+    let watch = args.has("watch");
     if read_only && full_access {
         die("--read-only and --full-access are mutually exclusive");
     }
@@ -335,18 +352,18 @@ pub fn run(raw: Vec<String>) -> ! {
     });
 
     let marker_before = store::id_for_dir(&dir_s);
-    let mut child = Command::new(&cmd);
-    child
+    let mut command = Command::new(&cmd);
+    command
         .args(&cargs)
         .current_dir(&dir)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::from(log_file))
         .process_group(0);
-    match child.spawn() {
-        Ok(_) => {}
-        Err(e) => die(&format!("failed to launch {cmd}: {e}")),
-    }
+    let launched_at = Instant::now();
+    let mut child = command
+        .spawn()
+        .unwrap_or_else(|e| die(&format!("failed to launch {cmd}: {e}")));
 
     // Birth watch: the child's SessionStart hook registers it on the bus.
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
@@ -363,6 +380,18 @@ pub fn run(raw: Vec<String>) -> ! {
         if hit.is_some() {
             break hit;
         }
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                eprintln!(
+                    "child exited before birth registration (status {}) — see {}",
+                    exit_code(&status),
+                    log_path.display()
+                );
+                std::process::exit(exit_code(&status).max(1));
+            }
+            Ok(None) => {}
+            Err(e) => die(&format!("cannot inspect child status: {e}")),
+        }
         if Instant::now() > deadline {
             break None;
         }
@@ -375,13 +404,31 @@ pub fn run(raw: Vec<String>) -> ! {
             log_path.display()
         ));
     };
-    if let Some(name) = args.flag("name") {
+    let display = if let Some(name) = args.flag("name") {
         store::register(&id, Some(&dir_s), Some(name), Some(&tool)).unwrap_or_else(|e| die(&e));
-        println!("spawned {name} ({id}) in {dir_s}");
+        name.to_string()
     } else {
-        println!("spawned {id} in {dir_s}");
+        id.clone()
+    };
+    if !watch {
+        if let Some(name) = args.flag("name") {
+            println!("spawned {name} ({id}) in {dir_s}");
+        } else {
+            println!("spawned {id} in {dir_s}");
+        }
+        std::process::exit(0);
     }
-    std::process::exit(0);
+    let status = child
+        .wait()
+        .unwrap_or_else(|e| die(&format!("cannot wait for child: {e}")));
+    let duration = elapsed(launched_at);
+    if status.success() {
+        println!("spawned {display}; first turn complete; {duration}");
+        std::process::exit(0);
+    }
+    let code = exit_code(&status);
+    println!("spawned {display}; first turn failed (exit {code}); {duration}");
+    std::process::exit(code);
 }
 
 #[cfg(test)]

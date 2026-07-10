@@ -161,8 +161,7 @@ impl LockMetadata {
         let pid = o.get("pid")?.get::<f64>().copied()?;
         let string = |key: &str| o.get(key)?.get::<String>().cloned();
         Some(Self {
-            pid: (pid.is_finite() && pid >= 0.0 && pid <= u32::MAX as f64)
-                .then_some(pid as u32)?,
+            pid: (pid.is_finite() && pid >= 0.0 && pid <= u32::MAX as f64).then_some(pid as u32)?,
             started_at: string("started_at")?,
             tool: string("tool")?,
             mode: string("mode")?,
@@ -233,9 +232,7 @@ fn acquire_lock(
             Ok(()) => break,
             Err(e) if e == rustix::io::Errno::AGAIN || e == rustix::io::Errno::INTR => {
                 if Instant::now() >= deadline {
-                    return Err(LockAcquireError::Busy(read_lock_metadata_file(
-                        &mut file,
-                    )));
+                    return Err(LockAcquireError::Busy(read_lock_metadata_file(&mut file)));
                 }
                 std::thread::sleep(Duration::from_millis(25));
             }
