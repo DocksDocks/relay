@@ -162,7 +162,11 @@ fn doctor(args: &Args) -> ! {
             Some(entry) => (entry.id, false),
             None if store::is_uuid(who) => (who.to_string(), false),
             None => {
-                doctor_line("FAIL", "identity", &format!("unknown session {who}"));
+                doctor_line(
+                    "FAIL",
+                    "identity",
+                    &format!("unknown session {who} — fix: relay list"),
+                );
                 std::process::exit(1);
             }
         },

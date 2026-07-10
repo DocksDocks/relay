@@ -43,6 +43,8 @@ const POLL_MS: u64 = 2000;
 const DEFAULT_SETTLE_MS: u64 = 5000;
 const DEFAULT_TURN_WAIT_MS: u64 = 300_000;
 const RPC_TIMEOUT_SECS: u64 = 20;
+const FOLLOW_ANCHOR_BYTES: u64 = 64;
+const WAKE_RETRY_MAX_MS: u64 = 30_000;
 
 fn die(msg: &str) -> ! {
     eprintln!("{msg}");
@@ -66,6 +68,19 @@ struct FollowFile {
     dev: u64,
     ino: u64,
     pending: Vec<u8>,
+    anchor_offset: u64,
+    anchor: Vec<u8>,
+}
+
+struct WakeRetry {
+    refusals: u32,
+    next_at: Instant,
+}
+
+enum WakeOutcome {
+    Delivered,
+    Refused,
+    Failed,
 }
 
 // Reachability: only a codex session hosted under an app-server can take a
@@ -77,6 +92,12 @@ fn decide(tool: &str, server: Option<&str>) -> Mode {
         Mode::Push
     } else {
         Mode::Wake
+    }
+}
+
+fn validate_tool(tool: &str) {
+    if !matches!(tool, "claude" | "codex") {
+        die(&format!("--tool must be claude|codex, got: {tool}"));
     }
 }
 
@@ -131,6 +152,7 @@ pub fn run(raw: Vec<String>) -> ! {
             die("--follow cannot be combined with --all, --once, or --server");
         }
         let tool = args.flag("tool").unwrap_or("claude");
+        validate_tool(tool);
         let _guard = store::acquire_watcher_lock(id, tool, "follow")
             .unwrap_or_else(|e| die(&format!("cannot follow {id}: {e}")));
         follow_mailbox(id);
@@ -158,6 +180,7 @@ pub fn run(raw: Vec<String>) -> ! {
     let mut guards = Vec::new();
     let mut active_targets = Vec::new();
     for target in targets {
+        validate_tool(&target.tool);
         if dry {
             active_targets.push(target);
             continue;
@@ -181,6 +204,7 @@ pub fn run(raw: Vec<String>) -> ! {
     // A woken target keeps its mail until its own hook drains it — don't
     // re-ring the doorbell every poll tick while that is in flight.
     let mut woken: HashSet<String> = HashSet::new();
+    let mut wake_retries: HashMap<String, WakeRetry> = HashMap::new();
     let mut had_error = false;
     loop {
         for t in &active_targets {
@@ -190,6 +214,7 @@ pub fn run(raw: Vec<String>) -> ! {
             let pending = store::peek(&t.id);
             if pending.is_empty() {
                 woken.remove(&t.id);
+                wake_retries.remove(&t.id);
                 continue;
             }
             match decide(&t.tool, server.as_deref()) {
@@ -206,8 +231,43 @@ pub fn run(raw: Vec<String>) -> ! {
                     if woken.contains(&t.id) {
                         continue;
                     }
-                    wake_fallback(t, dry);
-                    woken.insert(t.id.clone());
+                    if wake_retries
+                        .get(&t.id)
+                        .is_some_and(|retry| Instant::now() < retry.next_at)
+                    {
+                        continue;
+                    }
+                    match wake_fallback(t, dry) {
+                        WakeOutcome::Delivered => {
+                            wake_retries.remove(&t.id);
+                            woken.insert(t.id.clone());
+                        }
+                        WakeOutcome::Refused => {
+                            if once {
+                                had_error = true;
+                                continue;
+                            }
+                            let retry = wake_retries.entry(t.id.clone()).or_insert(WakeRetry {
+                                refusals: 0,
+                                next_at: Instant::now(),
+                            });
+                            retry.refusals = retry.refusals.saturating_add(1);
+                            let shift = retry.refusals.saturating_sub(1).min(4);
+                            let delay_ms = POLL_MS
+                                .saturating_mul(1_u64 << shift)
+                                .min(WAKE_RETRY_MAX_MS);
+                            retry.next_at = Instant::now() + Duration::from_millis(delay_ms);
+                            eprintln!(
+                                "[relay watch] wake fallback for {} refused; retrying in {}ms",
+                                t.id, delay_ms
+                            );
+                        }
+                        WakeOutcome::Failed => {
+                            wake_retries.remove(&t.id);
+                            woken.insert(t.id.clone());
+                            had_error = true;
+                        }
+                    }
                 }
             }
         }
@@ -231,7 +291,58 @@ fn read_follow_bytes(state: &mut FollowFile, out: &mut impl Write) -> Result<(),
             .and_then(|()| out.flush())
             .map_err(|e| format!("write followed mailbox line: {e}"))?;
     }
+    refresh_follow_anchor(state)?;
     Ok(())
+}
+
+fn refresh_follow_anchor(state: &mut FollowFile) -> Result<(), String> {
+    let offset = state
+        .file
+        .stream_position()
+        .map_err(|e| format!("read followed mailbox position: {e}"))?;
+    let anchor_len = offset.min(FOLLOW_ANCHOR_BYTES);
+    let anchor_offset = offset - anchor_len;
+    state
+        .file
+        .seek(SeekFrom::Start(anchor_offset))
+        .map_err(|e| format!("seek followed mailbox anchor: {e}"))?;
+    let mut anchor = vec![0; anchor_len as usize];
+    state
+        .file
+        .read_exact(&mut anchor)
+        .map_err(|e| format!("read followed mailbox anchor: {e}"))?;
+    state
+        .file
+        .seek(SeekFrom::Start(offset))
+        .map_err(|e| format!("restore followed mailbox position: {e}"))?;
+    state.anchor_offset = anchor_offset;
+    state.anchor = anchor;
+    Ok(())
+}
+
+fn followed_content_changed(state: &mut FollowFile) -> Result<bool, String> {
+    if state.anchor.is_empty() {
+        return Ok(false);
+    }
+    let offset = state
+        .file
+        .stream_position()
+        .map_err(|e| format!("read followed mailbox position: {e}"))?;
+    state
+        .file
+        .seek(SeekFrom::Start(state.anchor_offset))
+        .map_err(|e| format!("seek followed mailbox anchor: {e}"))?;
+    let mut actual = vec![0; state.anchor.len()];
+    let read = state.file.read_exact(&mut actual);
+    state
+        .file
+        .seek(SeekFrom::Start(offset))
+        .map_err(|e| format!("restore followed mailbox position: {e}"))?;
+    match read {
+        Ok(()) => Ok(actual != state.anchor),
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(true),
+        Err(e) => Err(format!("read followed mailbox anchor: {e}")),
+    }
 }
 
 fn open_follow_file(path: &Path, skip_existing: bool) -> Result<FollowFile, String> {
@@ -244,12 +355,16 @@ fn open_follow_file(path: &Path, skip_existing: bool) -> Result<FollowFile, Stri
         file.seek(SeekFrom::End(0))
             .map_err(|e| format!("seek followed mailbox {}: {e}", path.display()))?;
     }
-    Ok(FollowFile {
+    let mut state = FollowFile {
         file,
         dev: metadata.dev(),
         ino: metadata.ino(),
         pending: Vec::new(),
-    })
+        anchor_offset: 0,
+        anchor: Vec::new(),
+    };
+    refresh_follow_anchor(&mut state)?;
+    Ok(state)
 }
 
 fn follow_mailbox(id: &str) -> ! {
@@ -277,21 +392,32 @@ fn follow_mailbox(id: &str) -> ! {
                         Err(e) => eprintln!("[relay watch] {e}"),
                     }
                 } else if let Some(current) = state.as_mut() {
-                    let offset = current.file.stream_position().unwrap_or(0);
-                    if metadata.len() < offset {
-                        current.file.seek(SeekFrom::Start(0)).ok();
+                    let offset = current
+                        .file
+                        .stream_position()
+                        .unwrap_or_else(|e| die(&format!("read followed mailbox position: {e}")));
+                    let content_changed =
+                        followed_content_changed(current).unwrap_or_else(|e| die(&e));
+                    if metadata.len() < offset || content_changed {
+                        current
+                            .file
+                            .seek(SeekFrom::Start(0))
+                            .unwrap_or_else(|e| die(&format!("reset followed mailbox: {e}")));
                         current.pending.clear();
+                        current.anchor.clear();
                     }
                 }
                 if let Some(current) = state.as_mut() {
                     if let Err(e) = read_follow_bytes(current, &mut out) {
-                        eprintln!("[relay watch] {e}");
+                        die(&e);
                     }
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 if let Some(current) = state.as_mut() {
-                    let _ = read_follow_bytes(current, &mut out);
+                    if let Err(e) = read_follow_bytes(current, &mut out) {
+                        die(&e);
+                    }
                 }
                 state = None;
             }
@@ -408,7 +534,7 @@ fn elicitation_action(server_name: &str) -> &'static str {
 
 // Doorbell fallback via self-exec: `wake` lives in cli::run, which never
 // returns, so reuse it as a child process rather than a call.
-fn wake_fallback(t: &Target, dry: bool) {
+fn wake_fallback(t: &Target, dry: bool) -> WakeOutcome {
     if dry {
         println!(
             "{}",
@@ -418,7 +544,7 @@ fn wake_fallback(t: &Target, dry: bool) {
                 ("tool", &t.tool)
             ])
         );
-        return;
+        return WakeOutcome::Delivered;
     }
     let exe = std::env::current_exe().unwrap_or_else(|_| "relay".into());
     let mut c = std::process::Command::new(exe);
@@ -431,12 +557,19 @@ fn wake_fallback(t: &Target, dry: bool) {
         c.arg("--dir").arg(d);
     }
     match c.status() {
-        Ok(s) if s.success() => {}
-        Ok(s) => eprintln!("[relay watch] wake fallback for {} exited {s}", t.id),
-        Err(e) => eprintln!(
-            "[relay watch] wake fallback for {} failed to spawn: {e}",
-            t.id
-        ),
+        Ok(s) if s.success() => WakeOutcome::Delivered,
+        Ok(s) if s.code() == Some(3) => WakeOutcome::Refused,
+        Ok(s) => {
+            eprintln!("[relay watch] wake fallback for {} exited {s}", t.id);
+            WakeOutcome::Failed
+        }
+        Err(e) => {
+            eprintln!(
+                "[relay watch] wake fallback for {} failed to spawn: {e}",
+                t.id
+            );
+            WakeOutcome::Failed
+        }
     }
 }
 

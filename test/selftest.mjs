@@ -837,6 +837,52 @@ check('wake refuses a concurrent relay-launched resume and proceeds after its lo
   assert.equal(after.status, 0, `wake after lock release exited ${after.status}: ${after.stderr}`);
 });
 
+check('watch retries a refused wake after the resume lock releases and delivers queued mail', () => {
+  const id = '17171717-1717-4717-8717-171717171717';
+  const dir = path.join(HOME, 'proj-wake-retry');
+  fs.mkdirSync(dir, { recursive: true });
+  assert.equal(relay(['register', 'wake-retry', '--id', id, '--dir', dir]).status, 0);
+
+  const deliveryStub = path.join(HOME, 'fake-wake-delivery');
+  fs.writeFileSync(deliveryStub, `#!/usr/bin/env node
+const { spawnSync } = require('node:child_process');
+const i = process.argv.indexOf('--resume');
+const id = process.argv[i + 1];
+const evt = JSON.stringify({ session_id: id, cwd: process.cwd(), hook_event_name: 'SessionStart', source: 'resume' });
+const hook = spawnSync(process.env.STUB_RELAY_BIN, ['hook'], { input: evt, env: process.env });
+process.exit(hook.status ?? 1);
+`, { mode: 0o755 });
+
+  const active = spawnToFiles(
+    ['wake', 'wake-retry'],
+    { RELAY_WAKE_CMD_CLAUDE: wakeStub, WAKE_STUB_DELAY_MS: '5000' },
+    'retry-active-wake',
+  );
+  const resumeLock = path.join(HOME, 'locks', `resume-${id}.lock`);
+  waitFor(() => {
+    try { return JSON.parse(fs.readFileSync(resumeLock, 'utf8')).pid === active.child.pid; } catch { return false; }
+  }, 'the wake-retry resume lock');
+
+  assert.equal(relay(['send', 'wake-retry', '--', 'deliver after refusal']).status, 0);
+  const watched = spawnToFiles(
+    ['watch', 'wake-retry'],
+    { RELAY_WAKE_CMD_CLAUDE: deliveryStub, STUB_RELAY_BIN: BIN },
+    'retry-watch',
+  );
+  try {
+    waitFor(
+      () => fs.readFileSync(watched.stderrPath, 'utf8').includes('wake refused'),
+      'the initial wake refusal',
+    );
+    assert.equal(peek('wake-retry').count, 1, 'refused wake leaves mail durable');
+    active.child.kill('SIGKILL');
+    waitFor(() => peek('wake-retry').count === 0, 'watch retry delivery after lock release', 8000);
+  } finally {
+    active.child.kill('SIGKILL');
+    watched.child.kill('SIGKILL');
+  }
+});
+
 const busSendResult = (to, body) => toolJSON(runBus(dirA, [
   { jsonrpc: '2.0', id: 1, method: 'initialize', params: {} },
   { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'send', arguments: { to, body } } },
@@ -863,10 +909,23 @@ check('follow watcher provides live/dead/never/unknown status and tail -n0 -F se
   assert.ok(!output.includes('preexisting-skip'), 'startup content was skipped');
   assert.ok(output.includes('after-start'), 'an appended complete line was emitted');
   assert.equal(relay(['send', 'follow-target', '--', 'cli-stable']).stdout, 'queued -> follow-target\n');
+  waitFor(
+    () => fs.readFileSync(followed.stdoutPath, 'utf8').includes('cli-stable'),
+    'the pre-truncation follow offset',
+  );
+
+  const mailbox = path.join(HOME, 'mailbox', `${id}.jsonl`);
+  const inodeBefore = fs.statSync(mailbox).ino;
+  const regrown = `${JSON.stringify({ body: `same-inode-truncate-${'x'.repeat(4096)}` })}\n`;
+  fs.writeFileSync(mailbox, regrown);
+  assert.equal(fs.statSync(mailbox).ino, inodeBefore, 'truncate/regrow fixture preserves the inode');
+  waitFor(
+    () => fs.readFileSync(followed.stdoutPath, 'utf8').includes(regrown),
+    'the complete line after same-inode truncate/regrow',
+  );
 
   relayJSON(['inbox', 'follow-target']); // remove the current inode through the binary
   sleep(2200);
-  const mailbox = path.join(HOME, 'mailbox', `${id}.jsonl`);
   fs.appendFileSync(mailbox, '{"partial":'); // raw fixture: store API only emits complete lines
   sleep(2200);
   output = fs.readFileSync(followed.stdoutPath, 'utf8');
@@ -900,6 +959,45 @@ check('follow watcher provides live/dead/never/unknown status and tail -n0 -F se
   } finally {
     fs.chmodSync(unknownLock, 0o600);
   }
+});
+
+check('follow watcher exits and releases its lock when the stdout consumer closes', () => {
+  const id = '18181818-1818-4818-8818-181818181818';
+  const dir = path.join(HOME, 'proj-follow-closed-stdout');
+  fs.mkdirSync(dir, { recursive: true });
+  assert.equal(relay(['register', 'closed-stdout', '--id', id, '--dir', dir]).status, 0);
+
+  const watched = spawn(BIN, ['watch', '--follow', id], {
+    env: envFor(),
+    stdio: ['ignore', 'pipe', 'ignore'],
+  });
+  const lock = path.join(HOME, 'watchers', `${id}.lock`);
+  waitFor(() => {
+    try { return JSON.parse(fs.readFileSync(lock, 'utf8')).pid === watched.pid; } catch { return false; }
+  }, 'the closed-stdout watcher lock');
+  sleep(2200);
+  watched.stdout.destroy();
+  try {
+    assert.equal(relay(['send', 'closed-stdout', '--', 'break the closed pipe']).status, 0);
+    waitFor(
+      () => busSendResult('closed-stdout', 'probe output-failure liveness').recipient_watch === 'dead',
+      'the watcher lock to release after its stdout closes',
+    );
+  } finally {
+    watched.kill('SIGKILL');
+  }
+});
+
+check('watch rejects an invalid --tool before writing lock metadata', () => {
+  const id = '19191919-1919-4919-8919-191919191919';
+  const r = spawnSync(BIN, ['watch', '--follow', id, '--tool', 'bogus'], {
+    encoding: 'utf8',
+    env: envFor(),
+    timeout: 1000,
+  });
+  assert.equal(r.status, 1, `invalid tool should exit 1, got status=${r.status} signal=${r.signal}`);
+  assert.match(r.stderr, /--tool must be claude\|codex/);
+  assert.equal(fs.existsSync(path.join(HOME, 'watchers', `${id}.lock`)), false);
 });
 
 check('doctor verifies a live receive path, reports dead re-arm, and honors --id in a shared dir', () => {
@@ -942,6 +1040,12 @@ check('doctor verifies a live receive path, reports dead re-arm, and honors --id
   runHook({ session_id: doctorB, cwd: shared, source: 'resume' });
   const fallback = relay(['doctor'], { cwd: shared });
   assert.match(fallback.stdout, new RegExp(`single-session-only fallback resolved ${doctorB}`));
+});
+
+check('doctor gives an actionable command for an unknown named identity', () => {
+  const r = relay(['doctor', '--id', 'not-registered']);
+  assert.equal(r.status, 1);
+  assert.match(r.stdout, /FAIL identity: unknown session not-registered — fix: relay list/);
 });
 
 fs.rmSync(HOME, { recursive: true, force: true });
