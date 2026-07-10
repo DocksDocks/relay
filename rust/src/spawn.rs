@@ -82,6 +82,8 @@ pub fn run_log_writer(id: &str) -> ! {
     if !store::is_uuid(id) {
         die("spawn log writer requires a UUID");
     }
+    let _pump_liveness = store::acquire_spawn_pump_lock()
+        .unwrap_or_else(|e| die(&format!("acquire spawn-pump liveness lock: {e}")));
     let dir = store::home_dir().join("spawn-logs");
     fs::create_dir_all(&dir).unwrap_or_else(|e| die(&format!("create spawn-log dir: {e}")));
     let path = dir.join(format!("{}.stderr", store::sanitize(id)));

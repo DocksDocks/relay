@@ -737,9 +737,10 @@ check('GC refuses a symlinked surface without touching its target or permissions
   assert.equal(fs.existsSync(path.join(home, '.lock')), false, 'GC refused before creating its lock');
 });
 
-check('GC leaves aged foreign non-UUID files untouched in every surface directory', () => {
+check('GC ignores unreadable aged foreign files and still collects eligible relay state', () => {
   const home = fs.mkdtempSync(path.join(HOME, 'gc-foreign-'));
-  makeGcSurfaceDirs(home);
+  const aged = seedGcSession(home, 'aged', '43434343-4343-4343-8343-434343434343');
+  ageGcSession(home, aged);
   const foreign = [
     path.join(home, 'mailbox', 'notes.jsonl'),
     path.join(home, 'markers', 'not-a-relay-marker'),
@@ -751,11 +752,15 @@ check('GC leaves aged foreign non-UUID files untouched in every surface director
   for (const file of foreign) {
     fs.writeFileSync(file, 'not-a-uuid\n');
     fs.utimesSync(file, gcOld, gcOld);
+    fs.chmodSync(file, 0o000);
   }
+  fs.rmSync(path.join(home, 'gc-stamp'), { force: true });
 
   runGcBus(home, home);
 
-  assert.ok(foreign.every((file) => fs.existsSync(file)), 'foreign files survive in all surfaces');
+  assert.ok(aged.paths.every((file) => !fs.existsSync(file)), 'eligible relay surfaces were collected');
+  assert.ok(foreign.every((file) => fs.existsSync(file)), 'unreadable foreign files survive in all surfaces');
+  assert.equal(fs.existsSync(path.join(home, 'gc-stamp')), true, 'completed sweep writes its stamp');
 });
 
 check('GC cannot follow a mailbox-directory symlink to delete a victim file', () => {
@@ -822,6 +827,30 @@ check('GC preserves an aged session while its watcher lock is held', () => {
     assert.ok(held.paths.every((file) => fs.existsSync(file)), 'held-lock session survives intact');
   } finally {
     watcher.kill('SIGKILL');
+  }
+});
+
+check('GC preserves an aged candidate while a spawn-log pump holds its liveness lock', () => {
+  const home = fs.mkdtempSync(path.join(HOME, 'gc-spawn-pump-'));
+  const held = seedGcSession(home, 'held', '44444444-4444-4444-8444-444444444444');
+  const invoker = seedGcSession(home, 'invoker', '45454545-4545-4545-8545-454545454545');
+  const pumpId = '46464646-4646-4646-8646-464646464646';
+  ageGcSession(home, held);
+  fs.rmSync(path.join(home, 'gc-stamp'), { force: true });
+  const pump = spawn(BIN, ['__spawn-log-writer', pumpId], {
+    env: gcEnv(home),
+    stdio: ['pipe', 'ignore', 'ignore'],
+  });
+  try {
+    waitFor(
+      () => pump.exitCode === null && fs.existsSync(path.join(home, 'spawn-logs', `${pumpId}.stderr`)),
+      'spawn-pump liveness lock',
+    );
+    runGcBus(home, invoker.dir);
+    assert.ok(held.paths.every((file) => fs.existsSync(file)), 'pump-held candidate survives intact');
+  } finally {
+    pump.stdin.end();
+    pump.kill('SIGKILL');
   }
 });
 
