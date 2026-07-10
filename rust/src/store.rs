@@ -16,7 +16,7 @@
 // the same lock.
 
 use rustix::fs::{FlockOperation, flock};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -25,15 +25,25 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tinyjson::JsonValue;
 
 const WATCH_LOCK_RETRY: Duration = Duration::from_secs(2);
+const DEFAULT_GC_DAYS: u64 = 14;
+const GC_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
 pub const WATCH_PROGRESS_STALE_MS: i64 = 300_000;
 
-pub fn home_dir() -> PathBuf {
+fn home_override() -> Option<PathBuf> {
     for var in ["AGENT_RELAY_HOME", "SESSION_RELAY_HOME"] {
         if let Ok(v) = std::env::var(var) {
             if !v.is_empty() {
-                return PathBuf::from(v);
+                return Some(PathBuf::from(v));
             }
         }
+    }
+    None
+}
+
+pub fn home_dir() -> PathBuf {
+    if let Some(path) = home_override() {
+        return path;
     }
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
     Path::new(&home).join(".agent-relay")
@@ -221,45 +231,46 @@ fn acquire_lock(
     metadata: LockMetadata,
     retry_for: Duration,
 ) -> Result<HeldLock, LockAcquireError> {
-    ensure_dirs().map_err(LockAcquireError::Io)?;
-    let mut file = open_lock(path, true)
-        .map_err(|e| LockAcquireError::Io(format!("open lock {}: {e}", path.display())))?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-        .map_err(|e| LockAcquireError::Io(format!("chmod {}: {e}", path.display())))?;
     let deadline = Instant::now() + retry_for;
     loop {
-        match flock(&file, FlockOperation::NonBlockingLockExclusive) {
-            Ok(()) => break,
-            Err(e) if e == rustix::io::Errno::AGAIN || e == rustix::io::Errno::INTR => {
-                if Instant::now() >= deadline {
-                    return Err(LockAcquireError::Busy(read_lock_metadata_file(&mut file)));
+        // Coordinate creation/acquisition with GC's global store lock. Once
+        // this physical lock is acquired the returned fd keeps it live after
+        // the global lock is released.
+        let attempt = with_lock(|| {
+            let mut file =
+                open_lock(path, true).map_err(|e| format!("open lock {}: {e}", path.display()))?;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+                .map_err(|e| format!("chmod {}: {e}", path.display()))?;
+            match flock(&file, FlockOperation::NonBlockingLockExclusive) {
+                Ok(()) => {}
+                Err(e) if e == rustix::io::Errno::AGAIN || e == rustix::io::Errno::INTR => {
+                    return Ok(Err(read_lock_metadata_file(&mut file)));
                 }
-                std::thread::sleep(Duration::from_millis(25));
+                Err(e) => return Err(format!("flock {}: {e}", path.display())),
             }
-            Err(e) => {
-                return Err(LockAcquireError::Io(format!(
-                    "flock {}: {e}",
-                    path.display()
-                )));
+            let encoded = metadata
+                .to_json()
+                .stringify()
+                .map_err(|e| format!("lock metadata serialize: {e}"))?;
+            file.set_len(0)
+                .and_then(|()| file.seek(SeekFrom::Start(0)).map(|_| ()))
+                .and_then(|()| file.write_all(encoded.as_bytes()))
+                .and_then(|()| file.flush())
+                .map_err(|e| format!("write lock metadata {}: {e}", path.display()))?;
+            Ok(Ok(HeldLock {
+                _file: file,
+                metadata: metadata.clone(),
+            }))
+        })
+        .map_err(LockAcquireError::Io)?;
+        match attempt {
+            Ok(guard) => return Ok(guard),
+            Err(holder) if Instant::now() >= deadline => {
+                return Err(LockAcquireError::Busy(holder));
             }
+            Err(_) => std::thread::sleep(Duration::from_millis(25)),
         }
     }
-    let encoded = metadata
-        .to_json()
-        .stringify()
-        .map_err(|e| LockAcquireError::Io(format!("lock metadata serialize: {e}")))?;
-    file.set_len(0)
-        .and_then(|()| file.seek(SeekFrom::Start(0)).map(|_| ()))
-        .and_then(|()| file.write_all(encoded.as_bytes()))
-        .and_then(|()| file.flush())
-        .map_err(|e| {
-            let _ = flock(&file, FlockOperation::Unlock);
-            LockAcquireError::Io(format!("write lock metadata {}: {e}", path.display()))
-        })?;
-    Ok(HeldLock {
-        _file: file,
-        metadata,
-    })
 }
 
 pub fn acquire_watcher_lock(
@@ -541,6 +552,289 @@ fn write_registry(
         .format() // pretty, 2-space — same shape JSON.stringify(reg, null, 2) wrote
         .map_err(|e| format!("registry serialize: {e}"))?;
     atomic_write(&registry_path(), &text)
+}
+
+#[derive(Default)]
+struct GcCandidate {
+    id: Option<String>,
+    registry_key: Option<String>,
+    last_seen: Option<String>,
+    paths: Vec<PathBuf>,
+}
+
+fn gc_days() -> Result<u64, String> {
+    match std::env::var("AGENT_RELAY_GC_DAYS") {
+        Ok(raw) if !raw.is_empty() => raw
+            .parse()
+            .map_err(|_| "AGENT_RELAY_GC_DAYS must be a non-negative integer".to_string()),
+        Ok(_) | Err(std::env::VarError::NotPresent) => Ok(DEFAULT_GC_DAYS),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err("AGENT_RELAY_GC_DAYS must be valid UTF-8".to_string())
+        }
+    }
+}
+
+/// Resolve an existing store without creating anything. An explicit relay-home
+/// override is the authority for its own root (including test roots in /tmp);
+/// the default root must resolve beneath the configured HOME.
+fn safe_existing_root() -> Result<Option<(PathBuf, PathBuf)>, String> {
+    let raw =
+        std::path::absolute(home_dir()).map_err(|e| format!("resolve relay store root: {e}"))?;
+    match fs::symlink_metadata(&raw) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("stat relay store root {}: {e}", raw.display())),
+    }
+    let resolved = fs::canonicalize(&raw)
+        .map_err(|e| format!("canonicalize relay store root {}: {e}", raw.display()))?;
+    if !resolved.is_dir() {
+        return Err(format!(
+            "refusing GC: relay store root is not a directory: {}",
+            resolved.display()
+        ));
+    }
+    if home_override().is_none() {
+        let home = std::env::var("HOME").map_err(|_| {
+            "refusing GC: HOME is unavailable for default-root validation".to_string()
+        })?;
+        let home =
+            fs::canonicalize(&home).map_err(|e| format!("canonicalize HOME for relay GC: {e}"))?;
+        if resolved == home || !resolved.starts_with(&home) {
+            return Err(format!(
+                "refusing GC: default relay store {} resolves outside HOME {}",
+                resolved.display(),
+                home.display()
+            ));
+        }
+    }
+    Ok(Some((raw, resolved)))
+}
+
+fn add_gc_surface(
+    candidates: &mut HashMap<String, GcCandidate>,
+    id: Option<String>,
+    orphan_key: String,
+    path: PathBuf,
+) {
+    let key = id
+        .as_ref()
+        .map(|id| format!("session:{id}"))
+        .unwrap_or(orphan_key);
+    let candidate = candidates.entry(key).or_default();
+    if candidate.id.is_none() {
+        candidate.id = id;
+    }
+    candidate.paths.push(path);
+}
+
+fn known_gc_surfaces(root: &Path) -> Result<Vec<(Option<String>, String, PathBuf)>, String> {
+    let mut surfaces = Vec::new();
+    for directory in ["mailbox", "markers", "watchers", "locks", "spawn-logs"] {
+        let dir = root.join(directory);
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(format!("read GC surface {}: {e}", dir.display())),
+        };
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("read GC surface {}: {e}", dir.display()))?;
+            let path = entry.path();
+            if fs::symlink_metadata(&path)
+                .map(|metadata| metadata.is_dir())
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            let id = match directory {
+                "mailbox" => name.strip_suffix(".jsonl").map(str::to_string),
+                "markers" => fs::read_to_string(&path)
+                    .ok()
+                    .map(|raw| raw.trim().to_string())
+                    .filter(|id| !id.is_empty()),
+                "watchers" => name
+                    .strip_suffix(".lock")
+                    .or_else(|| name.strip_suffix(".progress"))
+                    .map(str::to_string),
+                "locks" => name
+                    .strip_prefix("resume-")
+                    .and_then(|name| name.strip_suffix(".lock"))
+                    .map(str::to_string),
+                "spawn-logs" => name.strip_suffix(".stderr").map(str::to_string),
+                _ => None,
+            };
+            let known_name = id.is_some() || directory == "markers";
+            if !known_name {
+                continue;
+            }
+            surfaces.push((id, format!("orphan:{directory}:{}", path.display()), path));
+        }
+    }
+    Ok(surfaces)
+}
+
+fn validate_gc_path(root: &Path, resolved_root: &Path, path: &Path) -> Result<(), String> {
+    let allowed_parent = ["mailbox", "markers", "watchers", "locks", "spawn-logs"]
+        .iter()
+        .map(|directory| root.join(directory))
+        .any(|directory| path.parent() == Some(directory.as_path()));
+    if path == root || !path.starts_with(root) || !allowed_parent {
+        return Err(format!(
+            "refusing GC: path is not a known relay-owned surface: {}",
+            path.display()
+        ));
+    }
+    let resolved = fs::canonicalize(path)
+        .map_err(|e| format!("canonicalize GC path {}: {e}", path.display()))?;
+    if resolved == resolved_root || !resolved.starts_with(resolved_root) {
+        return Err(format!(
+            "refusing GC: path resolves outside relay store: {} -> {}",
+            path.display(),
+            resolved.display()
+        ));
+    }
+    Ok(())
+}
+
+fn surface_is_old(path: &Path, cutoff: SystemTime) -> bool {
+    fs::symlink_metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .map(|modified| modified <= cutoff)
+        .unwrap_or(false)
+}
+
+/// Opportunistically remove sessions whose every known surface is older than
+/// the configured threshold. `self_id` is belt-and-braces: a shared-dir bus may
+/// resolve the marker owner's id rather than this process's id, so fresh
+/// last_seen/mtimes and held locks remain the primary liveness protections.
+/// `None` means identity unknown, not "skip GC".
+pub fn gc(now: SystemTime, self_id: Option<&str>) -> Result<usize, String> {
+    let days = gc_days()?;
+    if days == 0 {
+        return Ok(0);
+    }
+    let Some((root, resolved_root)) = safe_existing_root()? else {
+        return Ok(0);
+    };
+    let age = Duration::from_secs(
+        days.checked_mul(SECONDS_PER_DAY)
+            .ok_or_else(|| "AGENT_RELAY_GC_DAYS is too large".to_string())?,
+    );
+    let cutoff = now.checked_sub(age).unwrap_or(UNIX_EPOCH);
+    let cutoff_ms = cutoff
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_millis()
+        .min(i64::MAX as u128) as i64;
+    let cutoff_iso = iso_from_unix_ms(cutoff_ms);
+
+    with_lock(|| {
+        // Re-check after acquiring the mutation lock. This also catches a
+        // store-root symlink swap before any deletion begins.
+        let Some((locked_root, locked_resolved_root)) = safe_existing_root()? else {
+            return Ok(0);
+        };
+        if locked_root != root || locked_resolved_root != resolved_root {
+            return Err("refusing GC: relay store root changed during sweep".to_string());
+        }
+        let stamp = root.join("gc-stamp");
+        if let Ok(modified) = fs::metadata(&stamp).and_then(|metadata| metadata.modified()) {
+            if now.duration_since(modified).unwrap_or(Duration::ZERO) < GC_INTERVAL {
+                return Ok(0);
+            }
+        }
+
+        let (mut agents, mut names) = read_registry();
+        let mut candidates: HashMap<String, GcCandidate> = HashMap::new();
+        for (registry_key, value) in &agents {
+            let Some(entry) = Entry::from_json(value) else {
+                continue; // malformed registry state is preserved, never guessed old
+            };
+            let candidate = candidates
+                .entry(format!("session:{registry_key}"))
+                .or_default();
+            candidate.id = Some(registry_key.clone());
+            candidate.registry_key = Some(registry_key.clone());
+            candidate.last_seen = Some(entry.last_seen);
+        }
+        for (id, orphan_key, path) in known_gc_surfaces(&root)? {
+            add_gc_surface(&mut candidates, id, orphan_key, path);
+        }
+
+        // Validate the complete deletion set before mutating any surface.
+        for candidate in candidates.values() {
+            for path in &candidate.paths {
+                validate_gc_path(&root, &resolved_root, path)?;
+            }
+        }
+
+        let mut eligible = Vec::new();
+        for (key, candidate) in &candidates {
+            if candidate
+                .id
+                .as_deref()
+                .is_some_and(|id| Some(id) == self_id)
+            {
+                continue;
+            }
+            if candidate
+                .last_seen
+                .as_ref()
+                .is_some_and(|last_seen| last_seen.is_empty() || last_seen > &cutoff_iso)
+            {
+                continue;
+            }
+            if !candidate
+                .paths
+                .iter()
+                .all(|path| surface_is_old(path, cutoff))
+            {
+                continue;
+            }
+            if let Some(id) = candidate.id.as_deref() {
+                if matches!(watcher_status(id), LockStatus::Live | LockStatus::Unknown)
+                    || matches!(resume_status(id), LockStatus::Live | LockStatus::Unknown)
+                {
+                    continue;
+                }
+            }
+            eligible.push(key.clone());
+        }
+
+        let mut removed_files = 0;
+        let mut removed_registry_ids = HashSet::new();
+        for key in &eligible {
+            let candidate = &candidates[key];
+            for path in &candidate.paths {
+                match fs::remove_file(path) {
+                    Ok(()) => removed_files += 1,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(format!("remove GC surface {}: {e}", path.display())),
+                }
+            }
+            if let Some(registry_key) = &candidate.registry_key {
+                removed_registry_ids.insert(registry_key.clone());
+            }
+        }
+
+        // Registry is last: an interrupted sweep leaves visible entries that
+        // a later pass can retry, never invisible orphan files.
+        if !removed_registry_ids.is_empty() {
+            for id in &removed_registry_ids {
+                agents.remove(id);
+            }
+            names.retain(|_, value| {
+                value
+                    .get::<String>()
+                    .is_none_or(|id| !removed_registry_ids.contains(id))
+            });
+            write_registry(agents, names)?;
+        }
+        atomic_write(&stamp, &format!("{}\n", iso_now()))?;
+        Ok(removed_files + removed_registry_ids.len())
+    })
 }
 
 /// Upsert a session. Missing fields are preserved from any prior entry, so the

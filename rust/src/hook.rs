@@ -216,6 +216,9 @@ fn inner(tool: &str, event: HookEvent, input: &str) -> Result<(), String> {
                 .map(|d| d.to_string_lossy().into_owned())
                 .unwrap_or_else(|_| ".".to_string())
         });
+    if let Err(e) = store::gc(std::time::SystemTime::now(), Some(&id)) {
+        eprintln!("[session-relay/hook] GC skipped: {e}");
+    }
     store::set_marker(&dir, &id)?;
     store::register(&id, Some(&dir), None, Some(tool))?;
     let msgs = store::drain(&id)?;
