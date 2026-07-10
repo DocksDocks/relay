@@ -1,7 +1,7 @@
 // relay — session-relay's single binary. One executable, multi-call:
 //   relay bus                      MCP stdio server (manifest entry)
 //   relay hook [codex] [--event prompt]   SessionStart/UserPromptSubmit hook (register + drain inbox)
-//   relay discover|list|register|send|inbox|peek|wake   the CLI / doorbell
+//   relay discover|list|register|send|inbox|peek|wake|doctor   CLI / doorbell / health
 //   relay watch …                  poll mailboxes, push into live Codex threads via app-server
 //   relay __stress …               hidden test helper (cross-process lock race)
 
@@ -13,9 +13,10 @@ fn main() {
     match argv.first().map(String::as_str) {
         Some("bus") => relay::bus::run(),
         Some("hook") => relay::hook::run(&argv[1..]),
-        Some(cmd @ ("discover" | "list" | "register" | "send" | "inbox" | "peek" | "wake")) => {
-            relay::cli::run(cmd, argv.clone())
-        }
+        Some(
+            cmd
+            @ ("discover" | "list" | "register" | "send" | "inbox" | "peek" | "wake" | "doctor"),
+        ) => relay::cli::run(cmd, argv.clone()),
         Some("watch") => relay::watch::run(argv.clone()),
         Some("spawn") => relay::spawn::run(argv.clone()),
         // __stress <recipient-id> <who> <k> — mirrors test/selftest.mjs's
@@ -42,7 +43,7 @@ fn main() {
             }
         }
         _ => die(
-            "usage: relay bus | hook [codex] [--event prompt] | discover [--within min] [--tool t] | list | register <name> --id <uuid> [--dir <path>] | send <to> [--] <msg> | inbox <who> | peek <who> | wake <who> [--model m] [--effort e] [msg] | watch <who>...|--all [--server <sock>] [--auto-turn] [--once] | spawn <dir> [--tool t] [--model m] [--effort e] [--name n] [--] <task>",
+            "usage: relay bus | hook [codex] [--event prompt] | discover [--within min] [--tool t] | list | register <name> --id <uuid> [--dir <path>] | send <to> [--] <msg> | inbox <who> | peek <who> | wake <who> [--model m] [--effort e] [msg] | doctor [--id <session>] | watch <who>...|--all [--server <sock>] [--auto-turn] [--once] | spawn <dir> [--tool t] [--model m] [--effort e] [--name n] [--watch] [--] <task>",
         ),
     }
 }

@@ -16,6 +16,7 @@
 // instead of spawning.
 
 use crate::discover;
+use crate::hook;
 use crate::store;
 use std::collections::HashMap;
 use std::io::Write;
@@ -137,6 +138,167 @@ fn lock_age(path: &std::path::Path) -> String {
     } else {
         format!("{}h", seconds / 3600)
     }
+}
+
+fn progress_age(ms: i64) -> String {
+    let seconds = (ms.max(0) as u64) / 1000;
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 3600 {
+        format!("{}m", seconds / 60)
+    } else {
+        format!("{}h", seconds / 3600)
+    }
+}
+
+fn doctor_line(level: &str, check: &str, detail: &str) {
+    println!("{level} {check}: {detail}");
+}
+
+fn doctor(args: &Args) -> ! {
+    let cwd = cwd_string();
+    let (id, fallback) = match args.flag("id") {
+        Some(who) => match store::resolve(who) {
+            Some(entry) => (entry.id, false),
+            None if store::is_uuid(who) => (who.to_string(), false),
+            None => {
+                doctor_line("FAIL", "identity", &format!("unknown session {who}"));
+                std::process::exit(1);
+            }
+        },
+        None => match store::id_for_dir(&cwd) {
+            Some(id) => (id, true),
+            None => {
+                doctor_line(
+                    "FAIL",
+                    "identity",
+                    "no cwd marker — fix: pass --id <session-id-or-name>",
+                );
+                std::process::exit(1);
+            }
+        },
+    };
+
+    if fallback {
+        doctor_line(
+            "WARN",
+            "identity",
+            &format!(
+                "single-session-only fallback resolved {id} from {cwd}; pass --id for shared dirs"
+            ),
+        );
+    } else {
+        doctor_line("PASS", "identity", &id);
+    }
+
+    let mut failures = 0;
+    let entry = store::resolve(&id);
+    if let Some(entry) = &entry {
+        doctor_line(
+            "PASS",
+            "registration",
+            &format!(
+                "{} [{}] at {}",
+                entry.name.as_deref().unwrap_or(&entry.id),
+                entry.tool,
+                entry.dir.as_deref().unwrap_or("unknown dir")
+            ),
+        );
+    } else {
+        failures += 1;
+        doctor_line(
+            "FAIL",
+            "registration",
+            "registry entry missing — fix: restart or resume the session",
+        );
+    }
+
+    let mailbox = store::mailbox_path(&id);
+    match std::fs::File::open(&mailbox) {
+        Ok(_) => doctor_line(
+            "PASS",
+            "mailbox",
+            &format!("readable {}", mailbox.display()),
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => doctor_line(
+            "PASS",
+            "mailbox",
+            &format!("no mail yet ({})", mailbox.display()),
+        ),
+        Err(e) => {
+            failures += 1;
+            doctor_line(
+                "FAIL",
+                "mailbox",
+                &format!(
+                    "cannot read {} ({e}) — fix: restore mailbox read permissions",
+                    mailbox.display()
+                ),
+            );
+        }
+    }
+
+    let relay_exe = std::env::current_exe()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "relay".to_string());
+    let rearm = hook::watcher_command(&relay_exe, &id);
+    let watch = store::watcher_status(&id);
+    match watch {
+        store::LockStatus::Live => doctor_line("PASS", "watcher", "live lock held"),
+        store::LockStatus::Dead | store::LockStatus::Never => {
+            failures += 1;
+            doctor_line(
+                "FAIL",
+                "watcher",
+                &format!("{} — fix: {rearm}", watch.as_str()),
+            );
+        }
+        store::LockStatus::Unknown => {
+            failures += 1;
+            doctor_line(
+                "FAIL",
+                "watcher",
+                &format!("unknown lock state — fix: {rearm}"),
+            );
+        }
+    }
+
+    match store::watcher_progress_age_ms(&id) {
+        Some(ms) if ms > store::WATCH_PROGRESS_STALE_MS => doctor_line(
+            "WARN",
+            "watcher-progress",
+            &format!("last update {} ago; watcher may be stuck", progress_age(ms)),
+        ),
+        Some(ms) => doctor_line(
+            "PASS",
+            "watcher-progress",
+            &format!("updated {} ago", progress_age(ms)),
+        ),
+        None => doctor_line("WARN", "watcher-progress", "no progress stamp yet"),
+    }
+
+    match store::resume_status(&id) {
+        store::LockStatus::Live => doctor_line("PASS", "resume", "relay wake is running"),
+        store::LockStatus::Dead => {
+            doctor_line("PASS", "resume", "no active wake (prior tombstone)")
+        }
+        store::LockStatus::Never => doctor_line("PASS", "resume", "no relay wake recorded"),
+        store::LockStatus::Unknown => doctor_line("WARN", "resume", "lock state unknown"),
+    }
+
+    match store::with_lock(|| Ok(())) {
+        Ok(()) => doctor_line("PASS", "store-lock", "acquired and released"),
+        Err(e) => {
+            failures += 1;
+            doctor_line(
+                "FAIL",
+                "store-lock",
+                &format!("{e} — fix: inspect {}", store::home_dir().display()),
+            );
+        }
+    }
+
+    std::process::exit(if failures == 0 { 0 } else { 1 });
 }
 
 fn wake_cmd(tool: &str) -> String {
@@ -284,6 +446,7 @@ fn wake_usage_line(tool: &str, stdout: &[u8]) -> Option<String> {
 pub fn run(cmd: &str, raw: Vec<String>) -> ! {
     let args = Args(raw);
     match cmd {
+        "doctor" => doctor(&args),
         "discover" => {
             let within: f64 = args
                 .flag("within")
@@ -590,7 +753,7 @@ pub fn run(cmd: &str, raw: Vec<String>) -> ! {
             std::process::exit(out.status.code().unwrap_or(0));
         }
         _ => die(
-            "usage: relay discover [--within min] [--tool t] | list | register <name> --id <uuid> [--dir <path>] | send <to> <msg> | inbox <who> | peek <who> | wake <who> [--model m] [--effort e] [msg]",
+            "usage: relay discover [--within min] [--tool t] | list | register <name> --id <uuid> [--dir <path>] | send <to> <msg> | inbox <who> | peek <who> | wake <who> [--model m] [--effort e] [msg] | doctor [--id <session>]",
         ),
     }
 }
