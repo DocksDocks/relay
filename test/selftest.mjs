@@ -961,6 +961,60 @@ check('follow watcher provides live/dead/never/unknown status and tail -n0 -F se
   }
 });
 
+check('follow detects consumed-prefix rewrites that preserve the prior 64-byte suffix', () => {
+  const id = '20202020-2020-4020-8020-202020202020';
+  const dir = path.join(HOME, 'proj-follow-preserved-suffix');
+  fs.mkdirSync(dir, { recursive: true });
+  assert.equal(relay(['register', 'preserved-suffix', '--id', id, '--dir', dir]).status, 0);
+
+  const watched = spawnToFiles(['watch', '--follow', id], {}, 'preserved-suffix-watch');
+  const lock = path.join(HOME, 'watchers', `${id}.lock`);
+  waitFor(() => {
+    try { return JSON.parse(fs.readFileSync(lock, 'utf8')).pid === watched.child.pid; } catch { return false; }
+  }, 'the preserved-suffix watcher lock');
+  sleep(2200);
+
+  const mailbox = path.join(HOME, 'mailbox', `${id}.jsonl`);
+  const sharedSuffix = `${'s'.repeat(61)}"}\n`;
+  const line = (marker) => `{"body":"${marker}${'p'.repeat(256)}${sharedSuffix}`;
+  const original = line('old-prefix');
+  const equalReplacement = line('new-prefix');
+  assert.equal(original.length, equalReplacement.length);
+  assert.equal(original.slice(-64), equalReplacement.slice(-64));
+
+  try {
+    fs.appendFileSync(mailbox, original);
+    waitFor(
+      () => fs.readFileSync(watched.stdoutPath, 'utf8').includes(original),
+      'the original preserved-suffix line',
+    );
+    const inode = fs.statSync(mailbox).ino;
+
+    fs.writeFileSync(mailbox, equalReplacement);
+    assert.equal(fs.statSync(mailbox).ino, inode, 'equal-length rewrite preserves the inode');
+    waitFor(
+      () => fs.readFileSync(watched.stdoutPath, 'utf8').includes(equalReplacement),
+      'the equal-length replacement with an unchanged 64-byte suffix',
+    );
+
+    const longerReplacement = line('alt-prefix');
+    const appended = '{"extra":"after-longer-rewrite"}\n';
+    assert.equal(equalReplacement.slice(-64), longerReplacement.slice(-64));
+    fs.writeFileSync(mailbox, `${longerReplacement}${appended}`);
+    assert.equal(fs.statSync(mailbox).ino, inode, 'longer rewrite preserves the inode');
+    waitFor(
+      () => fs.readFileSync(watched.stdoutPath, 'utf8').includes(longerReplacement),
+      'the longer replacement with an unchanged consumed suffix',
+    );
+    waitFor(
+      () => fs.readFileSync(watched.stdoutPath, 'utf8').includes(appended),
+      'the append after the longer replacement',
+    );
+  } finally {
+    watched.child.kill('SIGKILL');
+  }
+});
+
 check('follow watcher exits and releases its lock when the stdout consumer closes', () => {
   const id = '18181818-1818-4818-8818-181818181818';
   const dir = path.join(HOME, 'proj-follow-closed-stdout');

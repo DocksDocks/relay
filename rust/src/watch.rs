@@ -30,6 +30,7 @@
 
 use crate::cli::{Args, DEFAULT_NUDGE};
 use crate::hook;
+use crate::sha256::Sha256;
 use crate::store;
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -43,7 +44,6 @@ const POLL_MS: u64 = 2000;
 const DEFAULT_SETTLE_MS: u64 = 5000;
 const DEFAULT_TURN_WAIT_MS: u64 = 300_000;
 const RPC_TIMEOUT_SECS: u64 = 20;
-const FOLLOW_ANCHOR_BYTES: u64 = 64;
 const WAKE_RETRY_MAX_MS: u64 = 30_000;
 
 fn die(msg: &str) -> ! {
@@ -68,8 +68,29 @@ struct FollowFile {
     dev: u64,
     ino: u64,
     pending: Vec<u8>,
-    anchor_offset: u64,
-    anchor: Vec<u8>,
+    prefix_hash: Sha256,
+    snapshot: FileSnapshot,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FileSnapshot {
+    len: u64,
+    mtime: i64,
+    mtime_nsec: i64,
+    ctime: i64,
+    ctime_nsec: i64,
+}
+
+impl FileSnapshot {
+    fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        Self {
+            len: metadata.len(),
+            mtime: metadata.mtime(),
+            mtime_nsec: metadata.mtime_nsec(),
+            ctime: metadata.ctime(),
+            ctime_nsec: metadata.ctime_nsec(),
+        }
+    }
 }
 
 struct WakeRetry {
@@ -284,6 +305,7 @@ fn read_follow_bytes(state: &mut FollowFile, out: &mut impl Write) -> Result<(),
         .file
         .read_to_end(&mut added)
         .map_err(|e| format!("read followed mailbox: {e}"))?;
+    state.prefix_hash.update(&added);
     state.pending.extend_from_slice(&added);
     while let Some(end) = state.pending.iter().position(|b| *b == b'\n') {
         let line: Vec<u8> = state.pending.drain(..=end).collect();
@@ -291,80 +313,96 @@ fn read_follow_bytes(state: &mut FollowFile, out: &mut impl Write) -> Result<(),
             .and_then(|()| out.flush())
             .map_err(|e| format!("write followed mailbox line: {e}"))?;
     }
-    refresh_follow_anchor(state)?;
+    let metadata = state
+        .file
+        .metadata()
+        .map_err(|e| format!("stat followed mailbox after read: {e}"))?;
+    state.snapshot = FileSnapshot::from_metadata(&metadata);
     Ok(())
 }
 
-fn refresh_follow_anchor(state: &mut FollowFile) -> Result<(), String> {
+fn digest_followed_prefix(
+    state: &mut FollowFile,
+    prefix_len: u64,
+) -> Result<Option<[u8; 32]>, String> {
     let offset = state
         .file
         .stream_position()
         .map_err(|e| format!("read followed mailbox position: {e}"))?;
-    let anchor_len = offset.min(FOLLOW_ANCHOR_BYTES);
-    let anchor_offset = offset - anchor_len;
     state
         .file
-        .seek(SeekFrom::Start(anchor_offset))
-        .map_err(|e| format!("seek followed mailbox anchor: {e}"))?;
-    let mut anchor = vec![0; anchor_len as usize];
-    state
-        .file
-        .read_exact(&mut anchor)
-        .map_err(|e| format!("read followed mailbox anchor: {e}"))?;
+        .seek(SeekFrom::Start(0))
+        .map_err(|e| format!("seek followed mailbox prefix: {e}"))?;
+
+    let mut hasher = Sha256::new();
+    let mut remaining = prefix_len;
+    let mut buffer = [0_u8; 8192];
+    let result = loop {
+        if remaining == 0 {
+            break Ok(Some(hasher.digest()));
+        }
+        let want = remaining.min(buffer.len() as u64) as usize;
+        match state.file.read(&mut buffer[..want]) {
+            Ok(0) => break Ok(None),
+            Ok(read) => {
+                hasher.update(&buffer[..read]);
+                remaining -= read as u64;
+            }
+            Err(e) => break Err(format!("read followed mailbox prefix: {e}")),
+        }
+    };
     state
         .file
         .seek(SeekFrom::Start(offset))
         .map_err(|e| format!("restore followed mailbox position: {e}"))?;
-    state.anchor_offset = anchor_offset;
-    state.anchor = anchor;
-    Ok(())
+    result
 }
 
-fn followed_content_changed(state: &mut FollowFile) -> Result<bool, String> {
-    if state.anchor.is_empty() {
+fn followed_content_changed(
+    state: &mut FollowFile,
+    metadata: &std::fs::Metadata,
+) -> Result<bool, String> {
+    if state.snapshot == FileSnapshot::from_metadata(metadata) {
         return Ok(false);
     }
     let offset = state
         .file
         .stream_position()
         .map_err(|e| format!("read followed mailbox position: {e}"))?;
-    state
-        .file
-        .seek(SeekFrom::Start(state.anchor_offset))
-        .map_err(|e| format!("seek followed mailbox anchor: {e}"))?;
-    let mut actual = vec![0; state.anchor.len()];
-    let read = state.file.read_exact(&mut actual);
-    state
-        .file
-        .seek(SeekFrom::Start(offset))
-        .map_err(|e| format!("restore followed mailbox position: {e}"))?;
-    match read {
-        Ok(()) => Ok(actual != state.anchor),
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(true),
-        Err(e) => Err(format!("read followed mailbox anchor: {e}")),
+    if metadata.len() < offset {
+        return Ok(true);
     }
+    let actual = digest_followed_prefix(state, offset)?;
+    Ok(actual.is_none_or(|digest| digest != state.prefix_hash.digest()))
 }
 
 fn open_follow_file(path: &Path, skip_existing: bool) -> Result<FollowFile, String> {
     let mut file = std::fs::File::open(path)
         .map_err(|e| format!("open followed mailbox {}: {e}", path.display()))?;
+    let mut prefix_hash = Sha256::new();
+    if skip_existing {
+        let mut buffer = [0_u8; 8192];
+        loop {
+            let read = file
+                .read(&mut buffer)
+                .map_err(|e| format!("read existing mailbox {}: {e}", path.display()))?;
+            if read == 0 {
+                break;
+            }
+            prefix_hash.update(&buffer[..read]);
+        }
+    }
     let metadata = file
         .metadata()
-        .map_err(|e| format!("stat followed mailbox {}: {e}", path.display()))?;
-    if skip_existing {
-        file.seek(SeekFrom::End(0))
-            .map_err(|e| format!("seek followed mailbox {}: {e}", path.display()))?;
-    }
-    let mut state = FollowFile {
+        .map_err(|e| format!("restat followed mailbox {}: {e}", path.display()))?;
+    Ok(FollowFile {
         file,
         dev: metadata.dev(),
         ino: metadata.ino(),
         pending: Vec::new(),
-        anchor_offset: 0,
-        anchor: Vec::new(),
-    };
-    refresh_follow_anchor(&mut state)?;
-    Ok(state)
+        prefix_hash,
+        snapshot: FileSnapshot::from_metadata(&metadata),
+    })
 }
 
 fn follow_mailbox(id: &str) -> ! {
@@ -392,19 +430,15 @@ fn follow_mailbox(id: &str) -> ! {
                         Err(e) => eprintln!("[relay watch] {e}"),
                     }
                 } else if let Some(current) = state.as_mut() {
-                    let offset = current
-                        .file
-                        .stream_position()
-                        .unwrap_or_else(|e| die(&format!("read followed mailbox position: {e}")));
                     let content_changed =
-                        followed_content_changed(current).unwrap_or_else(|e| die(&e));
-                    if metadata.len() < offset || content_changed {
+                        followed_content_changed(current, &metadata).unwrap_or_else(|e| die(&e));
+                    if content_changed {
                         current
                             .file
                             .seek(SeekFrom::Start(0))
                             .unwrap_or_else(|e| die(&format!("reset followed mailbox: {e}")));
                         current.pending.clear();
-                        current.anchor.clear();
+                        current.prefix_hash = Sha256::new();
                     }
                 }
                 if let Some(current) = state.as_mut() {
