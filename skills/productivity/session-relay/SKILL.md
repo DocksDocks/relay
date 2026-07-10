@@ -6,7 +6,7 @@ allowed-tools: Bash, Read
 metadata:
   pattern: tool-wrapper
   updated: "2026-07-10"
-  content_hash: "f95592003b701044c7a118eee0368a937da974008b54a43873dc0c7af3f0c7f2"
+  content_hash: "8bfcdb58fd4d6e1cffdd795936b376b41686a1d0ca02fde264dd7ed49cfa3f3d"
 ---
 
 # Session relay
@@ -30,7 +30,7 @@ Relay children and doorbell wakes run unattended and can reprocess full transcri
 | Piece | What it does | Where |
 |---|---|---|
 | Bus MCP server | `whoami` / `register` / `roster` / `send` / `inbox` / `discover` tools over the shared store | namespaced `mcp__plugin_session-relay_bus__*` |
-| Shared store | registry (`id → dir + name + tool`) + one JSONL inbox per recipient | `~/.agent-relay/` (override: `AGENT_RELAY_HOME`) |
+| Shared store | registry, JSONL inboxes, liveness locks, watcher offsets, and bounded spawn logs | `~/.agent-relay/` (override: `AGENT_RELAY_HOME`) |
 | SessionStart hook | auto-registers each session (Claude **or** Codex) and injects pending mail on start/resume; on Claude it also nudges the agent to arm `relay watch --follow <id>` as its Monitor | runs automatically |
 | UserPromptSubmit hook | drains pending mail into context on every user turn (both tools) — a live session sees mail without being woken | runs automatically |
 | Live discovery | `discover` scans the raw Claude + Codex session stores → sessions running now, even ones that never joined the bus | `discover` tool / `bin/relay discover` |
@@ -44,6 +44,10 @@ Delivery matrix — how mail reaches a recipient in each state:
 | idle | doorbell (`relay wake`) | doorbell (`relay wake`) |
 | live watcher (`recipient_watch: live`) | `relay watch --follow` Monitor / next prompt | `relay watch` + app-server / next prompt |
 | watcher `dead` / `never` / `unknown` | mail stays queued; sender sees degraded status and may use `relay wake` | same — durable queue, explicit degraded status |
+
+## Store hygiene
+
+`relay hook` and `relay bus` opportunistically sweep the shared store at most once every 6 hours. A session is removed only when its registry activity and every mailbox/marker/watcher/lock/spawn-log surface are all older than 14 days and neither watcher nor resume lock is held; the invoking session is never collected. Set `AGENT_RELAY_GC_DAYS` to another non-negative day count, or `0` to disable GC. Spawn stderr keeps flowing through a bounded pump that retains the newest diagnostic tail at approximately 4 MiB per log.
 
 ## Token discipline
 
@@ -224,7 +228,9 @@ birth a real, resumable session there instead:
 - Continue the conversation with `send worker1` + `relay wake worker1` — the id is
   durable and resumable; the process being one-shot is expected.
 - On birth timeout, the error names the child's stderr log
-  (`~/.agent-relay/spawn-logs/<id>.stderr`) — read it before retrying.
+  (`~/.agent-relay/spawn-logs/<id>.stderr`) — read it before retrying. Each log
+  keeps only its newest approximately 4 MiB, so copy it before another long run
+  if the earliest output matters.
 - **Billing:** every spawned child is a full agent session on your subscription
   (Claude OAuth / ChatGPT login) — heavier than a wake; spawn deliberately, never
   in loops.
