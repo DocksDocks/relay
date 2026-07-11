@@ -25,9 +25,8 @@ use std::os::unix::process::CommandExt;
 use tinyjson::JsonValue;
 
 pub(crate) const DEFAULT_NUDGE: &str = "You have new session-relay mail. Use the session-relay skill: call inbox to read your pending messages and act on them.";
-const BOOL_FLAGS: [&str; 9] = [
+const BOOL_FLAGS: [&str; 8] = [
     "dry",
-    "exec",
     "json",
     "auto-turn",
     "once",

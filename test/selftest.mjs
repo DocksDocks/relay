@@ -166,6 +166,12 @@ check('inbox() returns then clears pending messages', () => {
   assert.equal(box.messages[0].body, 'second message');
   assert.equal(peek('agent-B').count, 0);
 });
+check('non-attach verbs still treat --exec as a value flag', () => {
+  const r = relay(['send', 'agent-B', '--exec', 'must-not-send']);
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /usage: relay send/);
+  assert.equal(peek('agent-B').count, 0);
+});
 
 // --- unknown recipient is a tool error, not a crash ---
 const res3 = runBus(dirA, [
