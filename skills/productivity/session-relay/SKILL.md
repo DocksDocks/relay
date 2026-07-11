@@ -6,7 +6,7 @@ allowed-tools: Bash, Read
 metadata:
   pattern: tool-wrapper
   updated: "2026-07-10"
-  content_hash: "0dd77b176effb01b55b9689069662ab7567dbcc515e6f427c39d449148063ac8"
+  content_hash: "9b7d3c3930897fc077acce9d597b381fcf2430def7f4b3d0b2d32a3e7b3e5e18"
 ---
 
 # Session relay
@@ -195,6 +195,29 @@ codex --remote unix://$HOME/.codex-app.sock              # optional: attach the 
 <plugin>/bin/relay register <name> --id <uuid> --tool codex --server $HOME/.codex-app.sock
 <plugin>/bin/relay spawn <project> --tool codex --server $HOME/.codex-app.sock --name worker --reply-to <me> -- "<task>"
 ```
+
+For the full human-visible spawn-and-co-drive flow, keep the server in its own
+terminal and run these in order:
+
+```bash
+# terminal 1: one server owns the rollout
+codex app-server --listen unix://$HOME/.codex-app.sock
+
+# terminal 2: birth the relay worker on that server, then join its thread
+<plugin>/bin/relay spawn <project> --tool codex --server $HOME/.codex-app.sock \
+  --model gpt-5.6-sol --effort xhigh --name worker --reply-to <me> -- "<task>"
+<plugin>/bin/relay attach worker --exec   # choose worker's thread in the remote TUI picker
+
+# terminal 3: after the TUI is attached
+<plugin>/bin/relay send worker --from <me> -- "<follow-up>"
+<plugin>/bin/relay wake worker
+```
+
+The attached TUI shows the neutral acknowledgement user row and the worker's
+normal responding turn live. It deliberately does not show the raw fenced mail
+row: that item is durable model context but the TUI ignores injected raw items.
+This is shared-thread co-driving, not transcript copying; do not also run
+`codex exec resume` for that worker.
 
 Socket precedence is per-session registry `server` first, then the invocation's
 `--server`, then the store-wide `RELAY_APP_SERVER` fallback. A SessionStart hook
