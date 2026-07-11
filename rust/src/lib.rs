@@ -4,6 +4,7 @@ pub mod channel;
 pub mod cli;
 pub mod discover;
 pub mod hook;
+pub mod lifecycle;
 pub(crate) mod sha256;
 pub mod spawn;
 pub mod store;
