@@ -1,5 +1,6 @@
 // relay — session-relay's single binary. One executable, multi-call:
 //   relay bus                      MCP stdio server (manifest entry)
+//   relay channel                  EXPERIMENTAL one-way Claude channel MCP server
 //   relay hook [codex] [--event prompt]   SessionStart/UserPromptSubmit hook (register + drain inbox)
 //   relay discover|list|register|send|inbox|peek|attach|wake|doctor   CLI / attach / doorbell / health
 //   relay watch …                  poll mailboxes, push into live Codex threads via app-server
@@ -14,6 +15,7 @@ fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     match argv.first().map(String::as_str) {
         Some("bus") => relay::bus::run(),
+        Some("channel") => relay::channel::run(),
         Some("hook") => relay::hook::run(&argv[1..]),
         Some(
             cmd @ ("discover" | "list" | "register" | "send" | "inbox" | "peek" | "attach" | "wake"
@@ -52,7 +54,7 @@ fn main() {
             }
         }
         _ => die(
-            "usage: relay bus | hook [codex] [--event prompt] | discover [--within min] [--tool t] | list | register <name> --id <uuid> [--dir <path>] [--server <sock>] | send <to> [--] <msg> | inbox <who> | peek <who> | attach <who> [--exec] | wake <who> [--model m] [--effort e] [msg] | doctor [--id <session>] | watch <who>...|--all [--server <sock>] [--auto-turn] [--once] | spawn <dir> [--tool t] [--model m] [--effort e] [--name n] [--server <sock>] [--watch] [--] <task>",
+            "usage: relay bus | channel | hook [codex] [--event prompt] | discover [--within min] [--tool t] | list | register <name> --id <uuid> [--dir <path>] [--server <sock>] | send <to> [--] <msg> | inbox <who> | peek <who> | attach <who> [--exec] | wake <who> [--model m] [--effort e] [msg] | doctor [--id <session>] | watch <who>...|--all [--server <sock>] [--auto-turn] [--once] | spawn <dir> [--tool t] [--model m] [--effort e] [--name n] [--server <sock>] [--watch] [--] <task>",
         ),
     }
 }

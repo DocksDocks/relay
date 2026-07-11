@@ -221,7 +221,15 @@ fn inner(tool: &str, event: HookEvent, input: &str) -> Result<(), String> {
     }
     store::set_marker(&dir, &id)?;
     store::register(&id, Some(&dir), None, Some(tool), None)?;
-    let msgs = store::drain(&id)?;
+    // An opted-in EXPERIMENTAL channel owns new prompt-time delivery while its
+    // kernel flock is held. On crash/SIGKILL the OS releases that lock and the
+    // next prompt automatically resumes the normal hook drain. SessionStart
+    // still wins startup mail before a channel finishes initializing.
+    let msgs = if event == HookEvent::Prompt && store::live_watcher_mode(&id, "channel") {
+        Vec::new()
+    } else {
+        store::drain(&id)?
+    };
     let no_watch = std::env::var("RELAY_NO_WATCH").as_deref() == Ok("1");
     let relay_exe = std::env::current_exe()
         .map(|p| p.to_string_lossy().into_owned())

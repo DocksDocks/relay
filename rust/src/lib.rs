@@ -1,5 +1,6 @@
 pub(crate) mod appserver;
 pub mod bus;
+pub mod channel;
 pub mod cli;
 pub mod discover;
 pub mod hook;

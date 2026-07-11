@@ -317,6 +317,14 @@ pub fn watcher_status(id: &str) -> LockStatus {
     lock_status(&watcher_lock_path(id))
 }
 
+/// True only while a kernel-held watcher lock advertises the requested mode.
+/// A holder dying between the two probes can cause one conservative false
+/// positive (mail stays queued for the next hook), never a wrong drain.
+pub fn live_watcher_mode(id: &str, mode: &str) -> bool {
+    watcher_status(id) == LockStatus::Live
+        && read_lock_metadata(&watcher_lock_path(id)).is_some_and(|metadata| metadata.mode == mode)
+}
+
 pub fn resume_status(id: &str) -> LockStatus {
     lock_status(&resume_lock_path(id))
 }

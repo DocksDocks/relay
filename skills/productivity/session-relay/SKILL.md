@@ -1,12 +1,12 @@
 ---
 name: session-relay
-description: "Use when one agent must reach, get a reply from, or hand a human the interactive chat for an agent in ANOTHER session, project, or tool (Claude Code ⇄ Codex): discover the session, send over the shared bus, wake it with a tool-aware doorbell, or print/exec the guarded `relay attach` takeover command. Not for in-session subagents/Task (same session only), Agent Teams' intra-team mailbox (can't span sessions), or Channels push (single session)."
+description: "Use when one agent must reach, get a reply from, or hand a human the interactive chat for an agent in ANOTHER session, project, or tool (Claude Code ⇄ Codex): discover, send over the shared bus, wake, attach, or opt into EXPERIMENTAL Claude channel push. Not for in-session subagents/Task (same session only) or Agent Teams' intra-team mailbox (can't span sessions)."
 user-invocable: true
 allowed-tools: Bash, Read
 metadata:
   pattern: tool-wrapper
-  updated: "2026-07-10"
-  content_hash: "9b7d3c3930897fc077acce9d597b381fcf2430def7f4b3d0b2d32a3e7b3e5e18"
+  updated: "2026-07-11"
+  content_hash: "2bc37507a3f77834b9314a39b9912ab679181b3419f2e87b21270f7307658817"
 ---
 
 # Session relay
@@ -181,6 +181,52 @@ Both tools share **one** store and registry; every entry carries a `tool` field 
 - **Codex registers itself** via the session-relay Codex plugin's SessionStart hook (same `{session_id, cwd, source}` contract as Claude). No manual step.
 - **Codex doorbell:** `codex exec resume <id> -m <model> -c model_reasoning_effort=<effort> --json -- "<nudge>"`. The id is the Codex thread id (it surfaces in the `thread.started` event and the rollout filename) and equals the hook's `session_id`. Unlike Claude, `codex exec resume` is **not** cwd-scoped.
 - **Install on Codex:** add the `session-relay` plugin from the Codex marketplace (ships the skill + the SessionStart hook). For the bus tools inside Codex, rely on the plugin's MCP wiring or run `codex mcp add bus -- <plugin>/bin/relay bus`. A Codex agent can also send with no MCP at all: `<plugin>/bin/relay send <to> "<msg>"`.
+
+## EXPERIMENTAL live push into an open Claude session (`relay channel`)
+
+Claude Code channels are a version-sensitive research preview (v2.1.80+;
+verified here on v2.1.207). The flag is intentionally opt-in and may be hidden
+from `claude --help`. This v1 uses Anthropic's manual `server:` development seam
+because session-relay is not on the curated plugin-channel allowlist:
+
+```bash
+# One-time: use the absolute launcher path from the installed plugin.
+claude mcp add --transport stdio --scope user session-relay-channel -- \
+  <plugin>/bin/relay channel
+
+# Start the open session that should receive relay mail live.
+claude --dangerously-load-development-channels server:session-relay-channel
+```
+
+The development flag bypasses only the research-preview channel allowlist. It
+does **not** bypass tool permissions or the organization-wide `channelsEnabled`
+policy. Check that policy before diagnosing a silent channel:
+
+- Pro and Max users outside an organization need no enablement step.
+- claude.ai Team/Enterprise requires an Owner to enable **Admin settings →
+  Claude Code → Channels**, or deploy managed `{ "channelsEnabled": true }`.
+- Anthropic Console API authentication permits channels by default unless the
+  organization deploys managed settings; then that managed key is required.
+- `channelsEnabled` is managed-only, not a user/project setting. File delivery
+  uses `/etc/claude-code/managed-settings.json` on Linux/WSL,
+  `/Library/Application Support/ClaudeCode/managed-settings.json` on macOS, or
+  `C:\Program Files\ClaudeCode\managed-settings.json` on Windows. The admin
+  console is the preferred organization-wide path.
+
+The channel binds only to Claude's exact `CLAUDE_CODE_SESSION_ID`, waits at most
+five seconds for that UUID's hook registration, and fails closed on a missing,
+unregistered, wrong-tool, or wrong-directory identity. It never uses the shared
+cwd marker. While live it holds the session's watcher flock, so
+UserPromptSubmit cannot steal the same mailbox; a crash or `SIGKILL` releases
+the lock and the normal hook resumes delivery automatically.
+
+Each mail record becomes one ordered `notifications/claude/channel` event. Its
+content reuses the same sentinel-defused **UNTRUSTED DATA** fence as hooks and
+Codex live delivery. The channel is deliberately one-way: no tools, reply tool,
+or permission-relay capability. Reply through the separate `bus` MCP server.
+Channel notifications have no acknowledgement, so delivery is at-most-once to
+the stdio transport, not proof that Claude processed the event. Events arrive
+only while the opted-in session remains open.
 
 ## Zero-keystroke push into a live Codex thread (`relay watch`)
 
