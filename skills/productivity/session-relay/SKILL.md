@@ -6,7 +6,7 @@ allowed-tools: Bash, Read
 metadata:
   pattern: tool-wrapper
   updated: "2026-07-10"
-  content_hash: "67abeb656422f64c1525908059df5d5b5584bf65570f81b25769356e6f8fe9bb"
+  content_hash: "39884481aeba44b9d822849a34c547626ef75d1d5528299722b950ca960c22af"
 ---
 
 # Session relay
@@ -199,21 +199,45 @@ Socket precedence is per-session registry `server` first, then the invocation's
 `--server`, then the store-wide `RELAY_APP_SERVER` fallback. A SessionStart hook
 refresh preserves the registered socket. `relay spawn --server <socket>` records
 the socket on the born entry; app-server-native spawning lands in a later step.
-With no configured socket, watch uses the existing tool-aware doorbell. At this
-stage a configured but unreachable socket fails the push and re-enqueues mail;
-the live-view delivery step adds the unreachable-server doorbell fallback.
+With no configured socket, or when the configured socket cannot complete a
+WebSocket initialize handshake, watch/wake use the existing locked tool-aware
+doorbell. A reachable app-server always owns Codex delivery; even an explicit
+custom wake message uses the app-server path rather than starting a second
+`codex exec resume` writer. An empty-mailbox wake is a no-op only when that
+app-server is reachable; the no-server fallback keeps the legacy standalone
+doorbell behavior.
 
 - **Default mode** injects the fenced mail into the thread's history
   (`thread/inject_items`) — it persists durably and surfaces at the thread's next
-  turn; an attached TUI shows it live. No turn is started, so it costs nothing.
-- **`--auto-turn`** additionally starts a turn carrying the neutral doorbell nudge
-  (never mail content), `approvalPolicy: never`. Watch stays attached until the
-  turn completes because MCP tool calls elicit approval from the connected client
-  regardless of that policy: it accepts elicitations for the relay's own `bus`
-  server only (store-local tools) and declines every other server.
-- Claude sessions and Codex entries with no configured server use the `relay
-  wake` doorbell. Mail is re-enqueued if a configured push fails mid-flight.
-  `--once` does a single poll+deliver+exit (cron/tests).
+  turn. Raw injected items are model-visible but do **not** render as an attached
+  TUI chat row. No turn is started, so it costs nothing.
+- **`--auto-turn` and app-server `wake`** add a best-effort visible response:
+  read `thread/read` first; an `active` thread is left untouched. After an idle
+  read, inject the fenced payload, settle, re-read immediately before
+  `turn/start`, and start only if still idle. The turn input is a neutral
+  acknowledgement and never copies mail. The worker's normal reply is the row
+  the attached TUI displays.
+- **This check is not atomic.** Codex app-server has no start-if-idle operation.
+  A simultaneous human `turn/start` can land after relay's second idle read and
+  produce two concurrent turns with interleaved output. The checks shrink that
+  window; they do not provide an absolute no-competing-turn guarantee.
+- **Inject is the delivery boundary.** Before a successful inject, failures
+  re-enqueue drained mail. After inject succeeds, the mailbox drain is final even
+  if the acknowledgement turn is busy or fails. Long-running watch remembers a
+  pending acknowledgement in memory and retries only that neutral turn on later
+  idle ticks; it never re-injects. `--once` succeeds once inject succeeds. Wake is
+  one-shot: first-read busy exits 3 without draining; second-read busy exits 3
+  after delivery with a distinct deferred message. Re-wake then sees an empty
+  mailbox and is a clean no-op.
+- **Accepted degradation:** if a thread stays busy forever, or watch dies while
+  an acknowledgement is pending, no visible relay-initiated turn fires. The mail
+  remains durable in model context and surfaces on the thread's next turn.
+- Watch stays attached to a started turn because MCP calls elicit approval from
+  the connected client regardless of `approvalPolicy: never`. Joined/foreign
+  threads decline every elicitation, including `bus`; only relay-spawned threads
+  may accept their own bus server once the registry origin marker is present.
+- Claude sessions and Codex entries without a reachable server use the locked
+  `relay wake` doorbell. `--once` does a single poll+deliver+exit (cron/tests).
 - Each long-running target holds `~/.agent-relay/watchers/<id>.lock`; `--all`
   skips targets already watched, while an explicit duplicate target fails.
   `--once` leaves a persistent tombstone that reads `dead` after it exits.

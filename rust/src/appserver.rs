@@ -15,10 +15,10 @@
 //     call raises an `mcpServer/elicitation/request` server->client REQUEST
 //     that MUST be answered (`{action: "accept"|"decline"}`) or the turn wedges
 //     on `waitingOnApproval` forever. After `turn/start`, the client stays
-//     attached until `turn/completed`, accepting elicitations for the relay's
-//     own `bus` server and declining every other server.
+//     attached until `turn/completed`, accepting the relay's own `bus` server
+//     only when the registry proves the relay spawned the thread; joined or
+//     foreign threads decline every elicitation.
 
-use crate::cli::DEFAULT_NUDGE;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
@@ -27,6 +27,25 @@ use tinyjson::JsonValue;
 
 const DEFAULT_TURN_WAIT_MS: u64 = 300_000;
 const RPC_TIMEOUT_SECS: u64 = 20;
+pub(crate) const ACK_NUDGE: &str = "New session-relay mail was added to this thread's context. Acknowledge receipt and respond appropriately.";
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ThreadState {
+    Idle,
+    Active,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum DeliveryOutcome {
+    Delivered,
+    AckDeferred,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum DeliveryError {
+    BeforeInject(String),
+    AfterInject(String),
+}
 
 fn die(msg: &str) -> ! {
     eprintln!("{msg}");
@@ -39,34 +58,61 @@ pub(crate) fn deliver(
     block: &str,
     auto_turn: bool,
     settle_ms: u64,
-) -> Result<(), String> {
-    let mut ws = connect_initialized(server, "session-relay-watch", "session-relay watch")?;
+    allow_bus: bool,
+) -> Result<DeliveryOutcome, DeliveryError> {
+    let mut ws = connect_initialized(server, "session-relay", "session-relay delivery")
+        .map_err(DeliveryError::BeforeInject)?;
+    ws.request(
+        1,
+        "thread/resume",
+        sobj(vec![("threadId", JsonValue::from(thread_id.to_string()))]),
+    )
+    .map_err(DeliveryError::BeforeInject)?;
+    ws.request(2, "thread/inject_items", inject_params(thread_id, block))
+        .map_err(DeliveryError::BeforeInject)?;
+    if auto_turn {
+        std::thread::sleep(Duration::from_millis(settle_ms));
+        match read_status(&mut ws, 3, thread_id).map_err(DeliveryError::AfterInject)? {
+            ThreadState::Active => return Ok(DeliveryOutcome::AckDeferred),
+            ThreadState::Idle => {
+                start_ack_turn(&mut ws, 4, thread_id, allow_bus)
+                    .map_err(DeliveryError::AfterInject)?;
+            }
+        }
+    }
+    Ok(DeliveryOutcome::Delivered)
+}
+
+pub(crate) fn probe(server: &str) -> Result<(), String> {
+    connect_initialized(server, "session-relay-doctor", "session-relay doctor").map(|_| ())
+}
+
+pub(crate) fn thread_state(server: &str, thread_id: &str) -> Result<ThreadState, String> {
+    let mut ws = connect_initialized(server, "session-relay", "session-relay status")?;
     ws.request(
         1,
         "thread/resume",
         sobj(vec![("threadId", JsonValue::from(thread_id.to_string()))]),
     )?;
-    ws.request(2, "thread/inject_items", inject_params(thread_id, block))?;
-    if auto_turn {
-        std::thread::sleep(Duration::from_millis(settle_ms));
-        ws.request(3, "turn/start", turn_params(thread_id))?;
-        // Stay attached: MCP tool calls elicit approval from the CONNECTED
-        // client no matter the approvalPolicy; detaching here wedges the turn.
-        let wait_ms: u64 = std::env::var("RELAY_TURN_WAIT_MS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(DEFAULT_TURN_WAIT_MS);
-        if !ws.pump_turn(wait_ms)? {
-            eprintln!(
-                "[relay watch] turn on {thread_id} still running after {wait_ms}ms — detaching (a later MCP call may wedge it)"
-            );
-        }
-    }
-    Ok(())
+    read_status(&mut ws, 2, thread_id)
 }
 
-pub(crate) fn probe(server: &str) -> Result<(), String> {
-    connect_initialized(server, "session-relay-doctor", "session-relay doctor").map(|_| ())
+pub(crate) fn acknowledge(
+    server: &str,
+    thread_id: &str,
+    allow_bus: bool,
+) -> Result<DeliveryOutcome, String> {
+    let mut ws = connect_initialized(server, "session-relay", "session-relay acknowledgement")?;
+    ws.request(
+        1,
+        "thread/resume",
+        sobj(vec![("threadId", JsonValue::from(thread_id.to_string()))]),
+    )?;
+    if read_status(&mut ws, 2, thread_id)? == ThreadState::Active {
+        return Ok(DeliveryOutcome::AckDeferred);
+    }
+    start_ack_turn(&mut ws, 3, thread_id, allow_bus)?;
+    Ok(DeliveryOutcome::Delivered)
 }
 
 fn connect_initialized(server: &str, name: &str, title: &str) -> Result<WsConn, String> {
@@ -90,15 +136,61 @@ fn connect_initialized(server: &str, name: &str, title: &str) -> Result<WsConn, 
     Ok(ws)
 }
 
-// Approve only the relay's own bus server (whoami/register/roster/send/inbox/
-// discover — store-local, no shell, no file access); everything else is
-// declined so the turn fails that call cleanly instead of wedging.
-fn elicitation_action(server_name: &str) -> &'static str {
-    if server_name == "bus" {
+// The relay's own bus server is store-local (no shell or file tools), but it is
+// accepted only for relay-spawned threads. Joined/foreign threads decline all
+// elicitations so the connected client cannot grant authority it does not own.
+fn elicitation_action(server_name: &str, allow_bus: bool) -> &'static str {
+    if allow_bus && server_name == "bus" {
         "accept"
     } else {
         "decline"
     }
+}
+
+fn read_status(ws: &mut WsConn, id: u64, thread_id: &str) -> Result<ThreadState, String> {
+    let result = ws.request(
+        id,
+        "thread/read",
+        sobj(vec![("threadId", JsonValue::from(thread_id.to_string()))]),
+    )?;
+    let status_type = result
+        .get::<HashMap<String, JsonValue>>()
+        .and_then(|result| result.get("thread"))
+        .and_then(|thread| thread.get::<HashMap<String, JsonValue>>())
+        .and_then(|thread| thread.get("status"))
+        .and_then(|status| status.get::<HashMap<String, JsonValue>>())
+        .and_then(|status| status.get("type"))
+        .and_then(|kind| kind.get::<String>())
+        .map(String::as_str)
+        .ok_or_else(|| "thread/read response missing thread.status.type".to_string())?;
+    match status_type {
+        "idle" => Ok(ThreadState::Idle),
+        "active" => Ok(ThreadState::Active),
+        other => Err(format!(
+            "thread is not ready for relay delivery (status {other})"
+        )),
+    }
+}
+
+fn start_ack_turn(
+    ws: &mut WsConn,
+    id: u64,
+    thread_id: &str,
+    allow_bus: bool,
+) -> Result<(), String> {
+    ws.request(id, "turn/start", turn_params(thread_id))?;
+    // Stay attached: MCP tool calls elicit approval from the CONNECTED client
+    // no matter the approvalPolicy; detaching here can wedge the turn.
+    let wait_ms: u64 = std::env::var("RELAY_TURN_WAIT_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_TURN_WAIT_MS);
+    if !ws.pump_turn(wait_ms, allow_bus)? {
+        eprintln!(
+            "[relay] turn on {thread_id} still running after {wait_ms}ms — detaching (a later MCP call may wedge it)"
+        );
+    }
+    Ok(())
 }
 
 // ---- JSON-RPC param builders (pure — unit-tested shapes) ----
@@ -138,7 +230,7 @@ fn turn_params(thread_id: &str) -> JsonValue {
             "input",
             JsonValue::from(vec![sobj(vec![
                 ("type", JsonValue::from("text".to_string())),
-                ("text", JsonValue::from(DEFAULT_NUDGE.to_string())),
+                ("text", JsonValue::from(ACK_NUDGE.to_string())),
             ])]),
         ),
         ("approvalPolicy", JsonValue::from("never".to_string())),
@@ -394,7 +486,7 @@ impl WsConn {
     // turn/failed seen; Ok(false) = still running at the deadline. Server->
     // client `mcpServer/elicitation/request`s are answered per
     // `elicitation_action`; other server requests are left alone.
-    fn pump_turn(&mut self, ms: u64) -> Result<bool, String> {
+    fn pump_turn(&mut self, ms: u64, allow_bus: bool) -> Result<bool, String> {
         let deadline = Instant::now() + Duration::from_millis(ms);
         loop {
             if Instant::now() > deadline {
@@ -422,7 +514,7 @@ impl WsConn {
                         .and_then(|p| p.get("serverName"))
                         .and_then(|s| s.get::<String>().cloned())
                         .unwrap_or_default();
-                    let action = elicitation_action(&server_name);
+                    let action = elicitation_action(&server_name, allow_bus);
                     let msg = sobj(vec![
                         ("id", req_id),
                         (
@@ -464,10 +556,11 @@ mod tests {
     }
 
     #[test]
-    fn elicitations_accept_only_the_relay_bus_server() {
-        assert_eq!(elicitation_action("bus"), "accept");
-        assert_eq!(elicitation_action("codex_apps"), "decline");
-        assert_eq!(elicitation_action(""), "decline");
+    fn elicitations_accept_the_relay_bus_only_for_relay_owned_threads() {
+        assert_eq!(elicitation_action("bus", true), "accept");
+        assert_eq!(elicitation_action("bus", false), "decline");
+        assert_eq!(elicitation_action("codex_apps", true), "decline");
+        assert_eq!(elicitation_action("", true), "decline");
     }
 
     #[test]
@@ -525,7 +618,8 @@ mod tests {
             .get::<String>()
             .cloned()
             .unwrap();
-        assert_eq!(text, DEFAULT_NUDGE);
+        assert_eq!(text, ACK_NUDGE);
+        assert!(!text.to_ascii_lowercase().contains("call inbox"));
         assert!(!text.contains("session-relay-mail"));
     }
 }

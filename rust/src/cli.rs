@@ -26,6 +26,7 @@ use std::os::unix::process::CommandExt;
 use tinyjson::JsonValue;
 
 pub(crate) const DEFAULT_NUDGE: &str = "You have new session-relay mail. Use the session-relay skill: call inbox to read your pending messages and act on them.";
+const DEFAULT_TURN_SETTLE_MS: u64 = 5000;
 const BOOL_FLAGS: [&str; 8] = [
     "dry",
     "json",
@@ -622,6 +623,13 @@ fn doorbell_args(
     (wake_cmd(tool), cargs)
 }
 
+fn custom_wake_message(body: &str) -> JsonValue {
+    let mut msg: HashMap<String, JsonValue> = HashMap::new();
+    msg.insert("fromName".into(), JsonValue::from("relay wake".to_string()));
+    msg.insert("body".into(), JsonValue::from(body.to_string()));
+    JsonValue::from(msg)
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct WakeUsage {
     input_tokens: u64,
@@ -912,7 +920,7 @@ pub fn run(cmd: &str, raw: Vec<String>) -> ! {
         "wake" => {
             let explicit = explicit_target(&args);
             let rest = args.positionals(1);
-            let message = {
+            let custom_message = {
                 let m = args.message_after_sep().unwrap_or_else(|| {
                     if explicit.is_some() {
                         rest.join(" ")
@@ -920,12 +928,11 @@ pub fn run(cmd: &str, raw: Vec<String>) -> ! {
                         rest.iter().skip(1).copied().collect::<Vec<_>>().join(" ")
                     }
                 });
-                if m.is_empty() {
-                    DEFAULT_NUDGE.to_string()
-                } else {
-                    m
-                }
+                (!m.is_empty()).then_some(m)
             };
+            let message = custom_message
+                .clone()
+                .unwrap_or_else(|| DEFAULT_NUDGE.to_string());
             let target = explicit.or_else(|| {
                 rest.first()
                     .and_then(|who| store::resolve(who))
@@ -948,6 +955,68 @@ pub fn run(cmd: &str, raw: Vec<String>) -> ! {
                     "refusing to wake: target id is not a session UUID: {}",
                     target.id
                 ));
+            }
+            let server = target.server.clone().or_else(|| {
+                std::env::var("RELAY_APP_SERVER")
+                    .ok()
+                    .filter(|value| !value.is_empty())
+            });
+            if target.tool == "codex"
+                && !args.has("dry")
+                && server
+                    .as_deref()
+                    .is_some_and(|configured| appserver::probe(configured).is_ok())
+            {
+                let server = server.as_deref().unwrap();
+                if !store::mailbox_has_content(&target.id) && custom_message.is_none() {
+                    std::process::exit(0);
+                }
+                match appserver::thread_state(server, &target.id) {
+                    Ok(appserver::ThreadState::Active) => {
+                        eprintln!("wake refused: thread busy — nothing sent");
+                        std::process::exit(3);
+                    }
+                    Ok(appserver::ThreadState::Idle) => {}
+                    Err(e) => die(&format!("cannot read app-server thread status: {e}")),
+                }
+
+                let drained = store::drain(&target.id).unwrap_or_else(|e| die(&e));
+                let mut payload = drained.clone();
+                if let Some(custom) = custom_message.as_deref() {
+                    payload.push(custom_wake_message(custom));
+                }
+                if payload.is_empty() {
+                    std::process::exit(0);
+                }
+                let block = hook::mail_block(&payload, &target.id);
+                let settle_ms = std::env::var("RELAY_TURN_SETTLE_MS")
+                    .ok()
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(DEFAULT_TURN_SETTLE_MS);
+                match appserver::deliver(server, &target.id, &block, true, settle_ms, false) {
+                    Ok(appserver::DeliveryOutcome::Delivered) => std::process::exit(0),
+                    Ok(appserver::DeliveryOutcome::AckDeferred) => {
+                        eprintln!(
+                            "mail delivered to thread context; visible turn deferred — thread busy"
+                        );
+                        std::process::exit(3);
+                    }
+                    Err(appserver::DeliveryError::BeforeInject(e)) => {
+                        for message in &drained {
+                            if let Some(object) = message.get::<HashMap<String, JsonValue>>() {
+                                let _ = store::enqueue(&target.id, object);
+                            }
+                        }
+                        die(&format!(
+                            "app-server inject failed ({e}); queued mailbox mail re-enqueued"
+                        ));
+                    }
+                    Err(appserver::DeliveryError::AfterInject(e)) => {
+                        die(&format!(
+                            "mail delivered to thread context; visible acknowledgement failed: {e}"
+                        ));
+                    }
+                }
             }
             // Per-tool headless-resume doorbell, run from the target's project
             // dir. The untrusted message goes AFTER a `--` end-of-options

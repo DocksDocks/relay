@@ -23,10 +23,11 @@
 //     turn continues.
 // Delivery: default = inject_items with the UNTRUSTED-DATA fence (mail waits
 // for the thread's next turn); --auto-turn additionally starts a turn carrying
-// the neutral doorbell nudge (never mail content — the guardian refuses
-// actions instructed by untrusted mail). Targets that are not app-server
-// reachable fall back to the wake doorbell. Mail safety: messages are drained
-// atomically and re-enqueued if delivery fails.
+// a neutral acknowledgement (never mail content). Status is checked before
+// inject and again before turn/start. This shrinks, but cannot close, the
+// cross-client race with a simultaneous human turn/start. Targets that are not
+// app-server reachable fall back to the wake doorbell. A successful inject is
+// final: only a failure before inject succeeds may re-enqueue mail.
 
 use crate::appserver;
 use crate::cli::Args;
@@ -104,6 +105,12 @@ enum WakeOutcome {
     Delivered,
     Refused,
     Failed,
+}
+
+enum PushOutcome {
+    Delivered,
+    Busy,
+    AckDeferred(Option<String>),
 }
 
 // Reachability: only a codex session hosted under an app-server can take a
@@ -231,21 +238,69 @@ pub fn run(raw: Vec<String>) -> ! {
     // re-ring the doorbell every poll tick while that is in flight.
     let mut woken: HashSet<String> = HashSet::new();
     let mut wake_retries: HashMap<String, WakeRetry> = HashMap::new();
+    let mut pending_ack: HashSet<String> = HashSet::new();
     let mut had_error = false;
     loop {
         for t in &active_targets {
             if let Err(e) = store::update_watcher_progress(&t.id) {
                 eprintln!("[relay watch] progress update for {} failed: {e}", t.id);
             }
+            if pending_ack.contains(&t.id) {
+                let Some(server) = t.server.as_deref() else {
+                    eprintln!(
+                        "[relay watch] pending acknowledgement for {} has no app-server",
+                        t.id
+                    );
+                    continue;
+                };
+                if appserver::probe(server).is_err() {
+                    continue;
+                }
+                match appserver::acknowledge(server, &t.id, false) {
+                    Ok(appserver::DeliveryOutcome::Delivered) => {
+                        pending_ack.remove(&t.id);
+                    }
+                    Ok(appserver::DeliveryOutcome::AckDeferred) => continue,
+                    Err(e) => {
+                        eprintln!("[relay watch] acknowledgement for {} deferred: {e}", t.id);
+                        continue;
+                    }
+                }
+            }
             if !store::mailbox_has_content(&t.id) {
                 woken.remove(&t.id);
                 wake_retries.remove(&t.id);
                 continue;
             }
-            match decide(&t.tool, t.server.as_deref()) {
+            let configured_mode = decide(&t.tool, t.server.as_deref());
+            let mode = if configured_mode == Mode::Push
+                && !dry
+                && appserver::probe(t.server.as_deref().unwrap()).is_err()
+            {
+                Mode::Wake
+            } else {
+                configured_mode
+            };
+            match mode {
                 Mode::Push => {
                     match push_target(t.server.as_deref().unwrap(), t, auto_turn, dry, settle_ms) {
-                        Ok(_) => {}
+                        Ok(PushOutcome::Delivered) => {}
+                        Ok(PushOutcome::AckDeferred(reason)) => {
+                            if let Some(reason) = reason {
+                                eprintln!(
+                                    "[relay watch] mail delivered to {}; visible acknowledgement deferred: {reason}",
+                                    t.id
+                                );
+                            }
+                            if !once {
+                                pending_ack.insert(t.id.clone());
+                            }
+                        }
+                        Ok(PushOutcome::Busy) => {
+                            if once {
+                                had_error = true;
+                            }
+                        }
                         Err(e) => {
                             eprintln!("[relay watch] {e}");
                             had_error = true;
@@ -495,7 +550,7 @@ fn push_target(
     auto_turn: bool,
     dry: bool,
     settle_ms: u64,
-) -> Result<usize, String> {
+) -> Result<PushOutcome, String> {
     if dry {
         println!(
             "{}",
@@ -505,15 +560,20 @@ fn push_target(
                 ("server", server),
             ])
         );
-        return Ok(0);
+        return Ok(PushOutcome::Delivered);
+    }
+    match appserver::thread_state(server, &t.id) {
+        Ok(appserver::ThreadState::Active) => return Ok(PushOutcome::Busy),
+        Ok(appserver::ThreadState::Idle) => {}
+        Err(e) => return Err(format!("cannot read thread status for {}: {e}", t.id)),
     }
     let msgs = store::drain(&t.id)?;
     if msgs.is_empty() {
-        return Ok(0);
+        return Ok(PushOutcome::Delivered);
     }
     let block = hook::mail_block(&msgs, &t.id);
-    match appserver::deliver(server, &t.id, &block, auto_turn, settle_ms) {
-        Ok(()) => {
+    match appserver::deliver(server, &t.id, &block, auto_turn, settle_ms, false) {
+        Ok(outcome) => {
             println!(
                 "{}",
                 str_obj(&[
@@ -522,9 +582,12 @@ fn push_target(
                     ("mode", if auto_turn { "auto-turn" } else { "inject" }),
                 ])
             );
-            Ok(msgs.len())
+            match outcome {
+                appserver::DeliveryOutcome::Delivered => Ok(PushOutcome::Delivered),
+                appserver::DeliveryOutcome::AckDeferred => Ok(PushOutcome::AckDeferred(None)),
+            }
         }
-        Err(e) => {
+        Err(appserver::DeliveryError::BeforeInject(e)) => {
             for m in &msgs {
                 if let Some(mo) = m.get::<HashMap<String, JsonValue>>() {
                     let _ = store::enqueue(&t.id, mo);
@@ -532,6 +595,7 @@ fn push_target(
             }
             Err(format!("push to {} failed ({e}); mail re-enqueued", t.id))
         }
+        Err(appserver::DeliveryError::AfterInject(e)) => Ok(PushOutcome::AckDeferred(Some(e))),
     }
 }
 

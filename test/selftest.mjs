@@ -46,7 +46,7 @@ const HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'session-relay-test-'));
 // (proves SESSION_RELAY_HOME still works), host discovery/store vars scrubbed.
 function envFor(extra = {}) {
   const env = { ...process.env };
-  for (const k of ['AGENT_RELAY_HOME', 'AGENT_RELAY_GC_DAYS', 'RELAY_CLAUDE_PROJECTS', 'RELAY_CODEX_SESSIONS', 'CLAUDE_CONFIG_DIR', 'CODEX_HOME', 'RELAY_NO_WATCH', 'RELAY_APP_SERVER', 'RELAY_TURN_SETTLE_MS', 'RELAY_TURN_WAIT_MS', 'RELAY_SPAWN_CMD_CLAUDE', 'RELAY_SPAWN_CMD_CODEX', 'RELAY_WAKE_CMD_CLAUDE', 'RELAY_WAKE_CMD_CODEX', 'RELAY_SPAWN_TOOL', 'STUB_RELAY_BIN', 'STUB_TOOL', 'STUB_DELAY_MS', 'STUB_EXIT', 'STUB_SKIP_HOOK', 'STUB_STDERR_BYTES', 'WAKE_STUB_DELAY_MS', 'ATTACH_STUB_OUTPUT']) delete env[k];
+  for (const k of ['AGENT_RELAY_HOME', 'AGENT_RELAY_GC_DAYS', 'RELAY_CLAUDE_PROJECTS', 'RELAY_CODEX_SESSIONS', 'CLAUDE_CONFIG_DIR', 'CODEX_HOME', 'RELAY_NO_WATCH', 'RELAY_APP_SERVER', 'RELAY_TURN_SETTLE_MS', 'RELAY_TURN_WAIT_MS', 'RELAY_SPAWN_CMD_CLAUDE', 'RELAY_SPAWN_CMD_CODEX', 'RELAY_WAKE_CMD_CLAUDE', 'RELAY_WAKE_CMD_CODEX', 'RELAY_SPAWN_TOOL', 'STUB_RELAY_BIN', 'STUB_TOOL', 'STUB_DELAY_MS', 'STUB_EXIT', 'STUB_SKIP_HOOK', 'STUB_STDERR_BYTES', 'WAKE_STUB_DELAY_MS', 'WAKE_STUB_RECORD', 'ATTACH_STUB_OUTPUT']) delete env[k];
   return { ...env, SESSION_RELAY_HOME: HOME, ...extra };
 }
 const relay = (args, opts = {}) => spawnSync(BIN, args, { encoding: 'utf8', input: opts.input, cwd: opts.cwd, env: envFor(opts.env) });
@@ -350,6 +350,7 @@ check('attach fails closed when the resume lock cannot be probed', () => {
 const wakeStub = path.join(HOME, 'fake-wake');
 fs.writeFileSync(wakeStub, `#!/usr/bin/env node
 const fs = require('node:fs');
+if (process.env.WAKE_STUB_RECORD) fs.writeFileSync(process.env.WAKE_STUB_RECORD, JSON.stringify(process.argv.slice(2)));
 const file = process.env.WAKE_STUB_FILE;
 if (file) process.stdout.write(fs.readFileSync(file));
 else process.stdout.write(process.env.WAKE_STUB_STDOUT || '');
@@ -728,6 +729,20 @@ const spawnToFiles = (args, env, stem) => {
   fs.closeSync(stderr);
   return { child, stdoutPath, stderrPath };
 };
+const startFakeAppServer = (stem, statuses = ['idle']) => {
+  const serverSock = path.join(HOME, `${stem}.sock`);
+  const serverFrames = path.join(HOME, `${stem}.jsonl`);
+  const controlFile = path.join(HOME, `${stem}-control.json`);
+  fs.writeFileSync(serverFrames, '');
+  fs.writeFileSync(controlFile, JSON.stringify({ statuses }));
+  const child = spawn(process.execPath, [path.join(HERE, 'fake-app-server.mjs'), serverSock, serverFrames, controlFile], { stdio: 'ignore' });
+  waitFor(() => fs.existsSync(serverSock), `${stem} fake app-server socket`);
+  return {
+    child,
+    sock: serverSock,
+    frames: () => fs.readFileSync(serverFrames, 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line)),
+  };
+};
 for (let i = 0; i < 150 && !fs.existsSync(sock); i += 1) sleep(20);
 assert.ok(fs.existsSync(sock), 'fake app-server came up');
 const idW = '55555555-5555-5555-5555-555555555555';
@@ -758,7 +773,7 @@ check('watch prefers the registered server over the RELAY_APP_SERVER fallback', 
   assert.ok(!fr.some((f) => f.method === 'turn/start'), 'no turn without --auto-turn');
   assert.equal(peek('codex-W').count, 0, 'mailbox drained after a successful push');
 });
-check('watch --auto-turn starts a turn with the neutral nudge, answers the bus elicitation, stays until turn end', () => {
+check('watch --auto-turn checks idle twice, starts with the neutral nudge, and declines bus elicitation for a joined thread', () => {
   fs.writeFileSync(framesFile, '');
   assert.equal(relay(['send', 'codex-W', '--', 'second push']).status, 0);
   const r = relay(['watch', 'codex-W', '--once', '--auto-turn'], { env: { RELAY_TURN_SETTLE_MS: '50', RELAY_TURN_WAIT_MS: '8000' } });
@@ -770,9 +785,114 @@ check('watch --auto-turn starts a turn with the neutral nudge, answers the bus e
   assert.ok(/session-relay mail/i.test(turn.params.input[0].text), 'turn carries the neutral doorbell nudge');
   assert.ok(!turn.params.input[0].text.includes('second push'), 'mail content never rides in the turn input');
   assert.ok(fr.findIndex((f) => f.method === 'thread/inject_items') < fr.indexOf(turn), 'inject precedes the turn');
+  assert.ok(fr.filter((f) => f.method === 'thread/read').length >= 2, 'status is checked before inject and immediately before turn/start');
   const answer = fr.find((f) => f.id === 990 && f.result);
   assert.ok(answer, 'watch answered the mcpServer/elicitation/request (a detached client wedges the turn)');
-  assert.equal(answer.result.action, 'accept', 'the relay bus server is accepted');
+  assert.equal(answer.result.action, 'decline', 'joined/foreign threads decline even the relay bus server');
+});
+check('wake prefers a reachable registered app-server and an empty retry is a clean no-op', () => {
+  fs.writeFileSync(framesFile, '');
+  const wakeRecord = path.join(HOME, 'appserver-wake-fallback-record.json');
+  assert.equal(relay(['send', 'codex-W', '--', 'wake push']).status, 0);
+  const r = relay(['wake', 'codex-W'], {
+    env: { RELAY_WAKE_CMD_CODEX: wakeStub, WAKE_STUB_RECORD: wakeRecord, RELAY_TURN_SETTLE_MS: '20', RELAY_TURN_WAIT_MS: '8000' },
+  });
+  assert.equal(r.status, 0, `wake exited ${r.status}: ${r.stderr}`);
+  const first = readFrames();
+  assert.equal(first.filter((f) => f.method === 'thread/read').length, 2, 'wake checks status before inject and before turn/start');
+  assert.equal(first.filter((f) => f.method === 'thread/inject_items').length, 1, 'wake injects the drained mailbox once');
+  assert.equal(first.filter((f) => f.method === 'turn/start').length, 1, 'wake fires one visible acknowledgement turn');
+  assert.equal(peek('codex-W').count, 0, 'mailbox drain is final after inject');
+  assert.equal(fs.existsSync(wakeRecord), false, 'codex exec resume fallback was not spawned');
+
+  const again = relay(['wake', 'codex-W'], {
+    env: { RELAY_WAKE_CMD_CODEX: wakeStub, WAKE_STUB_RECORD: wakeRecord, RELAY_TURN_SETTLE_MS: '20' },
+  });
+  assert.equal(again.status, 0, `empty retry exited ${again.status}: ${again.stderr}`);
+  assert.equal(readFrames().filter((f) => f.method === 'thread/inject_items').length, 1, 'empty retry never re-injects');
+  assert.equal(fs.existsSync(wakeRecord), false, 'empty retry remains an app-server no-op');
+
+  const custom = relay(['wake', 'codex-W', '--', 'custom app-server nudge'], {
+    env: { RELAY_WAKE_CMD_CODEX: wakeStub, WAKE_STUB_RECORD: wakeRecord, RELAY_TURN_SETTLE_MS: '20', RELAY_TURN_WAIT_MS: '8000' },
+  });
+  assert.equal(custom.status, 0, `custom app-server wake exited ${custom.status}: ${custom.stderr}`);
+  const afterCustom = readFrames();
+  assert.equal(afterCustom.filter((f) => f.method === 'thread/inject_items').length, 2, 'custom text is injected as a new app-server payload');
+  const customInject = afterCustom.filter((f) => f.method === 'thread/inject_items').at(-1);
+  assert.match(customInject.params.items[0].content[0].text, /<session-relay-mail>/);
+  assert.match(customInject.params.items[0].content[0].text, /custom app-server nudge/);
+  assert.equal(afterCustom.filter((f) => f.method === 'turn/start').length, 2, 'custom text receives the same visible acknowledgement turn');
+  assert.equal(fs.existsSync(wakeRecord), false, 'custom text never downgrades an app-server-owned thread to codex exec resume');
+});
+check('wake leaves mail untouched and exits 3 when the first status read is active', () => {
+  const fake = startFakeAppServer('wake-busy-first', ['active']);
+  const id = '58585858-5858-4858-8858-585858585858';
+  try {
+    assert.equal(relay(['register', 'codex-busy-first', '--id', id, '--dir', dirW, '--tool', 'codex', '--server', fake.sock]).status, 0);
+    assert.equal(relay(['send', 'codex-busy-first', '--', 'busy first']).status, 0);
+    const r = relay(['wake', 'codex-busy-first'], { env: { RELAY_TURN_SETTLE_MS: '10' } });
+    assert.equal(r.status, 3, `busy wake exited ${r.status}: ${r.stderr}`);
+    assert.match(`${r.stdout}\n${r.stderr}`, /thread busy.*nothing sent/i);
+    assert.equal(peek('codex-busy-first').count, 1, 'mailbox is untouched');
+    assert.equal(fake.frames().some((f) => f.method === 'thread/inject_items'), false, 'nothing was injected');
+    relayJSON(['inbox', 'codex-busy-first']);
+  } finally {
+    fake.child.kill('SIGKILL');
+  }
+});
+check('wake drains exactly once but exits 3 with distinct wording when the second status read is active', () => {
+  const fake = startFakeAppServer('wake-busy-second', ['idle', 'active']);
+  const id = '59595959-5959-4959-8959-595959595959';
+  try {
+    assert.equal(relay(['register', 'codex-busy-second', '--id', id, '--dir', dirW, '--tool', 'codex', '--server', fake.sock]).status, 0);
+    assert.equal(relay(['send', 'codex-busy-second', '--', 'busy second']).status, 0);
+    const r = relay(['wake', 'codex-busy-second'], { env: { RELAY_TURN_SETTLE_MS: '10' } });
+    assert.equal(r.status, 3, `deferred wake exited ${r.status}: ${r.stderr}`);
+    assert.match(`${r.stdout}\n${r.stderr}`, /mail delivered to thread context; visible turn deferred — thread busy/);
+    assert.equal(peek('codex-busy-second').count, 0, 'successful inject makes the mailbox drain final');
+    assert.equal(fake.frames().filter((f) => f.method === 'thread/inject_items').length, 1, 'mail was injected once');
+    assert.equal(fake.frames().some((f) => f.method === 'turn/start'), false, 'busy second read defers the acknowledgement');
+
+    const again = relay(['wake', 'codex-busy-second'], { env: { RELAY_TURN_SETTLE_MS: '10' } });
+    assert.equal(again.status, 0, `empty retry exited ${again.status}: ${again.stderr}`);
+    assert.equal(fake.frames().filter((f) => f.method === 'thread/inject_items').length, 1, 'empty retry is idempotent');
+  } finally {
+    fake.child.kill('SIGKILL');
+  }
+});
+check('watch --once succeeds after inject when the second status read defers the acknowledgement', () => {
+  const fake = startFakeAppServer('watch-once-deferred', ['idle', 'active']);
+  const id = '60606060-6060-4060-8060-606060606060';
+  try {
+    assert.equal(relay(['register', 'codex-once-deferred', '--id', id, '--dir', dirW, '--tool', 'codex', '--server', fake.sock]).status, 0);
+    assert.equal(relay(['send', 'codex-once-deferred', '--', 'once deferred']).status, 0);
+    const r = relay(['watch', 'codex-once-deferred', '--once', '--auto-turn'], { env: { RELAY_TURN_SETTLE_MS: '10' } });
+    assert.equal(r.status, 0, `deferred --once exited ${r.status}: ${r.stderr}`);
+    assert.equal(peek('codex-once-deferred').count, 0, 'mail stays drained after successful inject');
+    assert.equal(fake.frames().filter((f) => f.method === 'thread/inject_items').length, 1);
+    assert.equal(fake.frames().some((f) => f.method === 'turn/start'), false);
+  } finally {
+    fake.child.kill('SIGKILL');
+  }
+});
+check('watch retries only a pending acknowledgement after post-inject contention clears', () => {
+  const fake = startFakeAppServer('watch-pending-ack', ['idle', 'active', 'idle']);
+  const id = '61616161-6161-4161-8161-616161616161';
+  let watched;
+  try {
+    assert.equal(relay(['register', 'codex-pending-ack', '--id', id, '--dir', dirW, '--tool', 'codex', '--server', fake.sock]).status, 0);
+    assert.equal(relay(['send', 'codex-pending-ack', '--', 'pending ack']).status, 0);
+    watched = spawnToFiles(['watch', 'codex-pending-ack', '--auto-turn'], { RELAY_TURN_SETTLE_MS: '10', RELAY_TURN_WAIT_MS: '8000' }, 'watch-pending-ack');
+    waitFor(() => fake.frames().some((f) => f.method === 'turn/start'), 'pending acknowledgement retry', 7000);
+    const fr = fake.frames();
+    assert.ok(fr.filter((f) => f.method === 'thread/read').length >= 3, 'pending acknowledgement rechecks status on a later tick');
+    assert.equal(fr.filter((f) => f.method === 'thread/inject_items').length, 1, 'pending acknowledgement never re-injects mail');
+    assert.equal(fr.filter((f) => f.method === 'turn/start').length, 1, 'pending acknowledgement fires once');
+    assert.equal(peek('codex-pending-ack').count, 0);
+  } finally {
+    watched?.child.kill('SIGKILL');
+    fake.child.kill('SIGKILL');
+  }
 });
 check('watch uses RELAY_APP_SERVER when a registry entry has no server', () => {
   const id = '56565656-5656-4656-8656-565656565656';
@@ -805,14 +925,29 @@ check('watch routes a claude target to the wake doorbell fallback (--dry)', () =
   assert.equal(line.tool, 'claude');
   relayJSON(['inbox', 'agent-A']); // drain: dry mode never touches the mailbox
 });
-check('watch re-enqueues mail when the app-server is unreachable (--once exits 1)', () => {
+check('watch falls back to the locked codex doorbell when the configured app-server is unreachable', () => {
   const id = '57575757-5757-4757-8757-575757575757';
   relay(['register', 'codex-unreachable', '--id', id, '--dir', dirW, '--tool', 'codex']);
   assert.equal(relay(['send', 'codex-unreachable', '--', 'must survive']).status, 0);
-  const r = relay(['watch', 'codex-unreachable', '--server', path.join(HOME, 'no-such.sock'), '--once']);
-  assert.notEqual(r.status, 0, 'unreachable server is a failure in --once mode');
-  assert.equal(peek('codex-unreachable').count, 1, 'mail re-enqueued after the failed push');
+  const wakeRecord = path.join(HOME, 'unreachable-fallback-record.json');
+  const r = relay(['watch', 'codex-unreachable', '--server', path.join(HOME, 'no-such.sock'), '--once'], {
+    env: { RELAY_WAKE_CMD_CODEX: wakeStub, WAKE_STUB_RECORD: wakeRecord },
+  });
+  assert.equal(r.status, 0, `unreachable server fallback exited ${r.status}: ${r.stderr}`);
+  assert.ok(fs.existsSync(wakeRecord), 'codex exec resume doorbell fallback ran');
+  assert.equal(peek('codex-unreachable').count, 1, 'the fake doorbell has no SessionStart hook, so its mailbox remains queued');
   assert.equal(relayJSON(['inbox', 'codex-unreachable']).messages[0].body, 'must survive');
+});
+check('wake preserves a custom message through codex exec resume when the registered app-server is unreachable', () => {
+  const id = '62626262-6262-4262-8262-626262626262';
+  const noServer = path.join(HOME, 'custom-no-such.sock');
+  const wakeRecord = path.join(HOME, 'custom-unreachable-record.json');
+  assert.equal(relay(['register', 'codex-custom-unreachable', '--id', id, '--dir', dirW, '--tool', 'codex', '--server', noServer]).status, 0);
+  const r = relay(['wake', 'codex-custom-unreachable', '--', 'custom fallback nudge'], {
+    env: { RELAY_WAKE_CMD_CODEX: wakeStub, WAKE_STUB_RECORD: wakeRecord },
+  });
+  assert.equal(r.status, 0, `custom fallback exited ${r.status}: ${r.stderr}`);
+  assert.deepEqual(JSON.parse(fs.readFileSync(wakeRecord, 'utf8')).at(-1), 'custom fallback nudge');
 });
 fakeSrv.kill();
 

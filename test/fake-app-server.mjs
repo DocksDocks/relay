@@ -4,22 +4,31 @@
 // speaks WS on every socket listener — spike-verified 2026-07-02 on codex-cli
 // 0.142.5) that records every client JSON-RPC message to a JSONL file and
 // answers just enough of the protocol for `relay watch` to complete a delivery:
-//   initialize → result; thread/resume → thread stub; thread/inject_items → {};
+//   initialize → result; thread/resume → thread stub; thread/read → configured
+//   status (idle by default); thread/inject_items → {};
 //   turn/start → turn stub + turn/started, then an mcpServer/elicitation/request
 //   for the bus server (MCP tool calls elicit approval from the connected
 //   client regardless of approvalPolicy — live-verified); turn/completed is
 //   emitted only after the client answers, mirroring the real wedge.
-// Usage: node fake-app-server.mjs <socket-path> <frames-out.jsonl>
+// Usage: node fake-app-server.mjs <socket-path> <frames-out.jsonl> [control.json]
+// control.json: { "statuses": ["idle", "active", ...],
+//                 "elicitationServer": "bus" }
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import net from 'node:net';
 
-const [sock, framesFile] = process.argv.slice(2);
+const [sock, framesFile, controlFile] = process.argv.slice(2);
 if (!sock || !framesFile) {
-  console.error('usage: fake-app-server.mjs <socket-path> <frames-out.jsonl>');
+  console.error('usage: fake-app-server.mjs <socket-path> <frames-out.jsonl> [control.json]');
   process.exit(1);
 }
 fs.rmSync(sock, { force: true });
+const control = controlFile ? JSON.parse(fs.readFileSync(controlFile, 'utf8')) : {};
+const statuses = Array.isArray(control.statuses) && control.statuses.length > 0
+  ? control.statuses
+  : ['idle'];
+const elicitationServer = control.elicitationServer ?? 'bus';
+let statusIndex = 0;
 
 const encodeText = (s) => {
   const p = Buffer.from(s, 'utf8');
@@ -81,11 +90,18 @@ const server = net.createServer((c) => {
       switch (msg.method) {
         case 'initialize': reply({ userAgent: 'fake-app-server/1.0' }); break;
         case 'thread/resume': reply({ thread: { id: msg.params?.threadId ?? null } }); break;
+        case 'thread/read': {
+          const type = statuses[Math.min(statusIndex, statuses.length - 1)];
+          statusIndex += 1;
+          const status = type === 'active' ? { type, activeFlags: [] } : { type };
+          reply({ thread: { id: msg.params?.threadId ?? null, status, turns: [] } });
+          break;
+        }
         case 'thread/inject_items': reply({}); break;
         case 'turn/start':
           reply({ turn: { id: 'turn-1', status: 'inProgress' } });
           c.write(encodeText(JSON.stringify({ method: 'turn/started', params: { turnId: 'turn-1', threadId: msg.params?.threadId ?? null } })));
-          c.write(encodeText(JSON.stringify({ id: 990, method: 'mcpServer/elicitation/request', params: { threadId: msg.params?.threadId ?? null, turnId: 'turn-1', serverName: 'bus', mode: 'form', _meta: { codex_approval_kind: 'mcp_tool_call' } } })));
+          c.write(encodeText(JSON.stringify({ id: 990, method: 'mcpServer/elicitation/request', params: { threadId: msg.params?.threadId ?? null, turnId: 'turn-1', serverName: elicitationServer, mode: 'form', _meta: { codex_approval_kind: 'mcp_tool_call' } } })));
           break;
         default: reply({});
       }
