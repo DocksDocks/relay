@@ -6,7 +6,7 @@ allowed-tools: Bash, Read
 metadata:
   pattern: tool-wrapper
   updated: "2026-07-11"
-  content_hash: "2bc37507a3f77834b9314a39b9912ab679181b3419f2e87b21270f7307658817"
+  content_hash: "df08a9bee008c439b3dabc0730d7d9c7e2667bd3619c04e0583ce0cc4fb30c43"
 ---
 
 # Session relay
@@ -182,7 +182,9 @@ Both tools share **one** store and registry; every entry carries a `tool` field 
 - **Codex doorbell:** `codex exec resume <id> -m <model> -c model_reasoning_effort=<effort> --json -- "<nudge>"`. The id is the Codex thread id (it surfaces in the `thread.started` event and the rollout filename) and equals the hook's `session_id`. Unlike Claude, `codex exec resume` is **not** cwd-scoped.
 - **Install on Codex:** add the `session-relay` plugin from the Codex marketplace (ships the skill + the SessionStart hook). For the bus tools inside Codex, rely on the plugin's MCP wiring or run `codex mcp add bus -- <plugin>/bin/relay bus`. A Codex agent can also send with no MCP at all: `<plugin>/bin/relay send <to> "<msg>"`.
 
-## EXPERIMENTAL live push into an open Claude session (`relay channel`)
+## Live view
+
+### EXPERIMENTAL live push into an open Claude session (`relay channel`)
 
 Claude Code channels are a version-sensitive research preview (v2.1.80+;
 verified here on v2.1.207). The flag is intentionally opt-in and may be hidden
@@ -228,7 +230,7 @@ Channel notifications have no acknowledgement, so delivery is at-most-once to
 the stdio transport, not proof that Claude processed the event. Events arrive
 only while the opted-in session remains open.
 
-## Zero-keystroke push into a live Codex thread (`relay watch`)
+### Zero-keystroke push into a live Codex thread (`relay watch`)
 
 The plain Codex TUI cannot be injected into; `codex app-server` is the
 maintainer-endorsed automation seam. Host (or attach) the target thread under an
@@ -264,6 +266,12 @@ normal responding turn live. It deliberately does not show the raw fenced mail
 row: that item is durable model context but the TUI ignores injected raw items.
 This is shared-thread co-driving, not transcript copying; do not also run
 `codex exec resume` for that worker.
+
+The raw Unix socket has no relay bearer-auth layer: filesystem access to the
+socket is the authentication boundary. Keep the socket and its parent directory
+user-only, never place it in a shared-writable directory, and do not proxy or
+forward it to an untrusted host. The untrusted-mail fence remains mandatory even
+on a private socket because other relay sessions still control mail content.
 
 Socket precedence is per-session registry `server` first, then the invocation's
 `--server`, then the store-wide `RELAY_APP_SERVER` fallback. A SessionStart hook
