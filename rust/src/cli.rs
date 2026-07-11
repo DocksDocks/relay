@@ -92,6 +92,7 @@ struct Target {
     name: Option<String>,
     last_seen: String,
     server: Option<String>,
+    allow_bus: bool,
 }
 
 // A target built straight from flags — addresses a discovered session that was
@@ -113,10 +114,12 @@ fn explicit_target(args: &Args) -> Option<Target> {
         name: None,
         last_seen: "unregistered".to_string(),
         server: None,
+        allow_bus: false,
     })
 }
 
 fn from_entry(e: store::Entry) -> Target {
+    let allow_bus = e.spawned_via.as_deref() == Some("app-server");
     Target {
         id: e.id,
         dir: e.dir,
@@ -124,6 +127,7 @@ fn from_entry(e: store::Entry) -> Target {
         name: e.name,
         last_seen: e.last_seen,
         server: e.server,
+        allow_bus,
     }
 }
 
@@ -257,6 +261,7 @@ fn discovered_target(id: &str) -> Option<Target> {
             name: string("name"),
             last_seen: string("lastActivity").unwrap_or_else(|| "unknown".to_string()),
             server: None,
+            allow_bus: false,
         })
     })
 }
@@ -993,7 +998,14 @@ pub fn run(cmd: &str, raw: Vec<String>) -> ! {
                     .ok()
                     .and_then(|value| value.parse().ok())
                     .unwrap_or(DEFAULT_TURN_SETTLE_MS);
-                match appserver::deliver(server, &target.id, &block, true, settle_ms, false) {
+                match appserver::deliver(
+                    server,
+                    &target.id,
+                    &block,
+                    true,
+                    settle_ms,
+                    target.allow_bus,
+                ) {
                     Ok(appserver::DeliveryOutcome::Delivered) => std::process::exit(0),
                     Ok(appserver::DeliveryOutcome::AckDeferred) => {
                         eprintln!(

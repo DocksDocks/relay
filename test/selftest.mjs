@@ -46,7 +46,7 @@ const HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'session-relay-test-'));
 // (proves SESSION_RELAY_HOME still works), host discovery/store vars scrubbed.
 function envFor(extra = {}) {
   const env = { ...process.env };
-  for (const k of ['AGENT_RELAY_HOME', 'AGENT_RELAY_GC_DAYS', 'RELAY_CLAUDE_PROJECTS', 'RELAY_CODEX_SESSIONS', 'CLAUDE_CONFIG_DIR', 'CODEX_HOME', 'RELAY_NO_WATCH', 'RELAY_APP_SERVER', 'RELAY_TURN_SETTLE_MS', 'RELAY_TURN_WAIT_MS', 'RELAY_SPAWN_CMD_CLAUDE', 'RELAY_SPAWN_CMD_CODEX', 'RELAY_WAKE_CMD_CLAUDE', 'RELAY_WAKE_CMD_CODEX', 'RELAY_SPAWN_TOOL', 'STUB_RELAY_BIN', 'STUB_TOOL', 'STUB_DELAY_MS', 'STUB_EXIT', 'STUB_SKIP_HOOK', 'STUB_STDERR_BYTES', 'WAKE_STUB_DELAY_MS', 'WAKE_STUB_RECORD', 'ATTACH_STUB_OUTPUT']) delete env[k];
+  for (const k of ['AGENT_RELAY_HOME', 'AGENT_RELAY_GC_DAYS', 'RELAY_CLAUDE_PROJECTS', 'RELAY_CODEX_SESSIONS', 'CLAUDE_CONFIG_DIR', 'CODEX_HOME', 'RELAY_NO_WATCH', 'RELAY_APP_SERVER', 'RELAY_TURN_SETTLE_MS', 'RELAY_TURN_WAIT_MS', 'RELAY_SPAWN_CMD_CLAUDE', 'RELAY_SPAWN_CMD_CODEX', 'RELAY_WAKE_CMD_CLAUDE', 'RELAY_WAKE_CMD_CODEX', 'RELAY_SPAWN_TOOL', 'STUB_RELAY_BIN', 'STUB_TOOL', 'STUB_RECORD', 'STUB_DELAY_MS', 'STUB_EXIT', 'STUB_SKIP_HOOK', 'STUB_STDERR_BYTES', 'WAKE_STUB_DELAY_MS', 'WAKE_STUB_RECORD', 'ATTACH_STUB_OUTPUT']) delete env[k];
   return { ...env, SESSION_RELAY_HOME: HOME, ...extra };
 }
 const relay = (args, opts = {}) => spawnSync(BIN, args, { encoding: 'utf8', input: opts.input, cwd: opts.cwd, env: envFor(opts.env) });
@@ -729,12 +729,13 @@ const spawnToFiles = (args, env, stem) => {
   fs.closeSync(stderr);
   return { child, stdoutPath, stderrPath };
 };
-const startFakeAppServer = (stem, statuses = ['idle']) => {
+const startFakeAppServer = (stem, settings = ['idle']) => {
   const serverSock = path.join(HOME, `${stem}.sock`);
   const serverFrames = path.join(HOME, `${stem}.jsonl`);
   const controlFile = path.join(HOME, `${stem}-control.json`);
   fs.writeFileSync(serverFrames, '');
-  fs.writeFileSync(controlFile, JSON.stringify({ statuses }));
+  const control = Array.isArray(settings) ? { statuses: settings } : settings;
+  fs.writeFileSync(controlFile, JSON.stringify(control));
   const child = spawn(process.execPath, [path.join(HERE, 'fake-app-server.mjs'), serverSock, serverFrames, controlFile], { stdio: 'ignore' });
   waitFor(() => fs.existsSync(serverSock), `${stem} fake app-server socket`);
   return {
@@ -1241,6 +1242,7 @@ const stub = path.join(HOME, 'fake-child');
 fs.writeFileSync(stub, `#!/usr/bin/env node
 const { spawnSync } = require('node:child_process');
 const fs = require('node:fs');
+if (process.env.STUB_RECORD) fs.writeFileSync(process.env.STUB_RECORD, JSON.stringify(process.argv.slice(2)));
 const i = process.argv.indexOf('--session-id');
 const id = i >= 0 ? process.argv[i + 1] : require('node:crypto').randomUUID();
 const evt = JSON.stringify({ session_id: id, cwd: process.cwd(), hook_event_name: 'SessionStart', source: 'startup' });
@@ -1324,18 +1326,125 @@ check('spawn births a claude child via the pre-mint path and registers its name'
   assert.equal(relay(['send', 'w1', '--', 'hello worker']).status, 0);
   assert.equal(peek('w1').count, 1, 'named worker is a routable bus target');
 });
-check('spawn births a codex child via the marker-watch path (no pre-set id flag)', () => {
+check('app-server spawn returns before turn completion while its detached pump later accepts bus elicitation', () => {
   const dirS = path.join(HOME, 'proj-s2');
+  const id = '71717171-7171-4171-8171-717171717171';
+  const fake = startFakeAppServer('spawn-appserver-async', {
+    threadId: id,
+    elicitationDelayMs: 1500,
+    completionDelayMs: 100,
+  });
+  const childRecord = path.join(HOME, 'spawn-appserver-child-record.json');
   fs.mkdirSync(dirS, { recursive: true });
-  const spawnServer = path.join(HOME, 'spawn-app.sock');
-  const r = relay(['spawn', dirS, '--tool', 'codex', '--name', 'w2', '--server', spawnServer, '--reply-to', 'agent-A', '--timeout', '5', '--', 'task two'],
-    { env: { RELAY_SPAWN_CMD_CODEX: stub, STUB_RELAY_BIN: BIN, STUB_TOOL: 'codex' } });
-  assert.equal(r.status, 0, `spawn exited ${r.status}: ${r.stderr}`);
-  const dry = relayJSON(['wake', 'w2', '--dry']);
-  assert.equal(dry.tool, 'codex', 'marker-watch birth registered the codex tool');
-  assert.equal(dry.cwd, dirS);
-  const registry = JSON.parse(fs.readFileSync(path.join(HOME, 'registry.json'), 'utf8'));
-  assert.equal(registry.agents[registry.names.w2].server, spawnServer, 'spawn persists its configured server after birth');
+  try {
+    const started = Date.now();
+    const r = relay(['spawn', dirS, '--tool', 'codex', '--model', 'gpt-5.6-sol', '--effort', 'xhigh', '--name', 'w2', '--server', fake.sock, '--reply-to', 'agent-A', '--timeout', '5', '--', 'task two'], {
+      env: { RELAY_SPAWN_CMD_CODEX: stub, STUB_RECORD: childRecord },
+    });
+    const elapsedMs = Date.now() - started;
+    assert.equal(r.status, 0, `spawn exited ${r.status}: ${r.stderr}`);
+    assert.ok(elapsedMs < 1000, `foreground returned before delayed elicitation/completion (${elapsedMs}ms)`);
+    assert.match(r.stdout, new RegExp(`^spawned w2 \\(${id}\\)`));
+    assert.equal(fs.existsSync(childRecord), false, 'reachable app-server spawn never launches codex exec');
+
+    const initial = fake.frames();
+    const threadStart = initial.find((frame) => frame.method === 'thread/start');
+    assert.equal(threadStart.params.cwd, fs.realpathSync(dirS));
+    assert.equal(threadStart.params.model, 'gpt-5.6-sol');
+    assert.equal(threadStart.params.sandbox, 'workspace-write');
+    assert.equal(threadStart.params.approvalPolicy, 'never');
+    const turnStart = initial.find((frame) => frame.method === 'turn/start');
+    assert.equal(turnStart.params.threadId, id);
+    assert.equal(turnStart.params.model, 'gpt-5.6-sol');
+    assert.equal(turnStart.params.effort, 'xhigh');
+    const prompt = turnStart.params.input[0].text;
+    assert.match(prompt, /separate git branch/);
+    assert.match(prompt, /Never modify live\/production systems/);
+    assert.match(prompt, new RegExp(`send "agent-A" --from ${id} --`));
+    assert.ok(prompt.trimEnd().endsWith('task two'));
+
+    let registry = JSON.parse(fs.readFileSync(path.join(HOME, 'registry.json'), 'utf8'));
+    assert.equal(registry.names.w2, id);
+    assert.equal(registry.agents[id].server, fake.sock);
+    assert.equal(registry.agents[id].spawned_via, 'app-server', 'origin is registered before the first turn');
+
+    waitFor(
+      () => fake.frames().some((frame) => frame.id === 990 && frame.result?.action === 'accept'),
+      'detached pump bus elicitation response after foreground exit',
+      4000,
+    );
+    waitFor(() => fake.frames().some((frame) => frame.event === 'connection/closed'), 'detached pump completion close');
+
+    assert.equal(relay(['hook', 'codex'], { input: JSON.stringify({ session_id: id, cwd: dirS, source: 'resume' }) }).status, 0);
+    registry = JSON.parse(fs.readFileSync(path.join(HOME, 'registry.json'), 'utf8'));
+    assert.equal(registry.agents[id].spawned_via, 'app-server', 'hook refresh preserves relay ownership');
+  } finally {
+    fake.child.kill('SIGKILL');
+  }
+});
+check('app-server spawn surfaces thread/start failure synchronously without a detached pump', () => {
+  const dirS = path.join(HOME, 'proj-spawn-thread-start-fail');
+  const fake = startFakeAppServer('spawn-thread-start-fail', { threadStartError: 'thread birth rejected' });
+  fs.mkdirSync(dirS, { recursive: true });
+  try {
+    const r = relay(['spawn', dirS, '--tool', 'codex', '--name', 'thread-start-fail', '--server', fake.sock, '--reply-to', 'agent-A', '--timeout', '2', '--', 'never starts']);
+    assert.notEqual(r.status, 0);
+    assert.match(r.stderr, /thread birth rejected/);
+    assert.equal(fake.frames().some((frame) => frame.method === 'turn/start'), false);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(HOME, 'registry.json'), 'utf8')).names['thread-start-fail'], undefined);
+    waitFor(() => fake.frames().some((frame) => frame.event === 'connection/closed'), 'failed thread/start connection close');
+  } finally {
+    fake.child.kill('SIGKILL');
+  }
+});
+check('app-server spawn surfaces initial turn/start failure synchronously without detaching', () => {
+  const dirS = path.join(HOME, 'proj-spawn-turn-start-fail');
+  const id = '72727272-7272-4272-8272-727272727272';
+  const fake = startFakeAppServer('spawn-turn-start-fail', { threadId: id, turnStartError: 'initial turn rejected' });
+  fs.mkdirSync(dirS, { recursive: true });
+  try {
+    const r = relay(['spawn', dirS, '--tool', 'codex', '--name', 'turn-start-fail', '--server', fake.sock, '--reply-to', 'agent-A', '--timeout', '2', '--', 'never runs']);
+    assert.notEqual(r.status, 0);
+    assert.match(r.stderr, /initial turn rejected/);
+    assert.equal(fake.frames().filter((frame) => frame.method === 'turn/start').length, 1);
+    assert.equal(fake.frames().some((frame) => frame.id === 990 && frame.result), false, 'no detached elicitation pump exists');
+    waitFor(() => fake.frames().some((frame) => frame.event === 'connection/closed'), 'failed turn/start connection close');
+  } finally {
+    fake.child.kill('SIGKILL');
+  }
+});
+check('app-server spawn --watch blocks until the detached pump reports turn completion', () => {
+  const dirS = path.join(HOME, 'proj-spawn-appserver-watch');
+  const id = '73737373-7373-4373-8373-737373737373';
+  const fake = startFakeAppServer('spawn-appserver-watch', { threadId: id, completionDelayMs: 600 });
+  fs.mkdirSync(dirS, { recursive: true });
+  try {
+    const started = Date.now();
+    const r = relay(['spawn', dirS, '--tool', 'codex', '--name', 'appserver-watch', '--server', fake.sock, '--reply-to', 'agent-A', '--timeout', '3', '--watch', '--', 'wait for me']);
+    const elapsedMs = Date.now() - started;
+    assert.equal(r.status, 0, `app-server --watch exited ${r.status}: ${r.stderr}`);
+    assert.ok(elapsedMs >= 550, `--watch waited for delayed completion (${elapsedMs}ms)`);
+    assert.match(r.stdout, /^spawned appserver-watch; first turn complete; /);
+  } finally {
+    fake.child.kill('SIGKILL');
+  }
+});
+check('app-server spawn pump exits and closes its connection at the spawn timeout', () => {
+  const dirS = path.join(HOME, 'proj-spawn-appserver-timeout');
+  const id = '74747474-7474-4474-8474-747474747474';
+  const fake = startFakeAppServer('spawn-appserver-timeout', { threadId: id, neverComplete: true });
+  fs.mkdirSync(dirS, { recursive: true });
+  try {
+    const started = Date.now();
+    const r = relay(['spawn', dirS, '--tool', 'codex', '--name', 'appserver-timeout', '--server', fake.sock, '--reply-to', 'agent-A', '--timeout', '1', '--watch', '--', 'time out']);
+    const elapsedMs = Date.now() - started;
+    assert.notEqual(r.status, 0, 'timed-out pump is not a successful watched turn');
+    assert.ok(elapsedMs >= 900 && elapsedMs < 3000, `pump honored the one-second cap (${elapsedMs}ms)`);
+    assert.match(r.stdout, /first turn failed/);
+    waitFor(() => fake.frames().some((frame) => frame.event === 'connection/closed'), 'timed-out pump connection close');
+  } finally {
+    fake.child.kill('SIGKILL');
+  }
 });
 check('spawn timeout names the child stderr log when no birth arrives', () => {
   const dirS = path.join(HOME, 'proj-s3');

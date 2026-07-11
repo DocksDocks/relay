@@ -6,7 +6,7 @@ allowed-tools: Bash, Read
 metadata:
   pattern: tool-wrapper
   updated: "2026-07-10"
-  content_hash: "39884481aeba44b9d822849a34c547626ef75d1d5528299722b950ca960c22af"
+  content_hash: "0dd77b176effb01b55b9689069662ab7567dbcc515e6f427c39d449148063ac8"
 ---
 
 # Session relay
@@ -193,12 +193,15 @@ codex app-server --listen unix://$HOME/.codex-app.sock   # socket must live unde
 codex --remote unix://$HOME/.codex-app.sock              # optional: attach the normal TUI to the same server
 <plugin>/bin/relay watch <name>... --server $HOME/.codex-app.sock          # or --all; or RELAY_APP_SERVER env
 <plugin>/bin/relay register <name> --id <uuid> --tool codex --server $HOME/.codex-app.sock
+<plugin>/bin/relay spawn <project> --tool codex --server $HOME/.codex-app.sock --name worker --reply-to <me> -- "<task>"
 ```
 
 Socket precedence is per-session registry `server` first, then the invocation's
 `--server`, then the store-wide `RELAY_APP_SERVER` fallback. A SessionStart hook
 refresh preserves the registered socket. `relay spawn --server <socket>` records
-the socket on the born entry; app-server-native spawning lands in a later step.
+the returned thread id itself with `spawned_via: app-server`, then starts the
+first worker turn on that same server-owned connection; no `codex exec` process
+or SessionStart hook is involved.
 With no configured socket, or when the configured socket cannot complete a
 WebSocket initialize handshake, watch/wake use the existing locked tool-aware
 doorbell. A reachable app-server always owns Codex delivery; even an explicit
@@ -263,11 +266,24 @@ birth a real, resumable session there instead:
 - **Model discipline:** pass `--model`/`--effort` every time. As of 2026-07, use
   `--model opus --effort max` for a Claude child or `--model gpt-5.6-sol --effort
   xhigh` for a Codex child unless the user's current tier list says otherwise.
-- The child launches detached; spawn returns as soon as the child's own SessionStart
-  hook registers it on the bus (typically <1s), long before the task finishes. Its
-  first prompt carries a standing prefix: report results/questions to `--reply-to`
-  (default: this session's bus name) via the absolute relay binary path — so the
-  reply loop works even in a project where session-relay isn't installed.
+- With no app-server, the child launches detached and spawn returns as soon as
+  the child's SessionStart hook registers it on the bus (typically <1s), long
+  before the task finishes. With Codex `--server <socket>`, relay instead calls
+  `thread/start`, self-registers the returned id and relay-owned origin, builds
+  the first prompt with that id, and synchronously confirms `turn/start` before
+  returning. No `codex exec` process or hook runs on this path.
+- The first prompt carries a standing prefix: report results/questions to
+  `--reply-to` (default: this session's bus name) via the absolute relay binary
+  path — so the reply loop works even in a project where session-relay isn't
+  installed. App-server spawn includes `--from <returned-id>` directly because
+  there is no hook-provided identity line.
+- **App-server turn pump:** after confirming `turn/start`, foreground spawn
+  returns while a detached relay helper keeps the same connection alive for MCP
+  elicitations. `--watch` waits for that helper instead. The helper accepts
+  `bus` only because the relay registered the thread's origin before starting
+  the turn; joined/foreign threads still decline all elicitations. The existing
+  `--timeout` (30 seconds by default) is a hard pump cap: completion, socket/
+  protocol error, or timeout closes the connection and exits the helper.
 - **Completion signal:** add `--watch` to keep the spawn caller attached to the
   direct child process until its first turn exits. The relay exit mirrors the
   child and stdout reports `first turn complete` or `first turn failed`; without

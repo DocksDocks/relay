@@ -4,6 +4,7 @@
 //   relay discover|list|register|send|inbox|peek|attach|wake|doctor   CLI / attach / doorbell / health
 //   relay watch …                  poll mailboxes, push into live Codex threads via app-server
 //   relay __spawn-log-writer <id>  hidden bounded stderr pump for detached spawn
+//   relay __appserver-spawn-pump    hidden bounded app-server first-turn pump
 //   relay __stress …               hidden test helper (cross-process lock race)
 
 use std::collections::HashMap;
@@ -26,6 +27,7 @@ fn main() {
             };
             relay::spawn::run_log_writer(id);
         }
+        Some("__appserver-spawn-pump") => relay::spawn::run_appserver_pump(),
         // __stress <recipient-id> <who> <k> — mirrors test/selftest.mjs's
         // stress worker: race k enqueues against k register upserts, plus one
         // unique-id register per iteration so a lost read-modify-write shows

@@ -481,6 +481,7 @@ pub struct Entry {
     pub tool: String,
     pub last_seen: String,
     pub server: Option<String>,
+    pub spawned_via: Option<String>,
 }
 
 impl Entry {
@@ -510,6 +511,13 @@ impl Entry {
                 .map(JsonValue::from)
                 .unwrap_or(JsonValue::from(())),
         );
+        m.insert(
+            "spawned_via".into(),
+            self.spawned_via
+                .clone()
+                .map(JsonValue::from)
+                .unwrap_or(JsonValue::from(())),
+        );
         JsonValue::from(m)
     }
 
@@ -523,6 +531,7 @@ impl Entry {
             tool: s("tool").unwrap_or_else(|| "claude".to_string()),
             last_seen: s("lastSeen").unwrap_or_default(),
             server: s("server"),
+            spawned_via: s("spawned_via"),
         })
     }
 }
@@ -1197,6 +1206,17 @@ pub fn register(
     tool: Option<&str>,
     server: Option<&str>,
 ) -> Result<Entry, String> {
+    register_with_origin(id, dir, name, tool, server, None)
+}
+
+pub fn register_with_origin(
+    id: &str,
+    dir: Option<&str>,
+    name: Option<&str>,
+    tool: Option<&str>,
+    server: Option<&str>,
+    spawned_via: Option<&str>,
+) -> Result<Entry, String> {
     if id.is_empty() {
         return Err("register requires an id".to_string());
     }
@@ -1224,6 +1244,9 @@ pub fn register(
             server: server
                 .map(str::to_string)
                 .or_else(|| prev.as_ref().and_then(|p| p.server.clone())),
+            spawned_via: spawned_via
+                .map(str::to_string)
+                .or_else(|| prev.as_ref().and_then(|p| p.spawned_via.clone())),
         };
         agents.insert(id.to_string(), entry.to_json());
         if let Some(n) = &entry.name {
@@ -1383,7 +1406,7 @@ mod tests {
     }
 
     #[test]
-    fn entry_roundtrips_server_and_legacy_entries_default_to_none() {
+    fn entry_roundtrips_server_and_origin_while_legacy_entries_default_to_none() {
         let entry = Entry {
             id: "11111111-1111-4111-8111-111111111111".into(),
             dir: Some("/tmp/project".into()),
@@ -1391,6 +1414,7 @@ mod tests {
             tool: "codex".into(),
             last_seen: "2026-07-10T00:00:00.000Z".into(),
             server: Some("/tmp/app.sock".into()),
+            spawned_via: Some("app-server".into()),
         };
         assert_eq!(Entry::from_json(&entry.to_json()), Some(entry.clone()));
 
@@ -1400,10 +1424,10 @@ mod tests {
             .cloned()
             .expect("entry object");
         legacy.remove("server");
-        assert_eq!(
-            Entry::from_json(&JsonValue::from(legacy)).unwrap().server,
-            None
-        );
+        legacy.remove("spawned_via");
+        let legacy_entry = Entry::from_json(&JsonValue::from(legacy)).unwrap();
+        assert_eq!(legacy_entry.server, None);
+        assert_eq!(legacy_entry.spawned_via, None);
     }
 
     #[test]

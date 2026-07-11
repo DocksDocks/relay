@@ -57,6 +57,7 @@ struct Target {
     tool: String,
     dir: Option<String>,
     server: Option<String>,
+    allow_bus: bool,
 }
 
 #[derive(PartialEq, Debug, Clone, Copy)]
@@ -145,17 +146,22 @@ fn resolve_targets(args: &Args, server: Option<&str>) -> Vec<Target> {
             tool,
             dir: args.flag("dir").map(str::to_string),
             server: server.map(str::to_string),
+            allow_bus: false,
         }];
     }
     if args.has("all") {
         return store::roster()
             .into_iter()
             .filter(|e| server.is_none() || e.tool == "codex")
-            .map(|e| Target {
-                id: e.id,
-                tool: e.tool,
-                dir: e.dir,
-                server: e.server.or_else(|| server.map(str::to_string)),
+            .map(|e| {
+                let allow_bus = e.spawned_via.as_deref() == Some("app-server");
+                Target {
+                    id: e.id,
+                    tool: e.tool,
+                    dir: e.dir,
+                    server: e.server.or_else(|| server.map(str::to_string)),
+                    allow_bus,
+                }
             })
             .collect();
     }
@@ -165,11 +171,13 @@ fn resolve_targets(args: &Args, server: Option<&str>) -> Vec<Target> {
             let Some(e) = store::resolve(who) else {
                 die(&format!("unknown session: {who}"));
             };
+            let allow_bus = e.spawned_via.as_deref() == Some("app-server");
             Target {
                 id: e.id,
                 tool: args.flag("tool").map(str::to_string).unwrap_or(e.tool),
                 dir: e.dir,
                 server: e.server.or_else(|| server.map(str::to_string)),
+                allow_bus,
             }
         })
         .collect()
@@ -256,7 +264,7 @@ pub fn run(raw: Vec<String>) -> ! {
                 if appserver::probe(server).is_err() {
                     continue;
                 }
-                match appserver::acknowledge(server, &t.id, false) {
+                match appserver::acknowledge(server, &t.id, t.allow_bus) {
                     Ok(appserver::DeliveryOutcome::Delivered) => {
                         pending_ack.remove(&t.id);
                     }
@@ -572,7 +580,7 @@ fn push_target(
         return Ok(PushOutcome::Delivered);
     }
     let block = hook::mail_block(&msgs, &t.id);
-    match appserver::deliver(server, &t.id, &block, auto_turn, settle_ms, false) {
+    match appserver::deliver(server, &t.id, &block, auto_turn, settle_ms, t.allow_bus) {
         Ok(outcome) => {
             println!(
                 "{}",

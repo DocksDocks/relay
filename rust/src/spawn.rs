@@ -19,14 +19,17 @@
 // The first prompt is TRUSTED (parent instructing its own child) — it is NOT
 // wrapped in the untrusted mail fence; later bus mail to the child is.
 
+use crate::appserver;
 use crate::cli::Args;
 use crate::store;
 use rustix::fs::{FlockOperation, flock};
+use std::collections::HashMap;
 use std::fs;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
+use tinyjson::JsonValue;
 
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
 const BIRTH_POLL_MS: u64 = 250;
@@ -75,6 +78,39 @@ fn compact_spawn_log(file: &mut fs::File) -> Result<(), String> {
         .and_then(|()| file.set_len(retain))
         .and_then(|()| file.seek(SeekFrom::End(0)).map(|_| ()))
         .map_err(|e| format!("compact spawn log: {e}"))
+}
+
+fn start_log_pump(log_id: &str) -> Result<(Child, ChildStdin, std::path::PathBuf), String> {
+    let log_dir = store::home_dir().join("spawn-logs");
+    fs::create_dir_all(&log_dir).map_err(|e| format!("create spawn-log dir: {e}"))?;
+    let log_path = log_dir.join(format!("{log_id}.stderr"));
+    fs::File::create(&log_path)
+        .map_err(|e| format!("cannot create spawn log {}: {e}", log_path.display()))?;
+    let relay_exe = std::env::current_exe().unwrap_or_else(|_| "relay".into());
+    let mut writer = Command::new(relay_exe)
+        .arg("__spawn-log-writer")
+        .arg(log_id)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("cannot launch spawn log writer: {e}"))?;
+    let stdin = writer
+        .stdin
+        .take()
+        .ok_or_else(|| "spawn log writer stdin unavailable".to_string())?;
+    Ok((writer, stdin, log_path))
+}
+
+fn associate_spawn_log(log_path: &std::path::Path, id: &str) {
+    let born_path = store::home_dir()
+        .join("spawn-logs")
+        .join(format!("{id}.stderr"));
+    if log_path != born_path {
+        if let Err(e) = fs::rename(log_path, &born_path) {
+            eprintln!("[relay spawn] cannot associate spawn log with born session {id}: {e}");
+        }
+    }
 }
 
 /// Hidden stderr pump used by `relay spawn`. It is a separate process so the
@@ -246,6 +282,219 @@ Your task:
     )
 }
 
+fn appserver_spawn_config(options: &AppServerSpawn<'_>) -> String {
+    let mut config: HashMap<String, JsonValue> = HashMap::new();
+    for (key, value) in [
+        ("server", Some(options.server)),
+        ("dir", Some(options.dir)),
+        ("name", options.name),
+        ("reply_to", Some(options.reply_to)),
+        ("task", Some(options.task)),
+        ("model", options.model),
+        ("effort", options.effort),
+        ("sandbox", Some(options.sandbox)),
+    ] {
+        config.insert(
+            key.to_string(),
+            value
+                .map(|value| JsonValue::from(value.to_string()))
+                .unwrap_or(JsonValue::from(())),
+        );
+    }
+    config.insert(
+        "timeout_secs".into(),
+        JsonValue::from(options.timeout_secs as f64),
+    );
+    JsonValue::from(config)
+        .stringify()
+        .unwrap_or_else(|_| "{}".to_string())
+}
+
+fn config_string(config: &HashMap<String, JsonValue>, key: &str) -> Option<String> {
+    config
+        .get(key)
+        .and_then(|value| value.get::<String>())
+        .cloned()
+}
+
+fn pump_report(key: &str, value: &str) {
+    let mut report: HashMap<String, JsonValue> = HashMap::new();
+    report.insert(key.to_string(), JsonValue::from(value.to_string()));
+    println!(
+        "{}",
+        JsonValue::from(report)
+            .stringify()
+            .unwrap_or_else(|_| "{}".to_string())
+    );
+    let _ = std::io::stdout().flush();
+}
+
+fn pump_fail(message: &str) -> ! {
+    pump_report("error", message);
+    std::process::exit(1);
+}
+
+/// Hidden helper for app-server-native spawn. The foreground parent reads the
+/// first stdout record and returns only after this process has confirmed the
+/// initial turn/start. This process then keeps the SAME connection and shared
+/// app-server event pump alive until completion or the bounded spawn timeout.
+pub fn run_appserver_pump() -> ! {
+    let mut input = String::new();
+    std::io::stdin()
+        .read_to_string(&mut input)
+        .unwrap_or_else(|e| pump_fail(&format!("read app-server spawn config: {e}")));
+    let config = input
+        .parse::<JsonValue>()
+        .ok()
+        .and_then(|value| value.get::<HashMap<String, JsonValue>>().cloned())
+        .unwrap_or_else(|| pump_fail("invalid app-server spawn config"));
+    let required = |key: &str| {
+        config_string(&config, key)
+            .unwrap_or_else(|| pump_fail(&format!("app-server spawn config missing {key}")))
+    };
+    let server = required("server");
+    let dir = required("dir");
+    let reply_to = required("reply_to");
+    let task = required("task");
+    let sandbox = required("sandbox");
+    let name = config_string(&config, "name");
+    let model = config_string(&config, "model");
+    let effort = config_string(&config, "effort");
+    let timeout_secs = config
+        .get("timeout_secs")
+        .and_then(|value| value.get::<f64>())
+        .copied()
+        .map(|value| value as u64)
+        .unwrap_or(DEFAULT_TIMEOUT_SECS);
+
+    let mut spawned = appserver::start_thread(&server, &dir, model.as_deref(), &sandbox)
+        .unwrap_or_else(|e| pump_fail(&e));
+    let id = spawned.id().to_string();
+    store::register_with_origin(
+        &id,
+        Some(&dir),
+        name.as_deref(),
+        Some("codex"),
+        Some(&server),
+        Some("app-server"),
+    )
+    .unwrap_or_else(|e| pump_fail(&e));
+    let abs_relay = std::env::current_exe()
+        .ok()
+        .map(|path| path.to_string_lossy().to_string())
+        .unwrap_or_else(|| "relay".to_string());
+    let prompt = build_prompt(&reply_to, &abs_relay, Some(&id), &task);
+    spawned
+        .start_initial_turn(&prompt, model.as_deref(), effort.as_deref())
+        .unwrap_or_else(|e| pump_fail(&e));
+
+    pump_report("started", &id);
+    match spawned.pump(timeout_secs.saturating_mul(1000)) {
+        Ok(true) => std::process::exit(0),
+        Ok(false) => {
+            eprintln!("app-server first turn timed out after {timeout_secs}s");
+            std::process::exit(124);
+        }
+        Err(e) => {
+            eprintln!("app-server first turn pump failed: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+struct AppServerSpawn<'a> {
+    server: &'a str,
+    dir: &'a str,
+    name: Option<&'a str>,
+    reply_to: &'a str,
+    task: &'a str,
+    model: Option<&'a str>,
+    effort: Option<&'a str>,
+    sandbox: &'a str,
+    timeout_secs: u64,
+    watch: bool,
+}
+
+fn run_appserver_spawn(options: AppServerSpawn<'_>) -> ! {
+    let provisional_id = store::uuid_v4();
+    let (mut log_writer, log_stdin, log_path) =
+        start_log_pump(&provisional_id).unwrap_or_else(|e| die(&e));
+    let relay_exe = std::env::current_exe().unwrap_or_else(|_| "relay".into());
+    let started_at = Instant::now();
+    let mut pump = Command::new(relay_exe)
+        .arg("__appserver-spawn-pump")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::from(log_stdin))
+        .process_group(0)
+        .spawn()
+        .unwrap_or_else(|e| die(&format!("cannot launch app-server spawn pump: {e}")));
+    let config = appserver_spawn_config(&options);
+    let mut pump_stdin = pump
+        .stdin
+        .take()
+        .unwrap_or_else(|| die("app-server spawn pump stdin unavailable"));
+    pump_stdin
+        .write_all(config.as_bytes())
+        .unwrap_or_else(|e| die(&format!("write app-server spawn config: {e}")));
+    drop(pump_stdin);
+
+    let pump_stdout = pump
+        .stdout
+        .take()
+        .unwrap_or_else(|| die("app-server spawn pump stdout unavailable"));
+    let mut first_line = String::new();
+    BufReader::new(pump_stdout)
+        .read_line(&mut first_line)
+        .unwrap_or_else(|e| die(&format!("read app-server spawn result: {e}")));
+    let report = first_line
+        .parse::<JsonValue>()
+        .ok()
+        .and_then(|value| value.get::<HashMap<String, JsonValue>>().cloned())
+        .unwrap_or_default();
+    if let Some(error) = config_string(&report, "error") {
+        let status = pump.wait().ok();
+        let _ = log_writer.wait();
+        eprintln!(
+            "app-server spawn failed: {error} — see {}",
+            log_path.display()
+        );
+        std::process::exit(status.as_ref().map(exit_code).unwrap_or(1).max(1));
+    }
+    let Some(id) = config_string(&report, "started") else {
+        let status = pump.wait().ok();
+        let _ = log_writer.wait();
+        eprintln!(
+            "app-server spawn pump exited before confirming turn/start — see {}",
+            log_path.display()
+        );
+        std::process::exit(status.as_ref().map(exit_code).unwrap_or(1).max(1));
+    };
+    associate_spawn_log(&log_path, &id);
+    let display = options.name.unwrap_or(&id);
+    if !options.watch {
+        if let Some(name) = options.name {
+            println!("spawned {name} ({id}) in {}", options.dir);
+        } else {
+            println!("spawned {id} in {}", options.dir);
+        }
+        std::process::exit(0);
+    }
+
+    let status = pump
+        .wait()
+        .unwrap_or_else(|e| die(&format!("cannot wait for app-server spawn pump: {e}")));
+    let _ = log_writer.wait();
+    let duration = elapsed(started_at);
+    if status.success() {
+        println!("spawned {display}; first turn complete; {duration}");
+        std::process::exit(0);
+    }
+    let code = exit_code(&status);
+    println!("spawned {display}; first turn failed (exit {code}); {duration}");
+    std::process::exit(code);
+}
+
 // Child argv (after the command itself). The prompt always sits behind a `--`
 // fence so a dash-leading task can never be parsed as a flag. No output-format
 // flags: the child is detached with null stdout — nothing ever reads it.
@@ -366,11 +615,54 @@ pub fn run(raw: Vec<String>) -> ! {
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|| "relay".to_string());
 
+    let perm = perm_args(&tool, read_only, full_access);
+    if tool == "codex" {
+        if let Some(server) = server {
+            if args.has("dry") {
+                let mut out: HashMap<String, JsonValue> = HashMap::new();
+                for (key, value) in [
+                    ("action", "app-server-spawn"),
+                    ("tool", "codex"),
+                    ("server", server),
+                    ("cwd", &dir_s),
+                    ("sandbox", &perm[1]),
+                    ("task", &task),
+                ] {
+                    out.insert(key.into(), JsonValue::from(value.to_string()));
+                }
+                if let Some(model) = model {
+                    out.insert("model".into(), JsonValue::from(model.to_string()));
+                }
+                if let Some(effort) = effort {
+                    out.insert("effort".into(), JsonValue::from(effort.to_string()));
+                }
+                println!(
+                    "{}",
+                    JsonValue::from(out)
+                        .stringify()
+                        .unwrap_or_else(|_| "{}".to_string())
+                );
+                std::process::exit(0);
+            }
+            run_appserver_spawn(AppServerSpawn {
+                server,
+                dir: &dir_s,
+                name: args.flag("name"),
+                reply_to: &reply_to,
+                task: &task,
+                model,
+                effort,
+                sandbox: &perm[1],
+                timeout_secs,
+                watch,
+            });
+        }
+    }
+
     // Claude accepts a pre-minted id (watch for exactly it); codex has no
     // pre-set-id flag, so birth is detected by the dir marker changing.
     let premint = (tool != "codex").then(store::uuid_v4);
     let prompt = build_prompt(&reply_to, &abs_relay, premint.as_deref(), &task);
-    let perm = perm_args(&tool, read_only, full_access);
     let skip_git_check = tool == "codex" && !dir.join(".git").exists();
     let cmd = child_cmd(&tool);
     let cargs = child_args(
@@ -414,31 +706,8 @@ pub fn run(raw: Vec<String>) -> ! {
 
     // stderr → a spawn-log so a child that execs then dies fast (bad flag,
     // auth failure) stays diagnosable; stdout/stdin are null by design.
-    let log_dir = store::home_dir().join("spawn-logs");
-    let _ = fs::create_dir_all(&log_dir);
     let log_id = premint.clone().unwrap_or_else(store::uuid_v4);
-    let log_path = log_dir.join(format!("{log_id}.stderr"));
-    // Synchronous create/truncate means this spawn can never inherit stale
-    // content, even if the pump process is delayed before opening the path.
-    fs::File::create(&log_path).unwrap_or_else(|e| {
-        die(&format!(
-            "cannot create spawn log {}: {e}",
-            log_path.display()
-        ))
-    });
-    let relay_exe = std::env::current_exe().unwrap_or_else(|_| "relay".into());
-    let mut log_writer = Command::new(relay_exe)
-        .arg("__spawn-log-writer")
-        .arg(&log_id)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap_or_else(|e| die(&format!("cannot launch spawn log writer: {e}")));
-    let log_stdin = log_writer
-        .stdin
-        .take()
-        .unwrap_or_else(|| die("spawn log writer stdin unavailable"));
+    let (mut log_writer, log_stdin, log_path) = start_log_pump(&log_id).unwrap_or_else(|e| die(&e));
 
     let marker_before = store::id_for_dir(&dir_s);
     let mut command = Command::new(&cmd);
@@ -495,15 +764,7 @@ pub fn run(raw: Vec<String>) -> ! {
             log_path.display()
         ));
     };
-    if id != log_id {
-        let born_path = log_dir.join(format!("{id}.stderr"));
-        match fs::rename(&log_path, &born_path) {
-            Ok(()) => {}
-            Err(e) => {
-                eprintln!("[relay spawn] cannot associate spawn log with born session {id}: {e}")
-            }
-        }
-    }
+    associate_spawn_log(&log_path, &id);
     let name = args.flag("name");
     if name.is_some() || server.is_some() {
         store::register(&id, Some(&dir_s), name, Some(&tool), server).unwrap_or_else(|e| die(&e));

@@ -3,8 +3,9 @@
 // used by selftest.mjs: a WebSocket server over a unix socket (the real thing
 // speaks WS on every socket listener — spike-verified 2026-07-02 on codex-cli
 // 0.142.5) that records every client JSON-RPC message to a JSONL file and
-// answers just enough of the protocol for `relay watch` to complete a delivery:
-//   initialize → result; thread/resume → thread stub; thread/read → configured
+// answers just enough of the protocol for relay delivery and spawn:
+//   initialize → result; thread/start → configured thread stub;
+//   thread/resume → thread stub; thread/read → configured
 //   status (idle by default); thread/inject_items → {};
 //   turn/start → turn stub + turn/started, then an mcpServer/elicitation/request
 //   for the bus server (MCP tool calls elicit approval from the connected
@@ -12,7 +13,10 @@
 //   emitted only after the client answers, mirroring the real wedge.
 // Usage: node fake-app-server.mjs <socket-path> <frames-out.jsonl> [control.json]
 // control.json: { "statuses": ["idle", "active", ...],
-//                 "elicitationServer": "bus" }
+//   "threadId": "uuid", "threadStartError": "message",
+//   "turnStartError": "message", "elicitationServer": "bus",
+//   "elicitationDelayMs": 0, "completionDelayMs": 0,
+//   "neverComplete": false }
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import net from 'node:net';
@@ -28,6 +32,9 @@ const statuses = Array.isArray(control.statuses) && control.statuses.length > 0
   ? control.statuses
   : ['idle'];
 const elicitationServer = control.elicitationServer ?? 'bus';
+const threadId = control.threadId ?? '77777777-7777-4777-8777-777777777777';
+const elicitationDelayMs = Number(control.elicitationDelayMs ?? 0);
+const completionDelayMs = Number(control.completionDelayMs ?? 0);
 let statusIndex = 0;
 
 const encodeText = (s) => {
@@ -60,6 +67,7 @@ const server = net.createServer((c) => {
   let buf = Buffer.alloc(0);
   let upgraded = false;
   c.on('error', () => {});
+  c.on('close', () => fs.appendFileSync(framesFile, `${JSON.stringify({ event: 'connection/closed' })}\n`));
   c.on('data', (d) => {
     buf = Buffer.concat([buf, d]);
     if (!upgraded) {
@@ -83,12 +91,29 @@ const server = net.createServer((c) => {
       if (msg.id === undefined) continue; // notification (e.g. initialized)
       if (msg.method === undefined) {
         // response to OUR elicitation request → the turn may finish
-        if (msg.id === 990) c.write(encodeText(JSON.stringify({ method: 'turn/completed', params: { turnId: 'turn-1' } })));
+        if (msg.id === 990 && !control.neverComplete) {
+          setTimeout(() => {
+            if (!c.destroyed) c.write(encodeText(JSON.stringify({ method: 'turn/completed', params: { turnId: 'turn-1' } })));
+          }, completionDelayMs);
+        }
         continue;
       }
       const reply = (result) => c.write(encodeText(JSON.stringify({ id: msg.id, result })));
+      const fail = (message) => c.write(encodeText(JSON.stringify({ id: msg.id, error: { code: -32000, message } })));
       switch (msg.method) {
         case 'initialize': reply({ userAgent: 'fake-app-server/1.0' }); break;
+        case 'thread/start':
+          if (control.threadStartError) fail(control.threadStartError);
+          else reply({
+            thread: { id: threadId, status: { type: 'idle' }, turns: [] },
+            model: msg.params?.model ?? 'fake-model',
+            modelProvider: 'fake-provider',
+            cwd: msg.params?.cwd ?? process.cwd(),
+            approvalPolicy: msg.params?.approvalPolicy ?? 'never',
+            approvalsReviewer: 'user',
+            sandbox: { type: 'workspaceWrite', writableRoots: [], networkAccess: false },
+          });
+          break;
         case 'thread/resume': reply({ thread: { id: msg.params?.threadId ?? null } }); break;
         case 'thread/read': {
           const type = statuses[Math.min(statusIndex, statuses.length - 1)];
@@ -99,9 +124,15 @@ const server = net.createServer((c) => {
         }
         case 'thread/inject_items': reply({}); break;
         case 'turn/start':
+          if (control.turnStartError) {
+            fail(control.turnStartError);
+            break;
+          }
           reply({ turn: { id: 'turn-1', status: 'inProgress' } });
           c.write(encodeText(JSON.stringify({ method: 'turn/started', params: { turnId: 'turn-1', threadId: msg.params?.threadId ?? null } })));
-          c.write(encodeText(JSON.stringify({ id: 990, method: 'mcpServer/elicitation/request', params: { threadId: msg.params?.threadId ?? null, turnId: 'turn-1', serverName: elicitationServer, mode: 'form', _meta: { codex_approval_kind: 'mcp_tool_call' } } })));
+          setTimeout(() => {
+            if (!c.destroyed) c.write(encodeText(JSON.stringify({ id: 990, method: 'mcpServer/elicitation/request', params: { threadId: msg.params?.threadId ?? null, turnId: 'turn-1', serverName: elicitationServer, mode: 'form', _meta: { codex_approval_kind: 'mcp_tool_call' } } })));
+          }, elicitationDelayMs);
           break;
         default: reply({});
       }

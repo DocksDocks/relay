@@ -47,6 +47,35 @@ pub(crate) enum DeliveryError {
     AfterInject(String),
 }
 
+pub(crate) struct SpawnedThread {
+    ws: WsConn,
+    id: String,
+}
+
+impl SpawnedThread {
+    pub(crate) fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub(crate) fn start_initial_turn(
+        &mut self,
+        prompt: &str,
+        model: Option<&str>,
+        effort: Option<&str>,
+    ) -> Result<(), String> {
+        self.ws.request(
+            2,
+            "turn/start",
+            initial_turn_params(&self.id, prompt, model, effort),
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn pump(mut self, timeout_ms: u64) -> Result<bool, String> {
+        self.ws.pump_turn(timeout_ms, true)
+    }
+}
+
 fn die(msg: &str) -> ! {
     eprintln!("{msg}");
     std::process::exit(1);
@@ -85,6 +114,25 @@ pub(crate) fn deliver(
 
 pub(crate) fn probe(server: &str) -> Result<(), String> {
     connect_initialized(server, "session-relay-doctor", "session-relay doctor").map(|_| ())
+}
+
+pub(crate) fn start_thread(
+    server: &str,
+    cwd: &str,
+    model: Option<&str>,
+    sandbox: &str,
+) -> Result<SpawnedThread, String> {
+    let mut ws = connect_initialized(server, "session-relay-spawn", "session-relay spawn")?;
+    let result = ws.request(1, "thread/start", thread_start_params(cwd, model, sandbox))?;
+    let id = result
+        .get::<HashMap<String, JsonValue>>()
+        .and_then(|result| result.get("thread"))
+        .and_then(|thread| thread.get::<HashMap<String, JsonValue>>())
+        .and_then(|thread| thread.get("id"))
+        .and_then(|id| id.get::<String>())
+        .cloned()
+        .ok_or_else(|| "thread/start response missing thread.id".to_string())?;
+    Ok(SpawnedThread { ws, id })
 }
 
 pub(crate) fn thread_state(server: &str, thread_id: &str) -> Result<ThreadState, String> {
@@ -237,6 +285,46 @@ fn turn_params(thread_id: &str) -> JsonValue {
     ])
 }
 
+fn thread_start_params(cwd: &str, model: Option<&str>, sandbox: &str) -> JsonValue {
+    let mut params: HashMap<String, JsonValue> = HashMap::new();
+    params.insert("cwd".into(), JsonValue::from(cwd.to_string()));
+    params.insert(
+        "approvalPolicy".into(),
+        JsonValue::from("never".to_string()),
+    );
+    params.insert("sandbox".into(), JsonValue::from(sandbox.to_string()));
+    if let Some(model) = model {
+        params.insert("model".into(), JsonValue::from(model.to_string()));
+    }
+    JsonValue::from(params)
+}
+
+fn initial_turn_params(
+    thread_id: &str,
+    prompt: &str,
+    model: Option<&str>,
+    effort: Option<&str>,
+) -> JsonValue {
+    let mut params = turn_params(thread_id)
+        .get::<HashMap<String, JsonValue>>()
+        .cloned()
+        .unwrap_or_default();
+    params.insert(
+        "input".into(),
+        JsonValue::from(vec![sobj(vec![
+            ("type", JsonValue::from("text".to_string())),
+            ("text", JsonValue::from(prompt.to_string())),
+        ])]),
+    );
+    if let Some(model) = model {
+        params.insert("model".into(), JsonValue::from(model.to_string()));
+    }
+    if let Some(effort) = effort {
+        params.insert("effort".into(), JsonValue::from(effort.to_string()));
+    }
+    JsonValue::from(params)
+}
+
 // ---- minimal WebSocket client over a unix socket ----
 
 fn urandom(n: usize) -> Vec<u8> {
@@ -352,7 +440,7 @@ struct WsConn {
 impl WsConn {
     fn connect(path: &str) -> Result<Self, String> {
         let mut s = UnixStream::connect(path).map_err(|e| format!("connect {path}: {e}"))?;
-        s.set_read_timeout(Some(Duration::from_secs(10))).ok();
+        s.set_read_timeout(Some(Duration::from_millis(100))).ok();
         let key = b64(&urandom(16));
         s.write_all(upgrade_request(&key).as_bytes())
             .map_err(|e| format!("upgrade write: {e}"))?;
