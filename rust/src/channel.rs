@@ -177,7 +177,7 @@ fn emit_mail(id: &str) -> Result<(), String> {
         return Ok(());
     }
     let mut guard = lifecycle::admit_operation(id, OperationKind::ChannelDeliver)?.into_guard()?;
-    let messages = store::drain_with_guard(&mut guard)?;
+    let messages = store::drain_with_guard(&mut guard)?.into_messages();
     for message in messages {
         let content = hook::mail_block(std::slice::from_ref(&message), id);
         send_frame(object(vec![

@@ -267,18 +267,25 @@ fn attach(args: &Args) -> ! {
     let mut guard = lifecycle::admit_operation(&target.id, OperationKind::AttachResume)
         .and_then(lifecycle::Admission::into_guard)
         .unwrap_or_else(|error| die(&error));
-    let output = spawn::run_child_with_guard(
+    let output = match spawn::run_child_with_guard(
         &mut guard,
         ChildLaunchSpec::AttachResume(AttachOptions::new(None, None)),
-    )
-    .unwrap_or_else(|error| die(&error));
+    ) {
+        Ok(output) => output,
+        Err(error) => {
+            drop(guard);
+            die(&error)
+        }
+    };
     if !output.stdout.is_empty() {
         let _ = std::io::stdout().write_all(&output.stdout);
     }
     if !output.stderr.is_empty() {
         let _ = std::io::stderr().write_all(&output.stderr);
     }
-    std::process::exit(output.status.code().unwrap_or(1));
+    let code = output.status.code().unwrap_or(1);
+    drop(guard);
+    std::process::exit(code);
 }
 
 fn lock_age(path: &std::path::Path) -> String {
@@ -807,7 +814,13 @@ pub fn run(cmd: &str, raw: Vec<String>) -> ! {
             let mut guard = lifecycle::admit_operation(&target.id, OperationKind::CliInboxDrain)
                 .and_then(lifecycle::Admission::into_guard)
                 .unwrap_or_else(|error| die(&error));
-            let msgs = store::drain_with_guard(&mut guard).unwrap_or_else(|e| die(&e));
+            let msgs = match store::drain_with_guard(&mut guard) {
+                Ok(receipt) => receipt.into_messages(),
+                Err(error) => {
+                    drop(guard);
+                    die(&error)
+                }
+            };
             let mut out: HashMap<String, JsonValue> = HashMap::new();
             out.insert("count".into(), JsonValue::from(msgs.len() as f64));
             out.insert("messages".into(), JsonValue::from(msgs));
@@ -817,6 +830,7 @@ pub fn run(cmd: &str, raw: Vec<String>) -> ! {
                     .format()
                     .unwrap_or_else(|_| "{}".into())
             );
+            drop(guard);
             std::process::exit(0);
         }
         "peek" => {
@@ -878,7 +892,11 @@ pub fn run(cmd: &str, raw: Vec<String>) -> ! {
                     target.id
                 ));
             }
-            let server = target.server.clone();
+            let server = target.server.clone().or_else(|| {
+                std::env::var("RELAY_APP_SERVER")
+                    .ok()
+                    .filter(|value| !value.is_empty())
+            });
             if target.tool == "codex"
                 && !args.has("dry")
                 && server
@@ -886,28 +904,52 @@ pub fn run(cmd: &str, raw: Vec<String>) -> ! {
                     .is_some_and(|configured| appserver::probe(configured).is_ok())
             {
                 let server = server.as_deref().unwrap();
+                if target.server.is_none() {
+                    store::register(
+                        &target.id,
+                        target.dir.as_deref(),
+                        None,
+                        Some(&target.tool),
+                        Some(server),
+                    )
+                    .unwrap_or_else(|error| {
+                        die(&format!("cannot bind wake app-server authority: {error}"))
+                    });
+                }
                 let mut guard =
                     lifecycle::admit_operation(&target.id, OperationKind::WakeAppServer)
                         .and_then(lifecycle::Admission::into_guard)
                         .unwrap_or_else(|error| die(&error));
                 if !store::mailbox_has_content(&target.id) && custom_message.is_none() {
+                    drop(guard);
                     std::process::exit(0);
                 }
                 match appserver::thread_state(server, &target.id) {
                     Ok(appserver::ThreadState::Active) => {
                         eprintln!("wake refused: thread busy — nothing sent");
+                        drop(guard);
                         std::process::exit(3);
                     }
                     Ok(appserver::ThreadState::Idle) => {}
-                    Err(e) => die(&format!("cannot read app-server thread status: {e}")),
+                    Err(e) => {
+                        drop(guard);
+                        die(&format!("cannot read app-server thread status: {e}"))
+                    }
                 }
 
-                let drained = store::drain_with_guard(&mut guard).unwrap_or_else(|e| die(&e));
-                let mut payload = drained.clone();
+                let drained = match store::drain_with_guard(&mut guard) {
+                    Ok(receipt) => receipt,
+                    Err(error) => {
+                        drop(guard);
+                        die(&error)
+                    }
+                };
+                let mut payload = drained.messages().to_vec();
                 if let Some(custom) = custom_message.as_deref() {
                     payload.push(custom_wake_message(custom));
                 }
                 if payload.is_empty() {
+                    drop(guard);
                     std::process::exit(0);
                 }
                 let block = hook::mail_block(&payload, &target.id);
@@ -915,13 +957,15 @@ pub fn run(cmd: &str, raw: Vec<String>) -> ! {
                     .ok()
                     .and_then(|value| value.parse().ok())
                     .unwrap_or(DEFAULT_TURN_SETTLE_MS);
-                match appserver::deliver_with_guard(
+                let delivery = appserver::deliver_with_guard(
                     &mut guard,
                     &block,
                     true,
                     settle_ms,
                     target.allow_bus,
-                ) {
+                );
+                drop(guard);
+                match delivery {
                     Ok(appserver::DeliveryOutcome::Delivered) => std::process::exit(0),
                     Ok(appserver::DeliveryOutcome::AckDeferred) => {
                         eprintln!(
@@ -930,11 +974,7 @@ pub fn run(cmd: &str, raw: Vec<String>) -> ! {
                         std::process::exit(3);
                     }
                     Err(appserver::DeliveryError::BeforeInject(e)) => {
-                        for message in &drained {
-                            if let Some(object) = message.get::<HashMap<String, JsonValue>>() {
-                                let _ = store::enqueue(&target.id, object);
-                            }
-                        }
+                        drained.rollback().unwrap_or_else(|error| die(&error));
                         die(&format!(
                             "app-server inject failed ({e}); queued mailbox mail re-enqueued"
                         ));
@@ -1027,9 +1067,16 @@ pub fn run(cmd: &str, raw: Vec<String>) -> ! {
             let mut guard = lifecycle::admit_operation(&target.id, OperationKind::WakeCli)
                 .and_then(lifecycle::Admission::into_guard)
                 .unwrap_or_else(|error| die(&error));
-            let out =
-                spawn::run_child_with_guard(&mut guard, ChildLaunchSpec::WakeDoorbell(message))
-                    .unwrap_or_else(|error| die(&error));
+            let out = match spawn::run_child_with_guard(
+                &mut guard,
+                ChildLaunchSpec::WakeDoorbell(message),
+            ) {
+                Ok(output) => output,
+                Err(error) => {
+                    drop(guard);
+                    die(&error)
+                }
+            };
             if !out.stdout.is_empty() {
                 let _ = std::io::stdout().write_all(&out.stdout);
             }
@@ -1039,7 +1086,9 @@ pub fn run(cmd: &str, raw: Vec<String>) -> ! {
             if let Some(line) = wake_usage_line(&target.tool, &out.stdout) {
                 eprintln!("{line}");
             }
-            std::process::exit(out.status.code().unwrap_or(0));
+            let code = out.status.code().unwrap_or(0);
+            drop(guard);
+            std::process::exit(code);
         }
         _ => die(
             "usage: relay discover [--within min] [--tool t] | list | register <name> --id <uuid> [--dir <path>] [--server <sock>] | send <to> <msg> | inbox <who> | peek <who> | attach <who> [--exec] | wake <who> [--model m] [--effort e] [msg] | doctor [--id <session>]",

@@ -144,7 +144,9 @@ fn drain_inbox(id: &str) -> Result<Vec<JsonValue>, ToolErr> {
     let mut guard = lifecycle::admit_operation(id, OperationKind::McpInboxDrain)
         .and_then(lifecycle::Admission::into_guard)
         .map_err(ToolErr::Soft)?;
-    store::drain_with_guard(&mut guard).map_err(ToolErr::Soft)
+    store::drain_with_guard(&mut guard)
+        .map(store::DrainReceipt::into_messages)
+        .map_err(ToolErr::Soft)
 }
 
 fn arg_str(args: &HashMap<String, JsonValue>, key: &str) -> Option<String> {

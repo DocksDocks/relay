@@ -5,6 +5,7 @@ use relay::lifecycle::{
 };
 use std::collections::HashMap;
 use std::fs;
+use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -150,7 +151,9 @@ fn lifecycle_admission_unmanaged_guard_binds_target_kind_and_epoch() {
     assert_eq!(guard.binding_epoch(), "0");
     assert!(guard.validate_kind(OperationKind::CliInboxDrain).is_ok());
     assert!(guard.validate_kind(OperationKind::McpInboxDrain).is_err());
-    let messages = relay::store::drain_with_guard(&mut guard).unwrap();
+    let messages = relay::store::drain_with_guard(&mut guard)
+        .unwrap()
+        .into_messages();
     assert_eq!(messages.len(), 1);
     assert!(
         !home
@@ -159,6 +162,108 @@ fn lifecycle_admission_unmanaged_guard_binds_target_kind_and_epoch() {
             .exists()
     );
     fs::remove_dir_all(home).ok();
+}
+
+#[test]
+fn lifecycle_admission_drain_receipt_rolls_back_exact_lines_before_new_mail() {
+    let home = fresh_home("receipt-rollback");
+    let cwd = home.join("project");
+    let session = "19999999-9999-4999-8999-999999999999";
+    seed_entry(&home, session, "claude", &cwd);
+    let mailbox = home.join("mailbox").join(format!("{session}.jsonl"));
+    let original = "{\"id\":\"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa\",\"body\":\"first\"}\n{\"id\":\"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb\",\"body\":\"second\"}\n";
+    fs::write(&mailbox, original).unwrap();
+    let store = LifecycleStore::new(home.clone());
+    let Admission::Unmanaged(mut guard) = store
+        .admit_operation(session, OperationKind::CliInboxDrain)
+        .unwrap()
+    else {
+        panic!("expected unmanaged admission");
+    };
+    let receipt = relay::store::drain_with_guard(&mut guard).unwrap();
+    fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&mailbox)
+        .unwrap()
+        .write_all(b"{\"id\":\"cccccccc-cccc-4ccc-8ccc-cccccccccccc\",\"body\":\"third\"}\n")
+        .unwrap();
+    receipt.rollback().unwrap();
+    let restored = fs::read_to_string(&mailbox).unwrap();
+    assert!(restored.starts_with(original));
+    assert!(restored.ends_with('\n'));
+    assert_eq!(
+        restored
+            .matches("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+            .count(),
+        1
+    );
+    assert_eq!(
+        restored
+            .matches("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+            .count(),
+        1
+    );
+    assert!(restored.rfind("third").unwrap() > restored.find("second").unwrap());
+    fs::remove_dir_all(home).ok();
+}
+
+#[test]
+fn lifecycle_admission_revalidates_registry_tool_cwd_and_server_authority() {
+    for (index, mutate) in ["tool", "cwd", "server"].into_iter().enumerate() {
+        let home = fresh_home(&format!("entry-revalidate-{mutate}"));
+        let cwd = home.join("project");
+        let session = format!("2{index:07}-9999-4999-8999-999999999999");
+        seed_entry(&home, &session, "codex", &cwd);
+        let store = LifecycleStore::new(home.clone());
+        let Admission::Unmanaged(mut guard) = store
+            .admit_operation(&session, OperationKind::WatchInject)
+            .unwrap()
+        else {
+            panic!("expected unmanaged admission");
+        };
+        let mut registry: JsonValue = fs::read_to_string(home.join("registry.json"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        let entry = registry
+            .get_mut::<HashMap<String, JsonValue>>()
+            .unwrap()
+            .get_mut("agents")
+            .unwrap()
+            .get_mut::<HashMap<String, JsonValue>>()
+            .unwrap()
+            .get_mut(&session)
+            .unwrap()
+            .get_mut::<HashMap<String, JsonValue>>()
+            .unwrap();
+        match mutate {
+            "tool" => {
+                entry.insert("tool".into(), JsonValue::from("claude".to_string()));
+            }
+            "cwd" => {
+                let changed = home.join("changed-project");
+                fs::create_dir_all(&changed).unwrap();
+                entry.insert(
+                    "dir".into(),
+                    JsonValue::from(changed.to_string_lossy().into_owned()),
+                );
+            }
+            "server" => {
+                entry.insert(
+                    "server".into(),
+                    JsonValue::from("/tmp/changed.sock".to_string()),
+                );
+            }
+            _ => unreachable!(),
+        }
+        fs::write(home.join("registry.json"), registry.format().unwrap()).unwrap();
+        assert!(
+            relay::store::drain_with_guard(&mut guard).is_err(),
+            "{mutate} mutation retained stale authority"
+        );
+        fs::remove_dir_all(home).ok();
+    }
 }
 
 #[test]
@@ -200,6 +305,7 @@ fn lifecycle_admission_guard_a_cannot_name_or_mutate_b() {
     assert!(
         relay::store::drain_with_guard(&mut guard_a)
             .unwrap()
+            .messages()
             .is_empty()
     );
     assert!(
@@ -223,6 +329,8 @@ fn lifecycle_admission_stale_unmanaged_guard_refuses_after_claiming() {
         Duration::from_secs(2),
         Duration::from_secs(1),
     ));
+    let mailbox = home.join("mailbox").join(format!("{session}.jsonl"));
+    fs::write(&mailbox, "{\"body\":\"must-stay\"}\n").unwrap();
     let Admission::Unmanaged(mut guard) = store
         .admit_operation(session, OperationKind::CliInboxDrain)
         .unwrap()
@@ -262,11 +370,60 @@ fn lifecycle_admission_stale_unmanaged_guard_refuses_after_claiming() {
         "binding never reached Claiming",
     );
     assert!(relay::store::drain_with_guard(&mut guard).is_err());
+    assert!(
+        fs::read_to_string(&mailbox).unwrap().contains("must-stay"),
+        "stale guard must preserve the mailbox after Claiming publication"
+    );
     drop(guard);
     assert!(matches!(
         claimant.join().unwrap().unwrap(),
         ClaimOutcome::Active { .. }
     ));
+    fs::remove_dir_all(home).ok();
+}
+
+#[test]
+fn lifecycle_admission_drain_timeout_exact_cas_persists_active_operations() {
+    let home = fresh_home("drain-timeout");
+    let cwd = home.join("project");
+    let session = "39999999-9999-4999-8999-999999999999";
+    let worker = "38888888-8888-4888-8888-888888888888";
+    let generation = "37777777-7777-4777-8777-777777777777";
+    seed_entry(&home, session, "claude", &cwd);
+    let store = LifecycleStore::with_timeouts(
+        home.clone(),
+        Duration::from_secs(1),
+        Duration::from_millis(80),
+    );
+    active_worker(&store, &cwd, worker, generation, session);
+    let Admission::Managed(guard) = store
+        .admit_operation(session, OperationKind::UserPromptDrain)
+        .unwrap()
+    else {
+        panic!("expected managed admission");
+    };
+    let intent = store
+        .publish_fence(worker, generation, "timeout test")
+        .unwrap();
+    let error = match store.drain_prior_operations(intent) {
+        Ok(_) => panic!("drain unexpectedly succeeded while a guard was live"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        relay::lifecycle::DrainError::TimedOut { .. }
+    ));
+    let fenced = store.read_worker(worker).unwrap().unwrap();
+    assert_eq!(fenced.state, ManagedState::FencingUnconfirmed);
+    let operation_id = fenced
+        .proof_gap
+        .as_deref()
+        .and_then(|gap| gap.split_once("active_operations="))
+        .map(|(_, ids)| ids)
+        .filter(|ids| !ids.contains(','))
+        .expect("timed-out operation id must be durable for lifecycle status");
+    assert!(relay::store::is_uuid(operation_id));
+    drop(guard);
     fs::remove_dir_all(home).ok();
 }
 
@@ -448,7 +605,6 @@ fn lifecycle_admission_reentry_matrix() {
         OperationKind::WakeAppServer,
         OperationKind::WakeCli,
         OperationKind::AttachResume,
-        OperationKind::Deliver,
         OperationKind::InitialTurn,
     ];
     for (index, kind) in kinds.into_iter().enumerate() {
@@ -469,7 +625,28 @@ fn lifecycle_admission_reentry_matrix() {
             OperationKind::CliInboxDrain
         };
         assert!(guard.validate_kind(wrong).is_err());
-        println!("PASS reentry kind={}", kind.as_str());
+        let lower = if matches!(
+            kind,
+            OperationKind::SessionStartDrain
+                | OperationKind::UserPromptDrain
+                | OperationKind::CliInboxDrain
+                | OperationKind::McpInboxDrain
+                | OperationKind::ChannelDeliver
+                | OperationKind::WatchInject
+                | OperationKind::WatchAutoTurn
+                | OperationKind::WakeAppServer
+        ) {
+            let mailbox = home.join("mailbox").join(format!("{session}.jsonl"));
+            fs::write(&mailbox, "{\"body\":\"matrix\"}\n").unwrap();
+            let mut guard = guard;
+            let receipt = relay::store::drain_with_guard(&mut guard).unwrap();
+            assert_eq!(receipt.messages().len(), 1);
+            assert!(!mailbox.exists());
+            "drain_with_guard"
+        } else {
+            "dedicated_behavior_test"
+        };
+        println!("PASS reentry kind={} lower={lower}", kind.as_str());
         fs::remove_dir_all(home).ok();
     }
 }

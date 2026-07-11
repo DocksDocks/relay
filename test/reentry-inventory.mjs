@@ -83,6 +83,34 @@ for (const rule of fixture.forbidden_calls) {
 }
 assert.deepEqual(findings, [], `unguarded lifecycle mutators remain:\n${findings.join('\n')}`);
 
+const lifecycleSource = sourceByName('plugins/session-relay/rust/src/lifecycle.rs');
+assert.doesNotMatch(
+  lifecycleSource.text,
+  /admit_operation_with_appserver/,
+  'app-server selector must be materialized before ordinary sealed admission',
+);
+const cliRun = functionByName(sourceByName('plugins/session-relay/rust/src/cli.rs'), 'run');
+assert.match(cliRun.text, /RELAY_APP_SERVER/, 'wake env fallback is missing');
+assert.match(
+  cliRun.text,
+  /store::register\([\s\S]*OperationKind::WakeAppServer/,
+  'wake fallback must materialize Entry authority before WakeAppServer admission',
+);
+const drain = functionByName(sourceByName('plugins/session-relay/rust/src/store.rs'), 'drain_with_guard');
+assert.match(drain.text, /guard\.with_authorized/, 'mailbox validation and removal must share one store lock');
+const rollback = functionByName(sourceByName('plugins/session-relay/rust/src/store.rs'), 'rollback');
+assert.doesNotMatch(rollback.text, /recipient|session_id|target/, 'receipt rollback may not accept an independent target');
+assert.match(rollback.text, /self\.raw[\s\S]*push_str\(&current\)/, 'receipt rollback must restore exact original lines before newer mail');
+const appserverSource = sourceByName('plugins/session-relay/rust/src/appserver.rs');
+const guardedRequest = functionByName(appserverSource, 'request_with_guard');
+assert.match(guardedRequest.text, /Duration::from_secs\(RPC_TIMEOUT_SECS\)/, 'guarded RPC must preserve the normal timeout');
+assert.match(guardedRequest.text, /recv_text_with_guard/, 'guarded RPC responses must poll lifecycle cancellation');
+assert.match(guardedRequest.text, /BeforeSend[\s\S]*AfterSend/, 'guarded RPC must retain its sent boundary');
+const guardedReceive = functionByName(appserverSource, 'recv_text_with_guard');
+assert.match(guardedReceive.text, /authorize_use[\s\S]*parse_frame/, 'buffered frames must reauthorize before parsing');
+const guardedConnect = functionByName(appserverSource, 'connect_with_guard');
+assert.match(guardedConnect.text, /connect_checked/, 'connect and HTTP upgrade must use the guard-aware poller');
+
 const threadState = functionByName(
   sourceByName('plugins/session-relay/rust/src/appserver.rs'),
   'thread_state',

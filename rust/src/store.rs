@@ -1391,9 +1391,43 @@ fn parse_lines(raw: &str) -> Vec<JsonValue> {
 
 /// Read AND clear the guard-bound inbox in one locked step. The recipient is
 /// derived from the sealed lifecycle capability; callers cannot supply one.
+pub struct DrainReceipt {
+    messages: Vec<JsonValue>,
+    raw: String,
+    path: PathBuf,
+    root: PathBuf,
+    _sealed: (),
+}
+
+impl DrainReceipt {
+    pub fn messages(&self) -> &[JsonValue] {
+        &self.messages
+    }
+
+    pub fn into_messages(self) -> Vec<JsonValue> {
+        self.messages
+    }
+
+    pub fn commit(self) {}
+
+    pub fn rollback(self) -> Result<(), String> {
+        with_lock_at(&self.root, || {
+            let current = fs::read_to_string(&self.path).unwrap_or_default();
+            let mut restored = self.raw;
+            restored.push_str(&current);
+            if restored.is_empty() {
+                return Ok(());
+            }
+            fs::write(&self.path, restored).map_err(|error| {
+                format!("restore drained mailbox {}: {error}", self.path.display())
+            })
+        })
+    }
+}
+
 pub fn drain_with_guard(
     guard: &mut crate::lifecycle::ReentryGuard,
-) -> Result<Vec<JsonValue>, String> {
+) -> Result<DrainReceipt, String> {
     let kind = guard.allowed();
     if !matches!(
         kind,
@@ -1408,19 +1442,21 @@ pub fn drain_with_guard(
     ) {
         return Err(format!("{} cannot drain a mailbox", kind.as_str()));
     }
-    let target = guard.authorize_use(kind)?;
-    with_lock_at(&target.root, || {
+    guard.with_authorized(kind, |target| {
         let path = target
             .root
             .join("mailbox")
             .join(format!("{}.jsonl", sanitize(&target.runtime_session_id)));
-        let raw = match fs::read_to_string(&path) {
-            Ok(r) => r,
-            Err(_) => return Ok(Vec::new()),
-        };
+        let raw = fs::read_to_string(&path).unwrap_or_default();
         let msgs = parse_lines(&raw);
         let _ = fs::remove_file(&path);
-        Ok(msgs)
+        Ok(DrainReceipt {
+            messages: msgs,
+            raw,
+            path,
+            root: target.root.clone(),
+            _sealed: (),
+        })
     })
 }
 

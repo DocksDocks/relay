@@ -26,6 +26,7 @@ function resolveBin() {
   const arch = { x64: 'x86_64', arm64: 'aarch64' }[process.arch];
   const triple = process.platform === 'darwin' ? `${arch}-apple-darwin` : `${arch}-unknown-linux-musl`;
   for (const c of [
+    path.join(PLUGIN, 'rust', 'target', 'debug', 'relay'),
     path.join(PLUGIN, 'rust', 'target', triple, 'release', 'relay'),
     path.join(PLUGIN, 'bin', `relay-${triple}`),
     path.join(PLUGIN, 'bin', 'relay'),
@@ -46,7 +47,7 @@ const HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'session-relay-test-'));
 // (proves SESSION_RELAY_HOME still works), host discovery/store vars scrubbed.
 function envFor(extra = {}) {
   const env = { ...process.env };
-  for (const k of ['AGENT_RELAY_HOME', 'AGENT_RELAY_GC_DAYS', 'RELAY_CLAUDE_PROJECTS', 'RELAY_CODEX_SESSIONS', 'CLAUDE_CONFIG_DIR', 'CLAUDE_PROJECT_DIR', 'CLAUDE_CODE_SESSION_ID', 'CODEX_HOME', 'RELAY_NO_WATCH', 'RELAY_APP_SERVER', 'RELAY_CHANNEL_POLL_MS', 'RELAY_CHANNEL_REGISTER_TIMEOUT_MS', 'RELAY_TURN_SETTLE_MS', 'RELAY_TURN_WAIT_MS', 'RELAY_SPAWN_CMD_CLAUDE', 'RELAY_SPAWN_CMD_CODEX', 'RELAY_WAKE_CMD_CLAUDE', 'RELAY_WAKE_CMD_CODEX', 'RELAY_SPAWN_TOOL', 'STUB_RELAY_BIN', 'STUB_TOOL', 'STUB_RECORD', 'STUB_DELAY_MS', 'STUB_EXIT', 'STUB_SKIP_HOOK', 'STUB_STDERR_BYTES', 'WAKE_STUB_DELAY_MS', 'WAKE_STUB_RECORD', 'ATTACH_STUB_OUTPUT']) delete env[k];
+  for (const k of ['AGENT_RELAY_HOME', 'AGENT_RELAY_GC_DAYS', 'RELAY_CLAUDE_PROJECTS', 'RELAY_CODEX_SESSIONS', 'CLAUDE_CONFIG_DIR', 'CLAUDE_PROJECT_DIR', 'CLAUDE_CODE_SESSION_ID', 'CODEX_HOME', 'RELAY_NO_WATCH', 'RELAY_APP_SERVER', 'RELAY_CHANNEL_POLL_MS', 'RELAY_CHANNEL_REGISTER_TIMEOUT_MS', 'RELAY_TURN_SETTLE_MS', 'RELAY_TURN_WAIT_MS', 'RELAY_SPAWN_CMD_CLAUDE', 'RELAY_SPAWN_CMD_CODEX', 'RELAY_WAKE_CMD_CLAUDE', 'RELAY_WAKE_CMD_CODEX', 'RELAY_SPAWN_TOOL', 'STUB_RELAY_BIN', 'STUB_TOOL', 'STUB_RECORD', 'STUB_DELAY_MS', 'STUB_EXIT', 'STUB_SKIP_HOOK', 'STUB_STDERR_BYTES', 'WAKE_STUB_DELAY_MS', 'WAKE_STUB_RECORD', 'ATTACH_STUB_OUTPUT', 'ATTACH_STUB_INTERACTIVE']) delete env[k];
   return { ...env, SESSION_RELAY_HOME: HOME, ...extra };
 }
 const relay = (args, opts = {}) => spawnSync(BIN, args, { encoding: 'utf8', input: opts.input, cwd: opts.cwd, env: envFor(opts.env) });
@@ -234,7 +235,13 @@ const attachStubDir = path.join(HOME, 'attach-stubs');
 fs.mkdirSync(attachStubDir);
 const attachStub = `#!/usr/bin/env node
 const fs = require('node:fs');
-fs.writeFileSync(process.env.ATTACH_STUB_OUTPUT, JSON.stringify({ argv: process.argv.slice(2), cwd: process.cwd() }));
+const interactive = process.env.ATTACH_STUB_INTERACTIVE === '1';
+const stdin = interactive ? fs.readFileSync(0, 'utf8') : '';
+if (interactive) {
+  process.stdout.write('attach-stdout');
+  process.stderr.write('attach-stderr');
+}
+fs.writeFileSync(process.env.ATTACH_STUB_OUTPUT, JSON.stringify({ argv: process.argv.slice(2), cwd: process.cwd(), ...(interactive ? { stdin } : {}) }));
 `;
 for (const tool of ['codex', 'claude']) {
   fs.writeFileSync(path.join(attachStubDir, tool), attachStub, { mode: 0o755 });
@@ -291,6 +298,24 @@ check('legacy attach --exec is accepted but still uses guarded spawn+wait', () =
     assert.match(result.stderr, /--exec is deprecated/);
     assert.doesNotMatch(result.stdout, /command:/);
   }
+});
+
+check('guarded attach inherits stdin/stdout/stderr while the relay parent waits', () => {
+  const record = path.join(HOME, 'attach-interactive.json');
+  const result = relay(['attach', 'agent-A'], {
+    input: 'interactive-input',
+    env: {
+      PATH: attachPath,
+      ATTACH_STUB_OUTPUT: record,
+      ATTACH_STUB_INTERACTIVE: '1',
+    },
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(JSON.parse(fs.readFileSync(record, 'utf8')).stdin, 'interactive-input');
+  assert.match(result.stdout, /attach-stdout/);
+  assert.match(result.stderr, /attach-stderr/);
+  const registry = JSON.parse(fs.readFileSync(path.join(HOME, 'registry.json'), 'utf8'));
+  assert.deepEqual(registry.active_operations ?? {}, {}, 'attach releases its durable operation id before exit');
 });
 
 check('attach strictly rejects extra operands, unknown flags, and exec after --', () => {
@@ -892,6 +917,17 @@ check('register records a per-session server and hook refresh preserves it', () 
   assert.equal(registry.agents[idW].server, sock);
 });
 
+check('attach derives registered codex app-server authority into guarded --remote mode', () => {
+  const record = path.join(HOME, 'attach-codex-remote.json');
+  const r = relay(['attach', 'codex-W'], {
+    env: { PATH: attachPath, ATTACH_STUB_OUTPUT: record },
+  });
+  assert.equal(r.status, 0, `remote attach exited ${r.status}: ${r.stderr}`);
+  assert.deepEqual(JSON.parse(fs.readFileSync(record, 'utf8')).argv, [
+    '--remote', `unix://${sock}`,
+  ]);
+});
+
 check('watch prefers the registered server over the RELAY_APP_SERVER fallback', () => {
   assert.equal(relay(['send', 'codex-W', '--', 'watch push test']).status, 0);
   const r = relay(['watch', 'codex-W', '--once'], { env: { RELAY_APP_SERVER: path.join(HOME, 'wrong.sock') } });
@@ -928,7 +964,7 @@ check('wake prefers a reachable registered app-server and an empty retry is a cl
   const wakeRecord = path.join(HOME, 'appserver-wake-fallback-record.json');
   assert.equal(relay(['send', 'codex-W', '--', 'wake push']).status, 0);
   const r = relay(['wake', 'codex-W'], {
-    env: { RELAY_WAKE_CMD_CODEX: wakeStub, WAKE_STUB_RECORD: wakeRecord, RELAY_TURN_SETTLE_MS: '20', RELAY_TURN_WAIT_MS: '8000' },
+    env: { RELAY_APP_SERVER: path.join(HOME, 'wrong-wake.sock'), RELAY_WAKE_CMD_CODEX: wakeStub, WAKE_STUB_RECORD: wakeRecord, RELAY_TURN_SETTLE_MS: '20', RELAY_TURN_WAIT_MS: '8000' },
   });
   assert.equal(r.status, 0, `wake exited ${r.status}: ${r.stderr}`);
   const first = readFrames();
@@ -1035,6 +1071,25 @@ check('watch uses RELAY_APP_SERVER when a registry entry has no server', () => {
   assert.equal(r.status, 0, `watch exited ${r.status}: ${r.stderr}`);
   assert.equal(peek('codex-env').count, 0);
 });
+check('wake uses RELAY_APP_SERVER when a registry entry has no server', () => {
+  fs.writeFileSync(framesFile, '');
+  const id = '67676767-6767-4767-8767-676767676767';
+  const wakeRecord = path.join(HOME, 'wake-env-fallback-record.json');
+  assert.equal(relay(['register', 'codex-wake-env', '--id', id, '--dir', dirW, '--tool', 'codex']).status, 0);
+  assert.equal(relay(['send', 'codex-wake-env', '--', 'wake env fallback']).status, 0);
+  const r = relay(['wake', 'codex-wake-env'], {
+    env: {
+      RELAY_APP_SERVER: sock,
+      RELAY_WAKE_CMD_CODEX: wakeStub,
+      WAKE_STUB_RECORD: wakeRecord,
+      RELAY_TURN_SETTLE_MS: '20',
+    },
+  });
+  assert.equal(r.status, 0, `wake env fallback exited ${r.status}: ${r.stderr}`);
+  assert.equal(peek('codex-wake-env').count, 0, 'wake env fallback drains through app-server');
+  assert.ok(readFrames().some((frame) => frame.method === 'thread/inject_items'));
+  assert.equal(fs.existsSync(wakeRecord), false, 'wake env fallback never launched codex exec');
+});
 check('doctor initializes and reports a registered app-server', () => {
   const watched = spawnToFiles(['watch', '--follow', idW, '--tool', 'codex'], {}, 'doctor-appserver-watch');
   const lock = path.join(HOME, 'watchers', `${idW}.lock`);
@@ -1081,6 +1136,22 @@ check('wake preserves a custom message through codex exec resume when the regist
   });
   assert.equal(r.status, 0, `custom fallback exited ${r.status}: ${r.stderr}`);
   assert.deepEqual(JSON.parse(fs.readFileSync(wakeRecord, 'utf8')).at(-1), 'custom fallback nudge');
+});
+check('wake does not persist an unreachable RELAY_APP_SERVER fallback into session authority', () => {
+  const id = '68686868-6868-4868-8868-686868686868';
+  const wakeRecord = path.join(HOME, 'env-unreachable-record.json');
+  assert.equal(relay(['register', 'codex-env-unreachable', '--id', id, '--dir', dirW, '--tool', 'codex']).status, 0);
+  const r = relay(['wake', 'codex-env-unreachable'], {
+    env: {
+      RELAY_APP_SERVER: path.join(HOME, 'env-no-such.sock'),
+      RELAY_WAKE_CMD_CODEX: wakeStub,
+      WAKE_STUB_RECORD: wakeRecord,
+    },
+  });
+  assert.equal(r.status, 0, `unreachable env fallback exited ${r.status}: ${r.stderr}`);
+  assert.ok(fs.existsSync(wakeRecord), 'unreachable env fallback uses codex exec');
+  const registry = JSON.parse(fs.readFileSync(path.join(HOME, 'registry.json'), 'utf8'));
+  assert.equal(registry.agents[id].server, null, 'unreachable env socket never becomes sealed authority');
 });
 fakeSrv.kill();
 

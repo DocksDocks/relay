@@ -66,6 +66,7 @@ const CHILD_ENV_ALLOWLIST: &[&str] = &[
     "RELAY_MANAGED_ATTACH_TOKEN",
     "RELAY_TEST_SENTINEL",
     "ATTACH_STUB_OUTPUT",
+    "ATTACH_STUB_INTERACTIVE",
     "WAKE_STUB_DELAY_MS",
     "WAKE_STUB_FILE",
     "WAKE_STUB_RECORD",
@@ -96,15 +97,19 @@ pub fn run_child_with_guard(
 ) -> Result<Output, String> {
     let kind = guard.allowed();
     let target = guard.authorize_use(kind)?;
-    let (program, args, child_cwd) = match (kind, spec) {
+    let (program, args, child_cwd, interactive) = match (kind, spec) {
         (OperationKind::AttachResume, ChildLaunchSpec::AttachResume(options)) => {
             let mut args = if target.tool == "codex" {
-                vec![
-                    "resume".to_string(),
-                    target.runtime_session_id.clone(),
-                    "-C".to_string(),
-                    target.canonical_cwd.clone(),
-                ]
+                if let Some(server) = target.server.as_deref() {
+                    vec!["--remote".to_string(), format!("unix://{server}")]
+                } else {
+                    vec![
+                        "resume".to_string(),
+                        target.runtime_session_id.clone(),
+                        "-C".to_string(),
+                        target.canonical_cwd.clone(),
+                    ]
+                }
             } else if target.tool == "claude" {
                 vec!["--resume".to_string(), target.runtime_session_id.clone()]
             } else {
@@ -131,7 +136,7 @@ pub fn run_child_with_guard(
                 }
             }
             let child_cwd = (target.tool == "claude").then(|| target.canonical_cwd.clone());
-            (target.tool.clone(), args, child_cwd)
+            (target.tool.clone(), args, child_cwd, true)
         }
         (OperationKind::WakeCli, ChildLaunchSpec::WakeDoorbell(message))
         | (OperationKind::WatchWakeFallback, ChildLaunchSpec::WatchWakeFallback(message)) => {
@@ -176,7 +181,7 @@ pub fn run_child_with_guard(
             }
             args.push("--".to_string());
             args.push(message.as_str().to_string());
-            (program, args, Some(target.canonical_cwd.clone()))
+            (program, args, Some(target.canonical_cwd.clone()), false)
         }
         (allowed, _) => {
             return Err(format!(
@@ -187,12 +192,18 @@ pub fn run_child_with_guard(
     };
     let _bound_generation = (&target.worker_id, &target.generation);
     let mut command = Command::new(&program);
-    command
-        .args(args)
-        .env_clear()
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    command.args(args).env_clear();
+    if interactive {
+        command
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+    } else {
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+    }
     if let Some(cwd) = child_cwd {
         command.current_dir(cwd);
     }
@@ -204,40 +215,54 @@ pub fn run_child_with_guard(
     let mut child = command
         .spawn()
         .map_err(|error| format!("failed to spawn guarded {program}: {error}"))?;
-    let Some(stdout) = child.stdout.take() else {
-        kill_and_reap_owned_fail_closed(&mut child);
-        return Err("guarded child stdout pipe is unavailable".to_string());
-    };
-    let Some(stderr) = child.stderr.take() else {
-        kill_and_reap_owned_fail_closed(&mut child);
-        return Err("guarded child stderr pipe is unavailable".to_string());
-    };
-    let stdout_reader = match std::thread::Builder::new()
-        .name("relay-guarded-stdout".to_string())
-        .spawn(move || {
-            let mut bytes = Vec::new();
-            let mut reader = stdout;
-            reader.read_to_end(&mut bytes).map(|_| bytes)
-        }) {
-        Ok(reader) => reader,
-        Err(error) => {
+    let stdout_reader = if interactive {
+        None
+    } else {
+        let Some(stdout) = child.stdout.take() else {
             kill_and_reap_owned_fail_closed(&mut child);
-            return Err(format!("spawn guarded stdout reader: {error}"));
-        }
+            return Err("guarded child stdout pipe is unavailable".to_string());
+        };
+        Some(
+            match std::thread::Builder::new()
+                .name("relay-guarded-stdout".to_string())
+                .spawn(move || {
+                    let mut bytes = Vec::new();
+                    let mut reader = stdout;
+                    reader.read_to_end(&mut bytes).map(|_| bytes)
+                }) {
+                Ok(reader) => reader,
+                Err(error) => {
+                    kill_and_reap_owned_fail_closed(&mut child);
+                    return Err(format!("spawn guarded stdout reader: {error}"));
+                }
+            },
+        )
     };
-    let stderr_reader = match std::thread::Builder::new()
-        .name("relay-guarded-stderr".to_string())
-        .spawn(move || {
-            let mut bytes = Vec::new();
-            let mut reader = stderr;
-            reader.read_to_end(&mut bytes).map(|_| bytes)
-        }) {
-        Ok(reader) => reader,
-        Err(error) => {
+    let stderr_reader = if interactive {
+        None
+    } else {
+        let Some(stderr) = child.stderr.take() else {
             kill_and_reap_owned_fail_closed(&mut child);
-            let _ = stdout_reader.join();
-            return Err(format!("spawn guarded stderr reader: {error}"));
-        }
+            return Err("guarded child stderr pipe is unavailable".to_string());
+        };
+        Some(
+            match std::thread::Builder::new()
+                .name("relay-guarded-stderr".to_string())
+                .spawn(move || {
+                    let mut bytes = Vec::new();
+                    let mut reader = stderr;
+                    reader.read_to_end(&mut bytes).map(|_| bytes)
+                }) {
+                Ok(reader) => reader,
+                Err(error) => {
+                    kill_and_reap_owned_fail_closed(&mut child);
+                    if let Some(stdout_reader) = stdout_reader {
+                        let _ = stdout_reader.join();
+                    }
+                    return Err(format!("spawn guarded stderr reader: {error}"));
+                }
+            },
+        )
     };
     let mut poll_error_reported = false;
     let (status, was_cancelled) = loop {
@@ -245,27 +270,27 @@ pub fn run_child_with_guard(
             let _ = child.kill();
             let deadline =
                 Instant::now() + Duration::from_millis(crate::lifecycle::MANAGED_CANCEL_GRACE_MS);
-            let mut grace_expired = false;
+            let mut unconfirmed_marked = false;
             let status = loop {
                 match child.try_wait() {
                     Ok(Some(status)) => break status,
                     Ok(None) => {
-                        if !grace_expired && Instant::now() >= deadline {
-                            grace_expired = true;
-                            eprintln!(
-                                "[relay] guarded child exceeded cancellation grace; retaining lifecycle guard until reap"
-                            );
+                        if !unconfirmed_marked && Instant::now() >= deadline {
+                            let reason = "guarded child remained active after cancellation grace";
+                            guard.mark_cancellation_unconfirmed(reason)?;
+                            unconfirmed_marked = true;
                         }
                         std::thread::sleep(Duration::from_millis(
                             crate::lifecycle::MANAGED_CANCEL_POLL_MS,
                         ));
                     }
                     Err(error) => {
-                        if !grace_expired && Instant::now() >= deadline {
-                            grace_expired = true;
-                            eprintln!(
-                                "[relay] guarded child wait failed past cancellation grace ({error}); retaining lifecycle guard"
+                        if !unconfirmed_marked && Instant::now() >= deadline {
+                            let reason = format!(
+                                "guarded child wait failed after cancellation grace: {error}"
                             );
+                            guard.mark_cancellation_unconfirmed(&reason)?;
+                            unconfirmed_marked = true;
                         }
                         std::thread::sleep(Duration::from_millis(
                             crate::lifecycle::MANAGED_CANCEL_POLL_MS,
@@ -295,13 +320,23 @@ pub fn run_child_with_guard(
         }
     };
     let stdout = stdout_reader
-        .join()
-        .map_err(|_| "guarded child stdout reader panicked".to_string())?
-        .map_err(|error| format!("read guarded child stdout: {error}"))?;
+        .map(|reader| {
+            reader
+                .join()
+                .map_err(|_| "guarded child stdout reader panicked".to_string())?
+                .map_err(|error| format!("read guarded child stdout: {error}"))
+        })
+        .transpose()?
+        .unwrap_or_default();
     let stderr = stderr_reader
-        .join()
-        .map_err(|_| "guarded child stderr reader panicked".to_string())?
-        .map_err(|error| format!("read guarded child stderr: {error}"))?;
+        .map(|reader| {
+            reader
+                .join()
+                .map_err(|_| "guarded child stderr reader panicked".to_string())?
+                .map_err(|error| format!("read guarded child stderr: {error}"))
+        })
+        .transpose()?
+        .unwrap_or_default();
     if was_cancelled || guard.cancelled() {
         return Err(format!("guarded child cancelled after status {status}"));
     }

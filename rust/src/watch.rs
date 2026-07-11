@@ -634,17 +634,17 @@ fn push_target(
         OperationKind::WatchInject
     };
     let mut guard = lifecycle::admit_operation(&t.id, kind)?.into_guard()?;
-    let msgs = store::drain_with_guard(&mut guard)?;
-    if msgs.is_empty() {
+    let drained = store::drain_with_guard(&mut guard)?;
+    if drained.messages().is_empty() {
         return Ok(PushOutcome::Delivered);
     }
-    let block = hook::mail_block(&msgs, &t.id);
+    let block = hook::mail_block(drained.messages(), &t.id);
     match appserver::deliver_with_guard(&mut guard, &block, auto_turn, settle_ms, t.allow_bus) {
         Ok(outcome) => {
             println!(
                 "{}",
                 str_obj(&[
-                    ("delivered", &msgs.len().to_string()),
+                    ("delivered", &drained.messages().len().to_string()),
                     ("to", &t.id),
                     ("mode", if auto_turn { "auto-turn" } else { "inject" }),
                 ])
@@ -655,11 +655,7 @@ fn push_target(
             }
         }
         Err(appserver::DeliveryError::BeforeInject(e)) => {
-            for m in &msgs {
-                if let Some(mo) = m.get::<HashMap<String, JsonValue>>() {
-                    let _ = store::enqueue(&t.id, mo);
-                }
-            }
+            drained.rollback()?;
             Err(format!("push to {} failed ({e}); mail re-enqueued", t.id))
         }
         Err(appserver::DeliveryError::AfterInject(e)) => Ok(PushOutcome::AckDeferred(Some(e))),

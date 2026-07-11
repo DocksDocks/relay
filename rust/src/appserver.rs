@@ -50,6 +50,19 @@ pub(crate) enum DeliveryError {
     AfterInject(String),
 }
 
+enum GuardedRequestError {
+    BeforeSend(String),
+    AfterSend(String),
+}
+
+impl GuardedRequestError {
+    fn into_message(self) -> String {
+        match self {
+            Self::BeforeSend(message) | Self::AfterSend(message) => message,
+        }
+    }
+}
+
 pub(crate) struct SpawnedThread {
     ws: WsConn,
     id: String,
@@ -74,11 +87,15 @@ impl SpawnedThread {
         {
             return Err("initial-turn guard does not match spawned thread authority".to_string());
         }
-        self.ws.request(
-            2,
-            "turn/start",
-            initial_turn_params(&self.id, prompt, model, effort),
-        )?;
+        self.ws
+            .request_with_guard(
+                2,
+                "turn/start",
+                initial_turn_params(&self.id, prompt, model, effort),
+                guard,
+                OperationKind::InitialTurn,
+            )
+            .map_err(GuardedRequestError::into_message)?;
         Ok(())
     }
 
@@ -126,19 +143,33 @@ pub(crate) fn deliver_with_guard(
     let thread_id = target
         .thread_id
         .ok_or_else(|| DeliveryError::BeforeInject("guard has no app-server thread".to_string()))?;
-    let mut ws = connect_initialized(&server, "session-relay", "session-relay delivery")
-        .map_err(DeliveryError::BeforeInject)?;
-    ws.request(
+    let mut ws = connect_initialized_with_guard(
+        &server,
+        "session-relay",
+        "session-relay delivery",
+        guard,
+        kind,
+    )
+    .map_err(DeliveryError::BeforeInject)?;
+    ws.request_with_guard(
         1,
         "thread/resume",
         sobj(vec![("threadId", JsonValue::from(thread_id.clone()))]),
+        guard,
+        kind,
     )
-    .map_err(DeliveryError::BeforeInject)?;
-    guard
-        .authorize_use(kind)
-        .map_err(DeliveryError::BeforeInject)?;
-    ws.request(2, "thread/inject_items", inject_params(&thread_id, block))
-        .map_err(DeliveryError::BeforeInject)?;
+    .map_err(|error| DeliveryError::BeforeInject(error.into_message()))?;
+    ws.request_with_guard(
+        2,
+        "thread/inject_items",
+        inject_params(&thread_id, block),
+        guard,
+        kind,
+    )
+    .map_err(|error| match error {
+        GuardedRequestError::BeforeSend(message) => DeliveryError::BeforeInject(message),
+        GuardedRequestError::AfterSend(message) => DeliveryError::AfterInject(message),
+    })?;
     if auto_turn {
         let settle_deadline = Instant::now() + Duration::from_millis(settle_ms);
         while Instant::now() < settle_deadline {
@@ -152,7 +183,9 @@ pub(crate) fn deliver_with_guard(
         guard
             .authorize_use(kind)
             .map_err(DeliveryError::AfterInject)?;
-        match read_status(&mut ws, 3, &thread_id).map_err(DeliveryError::AfterInject)? {
+        match read_status_with_guard(&mut ws, 3, &thread_id, guard, kind)
+            .map_err(DeliveryError::AfterInject)?
+        {
             ThreadState::Active => return Ok(DeliveryOutcome::AckDeferred),
             ThreadState::Idle => {
                 start_ack_turn_with_guard(&mut ws, 4, &thread_id, allow_bus, guard, kind)
@@ -206,13 +239,24 @@ pub(crate) fn acknowledge_with_guard(
     let thread_id = target
         .thread_id
         .ok_or_else(|| "guard has no app-server thread".to_string())?;
-    let mut ws = connect_initialized(&server, "session-relay", "session-relay acknowledgement")?;
-    ws.request(
+    let mut ws = connect_initialized_with_guard(
+        &server,
+        "session-relay",
+        "session-relay acknowledgement",
+        guard,
+        OperationKind::WatchAck,
+    )?;
+    ws.request_with_guard(
         1,
         "thread/resume",
         sobj(vec![("threadId", JsonValue::from(thread_id.clone()))]),
-    )?;
-    if read_status(&mut ws, 2, &thread_id)? == ThreadState::Active {
+        guard,
+        OperationKind::WatchAck,
+    )
+    .map_err(GuardedRequestError::into_message)?;
+    if read_status_with_guard(&mut ws, 2, &thread_id, guard, OperationKind::WatchAck)?
+        == ThreadState::Active
+    {
         return Ok(DeliveryOutcome::AckDeferred);
     }
     start_ack_turn_with_guard(
@@ -244,6 +288,36 @@ fn connect_initialized(server: &str, name: &str, title: &str) -> Result<WsConn, 
         )]),
     )?;
     ws.notify("initialized", JsonValue::from(HashMap::new()))?;
+    Ok(ws)
+}
+
+fn connect_initialized_with_guard(
+    server: &str,
+    name: &str,
+    title: &str,
+    guard: &mut ReentryGuard,
+    kind: OperationKind,
+) -> Result<WsConn, String> {
+    let mut ws = WsConn::connect_with_guard(server, guard, kind)?;
+    ws.request_with_guard(
+        0,
+        "initialize",
+        sobj(vec![(
+            "clientInfo",
+            sobj(vec![
+                ("name", JsonValue::from(name.to_string())),
+                ("title", JsonValue::from(title.to_string())),
+                (
+                    "version",
+                    JsonValue::from(env!("CARGO_PKG_VERSION").to_string()),
+                ),
+            ]),
+        )]),
+        guard,
+        kind,
+    )
+    .map_err(GuardedRequestError::into_message)?;
+    ws.notify_with_guard("initialized", JsonValue::from(HashMap::new()), guard, kind)?;
     Ok(ws)
 }
 
@@ -283,6 +357,45 @@ fn read_status(ws: &mut WsConn, id: u64, thread_id: &str) -> Result<ThreadState,
     }
 }
 
+fn read_status_with_guard(
+    ws: &mut WsConn,
+    id: u64,
+    thread_id: &str,
+    guard: &mut ReentryGuard,
+    kind: OperationKind,
+) -> Result<ThreadState, String> {
+    let result = ws
+        .request_with_guard(
+            id,
+            "thread/read",
+            sobj(vec![("threadId", JsonValue::from(thread_id.to_string()))]),
+            guard,
+            kind,
+        )
+        .map_err(GuardedRequestError::into_message)?;
+    parse_thread_state(result)
+}
+
+fn parse_thread_state(result: JsonValue) -> Result<ThreadState, String> {
+    let status_type = result
+        .get::<HashMap<String, JsonValue>>()
+        .and_then(|result| result.get("thread"))
+        .and_then(|thread| thread.get::<HashMap<String, JsonValue>>())
+        .and_then(|thread| thread.get("status"))
+        .and_then(|status| status.get::<HashMap<String, JsonValue>>())
+        .and_then(|status| status.get("type"))
+        .and_then(|kind| kind.get::<String>())
+        .map(String::as_str)
+        .ok_or_else(|| "thread/read response missing thread.status.type".to_string())?;
+    match status_type {
+        "idle" => Ok(ThreadState::Idle),
+        "active" => Ok(ThreadState::Active),
+        other => Err(format!(
+            "thread is not ready for relay delivery (status {other})"
+        )),
+    }
+}
+
 fn start_ack_turn_with_guard(
     ws: &mut WsConn,
     id: u64,
@@ -291,8 +404,8 @@ fn start_ack_turn_with_guard(
     guard: &mut ReentryGuard,
     kind: OperationKind,
 ) -> Result<(), String> {
-    guard.authorize_use(kind)?;
-    ws.request(id, "turn/start", turn_params(thread_id))?;
+    ws.request_with_guard(id, "turn/start", turn_params(thread_id), guard, kind)
+        .map_err(GuardedRequestError::into_message)?;
     let wait_ms: u64 = std::env::var("RELAY_TURN_WAIT_MS")
         .ok()
         .and_then(|value| value.parse().ok())
@@ -515,23 +628,52 @@ struct WsConn {
 
 impl WsConn {
     fn connect(path: &str) -> Result<Self, String> {
+        Self::connect_checked(path, || Ok(()))
+    }
+
+    fn connect_with_guard(
+        path: &str,
+        guard: &mut ReentryGuard,
+        kind: OperationKind,
+    ) -> Result<Self, String> {
+        Self::connect_checked(path, || guard.authorize_use(kind).map(|_| ()))
+    }
+
+    fn connect_checked(
+        path: &str,
+        mut check: impl FnMut() -> Result<(), String>,
+    ) -> Result<Self, String> {
+        check()?;
         let mut s = UnixStream::connect(path).map_err(|e| format!("connect {path}: {e}"))?;
         s.set_read_timeout(Some(Duration::from_millis(100))).ok();
         let key = b64(&urandom(16));
+        check()?;
         s.write_all(upgrade_request(&key).as_bytes())
             .map_err(|e| format!("upgrade write: {e}"))?;
         let mut hdr: Vec<u8> = Vec::new();
         let mut chunk = [0u8; 512];
+        let deadline = Instant::now() + Duration::from_secs(RPC_TIMEOUT_SECS);
         let end = loop {
+            check()?;
+            if Instant::now() >= deadline {
+                return Err("app-server upgrade response timeout".to_string());
+            }
             if let Some(pos) = hdr.windows(4).position(|w| w == b"\r\n\r\n") {
                 break pos + 4;
             }
             if hdr.len() > 16384 {
                 return Err("oversized upgrade response".into());
             }
-            let n = s
-                .read(&mut chunk)
-                .map_err(|e| format!("upgrade read: {e}"))?;
+            let n = match s.read(&mut chunk) {
+                Ok(n) => n,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        || error.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(format!("upgrade read: {error}")),
+            };
             if n == 0 {
                 return Err("connection closed during upgrade".into());
             }
@@ -601,11 +743,75 @@ impl WsConn {
         }
     }
 
+    fn recv_text_with_guard(
+        &mut self,
+        guard: &mut ReentryGuard,
+        kind: OperationKind,
+    ) -> Result<Option<String>, String> {
+        let mut assembled: Vec<u8> = Vec::new();
+        let mut in_text = false;
+        loop {
+            guard.authorize_use(kind)?;
+            if let Some((fin, opcode, payload, used)) = parse_frame(&self.buf) {
+                self.buf.drain(..used);
+                match opcode {
+                    0x1 => {
+                        assembled = payload;
+                        if fin {
+                            return Ok(Some(String::from_utf8_lossy(&assembled).into_owned()));
+                        }
+                        in_text = true;
+                    }
+                    0x0 if in_text => {
+                        assembled.extend_from_slice(&payload);
+                        if fin {
+                            return Ok(Some(String::from_utf8_lossy(&assembled).into_owned()));
+                        }
+                    }
+                    0x9 => {
+                        guard.authorize_use(kind)?;
+                        self.send_frame(0xA, &payload)?;
+                    }
+                    0x8 => return Err("server closed the connection".into()),
+                    _ => {}
+                }
+                continue;
+            }
+            let mut chunk = [0u8; 4096];
+            match self.s.read(&mut chunk) {
+                Ok(0) => return Err("connection closed".into()),
+                Ok(n) => self.buf.extend_from_slice(&chunk[..n]),
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        || error.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    return Ok(None);
+                }
+                Err(error) => return Err(format!("ws read: {error}")),
+            }
+        }
+    }
+
     fn notify(&mut self, method: &str, params: JsonValue) -> Result<(), String> {
         let msg = sobj(vec![
             ("method", JsonValue::from(method.to_string())),
             ("params", params),
         ]);
+        self.send_frame(0x1, msg.stringify().map_err(|e| format!("{e}"))?.as_bytes())
+    }
+
+    fn notify_with_guard(
+        &mut self,
+        method: &str,
+        params: JsonValue,
+        guard: &mut ReentryGuard,
+        kind: OperationKind,
+    ) -> Result<(), String> {
+        let msg = sobj(vec![
+            ("method", JsonValue::from(method.to_string())),
+            ("params", params),
+        ]);
+        guard.authorize_use(kind)?;
         self.send_frame(0x1, msg.stringify().map_err(|e| format!("{e}"))?.as_bytes())
     }
 
@@ -646,6 +852,67 @@ impl WsConn {
         }
     }
 
+    fn request_with_guard(
+        &mut self,
+        id: u64,
+        method: &str,
+        params: JsonValue,
+        guard: &mut ReentryGuard,
+        kind: OperationKind,
+    ) -> Result<JsonValue, GuardedRequestError> {
+        let msg = sobj(vec![
+            ("id", JsonValue::from(id as f64)),
+            ("method", JsonValue::from(method.to_string())),
+            ("params", params),
+        ]);
+        let encoded = msg
+            .stringify()
+            .map_err(|error| GuardedRequestError::BeforeSend(format!("{error}")))?;
+        guard
+            .authorize_use(kind)
+            .map_err(GuardedRequestError::BeforeSend)?;
+        self.send_frame(0x1, encoded.as_bytes())
+            .map_err(GuardedRequestError::AfterSend)?;
+        let deadline = Instant::now() + Duration::from_secs(RPC_TIMEOUT_SECS);
+        loop {
+            if guard.cancelled() {
+                return Err(GuardedRequestError::AfterSend(format!(
+                    "{method}: cancelled"
+                )));
+            }
+            if Instant::now() > deadline {
+                return Err(GuardedRequestError::AfterSend(format!(
+                    "{method}: response timeout"
+                )));
+            }
+            let Some(text) = self
+                .recv_text_with_guard(guard, kind)
+                .map_err(GuardedRequestError::AfterSend)?
+            else {
+                continue;
+            };
+            let Ok(v) = text.parse::<JsonValue>() else {
+                continue;
+            };
+            let Some(o) = v.get::<HashMap<String, JsonValue>>() else {
+                continue;
+            };
+            let got_id = o.get("id").and_then(|x| x.get::<f64>().copied());
+            if got_id != Some(id as f64) {
+                continue;
+            }
+            if let Some(err) = o.get("error") {
+                let emsg = err
+                    .get::<HashMap<String, JsonValue>>()
+                    .and_then(|e| e.get("message"))
+                    .and_then(|m| m.get::<String>().cloned())
+                    .unwrap_or_else(|| "unknown error".into());
+                return Err(GuardedRequestError::AfterSend(format!("{method}: {emsg}")));
+            }
+            return Ok(o.get("result").cloned().unwrap_or(JsonValue::from(())));
+        }
+    }
+
     fn pump_turn_with_guard(
         &mut self,
         ms: u64,
@@ -660,7 +927,8 @@ impl WsConn {
             if Instant::now() > deadline {
                 return Ok(false);
             }
-            let Some(text) = self.recv_text()? else {
+            let kind = guard.allowed();
+            let Some(text) = self.recv_text_with_guard(guard, kind)? else {
                 continue;
             };
             let Ok(value) = text.parse::<JsonValue>() else {
@@ -692,6 +960,7 @@ impl WsConn {
                             sobj(vec![("action", JsonValue::from(action.to_string()))]),
                         ),
                     ]);
+                    guard.authorize_use(guard.allowed())?;
                     self.send_frame(
                         0x1,
                         message

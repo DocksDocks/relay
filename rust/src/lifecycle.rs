@@ -28,6 +28,7 @@ const BINDINGS_KEY: &str = "session_bindings";
 const TOMBSTONES_KEY: &str = "managed_tombstones";
 const AUDIT_KEY: &str = "lifecycle_audit";
 const GC_MANIFESTS_KEY: &str = "managed_gc_manifests";
+const ACTIVE_OPERATIONS_KEY: &str = "active_operations";
 const GC_DAYS: u64 = 14;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -258,7 +259,6 @@ pub enum OperationKind {
     WakeAppServer,
     WakeCli,
     AttachResume,
-    Deliver,
     InitialTurn,
 }
 
@@ -277,7 +277,6 @@ impl OperationKind {
             Self::WakeAppServer => "WakeAppServer",
             Self::WakeCli => "WakeCli",
             Self::AttachResume => "AttachResume",
-            Self::Deliver => "Deliver",
             Self::InitialTurn => "InitialTurn",
         }
     }
@@ -292,6 +291,8 @@ enum GuardTarget {
         binding_epoch: String,
         tool: String,
         canonical_cwd: String,
+        server: Option<String>,
+        server_fingerprint: Option<String>,
     },
     AppServerThread {
         runtime_session_id: String,
@@ -330,6 +331,7 @@ pub struct ReentryGuard {
     _activity_guard: Option<SharedFileLock>,
     _deadline: Instant,
     cancel: CancelToken,
+    operation_id: String,
     _sealed: Sealed,
 }
 
@@ -771,9 +773,30 @@ impl LifecycleStore {
             drop(file);
             return Err("session binding changed during unmanaged admission".to_string());
         }
+        let operation_id = store::uuid_v4();
+        self.transaction(|registry| {
+            let mut operations = object_map(registry, ACTIVE_OPERATIONS_KEY)?;
+            let mut row = HashMap::new();
+            row.insert("operation_id".into(), JsonValue::from(operation_id.clone()));
+            row.insert(
+                "kind".into(),
+                JsonValue::from("LegacyUnmanagedEpoch".to_string()),
+            );
+            row.insert(
+                "runtime_session_id".into(),
+                JsonValue::from(runtime_session_id.to_string()),
+            );
+            row.insert("worker_id".into(), JsonValue::from(()));
+            row.insert("generation".into(), JsonValue::from(()));
+            operations.insert(operation_id.clone(), JsonValue::from(row));
+            set_object_map(registry, ACTIVE_OPERATIONS_KEY, operations);
+            Ok(())
+        })?;
         Ok(BindingEpochGuard {
             _file: file,
             binding_epoch: epoch,
+            store: self.clone(),
+            operation_id,
         })
     }
 
@@ -944,8 +967,9 @@ impl LifecycleStore {
                     return Err("worker selector does not match its session binding".to_string());
                 }
             }
+            let selected_server = entry.server.clone();
             let target = if operation_uses_appserver(kind) {
-                if let Some(server) = entry.server.clone() {
+                if let Some(server) = selected_server {
                     GuardTarget::AppServerThread {
                         runtime_session_id: runtime_session_id.clone(),
                         worker_id: worker_id.clone(),
@@ -974,6 +998,10 @@ impl LifecycleStore {
                         .dir
                         .map(|dir| canonical_cwd(&dir))
                         .ok_or_else(|| "operation target has no cwd".to_string())?,
+                    server_fingerprint: selected_server
+                        .as_ref()
+                        .map(|server| sha256_hex(server.as_bytes())),
+                    server: selected_server,
                 }
             };
             Ok(AdmissionPlan::Guard {
@@ -1027,6 +1055,7 @@ impl LifecycleStore {
         } else {
             None
         };
+        let operation_id = store::uuid_v4();
         let mut guard = ReentryGuard {
             store: self.clone(),
             target,
@@ -1046,8 +1075,34 @@ impl LifecycleStore {
                 )),
                 worker_or_session_epoch: binding_epoch,
             },
+            operation_id: operation_id.clone(),
             _sealed: Sealed(()),
         };
+        self.transaction(|registry| {
+            let mut operations = object_map(registry, ACTIVE_OPERATIONS_KEY)?;
+            let mut row = HashMap::new();
+            row.insert("operation_id".into(), JsonValue::from(operation_id.clone()));
+            row.insert("kind".into(), JsonValue::from(kind.as_str().to_string()));
+            row.insert(
+                "runtime_session_id".into(),
+                JsonValue::from(session_id.clone()),
+            );
+            row.insert(
+                "worker_id".into(),
+                target_worker_id(&guard.target)
+                    .map(|value| JsonValue::from(value.to_string()))
+                    .unwrap_or(JsonValue::from(())),
+            );
+            row.insert(
+                "generation".into(),
+                target_generation(&guard.target)
+                    .map(|value| JsonValue::from(value.to_string()))
+                    .unwrap_or(JsonValue::from(())),
+            );
+            operations.insert(operation_id.clone(), JsonValue::from(row));
+            set_object_map(registry, ACTIVE_OPERATIONS_KEY, operations);
+            Ok(())
+        })?;
         guard.authorize_use(kind)?;
         if managed {
             Ok(Admission::Managed(guard))
@@ -1123,6 +1178,11 @@ impl LifecycleStore {
                 drain_deadline.saturating_duration_since(Instant::now()),
             )?
             else {
+                self.mark_fence_unconfirmed(
+                    &intent,
+                    &sessions,
+                    "binding drain exceeded cancellation grace",
+                )?;
                 return Err(DrainError::TimedOut {
                     prior_operations: sessions,
                 });
@@ -1138,6 +1198,11 @@ impl LifecycleStore {
             drain_deadline.saturating_duration_since(Instant::now()),
         )?
         else {
+            self.mark_fence_unconfirmed(
+                &intent,
+                &sessions,
+                "activity drain exceeded cancellation grace",
+            )?;
             return Err(DrainError::TimedOut {
                 prior_operations: sessions,
             });
@@ -1152,6 +1217,44 @@ impl LifecycleStore {
                 _sealed: Sealed(()),
             },
             _sealed: Sealed(()),
+        })
+    }
+
+    fn mark_fence_unconfirmed(
+        &self,
+        intent: &FenceIntent,
+        _prior_operations: &[String],
+        reason: &str,
+    ) -> Result<(), DrainError> {
+        self.transaction(|registry| {
+            validate_fence_intent(registry, intent)?;
+            let active_operations = active_operation_ids(
+                registry,
+                Some(&intent.worker_id),
+                Some(&intent.generation),
+                &[],
+            )?;
+            let mut workers = object_map(registry, WORKERS_KEY)?;
+            let mut worker = workers
+                .get(&intent.worker_id)
+                .and_then(ManagedWorker::from_json)
+                .ok_or_else(|| "fence worker is missing or malformed".to_string())?;
+            worker.state = ManagedState::FencingUnconfirmed;
+            worker.version = next_version(&worker.version)?;
+            worker.proof_gap = Some(format!(
+                "{reason}; active_operations={}",
+                active_operations.join(",")
+            ));
+            workers.insert(intent.worker_id.clone(), worker.to_json());
+            set_object_map(registry, WORKERS_KEY, workers);
+            Ok(())
+        })
+        .map_err(|error| {
+            if error.contains("fence epoch/version/state changed") {
+                DrainError::StateChanged
+            } else {
+                DrainError::Store(error)
+            }
         })
     }
 
@@ -1681,11 +1784,21 @@ impl LifecycleStore {
             worker.state = if drained {
                 ManagedState::Active
             } else {
-                ManagedState::Fencing
+                ManagedState::FencingUnconfirmed
             };
             worker.version = next_version(&worker.version)?;
             if !drained {
                 worker.fence_reason = Some("older binding epoch did not drain before grace".into());
+                let active_operations = active_operation_ids(
+                    registry,
+                    None,
+                    None,
+                    std::slice::from_ref(&request.runtime_session_id),
+                )?;
+                worker.proof_gap = Some(format!(
+                    "older binding epoch did not drain before grace; active_operations={}",
+                    active_operations.join(",")
+                ));
             }
             bindings.insert(
                 request.runtime_session_id.clone(),
@@ -1813,48 +1926,114 @@ impl ReentryGuard {
         expected: OperationKind,
     ) -> Result<AuthorizedTarget, String> {
         self.validate_kind(expected)?;
-        let mut authorized = self.store.read_transaction(|registry| {
-            let bindings = object_map(registry, BINDINGS_KEY)?;
-            let workers = object_map(registry, WORKERS_KEY)?;
-            let session_id = target_runtime_session_id(&self.target);
-            let binding = bindings
-                .get(session_id)
-                .and_then(SessionBinding::from_json)
-                .ok_or_else(|| "operation binding is missing or malformed".to_string())?;
-            if binding.binding_epoch != target_binding_epoch(&self.target) {
-                return Err("operation binding epoch changed".to_string());
-            }
-            match (
-                target_worker_id(&self.target),
-                target_generation(&self.target),
-                &binding.state,
-            ) {
-                (None, None, BindingState::Unmanaged) => {}
-                (
-                    Some(expected_worker),
-                    Some(expected_generation),
-                    BindingState::Managed {
-                        worker_id,
-                        generation,
-                    },
-                ) if worker_id == expected_worker && generation == expected_generation => {
-                    let worker = workers
-                        .get(worker_id)
-                        .and_then(ManagedWorker::from_json)
-                        .ok_or_else(|| "operation worker is missing or malformed".to_string())?;
-                    if worker.state != ManagedState::Active
-                        || worker.version.as_str()
-                            != self.lifecycle_version.as_deref().unwrap_or_default()
-                    {
-                        return Err("operation lifecycle version/state changed".to_string());
-                    }
-                }
-                _ => return Err("operation binding state changed".to_string()),
-            }
-            Ok(authorized_target(&self.target))
-        })?;
+        let mut authorized = self
+            .store
+            .read_transaction(|registry| self.authorized_from(registry))?;
         authorized.root = self.store.root.clone();
         Ok(authorized)
+    }
+
+    fn authorized_from(&self, registry: &Registry) -> Result<AuthorizedTarget, String> {
+        let bindings = object_map(registry, BINDINGS_KEY)?;
+        let workers = object_map(registry, WORKERS_KEY)?;
+        let session_id = target_runtime_session_id(&self.target);
+        let binding = bindings
+            .get(session_id)
+            .and_then(SessionBinding::from_json)
+            .ok_or_else(|| "operation binding is missing or malformed".to_string())?;
+        if binding.binding_epoch != target_binding_epoch(&self.target) {
+            return Err("operation binding epoch changed".to_string());
+        }
+        let entry = registry
+            .agents
+            .get(session_id)
+            .and_then(Entry::from_json)
+            .ok_or_else(|| "operation registry entry is missing or malformed".to_string())?;
+        let expected = authorized_target(&self.target);
+        if entry.tool != expected.tool
+            || entry.dir.as_deref().map(canonical_cwd).as_deref()
+                != Some(expected.canonical_cwd.as_str())
+            || entry
+                .server
+                .as_deref()
+                .map(|server| sha256_hex(server.as_bytes()))
+                != expected.server_fingerprint
+        {
+            return Err("operation registry authority changed".to_string());
+        }
+        match (
+            target_worker_id(&self.target),
+            target_generation(&self.target),
+            &binding.state,
+        ) {
+            (None, None, BindingState::Unmanaged) => {}
+            (
+                Some(expected_worker),
+                Some(expected_generation),
+                BindingState::Managed {
+                    worker_id,
+                    generation,
+                },
+            ) if worker_id == expected_worker && generation == expected_generation => {
+                let worker = workers
+                    .get(worker_id)
+                    .and_then(ManagedWorker::from_json)
+                    .ok_or_else(|| "operation worker is missing or malformed".to_string())?;
+                if worker.state != ManagedState::Active
+                    || worker.version.as_str()
+                        != self.lifecycle_version.as_deref().unwrap_or_default()
+                {
+                    return Err("operation lifecycle version/state changed".to_string());
+                }
+            }
+            _ => return Err("operation binding state changed".to_string()),
+        }
+        Ok(authorized_target(&self.target))
+    }
+
+    pub(crate) fn with_authorized<T>(
+        &mut self,
+        expected: OperationKind,
+        f: impl FnOnce(&AuthorizedTarget) -> Result<T, String>,
+    ) -> Result<T, String> {
+        self.validate_kind(expected)?;
+        store::with_lock_at(&self.store.root, || {
+            let registry = store::read_registry_at(&self.store.root);
+            let mut target = self.authorized_from(&registry)?;
+            target.root = self.store.root.clone();
+            f(&target)
+        })
+    }
+
+    pub(crate) fn mark_cancellation_unconfirmed(&mut self, reason: &str) -> Result<(), String> {
+        let Some(worker_id) = target_worker_id(&self.target).map(str::to_string) else {
+            return Ok(());
+        };
+        let Some(generation) = target_generation(&self.target).map(str::to_string) else {
+            return Ok(());
+        };
+        self.store.transaction(|registry| {
+            let mut workers = object_map(registry, WORKERS_KEY)?;
+            let mut worker = workers
+                .get(&worker_id)
+                .and_then(ManagedWorker::from_json)
+                .ok_or_else(|| "cancelled operation worker is missing or malformed".to_string())?;
+            if worker.generation != generation {
+                return Err("cancelled operation generation changed".to_string());
+            }
+            if worker.state == ManagedState::FencingUnconfirmed {
+                return Ok(());
+            }
+            if worker.state != ManagedState::Fencing || worker.fence_epoch.is_none() {
+                return Err("cancelled operation is not in an exact fencing epoch".to_string());
+            }
+            worker.state = ManagedState::FencingUnconfirmed;
+            worker.version = next_version(&worker.version)?;
+            worker.proof_gap = Some(format!("{reason}; active_operations={}", self.operation_id));
+            workers.insert(worker_id.clone(), worker.to_json());
+            set_object_map(registry, WORKERS_KEY, workers);
+            Ok(())
+        })
     }
 
     pub(crate) fn cancelled(&mut self) -> bool {
@@ -1864,6 +2043,18 @@ impl ReentryGuard {
 
     pub(crate) fn allowed(&self) -> OperationKind {
         self.allowed
+    }
+}
+
+impl Drop for ReentryGuard {
+    fn drop(&mut self) {
+        let operation_id = self.operation_id.clone();
+        let _ = self.store.transaction(|registry| {
+            let mut operations = object_map(registry, ACTIVE_OPERATIONS_KEY)?;
+            operations.remove(&operation_id);
+            set_object_map(registry, ACTIVE_OPERATIONS_KEY, operations);
+            Ok(())
+        });
     }
 }
 
@@ -1908,7 +2099,6 @@ fn operation_uses_appserver(kind: OperationKind) -> bool {
             | OperationKind::WatchAutoTurn
             | OperationKind::WatchAck
             | OperationKind::WakeAppServer
-            | OperationKind::Deliver
             | OperationKind::InitialTurn
     )
 }
@@ -1954,6 +2144,8 @@ fn authorized_target(target: &GuardTarget) -> AuthorizedTarget {
             generation,
             tool,
             canonical_cwd,
+            server,
+            server_fingerprint,
             ..
         } => AuthorizedTarget {
             root: PathBuf::new(),
@@ -1962,8 +2154,8 @@ fn authorized_target(target: &GuardTarget) -> AuthorizedTarget {
             generation: generation.clone(),
             tool: tool.clone(),
             canonical_cwd: canonical_cwd.clone(),
-            server: None,
-            server_fingerprint: None,
+            server: server.clone(),
+            server_fingerprint: server_fingerprint.clone(),
             thread_id: None,
         },
         GuardTarget::AppServerThread {
@@ -2017,6 +2209,20 @@ fn validate_bounded_token(name: &str, value: &str, max: usize) -> Result<(), Str
 pub struct BindingEpochGuard {
     _file: fs::File,
     binding_epoch: String,
+    store: LifecycleStore,
+    operation_id: String,
+}
+
+impl Drop for BindingEpochGuard {
+    fn drop(&mut self) {
+        let operation_id = self.operation_id.clone();
+        let _ = self.store.transaction(|registry| {
+            let mut operations = object_map(registry, ACTIVE_OPERATIONS_KEY)?;
+            operations.remove(&operation_id);
+            set_object_map(registry, ACTIVE_OPERATIONS_KEY, operations);
+            Ok(())
+        });
+    }
 }
 
 impl BindingEpochGuard {
@@ -2389,6 +2595,30 @@ fn object_map(registry: &Registry, key: &str) -> Result<HashMap<String, JsonValu
             .cloned()
             .ok_or_else(|| format!("malformed lifecycle registry field {key}")),
     }
+}
+
+fn active_operation_ids(
+    registry: &Registry,
+    worker_id: Option<&str>,
+    generation: Option<&str>,
+    sessions: &[String],
+) -> Result<Vec<String>, String> {
+    let operations = object_map(registry, ACTIVE_OPERATIONS_KEY)?;
+    let mut ids = operations
+        .into_iter()
+        .filter_map(|(id, value)| {
+            let row = value.get::<HashMap<String, JsonValue>>()?;
+            let string = |key: &str| row.get(key)?.get::<String>().map(String::as_str);
+            let worker_match = worker_id
+                .is_some_and(|expected| string("worker_id") == Some(expected))
+                && generation.is_some_and(|expected| string("generation") == Some(expected));
+            let session_match = string("runtime_session_id")
+                .is_some_and(|session| sessions.iter().any(|candidate| candidate == session));
+            (worker_match || session_match).then_some(id)
+        })
+        .collect::<Vec<_>>();
+    ids.sort();
+    Ok(ids)
 }
 
 fn set_object_map(registry: &mut Registry, key: &str, map: HashMap<String, JsonValue>) {

@@ -576,7 +576,7 @@ fn managed_attach_drain_timeout_binds_fencing_never_active() {
     assert!(matches!(
         outcome,
         ClaimOutcome::Refused {
-            state: ManagedState::Fencing,
+            state: ManagedState::FencingUnconfirmed,
             ..
         }
     ));
@@ -584,10 +584,15 @@ fn managed_attach_drain_timeout_binds_fencing_never_active() {
         store.read_binding(session).unwrap().unwrap().state,
         BindingState::Managed { .. }
     ));
-    assert_eq!(
-        store.read_worker(worker).unwrap().unwrap().state,
-        ManagedState::Fencing
-    );
+    let fenced = store.read_worker(worker).unwrap().unwrap();
+    assert_eq!(fenced.state, ManagedState::FencingUnconfirmed);
+    let operation_id = fenced
+        .proof_gap
+        .as_deref()
+        .and_then(|gap| gap.split_once("active_operations="))
+        .map(|(_, ids)| ids)
+        .expect("claim timeout must persist its active operation id");
+    assert!(relay::store::is_uuid(operation_id));
     drop(guard);
     fs::remove_dir_all(home).ok();
 }

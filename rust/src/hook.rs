@@ -20,7 +20,7 @@ use crate::lifecycle::{
 };
 use crate::store;
 use std::collections::HashMap;
-use std::io::Read;
+use std::io::{Read, Write};
 use tinyjson::JsonValue;
 
 #[derive(Clone, Copy, PartialEq)]
@@ -235,25 +235,28 @@ fn inner(tool: &str, event: HookEvent, input: &str) -> Result<(), String> {
     // kernel flock is held. On crash/SIGKILL the OS releases that lock and the
     // next prompt automatically resumes the normal hook drain. SessionStart
     // still wins startup mail before a channel finishes initializing.
-    let msgs = if event == HookEvent::Prompt && store::live_watcher_mode(&id, "channel") {
-        Vec::new()
-    } else {
-        let kind = match event {
-            HookEvent::SessionStart => OperationKind::SessionStartDrain,
-            HookEvent::Prompt => OperationKind::UserPromptDrain,
+    let (msgs, guarded_emission, drained_receipt) =
+        if event == HookEvent::Prompt && store::live_watcher_mode(&id, "channel") {
+            (Vec::new(), None, None)
+        } else {
+            let kind = match event {
+                HookEvent::SessionStart => OperationKind::SessionStartDrain,
+                HookEvent::Prompt => OperationKind::UserPromptDrain,
+            };
+            let mut guard = match LifecycleStore::default().admit_operation(&id, kind)? {
+                Admission::Unmanaged(guard) | Admission::Managed(guard) => guard,
+                Admission::Refused { state, reason, .. } => {
+                    print_managed_stop(&format!(
+                        "managed worker {}: {reason}",
+                        managed_state_name(state)
+                    ))?;
+                    return Ok(());
+                }
+            };
+            let drained = store::drain_with_guard(&mut guard)?;
+            let msgs = drained.messages().to_vec();
+            (msgs, Some((guard, kind)), Some(drained))
         };
-        let mut guard = match LifecycleStore::default().admit_operation(&id, kind)? {
-            Admission::Unmanaged(guard) | Admission::Managed(guard) => guard,
-            Admission::Refused { state, reason, .. } => {
-                print_managed_stop(&format!(
-                    "managed worker {}: {reason}",
-                    managed_state_name(state)
-                ))?;
-                return Ok(());
-            }
-        };
-        store::drain_with_guard(&mut guard)?
-    };
     let no_watch = std::env::var("RELAY_NO_WATCH").as_deref() == Ok("1");
     let relay_exe = std::env::current_exe()
         .map(|p| p.to_string_lossy().into_owned())
@@ -277,7 +280,26 @@ fn inner(tool: &str, event: HookEvent, input: &str) -> Result<(), String> {
     let out = JsonValue::from(root)
         .stringify()
         .map_err(|e| format!("serialize hook output: {e}"))?;
-    print!("{out}");
+    if let Some((mut guard, kind)) = guarded_emission {
+        if let Err(error) = guard.authorize_use(kind) {
+            if let Some(receipt) = drained_receipt {
+                receipt.rollback()?;
+            }
+            print_managed_stop(&format!(
+                "hook emission refused after lifecycle changed: {error}"
+            ))?;
+            return Ok(());
+        }
+    }
+    if let Err(error) = std::io::stdout().write_all(out.as_bytes()) {
+        if let Some(receipt) = drained_receipt {
+            receipt.rollback()?;
+        }
+        return Err(format!("write hook output: {error}"));
+    }
+    if let Some(receipt) = drained_receipt {
+        receipt.commit();
+    }
     Ok(())
 }
 
