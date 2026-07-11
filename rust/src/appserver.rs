@@ -19,7 +19,10 @@
 //     only when the registry proves the relay spawned the thread; joined or
 //     foreign threads decline every elicitation.
 
+use crate::lifecycle::{OperationKind, ReentryGuard};
+use crate::sha256::Sha256;
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
@@ -50,6 +53,7 @@ pub(crate) enum DeliveryError {
 pub(crate) struct SpawnedThread {
     ws: WsConn,
     id: String,
+    server_fingerprint: String,
 }
 
 impl SpawnedThread {
@@ -57,12 +61,19 @@ impl SpawnedThread {
         &self.id
     }
 
-    pub(crate) fn start_initial_turn(
+    pub(crate) fn start_initial_turn_with_guard(
         &mut self,
+        guard: &mut ReentryGuard,
         prompt: &str,
         model: Option<&str>,
         effort: Option<&str>,
     ) -> Result<(), String> {
+        let target = guard.authorize_use(OperationKind::InitialTurn)?;
+        if target.thread_id.as_deref() != Some(self.id.as_str())
+            || target.server_fingerprint.as_deref() != Some(self.server_fingerprint.as_str())
+        {
+            return Err("initial-turn guard does not match spawned thread authority".to_string());
+        }
         self.ws.request(
             2,
             "turn/start",
@@ -71,8 +82,13 @@ impl SpawnedThread {
         Ok(())
     }
 
-    pub(crate) fn pump(mut self, timeout_ms: u64) -> Result<bool, String> {
-        self.ws.pump_turn(timeout_ms, true)
+    pub(crate) fn pump_with_guard(
+        mut self,
+        guard: &mut ReentryGuard,
+        timeout_ms: u64,
+    ) -> Result<bool, String> {
+        guard.authorize_use(OperationKind::InitialTurn)?;
+        self.ws.pump_turn_with_guard(timeout_ms, true, guard)
     }
 }
 
@@ -81,30 +97,65 @@ fn die(msg: &str) -> ! {
     std::process::exit(1);
 }
 
-pub(crate) fn deliver(
-    server: &str,
-    thread_id: &str,
+pub(crate) fn deliver_with_guard(
+    guard: &mut ReentryGuard,
     block: &str,
     auto_turn: bool,
     settle_ms: u64,
     allow_bus: bool,
 ) -> Result<DeliveryOutcome, DeliveryError> {
-    let mut ws = connect_initialized(server, "session-relay", "session-relay delivery")
+    let kind = guard.allowed();
+    if !matches!(
+        kind,
+        OperationKind::WatchInject | OperationKind::WatchAutoTurn | OperationKind::WakeAppServer
+    ) || (kind == OperationKind::WatchInject && auto_turn)
+        || (kind == OperationKind::WatchAutoTurn && !auto_turn)
+        || (kind == OperationKind::WakeAppServer && !auto_turn)
+    {
+        return Err(DeliveryError::BeforeInject(format!(
+            "{} cannot authorize this delivery mode",
+            kind.as_str()
+        )));
+    }
+    let target = guard
+        .authorize_use(kind)
+        .map_err(DeliveryError::BeforeInject)?;
+    let server = target
+        .server
+        .ok_or_else(|| DeliveryError::BeforeInject("guard has no app-server".to_string()))?;
+    let thread_id = target
+        .thread_id
+        .ok_or_else(|| DeliveryError::BeforeInject("guard has no app-server thread".to_string()))?;
+    let mut ws = connect_initialized(&server, "session-relay", "session-relay delivery")
         .map_err(DeliveryError::BeforeInject)?;
     ws.request(
         1,
         "thread/resume",
-        sobj(vec![("threadId", JsonValue::from(thread_id.to_string()))]),
+        sobj(vec![("threadId", JsonValue::from(thread_id.clone()))]),
     )
     .map_err(DeliveryError::BeforeInject)?;
-    ws.request(2, "thread/inject_items", inject_params(thread_id, block))
+    guard
+        .authorize_use(kind)
+        .map_err(DeliveryError::BeforeInject)?;
+    ws.request(2, "thread/inject_items", inject_params(&thread_id, block))
         .map_err(DeliveryError::BeforeInject)?;
     if auto_turn {
-        std::thread::sleep(Duration::from_millis(settle_ms));
-        match read_status(&mut ws, 3, thread_id).map_err(DeliveryError::AfterInject)? {
+        let settle_deadline = Instant::now() + Duration::from_millis(settle_ms);
+        while Instant::now() < settle_deadline {
+            if guard.cancelled() {
+                return Err(DeliveryError::AfterInject(
+                    "delivery cancelled during settle".to_string(),
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        guard
+            .authorize_use(kind)
+            .map_err(DeliveryError::AfterInject)?;
+        match read_status(&mut ws, 3, &thread_id).map_err(DeliveryError::AfterInject)? {
             ThreadState::Active => return Ok(DeliveryOutcome::AckDeferred),
             ThreadState::Idle => {
-                start_ack_turn(&mut ws, 4, thread_id, allow_bus)
+                start_ack_turn_with_guard(&mut ws, 4, &thread_id, allow_bus, guard, kind)
                     .map_err(DeliveryError::AfterInject)?;
             }
         }
@@ -132,34 +183,46 @@ pub(crate) fn start_thread(
         .and_then(|id| id.get::<String>())
         .cloned()
         .ok_or_else(|| "thread/start response missing thread.id".to_string())?;
-    Ok(SpawnedThread { ws, id })
+    Ok(SpawnedThread {
+        ws,
+        id,
+        server_fingerprint: sha256_hex(server.as_bytes()),
+    })
 }
 
 pub(crate) fn thread_state(server: &str, thread_id: &str) -> Result<ThreadState, String> {
     let mut ws = connect_initialized(server, "session-relay", "session-relay status")?;
-    ws.request(
-        1,
-        "thread/resume",
-        sobj(vec![("threadId", JsonValue::from(thread_id.to_string()))]),
-    )?;
-    read_status(&mut ws, 2, thread_id)
+    read_status(&mut ws, 1, thread_id)
 }
 
-pub(crate) fn acknowledge(
-    server: &str,
-    thread_id: &str,
+pub(crate) fn acknowledge_with_guard(
+    guard: &mut ReentryGuard,
     allow_bus: bool,
 ) -> Result<DeliveryOutcome, String> {
-    let mut ws = connect_initialized(server, "session-relay", "session-relay acknowledgement")?;
+    let target = guard.authorize_use(OperationKind::WatchAck)?;
+    let server = target
+        .server
+        .ok_or_else(|| "guard has no app-server".to_string())?;
+    let thread_id = target
+        .thread_id
+        .ok_or_else(|| "guard has no app-server thread".to_string())?;
+    let mut ws = connect_initialized(&server, "session-relay", "session-relay acknowledgement")?;
     ws.request(
         1,
         "thread/resume",
-        sobj(vec![("threadId", JsonValue::from(thread_id.to_string()))]),
+        sobj(vec![("threadId", JsonValue::from(thread_id.clone()))]),
     )?;
-    if read_status(&mut ws, 2, thread_id)? == ThreadState::Active {
+    if read_status(&mut ws, 2, &thread_id)? == ThreadState::Active {
         return Ok(DeliveryOutcome::AckDeferred);
     }
-    start_ack_turn(&mut ws, 3, thread_id, allow_bus)?;
+    start_ack_turn_with_guard(
+        &mut ws,
+        3,
+        &thread_id,
+        allow_bus,
+        guard,
+        OperationKind::WatchAck,
+    )?;
     Ok(DeliveryOutcome::Delivered)
 }
 
@@ -220,25 +283,38 @@ fn read_status(ws: &mut WsConn, id: u64, thread_id: &str) -> Result<ThreadState,
     }
 }
 
-fn start_ack_turn(
+fn start_ack_turn_with_guard(
     ws: &mut WsConn,
     id: u64,
     thread_id: &str,
     allow_bus: bool,
+    guard: &mut ReentryGuard,
+    kind: OperationKind,
 ) -> Result<(), String> {
+    guard.authorize_use(kind)?;
     ws.request(id, "turn/start", turn_params(thread_id))?;
-    // Stay attached: MCP tool calls elicit approval from the CONNECTED client
-    // no matter the approvalPolicy; detaching here can wedge the turn.
     let wait_ms: u64 = std::env::var("RELAY_TURN_WAIT_MS")
         .ok()
-        .and_then(|v| v.parse().ok())
+        .and_then(|value| value.parse().ok())
         .unwrap_or(DEFAULT_TURN_WAIT_MS);
-    if !ws.pump_turn(wait_ms, allow_bus)? {
+    if !ws.pump_turn_with_guard(wait_ms, allow_bus, guard)? {
         eprintln!(
             "[relay] turn on {thread_id} still running after {wait_ms}ms — detaching (a later MCP call may wedge it)"
         );
     }
     Ok(())
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hasher
+        .digest()
+        .iter()
+        .fold(String::with_capacity(64), |mut hex, byte| {
+            write!(hex, "{byte:02x}").expect("writing to String cannot fail");
+            hex
+        })
 }
 
 // ---- JSON-RPC param builders (pure — unit-tested shapes) ----
@@ -570,47 +646,59 @@ impl WsConn {
         }
     }
 
-    // Pump the event stream until the turn ends. Ok(true) = turn/completed or
-    // turn/failed seen; Ok(false) = still running at the deadline. Server->
-    // client `mcpServer/elicitation/request`s are answered per
-    // `elicitation_action`; other server requests are left alone.
-    fn pump_turn(&mut self, ms: u64, allow_bus: bool) -> Result<bool, String> {
+    fn pump_turn_with_guard(
+        &mut self,
+        ms: u64,
+        allow_bus: bool,
+        guard: &mut ReentryGuard,
+    ) -> Result<bool, String> {
         let deadline = Instant::now() + Duration::from_millis(ms);
         loop {
+            if guard.cancelled() {
+                return Err("app-server turn pump cancelled".to_string());
+            }
             if Instant::now() > deadline {
                 return Ok(false);
             }
             let Some(text) = self.recv_text()? else {
                 continue;
             };
-            let Ok(v) = text.parse::<JsonValue>() else {
+            let Ok(value) = text.parse::<JsonValue>() else {
                 continue;
             };
-            let Some(o) = v.get::<HashMap<String, JsonValue>>() else {
+            let Some(object) = value.get::<HashMap<String, JsonValue>>() else {
                 continue;
             };
-            let method = o.get("method").and_then(|m| m.get::<String>().cloned());
+            let method = object
+                .get("method")
+                .and_then(|value| value.get::<String>().cloned());
             match method.as_deref() {
                 Some("turn/completed") | Some("turn/failed") => return Ok(true),
                 Some("mcpServer/elicitation/request") => {
-                    let Some(req_id) = o.get("id").cloned() else {
+                    let Some(request_id) = object.get("id").cloned() else {
                         continue;
                     };
-                    let server_name = o
+                    let server_name = object
                         .get("params")
-                        .and_then(|p| p.get::<HashMap<String, JsonValue>>())
-                        .and_then(|p| p.get("serverName"))
-                        .and_then(|s| s.get::<String>().cloned())
+                        .and_then(|value| value.get::<HashMap<String, JsonValue>>())
+                        .and_then(|params| params.get("serverName"))
+                        .and_then(|value| value.get::<String>().cloned())
                         .unwrap_or_default();
                     let action = elicitation_action(&server_name, allow_bus);
-                    let msg = sobj(vec![
-                        ("id", req_id),
+                    let message = sobj(vec![
+                        ("id", request_id),
                         (
                             "result",
                             sobj(vec![("action", JsonValue::from(action.to_string()))]),
                         ),
                     ]);
-                    self.send_frame(0x1, msg.stringify().map_err(|e| format!("{e}"))?.as_bytes())?;
+                    self.send_frame(
+                        0x1,
+                        message
+                            .stringify()
+                            .map_err(|error| format!("{error}"))?
+                            .as_bytes(),
+                    )?;
                 }
                 _ => {}
             }

@@ -15,7 +15,8 @@
 
 use crate::cli::Args;
 use crate::lifecycle::{
-    BindingState, ClaimManagedAttach, ClaimOutcome, LifecycleStore, ManagedState,
+    Admission, BindingState, ClaimManagedAttach, ClaimOutcome, LifecycleStore, ManagedState,
+    OperationKind,
 };
 use crate::store;
 use std::collections::HashMap;
@@ -237,7 +238,21 @@ fn inner(tool: &str, event: HookEvent, input: &str) -> Result<(), String> {
     let msgs = if event == HookEvent::Prompt && store::live_watcher_mode(&id, "channel") {
         Vec::new()
     } else {
-        store::drain(&id)?
+        let kind = match event {
+            HookEvent::SessionStart => OperationKind::SessionStartDrain,
+            HookEvent::Prompt => OperationKind::UserPromptDrain,
+        };
+        let mut guard = match LifecycleStore::default().admit_operation(&id, kind)? {
+            Admission::Unmanaged(guard) | Admission::Managed(guard) => guard,
+            Admission::Refused { state, reason, .. } => {
+                print_managed_stop(&format!(
+                    "managed worker {}: {reason}",
+                    managed_state_name(state)
+                ))?;
+                return Ok(());
+            }
+        };
+        store::drain_with_guard(&mut guard)?
     };
     let no_watch = std::env::var("RELAY_NO_WATCH").as_deref() == Ok("1");
     let relay_exe = std::env::current_exe()

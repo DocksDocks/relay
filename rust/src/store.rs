@@ -1389,10 +1389,31 @@ fn parse_lines(raw: &str) -> Vec<JsonValue> {
         .collect()
 }
 
-/// Read AND clear a recipient's inbox in one locked step.
-pub fn drain(recipient_id: &str) -> Result<Vec<JsonValue>, String> {
-    with_lock(|| {
-        let path = mailbox_path(recipient_id);
+/// Read AND clear the guard-bound inbox in one locked step. The recipient is
+/// derived from the sealed lifecycle capability; callers cannot supply one.
+pub fn drain_with_guard(
+    guard: &mut crate::lifecycle::ReentryGuard,
+) -> Result<Vec<JsonValue>, String> {
+    let kind = guard.allowed();
+    if !matches!(
+        kind,
+        crate::lifecycle::OperationKind::SessionStartDrain
+            | crate::lifecycle::OperationKind::UserPromptDrain
+            | crate::lifecycle::OperationKind::CliInboxDrain
+            | crate::lifecycle::OperationKind::McpInboxDrain
+            | crate::lifecycle::OperationKind::ChannelDeliver
+            | crate::lifecycle::OperationKind::WatchInject
+            | crate::lifecycle::OperationKind::WatchAutoTurn
+            | crate::lifecycle::OperationKind::WakeAppServer
+    ) {
+        return Err(format!("{} cannot drain a mailbox", kind.as_str()));
+    }
+    let target = guard.authorize_use(kind)?;
+    with_lock_at(&target.root, || {
+        let path = target
+            .root
+            .join("mailbox")
+            .join(format!("{}.jsonl", sanitize(&target.runtime_session_id)));
         let raw = match fs::read_to_string(&path) {
             Ok(r) => r,
             Err(_) => return Ok(Vec::new()),

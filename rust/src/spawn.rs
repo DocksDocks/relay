@@ -21,13 +21,14 @@
 
 use crate::appserver;
 use crate::cli::Args;
+use crate::lifecycle::{ChildLaunchSpec, OperationKind, ReentryGuard};
 use crate::store;
 use rustix::fs::{FlockOperation, flock};
 use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
-use std::os::unix::process::{CommandExt, ExitStatusExt};
-use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
+use std::os::unix::process::*;
+use std::process::{Child, ChildStdin, Command, ExitStatus, Output, Stdio};
 use std::time::{Duration, Instant};
 use tinyjson::JsonValue;
 
@@ -36,6 +37,292 @@ const BIRTH_POLL_MS: u64 = 250;
 const SPAWN_LOG_MAX_BYTES: u64 = 4 * 1024 * 1024;
 const SPAWN_LOG_RETAIN_BYTES: u64 = 3 * 1024 * 1024;
 const SPAWN_LOG_BUFFER_BYTES: usize = 64 * 1024;
+
+const CHILD_ENV_ALLOWLIST: &[&str] = &[
+    "PATH",
+    "HOME",
+    "CODEX_HOME",
+    "CLAUDE_CONFIG_DIR",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "TMPDIR",
+    "TERM",
+    "LANG",
+    "LC_ALL",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "ANTHROPIC_API_KEY",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "OPENAI_API_KEY",
+    "AGENT_RELAY_HOME",
+    "SESSION_RELAY_HOME",
+    "RELAY_PLUGIN_ROOT",
+    "RELAY_MANAGED_WORKER_ID",
+    "RELAY_MANAGED_GENERATION",
+    "RELAY_MANAGED_ATTACH_TOKEN",
+    "RELAY_TEST_SENTINEL",
+    "ATTACH_STUB_OUTPUT",
+    "WAKE_STUB_DELAY_MS",
+    "WAKE_STUB_FILE",
+    "WAKE_STUB_RECORD",
+    "WAKE_STUB_STATUS",
+    "WAKE_STUB_STDERR",
+    "WAKE_STUB_STDOUT",
+    "STUB_RELAY_BIN",
+];
+
+fn kill_and_reap_owned_fail_closed(child: &mut Child) {
+    let _ = child.kill();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) | Err(_) => std::thread::sleep(Duration::from_millis(
+                crate::lifecycle::MANAGED_CANCEL_POLL_MS,
+            )),
+        }
+    }
+}
+
+/// Spawn, poll, cancel, and reap a transition-capable runtime child while the
+/// sealed guard retains its binding/activity locks. Target authority and the
+/// executable are derived exclusively from the guard.
+pub fn run_child_with_guard(
+    guard: &mut ReentryGuard,
+    spec: ChildLaunchSpec,
+) -> Result<Output, String> {
+    let kind = guard.allowed();
+    let target = guard.authorize_use(kind)?;
+    let (program, args, child_cwd) = match (kind, spec) {
+        (OperationKind::AttachResume, ChildLaunchSpec::AttachResume(options)) => {
+            let mut args = if target.tool == "codex" {
+                vec![
+                    "resume".to_string(),
+                    target.runtime_session_id.clone(),
+                    "-C".to_string(),
+                    target.canonical_cwd.clone(),
+                ]
+            } else if target.tool == "claude" {
+                vec!["--resume".to_string(), target.runtime_session_id.clone()]
+            } else {
+                return Err(format!("unsupported guarded runtime tool: {}", target.tool));
+            };
+            if let Some(model) = options.model() {
+                args.push(
+                    if target.tool == "codex" {
+                        "-m"
+                    } else {
+                        "--model"
+                    }
+                    .to_string(),
+                );
+                args.push(model.to_string());
+            }
+            if let Some(effort) = options.effort() {
+                if target.tool == "codex" {
+                    args.push("-c".to_string());
+                    args.push(format!("model_reasoning_effort={effort}"));
+                } else {
+                    args.push("--effort".to_string());
+                    args.push(effort.to_string());
+                }
+            }
+            let child_cwd = (target.tool == "claude").then(|| target.canonical_cwd.clone());
+            (target.tool.clone(), args, child_cwd)
+        }
+        (OperationKind::WakeCli, ChildLaunchSpec::WakeDoorbell(message))
+        | (OperationKind::WatchWakeFallback, ChildLaunchSpec::WatchWakeFallback(message)) => {
+            let program = wake_program(&target.tool)?;
+            let mut args = if target.tool == "codex" {
+                vec![
+                    "exec".to_string(),
+                    "resume".to_string(),
+                    target.runtime_session_id.clone(),
+                    "--json".to_string(),
+                ]
+            } else if target.tool == "claude" {
+                vec![
+                    "-p".to_string(),
+                    "--resume".to_string(),
+                    target.runtime_session_id.clone(),
+                    "--output-format".to_string(),
+                    "json".to_string(),
+                ]
+            } else {
+                return Err(format!("unsupported guarded runtime tool: {}", target.tool));
+            };
+            if let Some(model) = message.model() {
+                args.push(
+                    if target.tool == "codex" {
+                        "-m"
+                    } else {
+                        "--model"
+                    }
+                    .to_string(),
+                );
+                args.push(model.to_string());
+            }
+            if let Some(effort) = message.effort() {
+                if target.tool == "codex" {
+                    args.push("-c".to_string());
+                    args.push(format!("model_reasoning_effort={effort}"));
+                } else {
+                    args.push("--effort".to_string());
+                    args.push(effort.to_string());
+                }
+            }
+            args.push("--".to_string());
+            args.push(message.as_str().to_string());
+            (program, args, Some(target.canonical_cwd.clone()))
+        }
+        (allowed, _) => {
+            return Err(format!(
+                "child launch payload does not match guard kind {}",
+                allowed.as_str()
+            ));
+        }
+    };
+    let _bound_generation = (&target.worker_id, &target.generation);
+    let mut command = Command::new(&program);
+    command
+        .args(args)
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(cwd) = child_cwd {
+        command.current_dir(cwd);
+    }
+    for key in CHILD_ENV_ALLOWLIST {
+        if let Some(value) = std::env::var_os(key) {
+            command.env(key, value);
+        }
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("failed to spawn guarded {program}: {error}"))?;
+    let Some(stdout) = child.stdout.take() else {
+        kill_and_reap_owned_fail_closed(&mut child);
+        return Err("guarded child stdout pipe is unavailable".to_string());
+    };
+    let Some(stderr) = child.stderr.take() else {
+        kill_and_reap_owned_fail_closed(&mut child);
+        return Err("guarded child stderr pipe is unavailable".to_string());
+    };
+    let stdout_reader = match std::thread::Builder::new()
+        .name("relay-guarded-stdout".to_string())
+        .spawn(move || {
+            let mut bytes = Vec::new();
+            let mut reader = stdout;
+            reader.read_to_end(&mut bytes).map(|_| bytes)
+        }) {
+        Ok(reader) => reader,
+        Err(error) => {
+            kill_and_reap_owned_fail_closed(&mut child);
+            return Err(format!("spawn guarded stdout reader: {error}"));
+        }
+    };
+    let stderr_reader = match std::thread::Builder::new()
+        .name("relay-guarded-stderr".to_string())
+        .spawn(move || {
+            let mut bytes = Vec::new();
+            let mut reader = stderr;
+            reader.read_to_end(&mut bytes).map(|_| bytes)
+        }) {
+        Ok(reader) => reader,
+        Err(error) => {
+            kill_and_reap_owned_fail_closed(&mut child);
+            let _ = stdout_reader.join();
+            return Err(format!("spawn guarded stderr reader: {error}"));
+        }
+    };
+    let mut poll_error_reported = false;
+    let (status, was_cancelled) = loop {
+        if guard.cancelled() {
+            let _ = child.kill();
+            let deadline =
+                Instant::now() + Duration::from_millis(crate::lifecycle::MANAGED_CANCEL_GRACE_MS);
+            let mut grace_expired = false;
+            let status = loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => break status,
+                    Ok(None) => {
+                        if !grace_expired && Instant::now() >= deadline {
+                            grace_expired = true;
+                            eprintln!(
+                                "[relay] guarded child exceeded cancellation grace; retaining lifecycle guard until reap"
+                            );
+                        }
+                        std::thread::sleep(Duration::from_millis(
+                            crate::lifecycle::MANAGED_CANCEL_POLL_MS,
+                        ));
+                    }
+                    Err(error) => {
+                        if !grace_expired && Instant::now() >= deadline {
+                            grace_expired = true;
+                            eprintln!(
+                                "[relay] guarded child wait failed past cancellation grace ({error}); retaining lifecycle guard"
+                            );
+                        }
+                        std::thread::sleep(Duration::from_millis(
+                            crate::lifecycle::MANAGED_CANCEL_POLL_MS,
+                        ));
+                    }
+                }
+            };
+            break (status, true);
+        } else {
+            match child.try_wait() {
+                Ok(Some(status)) => break (status, false),
+                Ok(None) => std::thread::sleep(Duration::from_millis(
+                    crate::lifecycle::MANAGED_CANCEL_POLL_MS,
+                )),
+                Err(error) => {
+                    if !poll_error_reported {
+                        poll_error_reported = true;
+                        eprintln!(
+                            "[relay] guarded child poll failed ({error}); retaining lifecycle guard until reap"
+                        );
+                    }
+                    std::thread::sleep(Duration::from_millis(
+                        crate::lifecycle::MANAGED_CANCEL_POLL_MS,
+                    ));
+                }
+            }
+        }
+    };
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| "guarded child stdout reader panicked".to_string())?
+        .map_err(|error| format!("read guarded child stdout: {error}"))?;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| "guarded child stderr reader panicked".to_string())?
+        .map_err(|error| format!("read guarded child stderr: {error}"))?;
+    if was_cancelled || guard.cancelled() {
+        return Err(format!("guarded child cancelled after status {status}"));
+    }
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+fn wake_program(tool: &str) -> Result<String, String> {
+    let key = match tool {
+        "claude" => "RELAY_WAKE_CMD_CLAUDE",
+        "codex" => "RELAY_WAKE_CMD_CODEX",
+        other => return Err(format!("unsupported guarded runtime tool: {other}")),
+    };
+    Ok(std::env::var(key)
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| tool.to_string()))
+}
 
 fn die(msg: &str) -> ! {
     eprintln!("{msg}");
@@ -379,17 +666,20 @@ pub fn run_appserver_pump() -> ! {
         Some("app-server"),
     )
     .unwrap_or_else(|e| pump_fail(&e));
+    let mut guard = crate::lifecycle::admit_operation(&id, OperationKind::InitialTurn)
+        .and_then(crate::lifecycle::Admission::into_guard)
+        .unwrap_or_else(|error| pump_fail(&error));
     let abs_relay = std::env::current_exe()
         .ok()
         .map(|path| path.to_string_lossy().to_string())
         .unwrap_or_else(|| "relay".to_string());
     let prompt = build_prompt(&reply_to, &abs_relay, Some(&id), &task);
     spawned
-        .start_initial_turn(&prompt, model.as_deref(), effort.as_deref())
+        .start_initial_turn_with_guard(&mut guard, &prompt, model.as_deref(), effort.as_deref())
         .unwrap_or_else(|e| pump_fail(&e));
 
     pump_report("started", &id);
-    match spawned.pump(timeout_secs.saturating_mul(1000)) {
+    match spawned.pump_with_guard(&mut guard, timeout_secs.saturating_mul(1000)) {
         Ok(true) => std::process::exit(0),
         Ok(false) => {
             eprintln!("app-server first turn timed out after {timeout_secs}s");

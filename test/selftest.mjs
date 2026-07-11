@@ -230,23 +230,6 @@ check('wake --dry maps --model/--effort for codex and claude targets', () => {
   assert.ok(a.args.indexOf('--') > resume + 6, 'claude model flags stay before the prompt fence');
 });
 
-check('attach resolves registered names and ids into per-tool takeover commands', () => {
-  const byName = relay(['attach', 'codex-C']);
-  assert.equal(byName.status, 0, byName.stderr);
-  assert.match(byName.stdout, new RegExp(`command: codex resume ${idC} -C `));
-  assert.match(byName.stdout, /session: name=codex-C tool=codex dir=/);
-  assert.match(byName.stdout, /WARNING: split-brain risk/);
-
-  const byId = relay(['attach', idC]);
-  assert.equal(byId.status, 0, byId.stderr);
-  assert.match(byId.stdout, new RegExp(`command: codex resume ${idC} -C `));
-
-  const claude = relay(['attach', 'agent-A']);
-  assert.equal(claude.status, 0, claude.stderr);
-  assert.match(claude.stdout, new RegExp(`command: cd .* && claude --resume ${idA}`));
-  assert.match(claude.stdout, /WARNING: split-brain risk/);
-});
-
 const attachStubDir = path.join(HOME, 'attach-stubs');
 fs.mkdirSync(attachStubDir);
 const attachStub = `#!/usr/bin/env node
@@ -258,9 +241,9 @@ for (const tool of ['codex', 'claude']) {
 }
 const attachPath = `${attachStubDir}${path.delimiter}${process.env.PATH}`;
 
-check('attach --exec replaces the process with exact codex and claude argv/cwd', () => {
+check('attach always runs as a guarded spawn+wait and prints no copyable command', () => {
   const codexRecord = path.join(HOME, 'attach-codex.json');
-  const codex = relay(['attach', 'codex-C', '--exec'], {
+  const codex = relay(['attach', 'codex-C'], {
     env: { PATH: attachPath, ATTACH_STUB_OUTPUT: codexRecord },
   });
   assert.equal(codex.status, 0, codex.stderr);
@@ -269,18 +252,19 @@ check('attach --exec replaces the process with exact codex and claude argv/cwd',
     cwd: process.cwd(),
   });
   assert.match(codex.stderr, /WARNING: split-brain risk/);
+  assert.doesNotMatch(codex.stdout, /command:/);
 
-  const codexBeforeRecord = path.join(HOME, 'attach-codex-before.json');
-  const codexBefore = relay(['attach', '--exec', 'codex-C'], {
-    env: { PATH: attachPath, ATTACH_STUB_OUTPUT: codexBeforeRecord },
+  const byIdRecord = path.join(HOME, 'attach-codex-id.json');
+  const byId = relay(['attach', idC], {
+    env: { PATH: attachPath, ATTACH_STUB_OUTPUT: byIdRecord },
   });
-  assert.equal(codexBefore.status, 0, codexBefore.stderr);
-  assert.deepEqual(JSON.parse(fs.readFileSync(codexBeforeRecord, 'utf8')).argv, [
+  assert.equal(byId.status, 0, byId.stderr);
+  assert.deepEqual(JSON.parse(fs.readFileSync(byIdRecord, 'utf8')).argv, [
     'resume', idC, '-C', dirC,
   ]);
 
   const claudeRecord = path.join(HOME, 'attach-claude.json');
-  const claude = relay(['attach', 'agent-A', '--exec'], {
+  const claude = relay(['attach', 'agent-A'], {
     env: { PATH: attachPath, ATTACH_STUB_OUTPUT: claudeRecord },
   });
   assert.equal(claude.status, 0, claude.stderr);
@@ -289,6 +273,24 @@ check('attach --exec replaces the process with exact codex and claude argv/cwd',
     cwd: dirA,
   });
   assert.match(claude.stderr, /WARNING: split-brain risk/);
+});
+
+check('legacy attach --exec is accepted but still uses guarded spawn+wait', () => {
+  for (const args of [
+    ['attach', 'codex-C', '--exec'],
+    ['attach', '--exec', 'codex-C'],
+  ]) {
+    const record = path.join(HOME, `attach-legacy-${args[1] === '--exec' ? 'before' : 'after'}.json`);
+    const result = relay(args, {
+      env: { PATH: attachPath, ATTACH_STUB_OUTPUT: record },
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(JSON.parse(fs.readFileSync(record, 'utf8')).argv, [
+      'resume', idC, '-C', dirC,
+    ]);
+    assert.match(result.stderr, /--exec is deprecated/);
+    assert.doesNotMatch(result.stdout, /command:/);
+  }
 });
 
 check('attach strictly rejects extra operands, unknown flags, and exec after --', () => {
@@ -305,23 +307,17 @@ check('attach strictly rejects extra operands, unknown flags, and exec after --'
   assert.equal(fs.existsSync(record), false, '--exec after -- never replaced the process');
 });
 
-check('attach print mode tolerates a missing dir while --exec refuses it', () => {
+check('attach refuses a missing stored dir before guarded spawn', () => {
   const missingId = '53535353-5353-4353-8353-535353535353';
   const missingDir = path.join(HOME, 'missing-attach-dir');
   assert.equal(relay(['register', 'missing-attach', '--id', missingId, '--dir', missingDir, '--tool', 'codex']).status, 0);
-  const printed = relay(['attach', 'missing-attach']);
-  assert.equal(printed.status, 0, printed.stderr);
-  assert.match(printed.stdout, new RegExp(`command: codex resume ${missingId}`));
-  assert.doesNotMatch(printed.stdout, / -C /);
-  assert.match(printed.stdout, /WARNING: split-brain risk/);
-
-  const record = path.join(HOME, 'attach-missing.json');
-  const executed = relay(['attach', 'missing-attach', '--exec'], {
-    env: { PATH: attachPath, ATTACH_STUB_OUTPUT: record },
-  });
-  assert.equal(executed.status, 1);
-  assert.match(executed.stderr, /stored dir does not exist/);
-  assert.equal(fs.existsSync(record), false);
+  for (const args of [['attach', 'missing-attach'], ['attach', 'missing-attach', '--exec']]) {
+    const record = path.join(HOME, `attach-missing-${args.length}.json`);
+    const result = relay(args, { env: { PATH: attachPath, ATTACH_STUB_OUTPUT: record } });
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /stored dir does not exist/);
+    assert.equal(fs.existsSync(record), false);
+  }
 });
 
 check('attach rejects an unresolved non-UUID id', () => {

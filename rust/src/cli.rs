@@ -19,10 +19,14 @@
 use crate::appserver;
 use crate::discover;
 use crate::hook;
+use crate::lifecycle::{
+    self, AttachOptions, ChildLaunchSpec, DoorbellMessage, OperationKind, ValidatedEffort,
+    ValidatedModel,
+};
+use crate::spawn;
 use crate::store;
 use std::collections::HashMap;
 use std::io::Write;
-use std::os::unix::process::CommandExt;
 use tinyjson::JsonValue;
 
 pub(crate) const DEFAULT_NUDGE: &str = "You have new session-relay mail. Use the session-relay skill: call inbox to read your pending messages and act on them.";
@@ -90,7 +94,6 @@ struct Target {
     dir: Option<String>,
     tool: String,
     name: Option<String>,
-    last_seen: String,
     server: Option<String>,
     allow_bus: bool,
 }
@@ -112,7 +115,6 @@ fn explicit_target(args: &Args) -> Option<Target> {
         ),
         tool: args.flag("tool").unwrap_or("claude").to_string(),
         name: None,
-        last_seen: "unregistered".to_string(),
         server: None,
         allow_bus: false,
     })
@@ -125,7 +127,6 @@ fn from_entry(e: store::Entry) -> Target {
         dir: e.dir,
         tool: e.tool,
         name: e.name,
-        last_seen: e.last_seen,
         server: e.server,
         allow_bus,
     }
@@ -138,13 +139,6 @@ fn cwd_string() -> String {
 }
 
 const ATTACH_WARNING: &str = "WARNING: split-brain risk — neither CLI locks sessions; attaching while automation drives the session interleaves two writers. Prefer attach when the worker is idle; relay doctor --id <id> shows watcher/lock state.";
-
-struct AttachInvocation {
-    program: String,
-    args: Vec<String>,
-    cwd: Option<String>,
-    rendered: String,
-}
 
 struct ParsedAttachArgs {
     target: String,
@@ -183,68 +177,6 @@ fn parse_attach_args(raw: &[String]) -> Result<ParsedAttachArgs, ()> {
     Ok(ParsedAttachArgs { target, execute })
 }
 
-fn shell_word(value: &str) -> String {
-    if !value.is_empty()
-        && value
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'_' | b'-'))
-    {
-        value.to_string()
-    } else {
-        format!("'{}'", value.replace('\'', "'\"'\"'"))
-    }
-}
-
-fn attach_invocation(
-    tool: &str,
-    id: &str,
-    dir: Option<&str>,
-    dir_exists: bool,
-    server: Option<&str>,
-) -> Result<AttachInvocation, String> {
-    match tool {
-        "codex" => {
-            let mut args = if let Some(server) = server {
-                vec!["--remote".to_string(), format!("unix://{server}")]
-            } else {
-                vec!["resume".to_string(), id.to_string()]
-            };
-            if server.is_none() && dir_exists {
-                if let Some(dir) = dir {
-                    args.push("-C".to_string());
-                    args.push(dir.to_string());
-                }
-            }
-            let rendered = std::iter::once("codex".to_string())
-                .chain(args.iter().map(|arg| shell_word(arg)))
-                .collect::<Vec<_>>()
-                .join(" ");
-            Ok(AttachInvocation {
-                program: "codex".to_string(),
-                args,
-                cwd: None,
-                rendered,
-            })
-        }
-        "claude" => {
-            let args = vec!["--resume".to_string(), id.to_string()];
-            let command = format!("claude --resume {}", shell_word(id));
-            let rendered = dir
-                .map(|dir| format!("cd {} && {command}", shell_word(dir)))
-                .unwrap_or(command);
-            Ok(AttachInvocation {
-                program: "claude".to_string(),
-                args,
-                cwd: dir.map(str::to_string),
-                rendered,
-            })
-        }
-        _ => Err(format!(
-            "attach target tool must be claude|codex, got: {tool}"
-        )),
-    }
-}
-
 fn discovered_target(id: &str) -> Option<Target> {
     let rows = discover::discover(&discover::Options {
         active_within_min: 100.0 * 365.25 * 24.0 * 60.0,
@@ -259,7 +191,6 @@ fn discovered_target(id: &str) -> Option<Target> {
             dir: string("cwd"),
             tool: string("tool").unwrap_or_default(),
             name: string("name"),
-            last_seen: string("lastActivity").unwrap_or_else(|| "unknown".to_string()),
             server: None,
             allow_bus: false,
         })
@@ -326,45 +257,28 @@ fn attach(args: &Args) -> ! {
         .dir
         .as_deref()
         .is_some_and(|dir| std::path::Path::new(dir).is_dir());
-    let invocation = attach_invocation(
-        &target.tool,
-        &target.id,
-        target.dir.as_deref(),
-        dir_exists,
-        target.server.as_deref(),
-    )
-    .unwrap_or_else(|e| {
-        eprintln!("{ATTACH_WARNING}");
-        die(&e)
-    });
-
-    if parsed.execute {
-        eprintln!("{ATTACH_WARNING}");
-        let Some(_) = target.dir.as_deref().filter(|_| dir_exists) else {
-            die("attach --exec refused: stored dir does not exist");
-        };
-        let mut command = std::process::Command::new(&invocation.program);
-        command.args(&invocation.args);
-        if let Some(cwd) = invocation.cwd.as_deref() {
-            command.current_dir(cwd);
-        }
-        let error = command.exec();
-        die(&format!(
-            "attach --exec failed to replace process with {}: {error}",
-            invocation.program
-        ));
+    if !dir_exists {
+        die("attach refused: stored dir does not exist");
     }
-
-    println!(
-        "session: name={} tool={} dir={} last_seen={}",
-        target.name.as_deref().unwrap_or("(unnamed)"),
-        target.tool,
-        target.dir.as_deref().unwrap_or("?"),
-        target.last_seen
-    );
-    println!("command: {}", invocation.rendered);
-    println!("{ATTACH_WARNING}");
-    std::process::exit(0);
+    if parsed.execute {
+        eprintln!("--exec is deprecated; attach now retains a guarded parent until child exit");
+    }
+    eprintln!("{ATTACH_WARNING}");
+    let mut guard = lifecycle::admit_operation(&target.id, OperationKind::AttachResume)
+        .and_then(lifecycle::Admission::into_guard)
+        .unwrap_or_else(|error| die(&error));
+    let output = spawn::run_child_with_guard(
+        &mut guard,
+        ChildLaunchSpec::AttachResume(AttachOptions::new(None, None)),
+    )
+    .unwrap_or_else(|error| die(&error));
+    if !output.stdout.is_empty() {
+        let _ = std::io::stdout().write_all(&output.stdout);
+    }
+    if !output.stderr.is_empty() {
+        let _ = std::io::stderr().write_all(&output.stderr);
+    }
+    std::process::exit(output.status.code().unwrap_or(1));
 }
 
 fn lock_age(path: &std::path::Path) -> String {
@@ -890,7 +804,10 @@ pub fn run(cmd: &str, raw: Vec<String>) -> ! {
             let Some(target) = store::resolve(who) else {
                 die(&format!("unknown session: {who}"));
             };
-            let msgs = store::drain(&target.id).unwrap_or_else(|e| die(&e));
+            let mut guard = lifecycle::admit_operation(&target.id, OperationKind::CliInboxDrain)
+                .and_then(lifecycle::Admission::into_guard)
+                .unwrap_or_else(|error| die(&error));
+            let msgs = store::drain_with_guard(&mut guard).unwrap_or_else(|e| die(&e));
             let mut out: HashMap<String, JsonValue> = HashMap::new();
             out.insert("count".into(), JsonValue::from(msgs.len() as f64));
             out.insert("messages".into(), JsonValue::from(msgs));
@@ -961,11 +878,7 @@ pub fn run(cmd: &str, raw: Vec<String>) -> ! {
                     target.id
                 ));
             }
-            let server = target.server.clone().or_else(|| {
-                std::env::var("RELAY_APP_SERVER")
-                    .ok()
-                    .filter(|value| !value.is_empty())
-            });
+            let server = target.server.clone();
             if target.tool == "codex"
                 && !args.has("dry")
                 && server
@@ -973,6 +886,10 @@ pub fn run(cmd: &str, raw: Vec<String>) -> ! {
                     .is_some_and(|configured| appserver::probe(configured).is_ok())
             {
                 let server = server.as_deref().unwrap();
+                let mut guard =
+                    lifecycle::admit_operation(&target.id, OperationKind::WakeAppServer)
+                        .and_then(lifecycle::Admission::into_guard)
+                        .unwrap_or_else(|error| die(&error));
                 if !store::mailbox_has_content(&target.id) && custom_message.is_none() {
                     std::process::exit(0);
                 }
@@ -985,7 +902,7 @@ pub fn run(cmd: &str, raw: Vec<String>) -> ! {
                     Err(e) => die(&format!("cannot read app-server thread status: {e}")),
                 }
 
-                let drained = store::drain(&target.id).unwrap_or_else(|e| die(&e));
+                let drained = store::drain_with_guard(&mut guard).unwrap_or_else(|e| die(&e));
                 let mut payload = drained.clone();
                 if let Some(custom) = custom_message.as_deref() {
                     payload.push(custom_wake_message(custom));
@@ -998,9 +915,8 @@ pub fn run(cmd: &str, raw: Vec<String>) -> ! {
                     .ok()
                     .and_then(|value| value.parse().ok())
                     .unwrap_or(DEFAULT_TURN_SETTLE_MS);
-                match appserver::deliver(
-                    server,
-                    &target.id,
+                match appserver::deliver_with_guard(
+                    &mut guard,
                     &block,
                     true,
                     settle_ms,
@@ -1091,11 +1007,29 @@ pub fn run(cmd: &str, raw: Vec<String>) -> ! {
                     die(&format!("cannot acquire wake resume lock: {e}"));
                 }
             };
-            let out = std::process::Command::new(&cmd)
-                .args(&cargs)
-                .current_dir(&dir)
-                .output()
-                .unwrap_or_else(|e| die(&format!("failed to spawn {cmd}: {e}")));
+            if store::resolve(&target.id).is_none() {
+                store::register(&target.id, Some(&dir), None, Some(&target.tool), None)
+                    .unwrap_or_else(|error| {
+                        die(&format!("cannot register explicit wake target: {error}"))
+                    });
+            }
+            let model = model
+                .map(ValidatedModel::parse)
+                .transpose()
+                .unwrap_or_else(|error| die(&error));
+            let effort = effort
+                .map(ValidatedEffort::parse)
+                .transpose()
+                .unwrap_or_else(|error| die(&error));
+            let message = DoorbellMessage::parse(&message)
+                .map(|message| message.with_runtime_options(model, effort))
+                .unwrap_or_else(|error| die(&error));
+            let mut guard = lifecycle::admit_operation(&target.id, OperationKind::WakeCli)
+                .and_then(lifecycle::Admission::into_guard)
+                .unwrap_or_else(|error| die(&error));
+            let out =
+                spawn::run_child_with_guard(&mut guard, ChildLaunchSpec::WakeDoorbell(message))
+                    .unwrap_or_else(|error| die(&error));
             if !out.stdout.is_empty() {
                 let _ = std::io::stdout().write_all(&out.stdout);
             }
@@ -1233,75 +1167,6 @@ mod tests {
     #[test]
     fn parser_ignores_garbage_stdout() {
         assert_eq!(wake_usage_line("codex", b"not json"), None);
-    }
-
-    #[test]
-    fn attach_codex_uses_resume_and_existing_registered_dir() {
-        let attach = attach_invocation(
-            "codex",
-            "11111111-1111-4111-8111-111111111111",
-            Some("/tmp/project with space"),
-            true,
-            None,
-        )
-        .unwrap();
-        assert_eq!(attach.program, "codex");
-        assert_eq!(
-            attach.args,
-            strings(&[
-                "resume",
-                "11111111-1111-4111-8111-111111111111",
-                "-C",
-                "/tmp/project with space"
-            ])
-        );
-        assert_eq!(
-            attach.rendered,
-            "codex resume 11111111-1111-4111-8111-111111111111 -C '/tmp/project with space'"
-        );
-    }
-
-    #[test]
-    fn attach_claude_changes_to_the_registered_dir() {
-        let attach = attach_invocation(
-            "claude",
-            "22222222-2222-4222-8222-222222222222",
-            Some("/tmp/project with space"),
-            true,
-            None,
-        )
-        .unwrap();
-        assert_eq!(attach.program, "claude");
-        assert_eq!(
-            attach.args,
-            strings(&["--resume", "22222222-2222-4222-8222-222222222222"])
-        );
-        assert_eq!(attach.cwd.as_deref(), Some("/tmp/project with space"));
-        assert_eq!(
-            attach.rendered,
-            "cd '/tmp/project with space' && claude --resume 22222222-2222-4222-8222-222222222222"
-        );
-    }
-
-    #[test]
-    fn attach_codex_server_seam_prefers_remote_over_resume() {
-        let attach = attach_invocation(
-            "codex",
-            "33333333-3333-4333-8333-333333333333",
-            Some("/tmp/project"),
-            true,
-            Some("/tmp/codex app.sock"),
-        )
-        .unwrap();
-        assert_eq!(attach.program, "codex");
-        assert_eq!(
-            attach.args,
-            strings(&["--remote", "unix:///tmp/codex app.sock"])
-        );
-        assert_eq!(
-            attach.rendered,
-            "codex --remote 'unix:///tmp/codex app.sock'"
-        );
     }
 
     #[test]

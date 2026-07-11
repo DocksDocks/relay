@@ -169,6 +169,7 @@ pub struct ManagedWorker {
     pub required_scope: RequiredScope,
     pub execution: ExecutionBackend,
     pub fence_reason: Option<String>,
+    pub fence_epoch: Option<String>,
     pub proof_gap: Option<String>,
     pub release_receipt: Option<ReleaseReceipt>,
 }
@@ -242,6 +243,278 @@ pub enum ClaimOutcome {
         reason: String,
     },
 }
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum OperationKind {
+    SessionStartDrain,
+    UserPromptDrain,
+    CliInboxDrain,
+    McpInboxDrain,
+    ChannelDeliver,
+    WatchInject,
+    WatchAutoTurn,
+    WatchAck,
+    WatchWakeFallback,
+    WakeAppServer,
+    WakeCli,
+    AttachResume,
+    Deliver,
+    InitialTurn,
+}
+
+impl OperationKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SessionStartDrain => "SessionStartDrain",
+            Self::UserPromptDrain => "UserPromptDrain",
+            Self::CliInboxDrain => "CliInboxDrain",
+            Self::McpInboxDrain => "McpInboxDrain",
+            Self::ChannelDeliver => "ChannelDeliver",
+            Self::WatchInject => "WatchInject",
+            Self::WatchAutoTurn => "WatchAutoTurn",
+            Self::WatchAck => "WatchAck",
+            Self::WatchWakeFallback => "WatchWakeFallback",
+            Self::WakeAppServer => "WakeAppServer",
+            Self::WakeCli => "WakeCli",
+            Self::AttachResume => "AttachResume",
+            Self::Deliver => "Deliver",
+            Self::InitialTurn => "InitialTurn",
+        }
+    }
+}
+
+#[derive(Debug)]
+enum GuardTarget {
+    Session {
+        runtime_session_id: String,
+        worker_id: Option<String>,
+        generation: Option<String>,
+        binding_epoch: String,
+        tool: String,
+        canonical_cwd: String,
+    },
+    AppServerThread {
+        runtime_session_id: String,
+        worker_id: Option<String>,
+        generation: Option<String>,
+        binding_epoch: String,
+        tool: String,
+        canonical_cwd: String,
+        server: String,
+        server_fingerprint: String,
+        thread_id: String,
+    },
+}
+
+pub struct SharedFileLock {
+    _file: fs::File,
+    _sealed: Sealed,
+}
+
+pub struct ExclusiveFileLock {
+    _file: fs::File,
+    _sealed: Sealed,
+}
+
+struct CancelToken {
+    path: PathBuf,
+    worker_or_session_epoch: String,
+}
+
+pub struct ReentryGuard {
+    store: LifecycleStore,
+    target: GuardTarget,
+    allowed: OperationKind,
+    lifecycle_version: Option<String>,
+    _binding_guard: SharedFileLock,
+    _activity_guard: Option<SharedFileLock>,
+    _deadline: Instant,
+    cancel: CancelToken,
+    _sealed: Sealed,
+}
+
+pub enum Admission {
+    Unmanaged(ReentryGuard),
+    Managed(ReentryGuard),
+    Refused {
+        worker_id: String,
+        state: ManagedState,
+        reason: String,
+    },
+}
+
+impl Admission {
+    pub fn into_guard(self) -> Result<ReentryGuard, String> {
+        match self {
+            Self::Unmanaged(guard) | Self::Managed(guard) => Ok(guard),
+            Self::Refused {
+                worker_id,
+                state,
+                reason,
+            } => Err(format!(
+                "operation refused for managed worker {worker_id} in {}: {reason}",
+                state.as_str()
+            )),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FenceIntent {
+    worker_id: String,
+    generation: String,
+    fence_epoch: String,
+    fencing_version: String,
+    root: PathBuf,
+}
+
+pub struct FencePermit {
+    intent: FenceIntent,
+    _binding_guards: Vec<ExclusiveFileLock>,
+    _activity_guard: ExclusiveFileLock,
+    _sealed: Sealed,
+}
+
+impl FencePermit {
+    pub fn worker_id(&self) -> &str {
+        &self.intent.worker_id
+    }
+
+    pub fn generation(&self) -> &str {
+        &self.intent.generation
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub enum DrainError {
+    TimedOut { prior_operations: Vec<String> },
+    StaleGeneration,
+    StateChanged,
+    Store(String),
+}
+
+impl From<String> for DrainError {
+    fn from(value: String) -> Self {
+        Self::Store(value)
+    }
+}
+
+pub(crate) struct AuthorizedTarget {
+    pub(crate) root: PathBuf,
+    pub(crate) runtime_session_id: String,
+    pub(crate) worker_id: Option<String>,
+    pub(crate) generation: Option<String>,
+    pub(crate) tool: String,
+    pub(crate) canonical_cwd: String,
+    pub(crate) server: Option<String>,
+    pub(crate) server_fingerprint: Option<String>,
+    pub(crate) thread_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ValidatedModel(String);
+
+impl ValidatedModel {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        validate_bounded_token("model", value, 128).map(|()| Self(value.to_string()))
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ValidatedEffort(String);
+
+impl ValidatedEffort {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        if matches!(
+            value,
+            "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+        ) {
+            Ok(Self(value.to_string()))
+        } else {
+            Err("effort is not an allowed tier".to_string())
+        }
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DoorbellMessage {
+    text: String,
+    model: Option<ValidatedModel>,
+    effort: Option<ValidatedEffort>,
+}
+
+impl DoorbellMessage {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        if value.is_empty() || value.len() > 16_384 || value.contains('\0') {
+            Err("doorbell message must be 1..=16384 bytes without NUL".to_string())
+        } else {
+            Ok(Self {
+                text: value.to_string(),
+                model: None,
+                effort: None,
+            })
+        }
+    }
+
+    pub fn with_runtime_options(
+        mut self,
+        model: Option<ValidatedModel>,
+        effort: Option<ValidatedEffort>,
+    ) -> Self {
+        self.model = model;
+        self.effort = effort;
+        self
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.text
+    }
+
+    pub(crate) fn model(&self) -> Option<&str> {
+        self.model.as_ref().map(ValidatedModel::as_str)
+    }
+
+    pub(crate) fn effort(&self) -> Option<&str> {
+        self.effort.as_ref().map(ValidatedEffort::as_str)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AttachOptions {
+    model: Option<ValidatedModel>,
+    effort: Option<ValidatedEffort>,
+}
+
+impl AttachOptions {
+    pub fn new(model: Option<ValidatedModel>, effort: Option<ValidatedEffort>) -> Self {
+        Self { model, effort }
+    }
+
+    pub(crate) fn model(&self) -> Option<&str> {
+        self.model.as_ref().map(ValidatedModel::as_str)
+    }
+
+    pub(crate) fn effort(&self) -> Option<&str> {
+        self.effort.as_ref().map(ValidatedEffort::as_str)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ChildLaunchSpec {
+    AttachResume(AttachOptions),
+    WakeDoorbell(DoorbellMessage),
+    WatchWakeFallback(DoorbellMessage),
+}
+
+pub(crate) struct Sealed(());
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GcCheckpoint {
@@ -358,6 +631,7 @@ impl LifecycleStore {
                 required_scope: spec.required_scope,
                 execution: spec.execution,
                 fence_reason: None,
+                fence_epoch: None,
                 proof_gap: None,
                 release_receipt: None,
             };
@@ -573,6 +847,311 @@ impl LifecycleStore {
             workers.insert(worker_id.to_string(), worker.to_json());
             set_object_map(registry, WORKERS_KEY, workers);
             Ok(worker)
+        })
+    }
+
+    pub fn admit_operation(
+        &self,
+        session_or_worker: &str,
+        kind: OperationKind,
+    ) -> Result<Admission, String> {
+        let plan = self.transaction(|registry| {
+            let workers = object_map(registry, WORKERS_KEY)?;
+            let mut bindings = object_map(registry, BINDINGS_KEY)?;
+            let (runtime_session_id, selected_worker) = if let Some(worker) = workers
+                .get(session_or_worker)
+                .and_then(ManagedWorker::from_json)
+            {
+                let session = worker
+                    .runtime_session_id
+                    .clone()
+                    .ok_or_else(|| "managed worker has no bound runtime session".to_string())?;
+                (session, Some(worker))
+            } else {
+                (session_or_worker.to_string(), None)
+            };
+            validate_uuid("runtime_session_id", &runtime_session_id)?;
+            let entry = registry
+                .agents
+                .get(&runtime_session_id)
+                .and_then(Entry::from_json)
+                .ok_or_else(|| "operation target is not a registered session".to_string())?;
+            let binding = match bindings.get(&runtime_session_id) {
+                Some(value) => SessionBinding::from_json(value)
+                    .ok_or_else(|| "malformed session binding".to_string())?,
+                None => {
+                    let binding = SessionBinding {
+                        runtime_session_id: runtime_session_id.clone(),
+                        binding_epoch: "0".to_string(),
+                        state: BindingState::Unmanaged,
+                    };
+                    bindings.insert(runtime_session_id.clone(), binding.to_json());
+                    set_object_map(registry, BINDINGS_KEY, bindings.clone());
+                    binding
+                }
+            };
+            let (worker_id, generation, lifecycle_version, managed) = match &binding.state {
+                BindingState::Unmanaged => (None, None, None, false),
+                BindingState::GcDeleting { .. } => {
+                    return Err("session binding is being deleted".to_string());
+                }
+                BindingState::Claiming {
+                    worker_id,
+                    generation,
+                    ..
+                } => {
+                    let state = workers
+                        .get(worker_id)
+                        .and_then(ManagedWorker::from_json)
+                        .map(|worker| worker.state)
+                        .unwrap_or(ManagedState::Attaching);
+                    return Ok(AdmissionPlan::Refused {
+                        worker_id: worker_id.clone(),
+                        state,
+                        reason: format!("binding generation {generation} is still Claiming"),
+                    });
+                }
+                BindingState::Managed {
+                    worker_id,
+                    generation,
+                } => {
+                    let worker = workers
+                        .get(worker_id)
+                        .and_then(ManagedWorker::from_json)
+                        .ok_or_else(|| "managed binding references a missing worker".to_string())?;
+                    if worker.generation != *generation {
+                        return Err("managed binding generation mismatch".to_string());
+                    }
+                    if worker.state != ManagedState::Active {
+                        return Ok(AdmissionPlan::Refused {
+                            worker_id: worker_id.clone(),
+                            state: worker.state,
+                            reason: "managed worker is not Active".to_string(),
+                        });
+                    }
+                    (
+                        Some(worker_id.clone()),
+                        Some(generation.clone()),
+                        Some(worker.version),
+                        true,
+                    )
+                }
+            };
+            if let Some(worker) = selected_worker {
+                if worker_id.as_deref() != Some(worker.worker_id.as_str())
+                    || generation.as_deref() != Some(worker.generation.as_str())
+                {
+                    return Err("worker selector does not match its session binding".to_string());
+                }
+            }
+            let target = if operation_uses_appserver(kind) {
+                if let Some(server) = entry.server.clone() {
+                    GuardTarget::AppServerThread {
+                        runtime_session_id: runtime_session_id.clone(),
+                        worker_id: worker_id.clone(),
+                        generation: generation.clone(),
+                        binding_epoch: binding.binding_epoch.clone(),
+                        tool: entry.tool,
+                        canonical_cwd: entry
+                            .dir
+                            .map(|dir| canonical_cwd(&dir))
+                            .ok_or_else(|| "operation target has no cwd".to_string())?,
+                        server_fingerprint: sha256_hex(server.as_bytes()),
+                        server,
+                        thread_id: runtime_session_id,
+                    }
+                } else {
+                    return Err("operation target has no app-server authority".to_string());
+                }
+            } else {
+                GuardTarget::Session {
+                    runtime_session_id,
+                    worker_id: worker_id.clone(),
+                    generation: generation.clone(),
+                    binding_epoch: binding.binding_epoch,
+                    tool: entry.tool,
+                    canonical_cwd: entry
+                        .dir
+                        .map(|dir| canonical_cwd(&dir))
+                        .ok_or_else(|| "operation target has no cwd".to_string())?,
+                }
+            };
+            Ok(AdmissionPlan::Guard {
+                target,
+                lifecycle_version,
+                managed,
+            })
+        })?;
+        let AdmissionPlan::Guard {
+            target,
+            lifecycle_version,
+            managed,
+        } = plan
+        else {
+            let AdmissionPlan::Refused {
+                worker_id,
+                state,
+                reason,
+            } = plan
+            else {
+                unreachable!()
+            };
+            return Ok(Admission::Refused {
+                worker_id,
+                state,
+                reason,
+            });
+        };
+        let session_id = target_runtime_session_id(&target).to_string();
+        let binding_epoch = target_binding_epoch(&target).to_string();
+        let binding_file = acquire_binding_lock(
+            &self.root,
+            &session_id,
+            FlockOperation::NonBlockingLockShared,
+            self.attach_deadline,
+        )?
+        .ok_or_else(|| "timed out acquiring shared binding guard".to_string())?;
+        let activity_guard = if let (Some(worker_id), Some(generation)) =
+            (target_worker_id(&target), target_generation(&target))
+        {
+            let file = acquire_path_lock(
+                &activity_lock_path(&self.root, worker_id, generation),
+                FlockOperation::NonBlockingLockShared,
+                self.attach_deadline,
+            )?
+            .ok_or_else(|| "timed out acquiring shared activity guard".to_string())?;
+            Some(SharedFileLock {
+                _file: file,
+                _sealed: Sealed(()),
+            })
+        } else {
+            None
+        };
+        let mut guard = ReentryGuard {
+            store: self.clone(),
+            target,
+            allowed: kind,
+            lifecycle_version,
+            _binding_guard: SharedFileLock {
+                _file: binding_file,
+                _sealed: Sealed(()),
+            },
+            _activity_guard: activity_guard,
+            _deadline: Instant::now() + self.attach_deadline,
+            cancel: CancelToken {
+                path: self.root.join("locks").join(format!(
+                    "cancel-{}-{}.token",
+                    store::sanitize(&session_id),
+                    binding_epoch
+                )),
+                worker_or_session_epoch: binding_epoch,
+            },
+            _sealed: Sealed(()),
+        };
+        guard.authorize_use(kind)?;
+        if managed {
+            Ok(Admission::Managed(guard))
+        } else {
+            Ok(Admission::Unmanaged(guard))
+        }
+    }
+
+    pub fn publish_fence(
+        &self,
+        worker_id: &str,
+        generation: &str,
+        reason: &str,
+    ) -> Result<FenceIntent, String> {
+        if reason.is_empty() || reason.len() > 4096 {
+            return Err("fence reason must be 1..=4096 bytes".to_string());
+        }
+        self.transaction(|registry| {
+            let mut workers = object_map(registry, WORKERS_KEY)?;
+            let mut worker = workers
+                .get(worker_id)
+                .and_then(ManagedWorker::from_json)
+                .ok_or_else(|| "managed worker not found or malformed".to_string())?;
+            if worker.generation != generation || worker.state != ManagedState::Active {
+                return Err("worker generation is stale or not Active".to_string());
+            }
+            let fence_epoch = store::uuid_v4();
+            worker.state = ManagedState::Fencing;
+            worker.version = next_version(&worker.version)?;
+            worker.fence_reason = Some(reason.to_string());
+            worker.fence_epoch = Some(fence_epoch.clone());
+            workers.insert(worker_id.to_string(), worker.to_json());
+            set_object_map(registry, WORKERS_KEY, workers);
+            Ok(FenceIntent {
+                worker_id: worker_id.to_string(),
+                generation: generation.to_string(),
+                fence_epoch,
+                fencing_version: worker.version,
+                root: self.root.clone(),
+            })
+        })
+    }
+
+    pub fn drain_prior_operations(&self, intent: FenceIntent) -> Result<FencePermit, DrainError> {
+        if intent.root != self.root {
+            return Err(DrainError::StateChanged);
+        }
+        let mut sessions = self.read_transaction(|registry| {
+            validate_fence_intent(registry, &intent)?;
+            let bindings = object_map(registry, BINDINGS_KEY)?;
+            Ok(bindings
+                .into_iter()
+                .filter_map(|(session_id, value)| {
+                    let binding = SessionBinding::from_json(&value)?;
+                    matches!(
+                        binding.state,
+                        BindingState::Managed { ref worker_id, ref generation }
+                            if worker_id == &intent.worker_id
+                                && generation == &intent.generation
+                    )
+                    .then_some(session_id)
+                })
+                .collect::<Vec<_>>())
+        })?;
+        sessions.sort();
+        let drain_deadline = Instant::now() + self.cancel_grace;
+        let mut binding_guards = Vec::with_capacity(sessions.len());
+        for session_id in &sessions {
+            let Some(file) = acquire_binding_lock(
+                &self.root,
+                session_id,
+                FlockOperation::NonBlockingLockExclusive,
+                drain_deadline.saturating_duration_since(Instant::now()),
+            )?
+            else {
+                return Err(DrainError::TimedOut {
+                    prior_operations: sessions,
+                });
+            };
+            binding_guards.push(ExclusiveFileLock {
+                _file: file,
+                _sealed: Sealed(()),
+            });
+        }
+        let Some(activity_file) = acquire_path_lock(
+            &activity_lock_path(&self.root, &intent.worker_id, &intent.generation),
+            FlockOperation::NonBlockingLockExclusive,
+            drain_deadline.saturating_duration_since(Instant::now()),
+        )?
+        else {
+            return Err(DrainError::TimedOut {
+                prior_operations: sessions,
+            });
+        };
+        self.read_transaction(|registry| validate_fence_intent(registry, &intent))
+            .map_err(|_| DrainError::StateChanged)?;
+        Ok(FencePermit {
+            intent,
+            _binding_guards: binding_guards,
+            _activity_guard: ExclusiveFileLock {
+                _file: activity_file,
+                _sealed: Sealed(()),
+            },
+            _sealed: Sealed(()),
         })
     }
 
@@ -1199,6 +1778,242 @@ impl LifecycleStore {
     }
 }
 
+enum AdmissionPlan {
+    Guard {
+        target: GuardTarget,
+        lifecycle_version: Option<String>,
+        managed: bool,
+    },
+    Refused {
+        worker_id: String,
+        state: ManagedState,
+        reason: String,
+    },
+}
+
+impl ReentryGuard {
+    pub fn binding_epoch(&self) -> &str {
+        target_binding_epoch(&self.target)
+    }
+
+    pub fn validate_kind(&self, expected: OperationKind) -> Result<(), String> {
+        if self.allowed == expected {
+            Ok(())
+        } else {
+            Err(format!(
+                "guard kind {} cannot authorize {}",
+                self.allowed.as_str(),
+                expected.as_str()
+            ))
+        }
+    }
+
+    pub(crate) fn authorize_use(
+        &mut self,
+        expected: OperationKind,
+    ) -> Result<AuthorizedTarget, String> {
+        self.validate_kind(expected)?;
+        let mut authorized = self.store.read_transaction(|registry| {
+            let bindings = object_map(registry, BINDINGS_KEY)?;
+            let workers = object_map(registry, WORKERS_KEY)?;
+            let session_id = target_runtime_session_id(&self.target);
+            let binding = bindings
+                .get(session_id)
+                .and_then(SessionBinding::from_json)
+                .ok_or_else(|| "operation binding is missing or malformed".to_string())?;
+            if binding.binding_epoch != target_binding_epoch(&self.target) {
+                return Err("operation binding epoch changed".to_string());
+            }
+            match (
+                target_worker_id(&self.target),
+                target_generation(&self.target),
+                &binding.state,
+            ) {
+                (None, None, BindingState::Unmanaged) => {}
+                (
+                    Some(expected_worker),
+                    Some(expected_generation),
+                    BindingState::Managed {
+                        worker_id,
+                        generation,
+                    },
+                ) if worker_id == expected_worker && generation == expected_generation => {
+                    let worker = workers
+                        .get(worker_id)
+                        .and_then(ManagedWorker::from_json)
+                        .ok_or_else(|| "operation worker is missing or malformed".to_string())?;
+                    if worker.state != ManagedState::Active
+                        || worker.version.as_str()
+                            != self.lifecycle_version.as_deref().unwrap_or_default()
+                    {
+                        return Err("operation lifecycle version/state changed".to_string());
+                    }
+                }
+                _ => return Err("operation binding state changed".to_string()),
+            }
+            Ok(authorized_target(&self.target))
+        })?;
+        authorized.root = self.store.root.clone();
+        Ok(authorized)
+    }
+
+    pub(crate) fn cancelled(&mut self) -> bool {
+        let _ = (&self.cancel.path, &self.cancel.worker_or_session_epoch);
+        self.authorize_use(self.allowed).is_err()
+    }
+
+    pub(crate) fn allowed(&self) -> OperationKind {
+        self.allowed
+    }
+}
+
+pub fn admit_operation(session_or_worker: &str, kind: OperationKind) -> Result<Admission, String> {
+    LifecycleStore::default().admit_operation(session_or_worker, kind)
+}
+
+pub fn publish_fence(
+    worker_id: &str,
+    generation: &str,
+    reason: &str,
+) -> Result<FenceIntent, String> {
+    LifecycleStore::default().publish_fence(worker_id, generation, reason)
+}
+
+pub fn drain_prior_operations(intent: FenceIntent) -> Result<FencePermit, DrainError> {
+    LifecycleStore::new(intent.root.clone()).drain_prior_operations(intent)
+}
+
+fn validate_fence_intent(registry: &Registry, intent: &FenceIntent) -> Result<(), String> {
+    let workers = object_map(registry, WORKERS_KEY)?;
+    let worker = workers
+        .get(&intent.worker_id)
+        .and_then(ManagedWorker::from_json)
+        .ok_or_else(|| "fence worker is missing or malformed".to_string())?;
+    if worker.generation != intent.generation {
+        return Err("fence generation changed".to_string());
+    }
+    if worker.state != ManagedState::Fencing
+        || worker.version != intent.fencing_version
+        || worker.fence_epoch.as_deref() != Some(intent.fence_epoch.as_str())
+    {
+        return Err("fence epoch/version/state changed".to_string());
+    }
+    Ok(())
+}
+
+fn operation_uses_appserver(kind: OperationKind) -> bool {
+    matches!(
+        kind,
+        OperationKind::WatchInject
+            | OperationKind::WatchAutoTurn
+            | OperationKind::WatchAck
+            | OperationKind::WakeAppServer
+            | OperationKind::Deliver
+            | OperationKind::InitialTurn
+    )
+}
+
+fn target_runtime_session_id(target: &GuardTarget) -> &str {
+    match target {
+        GuardTarget::Session {
+            runtime_session_id, ..
+        }
+        | GuardTarget::AppServerThread {
+            runtime_session_id, ..
+        } => runtime_session_id,
+    }
+}
+
+fn target_binding_epoch(target: &GuardTarget) -> &str {
+    match target {
+        GuardTarget::Session { binding_epoch, .. }
+        | GuardTarget::AppServerThread { binding_epoch, .. } => binding_epoch,
+    }
+}
+
+fn target_worker_id(target: &GuardTarget) -> Option<&str> {
+    match target {
+        GuardTarget::Session { worker_id, .. } | GuardTarget::AppServerThread { worker_id, .. } => {
+            worker_id.as_deref()
+        }
+    }
+}
+
+fn target_generation(target: &GuardTarget) -> Option<&str> {
+    match target {
+        GuardTarget::Session { generation, .. }
+        | GuardTarget::AppServerThread { generation, .. } => generation.as_deref(),
+    }
+}
+
+fn authorized_target(target: &GuardTarget) -> AuthorizedTarget {
+    match target {
+        GuardTarget::Session {
+            runtime_session_id,
+            worker_id,
+            generation,
+            tool,
+            canonical_cwd,
+            ..
+        } => AuthorizedTarget {
+            root: PathBuf::new(),
+            runtime_session_id: runtime_session_id.clone(),
+            worker_id: worker_id.clone(),
+            generation: generation.clone(),
+            tool: tool.clone(),
+            canonical_cwd: canonical_cwd.clone(),
+            server: None,
+            server_fingerprint: None,
+            thread_id: None,
+        },
+        GuardTarget::AppServerThread {
+            runtime_session_id,
+            worker_id,
+            generation,
+            tool,
+            canonical_cwd,
+            server,
+            server_fingerprint,
+            thread_id,
+            ..
+        } => {
+            let _ = server_fingerprint;
+            AuthorizedTarget {
+                root: PathBuf::new(),
+                runtime_session_id: runtime_session_id.clone(),
+                worker_id: worker_id.clone(),
+                generation: generation.clone(),
+                tool: tool.clone(),
+                canonical_cwd: canonical_cwd.clone(),
+                server: Some(server.clone()),
+                server_fingerprint: Some(server_fingerprint.clone()),
+                thread_id: Some(thread_id.clone()),
+            }
+        }
+    }
+}
+
+fn activity_lock_path(root: &Path, worker_id: &str, generation: &str) -> PathBuf {
+    root.join("locks").join(format!(
+        "activity-{}-{}.lock",
+        store::sanitize(worker_id),
+        store::sanitize(generation)
+    ))
+}
+
+fn validate_bounded_token(name: &str, value: &str, max: usize) -> Result<(), String> {
+    if value.is_empty()
+        || value.len() > max
+        || !value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'/' | b':')
+        })
+    {
+        Err(format!("{name} is outside the closed token grammar"))
+    } else {
+        Ok(())
+    }
+}
+
 pub struct BindingEpochGuard {
     _file: fs::File,
     binding_epoch: String,
@@ -1592,13 +2407,25 @@ fn acquire_binding_lock(
         "binding-{}.lock",
         store::sanitize(runtime_session_id)
     ));
+    acquire_path_lock(&path, operation, timeout)
+}
+
+fn acquire_path_lock(
+    path: &Path,
+    operation: FlockOperation,
+    timeout: Duration,
+) -> Result<Option<fs::File>, String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("create lifecycle lock dir: {error}"))?;
+    }
     let file = fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
         .mode(0o600)
-        .open(&path)
+        .open(path)
         .map_err(|error| format!("open binding lock {}: {error}", path.display()))?;
     let deadline = Instant::now() + timeout;
     loop {
@@ -1611,7 +2438,7 @@ fn acquire_binding_lock(
                 thread::sleep(Duration::from_millis(MANAGED_CANCEL_POLL_MS.min(10)));
             }
             Err(error) => {
-                return Err(format!("lock binding file {}: {error}", path.display()));
+                return Err(format!("lock lifecycle file {}: {error}", path.display()));
             }
         }
     }
@@ -1778,6 +2605,7 @@ impl ManagedWorker {
         object.insert("process_identity".into(), JsonValue::from(()));
         object.insert("appserver_lineage".into(), JsonValue::from(()));
         object.insert("fence_reason".into(), optional_string(&self.fence_reason));
+        object.insert("fence_epoch".into(), optional_string(&self.fence_epoch));
         object.insert("proof_gap".into(), optional_string(&self.proof_gap));
         object.insert(
             "release_receipt".into(),
@@ -1805,6 +2633,7 @@ impl ManagedWorker {
             required_scope: RequiredScope::parse(&string(object, "required_scope")?)?,
             execution: ExecutionBackend::parse(&string(object, "execution")?)?,
             fence_reason: optional_string_from(object, "fence_reason"),
+            fence_epoch: optional_string_from(object, "fence_epoch"),
             proof_gap: optional_string_from(object, "proof_gap"),
             release_receipt: object
                 .get("release_receipt")
