@@ -1,12 +1,12 @@
 ---
 name: session-relay
-description: "Use when one agent must reach — or get a reply from — an agent in ANOTHER session, project, or tool (Claude Code ⇄ Codex): auto-discover the other running session, address it by name, send via the bus tools (whoami/register/roster/send/inbox/discover) over a shared store, and wake an idle target with a tool-aware doorbell — `claude -p --resume` (from its project dir) or `codex exec resume`. Not for in-session subagents/Task (same session only), Agent Teams' intra-team mailbox (can't span sessions), or Channels push (single session)."
+description: "Use when one agent must reach, get a reply from, or hand a human the interactive chat for an agent in ANOTHER session, project, or tool (Claude Code ⇄ Codex): discover the session, send over the shared bus, wake it with a tool-aware doorbell, or print/exec the guarded `relay attach` takeover command. Not for in-session subagents/Task (same session only), Agent Teams' intra-team mailbox (can't span sessions), or Channels push (single session)."
 user-invocable: true
 allowed-tools: Bash, Read
 metadata:
   pattern: tool-wrapper
   updated: "2026-07-10"
-  content_hash: "8bfcdb58fd4d6e1cffdd795936b376b41686a1d0ca02fde264dd7ed49cfa3f3d"
+  content_hash: "61519e1e09352fb0e11710896c9ba69b791521a2adfce92a058a2949f30998a1"
 ---
 
 # Session relay
@@ -131,6 +131,23 @@ The woken session's SessionStart hook injects the mail; with `-p` it processes i
 Run `<plugin>/bin/relay doctor --id <your-session-id-or-name>` after an environment crash or whenever mail seems delayed. `--id` is authoritative in shared project directories; without it, doctor prints a `single-session-only fallback` warning for the cwd marker it resolved.
 
 Doctor prints `PASS` / `WARN` / `FAIL` for registration, mailbox readability, watcher lock, watcher progress, relay-launched resume state, and store-lock health. Exit 0 means no failed checks. A dead or never-armed watcher fails with the exact re-arm command. A held watcher lock proves the watcher process is alive, not that it is making progress; a stale progress stamp is therefore a separate warning.
+
+## Attach to a session
+
+Use `relay attach <name-or-id>` when the human wants to take over a relay worker's interactive chat. Print mode is the default: it resolves registered names or exact discovered UUIDs, shows the session context, and prints the correct shell command. `relay attach <name-or-id> --exec` replaces relay with the interactive CLI; it refuses a stale/missing stored directory. A relay wake already holding `locks/resume-<id>.lock` makes attach exit 3.
+
+```bash
+relay attach worker             # inspect the exact command and context first
+relay attach worker --exec      # replace relay with the interactive client
+
+# Manual equivalents when you already know the exact UUID:
+codex resume <uuid> -C <registered-dir>
+cd <registered-dir> && claude --resume <uuid>
+```
+
+Exact UUIDs are the reliable route. Interactive pickers can omit headless sessions (`codex exec` omission: openai/codex#24502; Claude `-p` sessions likewise may not appear), while exact-id resume still works.
+
+WARNING: split-brain risk — neither CLI locks sessions; attaching while automation drives the session interleaves two writers. Prefer attach when the worker is idle; relay doctor --id <id> shows watcher/lock state.
 
 ## Name this session (once)
 
@@ -294,6 +311,7 @@ cd "$(<plugin>/bin/relay list | awk '$1=="agent-B"{print $4}')" \
 - `discover` infers liveness from session-file recency (mtime), not a live handshake — a just-idle session can still appear; a long-dead one won't (it falls outside the window).
 - There is no live session-to-session socket. Even `relay watch` is queue + push-into-thread: mail always lands in the shared store first, and only Codex-under-app-server targets take a push — Claude live delivery is the Monitor watch or the next prompt.
 - `relay watch` flags: `--server`, `--tool`, `--auto-turn`, `--once`, `--all`, `--dry`, `--id`, `--follow <id>`. `relay wake` flags: `--id`, `--dir`, `--tool`, `--model`, `--effort`, `--dry`. `relay spawn` flags: `--tool`, `--model`, `--effort`, `--name`, `--reply-to`, `--timeout`, `--read-only`, `--full-access`, `--watch`, `--dry`. `relay doctor` takes optional `--id <session-id-or-name>`. `relay send` identity flag: `--from <name-or-id>`. Do not invent others; there is no `--interval`, `--wait`, or daemon-mode config.
+- `relay attach` takes one name-or-UUID and optional `--exec`; print mode is the default. There is no attach picker or co-driving mode.
 - Identity params: `send` takes optional `from`, `inbox` takes optional `id` — both must name a REGISTERED session (id or name) and both mean "act as / drain this session". There is no `--as`, no `sender:` field, and no way to send as an unregistered identity.
 
 ## Success criteria
