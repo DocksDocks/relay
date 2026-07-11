@@ -220,7 +220,7 @@ fn inner(tool: &str, event: HookEvent, input: &str) -> Result<(), String> {
         eprintln!("[session-relay/hook] GC skipped: {e}");
     }
     store::set_marker(&dir, &id)?;
-    store::register(&id, Some(&dir), None, Some(tool))?;
+    store::register(&id, Some(&dir), None, Some(tool), None)?;
     let msgs = store::drain(&id)?;
     let no_watch = std::env::var("RELAY_NO_WATCH").as_deref() == Ok("1");
     let relay_exe = std::env::current_exe()

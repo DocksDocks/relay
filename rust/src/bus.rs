@@ -32,7 +32,8 @@ const TOOLS_JSON: &str = r#"[
       "properties": {
         "name": { "type": "string", "description": "Friendly name to claim, e.g. \"frontend\" or \"agent-A\"." },
         "id": { "type": "string", "description": "Override session id (defaults to this session, resolved from the project dir)." },
-        "dir": { "type": "string", "description": "Override project dir (defaults to the launch dir)." }
+        "dir": { "type": "string", "description": "Override project dir (defaults to the launch dir)." },
+        "server": { "type": "string", "description": "Codex app-server Unix socket for live delivery to this session." }
       },
       "required": ["name"],
       "additionalProperties": false
@@ -203,8 +204,9 @@ fn call_tool(
             };
             let dir = arg_str(args, "dir").unwrap_or_else(|| pdir.to_string());
             let name = arg_str(args, "name");
-            let entry =
-                store::register(&id, Some(&dir), name.as_deref(), None).map_err(ToolErr::Soft)?;
+            let server = arg_str(args, "server");
+            let entry = store::register(&id, Some(&dir), name.as_deref(), None, server.as_deref())
+                .map_err(ToolErr::Soft)?;
             Ok(text(registered_entry(&entry), false))
         }
         "roster" => {

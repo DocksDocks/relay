@@ -39,7 +39,7 @@ fn die(msg: &str) -> ! {
     std::process::exit(1);
 }
 
-const USAGE: &str = "usage: relay spawn <dir> [--tool claude|codex] [--model <m>] [--effort <e>] [--name <busName>] [--reply-to <nameOrId>] [--timeout <sec>] [--read-only] [--full-access] [--watch] [--dry] [--] <first task>";
+const USAGE: &str = "usage: relay spawn <dir> [--tool claude|codex] [--model <m>] [--effort <e>] [--name <busName>] [--server <unix-socket>] [--reply-to <nameOrId>] [--timeout <sec>] [--read-only] [--full-access] [--watch] [--dry] [--] <first task>";
 
 fn exit_code(status: &ExitStatus) -> i32 {
     status
@@ -333,6 +333,7 @@ pub fn run(raw: Vec<String>) -> ! {
     }
     let model = args.flag("model");
     let effort = args.flag("effort");
+    let server = args.flag("server");
     if model.is_none() {
         eprintln!(
             "[relay spawn] no --model given — pass --model/--effort to pin a deliberate worker model"
@@ -398,6 +399,12 @@ pub fn run(raw: Vec<String>) -> ! {
         );
         m.insert("cwd".into(), tinyjson::JsonValue::from(dir_s.clone()));
         m.insert("prompt".into(), tinyjson::JsonValue::from(prompt.clone()));
+        if let Some(server) = server {
+            m.insert(
+                "server".into(),
+                tinyjson::JsonValue::from(server.to_string()),
+            );
+        }
         println!(
             "{}",
             tinyjson::JsonValue::from(m).stringify().unwrap_or_default()
@@ -497,12 +504,11 @@ pub fn run(raw: Vec<String>) -> ! {
             }
         }
     }
-    let display = if let Some(name) = args.flag("name") {
-        store::register(&id, Some(&dir_s), Some(name), Some(&tool)).unwrap_or_else(|e| die(&e));
-        name.to_string()
-    } else {
-        id.clone()
-    };
+    let name = args.flag("name");
+    if name.is_some() || server.is_some() {
+        store::register(&id, Some(&dir_s), name, Some(&tool), server).unwrap_or_else(|e| die(&e));
+    }
+    let display = name.map(str::to_string).unwrap_or_else(|| id.clone());
     if !watch {
         if let Some(name) = args.flag("name") {
             println!("spawned {name} ({id}) in {dir_s}");

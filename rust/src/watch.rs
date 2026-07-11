@@ -55,6 +55,7 @@ struct Target {
     id: String,
     tool: String,
     dir: Option<String>,
+    server: Option<String>,
 }
 
 #[derive(PartialEq, Debug, Clone, Copy)]
@@ -136,6 +137,7 @@ fn resolve_targets(args: &Args, server: Option<&str>) -> Vec<Target> {
             id: id.to_string(),
             tool,
             dir: args.flag("dir").map(str::to_string),
+            server: server.map(str::to_string),
         }];
     }
     if args.has("all") {
@@ -146,6 +148,7 @@ fn resolve_targets(args: &Args, server: Option<&str>) -> Vec<Target> {
                 id: e.id,
                 tool: e.tool,
                 dir: e.dir,
+                server: e.server.or_else(|| server.map(str::to_string)),
             })
             .collect();
     }
@@ -159,6 +162,7 @@ fn resolve_targets(args: &Args, server: Option<&str>) -> Vec<Target> {
                 id: e.id,
                 tool: args.flag("tool").map(str::to_string).unwrap_or(e.tool),
                 dir: e.dir,
+                server: e.server.or_else(|| server.map(str::to_string)),
             }
         })
         .collect()
@@ -179,7 +183,7 @@ pub fn run(raw: Vec<String>) -> ! {
             .unwrap_or_else(|e| die(&format!("cannot follow {id}: {e}")));
         follow_mailbox(id);
     }
-    let server = args.flag("server").map(str::to_string).or_else(|| {
+    let fallback_server = args.flag("server").map(str::to_string).or_else(|| {
         std::env::var("RELAY_APP_SERVER")
             .ok()
             .filter(|v| !v.is_empty())
@@ -192,7 +196,7 @@ pub fn run(raw: Vec<String>) -> ! {
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_SETTLE_MS);
 
-    let targets = resolve_targets(&args, server.as_deref());
+    let targets = resolve_targets(&args, fallback_server.as_deref());
     if targets.is_empty() {
         die(
             "usage: relay watch <nameOrId>... | --all | --id <uuid> [--server <unix-socket>] [--tool codex] [--auto-turn] [--once] [--dry]",
@@ -238,9 +242,9 @@ pub fn run(raw: Vec<String>) -> ! {
                 wake_retries.remove(&t.id);
                 continue;
             }
-            match decide(&t.tool, server.as_deref()) {
+            match decide(&t.tool, t.server.as_deref()) {
                 Mode::Push => {
-                    match push_target(server.as_deref().unwrap(), t, auto_turn, dry, settle_ms) {
+                    match push_target(t.server.as_deref().unwrap(), t, auto_turn, dry, settle_ms) {
                         Ok(_) => {}
                         Err(e) => {
                             eprintln!("[relay watch] {e}");

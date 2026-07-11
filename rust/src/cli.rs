@@ -16,6 +16,7 @@
 // run from the target's registered project dir. `--dry` prints the command
 // instead of spawning.
 
+use crate::appserver;
 use crate::discover;
 use crate::hook;
 use crate::store;
@@ -89,6 +90,7 @@ struct Target {
     tool: String,
     name: Option<String>,
     last_seen: String,
+    server: Option<String>,
 }
 
 // A target built straight from flags — addresses a discovered session that was
@@ -109,6 +111,7 @@ fn explicit_target(args: &Args) -> Option<Target> {
         tool: args.flag("tool").unwrap_or("claude").to_string(),
         name: None,
         last_seen: "unregistered".to_string(),
+        server: None,
     })
 }
 
@@ -119,6 +122,7 @@ fn from_entry(e: store::Entry) -> Target {
         tool: e.tool,
         name: e.name,
         last_seen: e.last_seen,
+        server: e.server,
     }
 }
 
@@ -251,6 +255,7 @@ fn discovered_target(id: &str) -> Option<Target> {
             tool: string("tool").unwrap_or_default(),
             name: string("name"),
             last_seen: string("lastActivity").unwrap_or_else(|| "unknown".to_string()),
+            server: None,
         })
     })
 }
@@ -315,15 +320,12 @@ fn attach(args: &Args) -> ! {
         .dir
         .as_deref()
         .is_some_and(|dir| std::path::Path::new(dir).is_dir());
-    // The live-view plan will pass a registered app-server socket here once
-    // its optional `server` schema lands. Attach composition is ready now;
-    // current registry entries intentionally have no server field.
     let invocation = attach_invocation(
         &target.tool,
         &target.id,
         target.dir.as_deref(),
         dir_exists,
-        None,
+        target.server.as_deref(),
     )
     .unwrap_or_else(|e| {
         eprintln!("{ATTACH_WARNING}");
@@ -451,6 +453,31 @@ fn doctor(args: &Args) -> ! {
             "registration",
             "registry entry missing — fix: restart or resume the session",
         );
+    }
+
+    let configured_server = entry
+        .as_ref()
+        .and_then(|entry| entry.server.clone())
+        .or_else(|| {
+            std::env::var("RELAY_APP_SERVER")
+                .ok()
+                .filter(|value| !value.is_empty())
+        });
+    match configured_server {
+        Some(server) => match appserver::probe(&server) {
+            Ok(()) => doctor_line("PASS", "app-server", &format!("reachable {server}")),
+            Err(error) => {
+                failures += 1;
+                doctor_line(
+                    "FAIL",
+                    "app-server",
+                    &format!(
+                        "unreachable {server} ({error}) — fix: start the configured server or update registration"
+                    ),
+                );
+            }
+        },
+        None => doctor_line("PASS", "app-server", "not configured (doorbell fallback)"),
     }
 
     let mailbox = store::mailbox_path(&id);
@@ -762,14 +789,20 @@ pub fn run(cmd: &str, raw: Vec<String>) -> ! {
             let pos = args.positionals(1);
             let (Some(name), Some(id)) = (pos.first(), args.flag("id")) else {
                 die(
-                    "usage: relay register <name> --id <uuid> [--dir <path>] [--tool claude|codex]",
+                    "usage: relay register <name> --id <uuid> [--dir <path>] [--tool claude|codex] [--server <unix-socket>]",
                 );
             };
             let dir = args
                 .flag("dir")
                 .map(str::to_string)
                 .unwrap_or_else(cwd_string);
-            match store::register(id, Some(&dir), Some(name), args.flag("tool")) {
+            match store::register(
+                id,
+                Some(&dir),
+                Some(name),
+                args.flag("tool"),
+                args.flag("server"),
+            ) {
                 Ok(e) => {
                     println!(
                         "registered {} [{}] -> {} @ {}",
@@ -994,7 +1027,7 @@ pub fn run(cmd: &str, raw: Vec<String>) -> ! {
             std::process::exit(out.status.code().unwrap_or(0));
         }
         _ => die(
-            "usage: relay discover [--within min] [--tool t] | list | register <name> --id <uuid> [--dir <path>] | send <to> <msg> | inbox <who> | peek <who> | attach <who> [--exec] | wake <who> [--model m] [--effort e] [msg] | doctor [--id <session>]",
+            "usage: relay discover [--within min] [--tool t] | list | register <name> --id <uuid> [--dir <path>] [--server <sock>] | send <to> <msg> | inbox <who> | peek <who> | attach <who> [--exec] | wake <who> [--model m] [--effort e] [msg] | doctor [--id <session>]",
         ),
     }
 }

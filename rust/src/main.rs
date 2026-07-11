@@ -43,14 +43,14 @@ fn main() {
                 msg.insert("from".into(), JsonValue::from(who.clone()));
                 msg.insert("body".into(), JsonValue::from(format!("{who}-{i}")));
                 relay::store::enqueue(recipient, &msg).unwrap_or_else(|e| die(&e));
-                relay::store::register(who, Some(&format!("/tmp/{who}")), Some(who), None)
+                relay::store::register(who, Some(&format!("/tmp/{who}")), Some(who), None, None)
                     .unwrap_or_else(|e| die(&e));
-                relay::store::register(&format!("{who}-op{i}"), Some("/tmp/x"), None, None)
+                relay::store::register(&format!("{who}-op{i}"), Some("/tmp/x"), None, None, None)
                     .unwrap_or_else(|e| die(&e));
             }
         }
         _ => die(
-            "usage: relay bus | hook [codex] [--event prompt] | discover [--within min] [--tool t] | list | register <name> --id <uuid> [--dir <path>] | send <to> [--] <msg> | inbox <who> | peek <who> | attach <who> [--exec] | wake <who> [--model m] [--effort e] [msg] | doctor [--id <session>] | watch <who>...|--all [--server <sock>] [--auto-turn] [--once] | spawn <dir> [--tool t] [--model m] [--effort e] [--name n] [--watch] [--] <task>",
+            "usage: relay bus | hook [codex] [--event prompt] | discover [--within min] [--tool t] | list | register <name> --id <uuid> [--dir <path>] [--server <sock>] | send <to> [--] <msg> | inbox <who> | peek <who> | attach <who> [--exec] | wake <who> [--model m] [--effort e] [msg] | doctor [--id <session>] | watch <who>...|--all [--server <sock>] [--auto-turn] [--once] | spawn <dir> [--tool t] [--model m] [--effort e] [--name n] [--server <sock>] [--watch] [--] <task>",
         ),
     }
 }

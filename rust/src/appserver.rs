@@ -40,23 +40,7 @@ pub(crate) fn deliver(
     auto_turn: bool,
     settle_ms: u64,
 ) -> Result<(), String> {
-    let mut ws = WsConn::connect(server)?;
-    ws.request(
-        0,
-        "initialize",
-        sobj(vec![(
-            "clientInfo",
-            sobj(vec![
-                ("name", JsonValue::from("session-relay-watch".to_string())),
-                ("title", JsonValue::from("session-relay watch".to_string())),
-                (
-                    "version",
-                    JsonValue::from(env!("CARGO_PKG_VERSION").to_string()),
-                ),
-            ]),
-        )]),
-    )?;
-    ws.notify("initialized", JsonValue::from(HashMap::new()))?;
+    let mut ws = connect_initialized(server, "session-relay-watch", "session-relay watch")?;
     ws.request(
         1,
         "thread/resume",
@@ -79,6 +63,31 @@ pub(crate) fn deliver(
         }
     }
     Ok(())
+}
+
+pub(crate) fn probe(server: &str) -> Result<(), String> {
+    connect_initialized(server, "session-relay-doctor", "session-relay doctor").map(|_| ())
+}
+
+fn connect_initialized(server: &str, name: &str, title: &str) -> Result<WsConn, String> {
+    let mut ws = WsConn::connect(server)?;
+    ws.request(
+        0,
+        "initialize",
+        sobj(vec![(
+            "clientInfo",
+            sobj(vec![
+                ("name", JsonValue::from(name.to_string())),
+                ("title", JsonValue::from(title.to_string())),
+                (
+                    "version",
+                    JsonValue::from(env!("CARGO_PKG_VERSION").to_string()),
+                ),
+            ]),
+        )]),
+    )?;
+    ws.notify("initialized", JsonValue::from(HashMap::new()))?;
+    Ok(ws)
 }
 
 // Approve only the relay's own bus server (whoami/register/roster/send/inbox/

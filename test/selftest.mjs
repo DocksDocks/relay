@@ -733,12 +733,20 @@ assert.ok(fs.existsSync(sock), 'fake app-server came up');
 const idW = '55555555-5555-5555-5555-555555555555';
 const dirW = path.join(HOME, 'proj-w');
 fs.mkdirSync(dirW, { recursive: true });
-relay(['register', 'codex-W', '--id', idW, '--dir', dirW, '--tool', 'codex']);
+relay(['register', 'codex-W', '--id', idW, '--dir', dirW, '--tool', 'codex', '--server', sock]);
 const readFrames = () => fs.readFileSync(framesFile, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
 
-check('watch --once injects fenced mail into the app-server thread and drains the mailbox', () => {
+check('register records a per-session server and hook refresh preserves it', () => {
+  let registry = JSON.parse(fs.readFileSync(path.join(HOME, 'registry.json'), 'utf8'));
+  assert.equal(registry.agents[idW].server, sock);
+  assert.equal(relay(['hook', 'codex'], { input: JSON.stringify({ session_id: idW, cwd: dirW, source: 'resume' }) }).status, 0);
+  registry = JSON.parse(fs.readFileSync(path.join(HOME, 'registry.json'), 'utf8'));
+  assert.equal(registry.agents[idW].server, sock);
+});
+
+check('watch prefers the registered server over the RELAY_APP_SERVER fallback', () => {
   assert.equal(relay(['send', 'codex-W', '--', 'watch push test']).status, 0);
-  const r = relay(['watch', 'codex-W', '--server', sock, '--once']);
+  const r = relay(['watch', 'codex-W', '--once'], { env: { RELAY_APP_SERVER: path.join(HOME, 'wrong.sock') } });
   assert.equal(r.status, 0, `watch exited ${r.status}: ${r.stderr}`);
   const fr = readFrames();
   const resume = fr.find((f) => f.method === 'thread/resume');
@@ -753,7 +761,7 @@ check('watch --once injects fenced mail into the app-server thread and drains th
 check('watch --auto-turn starts a turn with the neutral nudge, answers the bus elicitation, stays until turn end', () => {
   fs.writeFileSync(framesFile, '');
   assert.equal(relay(['send', 'codex-W', '--', 'second push']).status, 0);
-  const r = relay(['watch', 'codex-W', '--server', sock, '--once', '--auto-turn'], { env: { RELAY_TURN_SETTLE_MS: '50', RELAY_TURN_WAIT_MS: '8000' } });
+  const r = relay(['watch', 'codex-W', '--once', '--auto-turn'], { env: { RELAY_TURN_SETTLE_MS: '50', RELAY_TURN_WAIT_MS: '8000' } });
   assert.equal(r.status, 0, `watch exited ${r.status}: ${r.stderr}`);
   const fr = readFrames();
   const turn = fr.find((f) => f.method === 'turn/start');
@@ -766,6 +774,27 @@ check('watch --auto-turn starts a turn with the neutral nudge, answers the bus e
   assert.ok(answer, 'watch answered the mcpServer/elicitation/request (a detached client wedges the turn)');
   assert.equal(answer.result.action, 'accept', 'the relay bus server is accepted');
 });
+check('watch uses RELAY_APP_SERVER when a registry entry has no server', () => {
+  const id = '56565656-5656-4656-8656-565656565656';
+  relay(['register', 'codex-env', '--id', id, '--dir', dirW, '--tool', 'codex']);
+  assert.equal(relay(['send', 'codex-env', '--', 'env fallback']).status, 0);
+  const r = relay(['watch', 'codex-env', '--once'], { env: { RELAY_APP_SERVER: sock } });
+  assert.equal(r.status, 0, `watch exited ${r.status}: ${r.stderr}`);
+  assert.equal(peek('codex-env').count, 0);
+});
+check('doctor initializes and reports a registered app-server', () => {
+  const watched = spawnToFiles(['watch', '--follow', idW, '--tool', 'codex'], {}, 'doctor-appserver-watch');
+  const lock = path.join(HOME, 'watchers', `${idW}.lock`);
+  waitFor(() => fs.existsSync(lock), 'the app-server doctor watcher lock');
+  waitFor(() => fs.existsSync(path.join(HOME, 'watchers', `${idW}.progress`)), 'the app-server doctor progress stamp');
+  try {
+    const r = relay(['doctor', '--id', 'codex-W']);
+    assert.equal(r.status, 0, `doctor exited ${r.status}: ${r.stdout}\n${r.stderr}`);
+    assert.match(r.stdout, new RegExp(`PASS app-server: reachable ${sock.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
+  } finally {
+    watched.child.kill('SIGKILL');
+  }
+});
 check('watch routes a claude target to the wake doorbell fallback (--dry)', () => {
   assert.equal(relay(['send', 'agent-A', '--', 'claude-bound']).status, 0);
   const r = relay(['watch', 'agent-A', '--server', sock, '--once', '--dry']);
@@ -777,11 +806,13 @@ check('watch routes a claude target to the wake doorbell fallback (--dry)', () =
   relayJSON(['inbox', 'agent-A']); // drain: dry mode never touches the mailbox
 });
 check('watch re-enqueues mail when the app-server is unreachable (--once exits 1)', () => {
-  assert.equal(relay(['send', 'codex-W', '--', 'must survive']).status, 0);
-  const r = relay(['watch', 'codex-W', '--server', path.join(HOME, 'no-such.sock'), '--once']);
+  const id = '57575757-5757-4757-8757-575757575757';
+  relay(['register', 'codex-unreachable', '--id', id, '--dir', dirW, '--tool', 'codex']);
+  assert.equal(relay(['send', 'codex-unreachable', '--', 'must survive']).status, 0);
+  const r = relay(['watch', 'codex-unreachable', '--server', path.join(HOME, 'no-such.sock'), '--once']);
   assert.notEqual(r.status, 0, 'unreachable server is a failure in --once mode');
-  assert.equal(peek('codex-W').count, 1, 'mail re-enqueued after the failed push');
-  assert.equal(relayJSON(['inbox', 'codex-W']).messages[0].body, 'must survive');
+  assert.equal(peek('codex-unreachable').count, 1, 'mail re-enqueued after the failed push');
+  assert.equal(relayJSON(['inbox', 'codex-unreachable']).messages[0].body, 'must survive');
 });
 fakeSrv.kill();
 
@@ -1161,12 +1192,15 @@ check('spawn births a claude child via the pre-mint path and registers its name'
 check('spawn births a codex child via the marker-watch path (no pre-set id flag)', () => {
   const dirS = path.join(HOME, 'proj-s2');
   fs.mkdirSync(dirS, { recursive: true });
-  const r = relay(['spawn', dirS, '--tool', 'codex', '--name', 'w2', '--reply-to', 'agent-A', '--timeout', '5', '--', 'task two'],
+  const spawnServer = path.join(HOME, 'spawn-app.sock');
+  const r = relay(['spawn', dirS, '--tool', 'codex', '--name', 'w2', '--server', spawnServer, '--reply-to', 'agent-A', '--timeout', '5', '--', 'task two'],
     { env: { RELAY_SPAWN_CMD_CODEX: stub, STUB_RELAY_BIN: BIN, STUB_TOOL: 'codex' } });
   assert.equal(r.status, 0, `spawn exited ${r.status}: ${r.stderr}`);
   const dry = relayJSON(['wake', 'w2', '--dry']);
   assert.equal(dry.tool, 'codex', 'marker-watch birth registered the codex tool');
   assert.equal(dry.cwd, dirS);
+  const registry = JSON.parse(fs.readFileSync(path.join(HOME, 'registry.json'), 'utf8'));
+  assert.equal(registry.agents[registry.names.w2].server, spawnServer, 'spawn persists its configured server after birth');
 });
 check('spawn timeout names the child stderr log when no birth arrives', () => {
   const dirS = path.join(HOME, 'proj-s3');

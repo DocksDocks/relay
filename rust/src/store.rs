@@ -480,6 +480,7 @@ pub struct Entry {
     pub name: Option<String>,
     pub tool: String,
     pub last_seen: String,
+    pub server: Option<String>,
 }
 
 impl Entry {
@@ -502,6 +503,13 @@ impl Entry {
         );
         m.insert("tool".into(), JsonValue::from(self.tool.clone()));
         m.insert("lastSeen".into(), JsonValue::from(self.last_seen.clone()));
+        m.insert(
+            "server".into(),
+            self.server
+                .clone()
+                .map(JsonValue::from)
+                .unwrap_or(JsonValue::from(())),
+        );
         JsonValue::from(m)
     }
 
@@ -514,6 +522,7 @@ impl Entry {
             name: s("name"),
             tool: s("tool").unwrap_or_else(|| "claude".to_string()),
             last_seen: s("lastSeen").unwrap_or_default(),
+            server: s("server"),
         })
     }
 }
@@ -1186,6 +1195,7 @@ pub fn register(
     dir: Option<&str>,
     name: Option<&str>,
     tool: Option<&str>,
+    server: Option<&str>,
 ) -> Result<Entry, String> {
     if id.is_empty() {
         return Err("register requires an id".to_string());
@@ -1211,6 +1221,9 @@ pub fn register(
                 .or_else(|| prev.as_ref().map(|p| p.tool.clone()))
                 .unwrap_or_else(|| "claude".to_string()),
             last_seen: iso_now(),
+            server: server
+                .map(str::to_string)
+                .or_else(|| prev.as_ref().and_then(|p| p.server.clone())),
         };
         agents.insert(id.to_string(), entry.to_json());
         if let Some(n) = &entry.name {
@@ -1367,6 +1380,30 @@ mod tests {
         assert_eq!(u.len(), 36);
         assert_eq!(&u[14..15], "4");
         assert!(matches!(&u[19..20], "8" | "9" | "a" | "b"));
+    }
+
+    #[test]
+    fn entry_roundtrips_server_and_legacy_entries_default_to_none() {
+        let entry = Entry {
+            id: "11111111-1111-4111-8111-111111111111".into(),
+            dir: Some("/tmp/project".into()),
+            name: Some("worker".into()),
+            tool: "codex".into(),
+            last_seen: "2026-07-10T00:00:00.000Z".into(),
+            server: Some("/tmp/app.sock".into()),
+        };
+        assert_eq!(Entry::from_json(&entry.to_json()), Some(entry.clone()));
+
+        let mut legacy = entry
+            .to_json()
+            .get::<HashMap<String, JsonValue>>()
+            .cloned()
+            .expect("entry object");
+        legacy.remove("server");
+        assert_eq!(
+            Entry::from_json(&JsonValue::from(legacy)).unwrap().server,
+            None
+        );
     }
 
     #[test]

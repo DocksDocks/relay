@@ -6,7 +6,7 @@ allowed-tools: Bash, Read
 metadata:
   pattern: tool-wrapper
   updated: "2026-07-10"
-  content_hash: "61519e1e09352fb0e11710896c9ba69b791521a2adfce92a058a2949f30998a1"
+  content_hash: "67abeb656422f64c1525908059df5d5b5584bf65570f81b25769356e6f8fe9bb"
 ---
 
 # Session relay
@@ -130,11 +130,13 @@ The woken session's SessionStart hook injects the mail; with `-p` it processes i
 
 Run `<plugin>/bin/relay doctor --id <your-session-id-or-name>` after an environment crash or whenever mail seems delayed. `--id` is authoritative in shared project directories; without it, doctor prints a `single-session-only fallback` warning for the cwd marker it resolved.
 
-Doctor prints `PASS` / `WARN` / `FAIL` for registration, mailbox readability, watcher lock, watcher progress, relay-launched resume state, and store-lock health. Exit 0 means no failed checks. A dead or never-armed watcher fails with the exact re-arm command. A held watcher lock proves the watcher process is alive, not that it is making progress; a stale progress stamp is therefore a separate warning.
+Doctor prints `PASS` / `WARN` / `FAIL` for registration, mailbox readability, configured app-server reachability (WebSocket connect + initialize), watcher lock, watcher progress, relay-launched resume state, and store-lock health. Exit 0 means no failed checks. No configured app-server is a healthy doorbell-fallback state. A dead or never-armed watcher fails with the exact re-arm command. A held watcher lock proves the watcher process is alive, not that it is making progress; a stale progress stamp is therefore a separate warning.
 
 ## Attach to a session
 
 Use `relay attach <name-or-id>` when the human wants to take over a relay worker's interactive chat. Print mode is the default: it resolves registered names or exact discovered UUIDs, shows the session context, and prints the correct shell command. `relay attach <name-or-id> --exec` replaces relay with the interactive CLI; it refuses a stale/missing stored directory. A relay wake already holding `locks/resume-<id>.lock` makes attach exit 3.
+
+For a Codex entry registered with an app-server socket, attach prints/execs `codex --remote unix://<socket>` so the human joins the server-owned thread instead of starting a second rollout writer.
 
 ```bash
 relay attach worker             # inspect the exact command and context first
@@ -190,7 +192,16 @@ app-server on a unix socket, then let `relay watch` deliver:
 codex app-server --listen unix://$HOME/.codex-app.sock   # socket must live under $HOME, not /tmp
 codex --remote unix://$HOME/.codex-app.sock              # optional: attach the normal TUI to the same server
 <plugin>/bin/relay watch <name>... --server $HOME/.codex-app.sock          # or --all; or RELAY_APP_SERVER env
+<plugin>/bin/relay register <name> --id <uuid> --tool codex --server $HOME/.codex-app.sock
 ```
+
+Socket precedence is per-session registry `server` first, then the invocation's
+`--server`, then the store-wide `RELAY_APP_SERVER` fallback. A SessionStart hook
+refresh preserves the registered socket. `relay spawn --server <socket>` records
+the socket on the born entry; app-server-native spawning lands in a later step.
+With no configured socket, watch uses the existing tool-aware doorbell. At this
+stage a configured but unreachable socket fails the push and re-enqueues mail;
+the live-view delivery step adds the unreachable-server doorbell fallback.
 
 - **Default mode** injects the fenced mail into the thread's history
   (`thread/inject_items`) — it persists durably and surfaces at the thread's next
@@ -200,9 +211,9 @@ codex --remote unix://$HOME/.codex-app.sock              # optional: attach the 
   turn completes because MCP tool calls elicit approval from the connected client
   regardless of that policy: it accepts elicitations for the relay's own `bus`
   server only (store-local tools) and declines every other server.
-- Targets that aren't app-server-reachable (Claude sessions, no `--server`,
-  socket down) fall back to the `relay wake` doorbell; mail is re-enqueued if a
-  push fails mid-flight. `--once` does a single poll+deliver+exit (cron/tests).
+- Claude sessions and Codex entries with no configured server use the `relay
+  wake` doorbell. Mail is re-enqueued if a configured push fails mid-flight.
+  `--once` does a single poll+deliver+exit (cron/tests).
 - Each long-running target holds `~/.agent-relay/watchers/<id>.lock`; `--all`
   skips targets already watched, while an explicit duplicate target fails.
   `--once` leaves a persistent tombstone that reads `dead` after it exits.
@@ -310,7 +321,7 @@ cd "$(<plugin>/bin/relay list | awk '$1=="agent-B"{print $4}')" \
 - The only bus tools: `whoami`, `register`, `roster`, `send`, `inbox`, `discover`. If the tools aren't available, the plugin isn't enabled here.
 - `discover` infers liveness from session-file recency (mtime), not a live handshake — a just-idle session can still appear; a long-dead one won't (it falls outside the window).
 - There is no live session-to-session socket. Even `relay watch` is queue + push-into-thread: mail always lands in the shared store first, and only Codex-under-app-server targets take a push — Claude live delivery is the Monitor watch or the next prompt.
-- `relay watch` flags: `--server`, `--tool`, `--auto-turn`, `--once`, `--all`, `--dry`, `--id`, `--follow <id>`. `relay wake` flags: `--id`, `--dir`, `--tool`, `--model`, `--effort`, `--dry`. `relay spawn` flags: `--tool`, `--model`, `--effort`, `--name`, `--reply-to`, `--timeout`, `--read-only`, `--full-access`, `--watch`, `--dry`. `relay doctor` takes optional `--id <session-id-or-name>`. `relay send` identity flag: `--from <name-or-id>`. Do not invent others; there is no `--interval`, `--wait`, or daemon-mode config.
+- `relay watch` flags: `--server`, `--tool`, `--auto-turn`, `--once`, `--all`, `--dry`, `--id`, `--follow <id>`. `relay wake` flags: `--id`, `--dir`, `--tool`, `--model`, `--effort`, `--dry`. `relay spawn` flags: `--tool`, `--model`, `--effort`, `--name`, `--server`, `--reply-to`, `--timeout`, `--read-only`, `--full-access`, `--watch`, `--dry`. `relay register` accepts optional `--server <unix-socket>`. `relay doctor` takes optional `--id <session-id-or-name>`. `relay send` identity flag: `--from <name-or-id>`. Do not invent others; there is no `--interval`, `--wait`, or daemon-mode config.
 - `relay attach` takes one name-or-UUID and optional `--exec`; print mode is the default. There is no attach picker or co-driving mode.
 - Identity params: `send` takes optional `from`, `inbox` takes optional `id` — both must name a REGISTERED session (id or name) and both mean "act as / drain this session". There is no `--as`, no `sender:` field, and no way to send as an unregistered identity.
 
