@@ -60,7 +60,7 @@ fs.chmodSync(artifactRoot, 0o700);
 const dirs = Object.fromEntries(Object.entries({
   home: path.join(artifactRoot, 'home'),
   codexHome: path.join(artifactRoot, 'codex-home'),
-  claudeConfig: path.join(artifactRoot, 'claude-config'),
+  claudeConfig: path.join(artifactRoot, 'home', '.claude'),
   pluginConfig: path.join(artifactRoot, 'plugin-config'),
   relayStore: path.join(artifactRoot, 'relay-store'),
   cwd: path.join(artifactRoot, 'cwd'),
@@ -370,52 +370,6 @@ if (mode === 'timeout') {
 }
 `;
 
-const AUTH_VIEW_SOURCE = String.raw`#define _GNU_SOURCE
-#include <errno.h>
-#include <fcntl.h>
-#include <sched.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <sys/mount.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <unistd.h>
-
-static int write_text(const char *path, const char *text) {
-  int fd = open(path, O_WRONLY | O_CLOEXEC);
-  if (fd < 0) return -1;
-  size_t len = strlen(text);
-  ssize_t n = write(fd, text, len);
-  int saved = errno;
-  close(fd);
-  errno = saved;
-  return n == (ssize_t)len ? 0 : -1;
-}
-
-int main(int argc, char **argv) {
-  if (argc < 3) { fputs("auth-view: target and command required\n", stderr); return 64; }
-  const char *source = getenv("RELAY_PRIVATE_CREDENTIAL_SOURCE");
-  if (!source || !*source) { fputs("auth-view: credential reference unavailable\n", stderr); return 65; }
-  uid_t uid = getuid(); gid_t gid = getgid();
-  if (unshare(CLONE_NEWUSER) < 0) { perror("auth-view: user namespace"); return 66; }
-  char map[128];
-  (void)write_text("/proc/self/setgroups", "deny\n");
-  snprintf(map, sizeof(map), "0 %u 1\n", (unsigned)uid);
-  if (write_text("/proc/self/uid_map", map) < 0) { perror("auth-view: uid map"); return 67; }
-  snprintf(map, sizeof(map), "0 %u 1\n", (unsigned)gid);
-  if (write_text("/proc/self/gid_map", map) < 0) { perror("auth-view: gid map"); return 68; }
-  if (unshare(CLONE_NEWNS) < 0) { perror("auth-view: mount namespace"); return 69; }
-  if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) < 0) { perror("auth-view: private mounts"); return 70; }
-  if (mount(source, argv[1], NULL, MS_BIND, NULL) < 0) { perror("auth-view: bind credential"); return 71; }
-  if (mount(NULL, argv[1], NULL, MS_BIND | MS_REMOUNT | MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC, NULL) < 0) { perror("auth-view: readonly credential"); return 72; }
-  unsetenv("RELAY_PRIVATE_CREDENTIAL_SOURCE");
-  execvp(argv[2], &argv[2]);
-  perror("auth-view: exec");
-  return 73;
-}
-`;
-
 const NAMESPACE_SOURCE = String.raw`#define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
@@ -425,60 +379,135 @@ const NAMESPACE_SOURCE = String.raw`#define _GNU_SOURCE
 #include <string.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 static int write_text(const char *path, const char *text) {
-  int fd = open(path, O_WRONLY | O_CLOEXEC); if (fd < 0) return -1;
-  size_t len = strlen(text); ssize_t n = write(fd, text, len); int saved = errno; close(fd); errno = saved;
+  int fd = open(path, O_WRONLY | O_CLOEXEC);
+  if (fd < 0) return -1;
+  size_t len = strlen(text);
+  ssize_t n = write(fd, text, len);
+  int saved = n == (ssize_t)len ? 0 : (errno == 0 ? EIO : errno);
+  close(fd);
+  errno = saved;
   return n == (ssize_t)len ? 0 : -1;
 }
 static int mount_counts(int *proc_count, int *cgroup_count) {
-  FILE *f = fopen("/proc/self/mountinfo", "r"); if (!f) return -1;
-  char *line = NULL; size_t cap = 0; *proc_count = 0; *cgroup_count = 0;
+  FILE *f = fopen("/proc/self/mountinfo", "r");
+  if (!f) return -1;
+  char *line = NULL;
+  size_t cap = 0;
+  *proc_count = 0;
+  *cgroup_count = 0;
   while (getline(&line, &cap, f) >= 0) {
     if (strstr(line, " - proc ")) (*proc_count)++;
     if (strstr(line, " - cgroup2 ")) (*cgroup_count)++;
   }
-  free(line); fclose(f); return 0;
+  free(line);
+  fclose(f);
+  return 0;
 }
-static int collect_mounts(char paths[][4096], int max) {
-  FILE *f = fopen("/proc/self/mountinfo", "r"); if (!f) return -1;
-  char *line = NULL; size_t cap = 0; int n = 0;
-  while (getline(&line, &cap, f) >= 0 && n < max) {
-    if (!strstr(line, " - proc ") && !strstr(line, " - cgroup2 ")) continue;
-    char *save = NULL; char *token = strtok_r(line, " ", &save); int field = 1;
-    while (token && field < 5) { token = strtok_r(NULL, " ", &save); field++; }
-    if (token) { snprintf(paths[n], 4096, "%s", token); n++; }
-  }
-  free(line); fclose(f);
-  for (int i = 0; i < n; i++) for (int j = i + 1; j < n; j++) if (strlen(paths[j]) > strlen(paths[i])) { char tmp[4096]; memcpy(tmp, paths[i], 4096); memcpy(paths[i], paths[j], 4096); memcpy(paths[j], tmp, 4096); }
-  return n;
+static int fail_reason(const char *stage, int error_number, const char *reason,
+                       int user_namespace, int other_namespaces) {
+  printf("{\"user_namespace\":%s,\"mount_pid_cgroup_namespaces\":%s,\"failure_stage\":\"%s\",\"failure_errno\":%d,\"failure_reason\":\"%s\"}\n",
+         user_namespace ? "true" : "false",
+         other_namespaces ? "true" : "false",
+         stage,
+         error_number,
+         reason);
+  return 2;
+}
+static int fail_errno(const char *stage, int user_namespace, int other_namespaces) {
+  int saved = errno;
+  return fail_reason(stage, saved, strerror(saved), user_namespace, other_namespaces);
+}
+static int make_dir(const char *path, mode_t mode) {
+  if (mkdir(path, mode) == 0 || errno == EEXIST) return 0;
+  return -1;
 }
 int main(int argc, char **argv) {
-  (void)argc; (void)argv;
-  uid_t uid = getuid(); gid_t gid = getgid(); char map[128];
-  if (unshare(CLONE_NEWUSER) < 0) { printf("{\"user_namespace\":false,\"reason\":\"errno_%d\"}\n", errno); return 2; }
-  (void)write_text("/proc/self/setgroups", "deny\n");
-  snprintf(map, sizeof(map), "0 %u 1\n", (unsigned)uid); if (write_text("/proc/self/uid_map", map) < 0) return 3;
-  snprintf(map, sizeof(map), "0 %u 1\n", (unsigned)gid); if (write_text("/proc/self/gid_map", map) < 0) return 4;
-  if (unshare(CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWCGROUP) < 0) { printf("{\"user_namespace\":true,\"mount_pid_cgroup_namespaces\":false,\"reason\":\"errno_%d\"}\n", errno); return 5; }
-  pid_t child = fork(); if (child < 0) return 6;
-  if (child > 0) { int status = 0; if (waitpid(child, &status, 0) < 0) return 7; return WIFEXITED(status) ? WEXITSTATUS(status) : 8; }
-  if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) < 0) return 9;
-  char paths[128][4096]; int mounts = collect_mounts(paths, 128); if (mounts < 0) return 10;
-  int detached = 0; for (int i = 0; i < mounts; i++) if (umount2(paths[i], MNT_DETACH) == 0) detached++;
-  mkdir("/proc", 0555); mkdir("/sys", 0555); mkdir("/sys/fs", 0555); mkdir("/sys/fs/cgroup", 0555);
-  int fresh_proc = mount("proc", "/proc", "proc", MS_NOSUID | MS_NODEV | MS_NOEXEC, NULL) == 0;
-  int fresh_cgroup = mount("none", "/sys/fs/cgroup", "cgroup2", MS_NOSUID | MS_NODEV | MS_NOEXEC, NULL) == 0;
-  int cgroup_ro = fresh_cgroup && mount(NULL, "/sys/fs/cgroup", NULL, MS_REMOUNT | MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC, NULL) == 0;
-  int proc_count = -1, cgroup_count = -1; if (fresh_proc) (void)mount_counts(&proc_count, &cgroup_count);
-  const char *host_pid = getenv("RELAY_PROBE_HOST_PID"); char host_fd[128]; snprintf(host_fd, sizeof(host_fd), "/proc/%s/fd", host_pid ? host_pid : "0");
-  struct stat st; int host_proc_hidden = stat(host_fd, &st) < 0 && errno == ENOENT;
+  (void)argc;
+  (void)argv;
+  uid_t uid = getuid();
+  gid_t gid = getgid();
+  char map[128];
+  if (unshare(CLONE_NEWUSER) < 0) return fail_errno("unshare_user", 0, 0);
+  if (write_text("/proc/self/setgroups", "deny\n") < 0 && errno != ENOENT) return fail_errno("setgroups_deny", 1, 0);
+  snprintf(map, sizeof(map), "0 %u 1\n", (unsigned)uid);
+  if (write_text("/proc/self/uid_map", map) < 0) return fail_errno("uid_map", 1, 0);
+  snprintf(map, sizeof(map), "0 %u 1\n", (unsigned)gid);
+  if (write_text("/proc/self/gid_map", map) < 0) return fail_errno("gid_map", 1, 0);
+  if (unshare(CLONE_NEWNS) < 0) return fail_errno("unshare_mount", 1, 0);
+  if (unshare(CLONE_NEWPID) < 0) return fail_errno("unshare_pid", 1, 0);
+  if (unshare(CLONE_NEWCGROUP) < 0) return fail_errno("unshare_cgroup", 1, 0);
+
+  pid_t child = fork();
+  if (child < 0) return fail_errno("fork_pid_namespace_init", 1, 1);
+  if (child > 0) {
+    int status = 0;
+    if (waitpid(child, &status, 0) < 0) return fail_errno("wait_pid_namespace_init", 1, 1);
+    if (WIFEXITED(status)) return WEXITSTATUS(status);
+    return fail_reason("pid_namespace_init_signal", 0, "namespace init terminated by signal", 1, 1);
+  }
+
+  if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) < 0) return fail_errno("make_mounts_private", 1, 1);
+  int inherited_proc = -1;
+  int inherited_cgroup = -1;
+  if (mount_counts(&inherited_proc, &inherited_cgroup) < 0) return fail_errno("count_inherited_mounts", 1, 1);
+
+  const char *tmp = getenv("TMPDIR");
+  if (!tmp || !*tmp) return fail_reason("isolated_tmpdir", 0, "TMPDIR is unavailable", 1, 1);
+  char new_root[4096];
+  int root_len = snprintf(new_root, sizeof(new_root), "%s/namespace-root-%ld", tmp, (long)getpid());
+  if (root_len < 0 || (size_t)root_len >= sizeof(new_root)) return fail_reason("isolated_root_path", ENAMETOOLONG, "isolated root path is too long", 1, 1);
+  if (make_dir(new_root, 0700) < 0) return fail_errno("create_isolated_root", 1, 1);
+  if (mount("tmpfs", new_root, "tmpfs", MS_NOSUID | MS_NODEV, "mode=0755") < 0) return fail_errno("mount_isolated_root", 1, 1);
+
+  char old_root[4096];
+  char proc_path[4096];
+  char sys_path[4096];
+  char sys_fs_path[4096];
+  char cgroup_path[4096];
+  if (snprintf(old_root, sizeof(old_root), "%s/oldroot", new_root) >= (int)sizeof(old_root) ||
+      snprintf(proc_path, sizeof(proc_path), "%s/proc", new_root) >= (int)sizeof(proc_path) ||
+      snprintf(sys_path, sizeof(sys_path), "%s/sys", new_root) >= (int)sizeof(sys_path) ||
+      snprintf(sys_fs_path, sizeof(sys_fs_path), "%s/sys/fs", new_root) >= (int)sizeof(sys_fs_path) ||
+      snprintf(cgroup_path, sizeof(cgroup_path), "%s/sys/fs/cgroup", new_root) >= (int)sizeof(cgroup_path)) {
+    return fail_reason("isolated_root_children", ENAMETOOLONG, "isolated root child path is too long", 1, 1);
+  }
+  if (make_dir(old_root, 0700) < 0 || make_dir(proc_path, 0555) < 0 ||
+      make_dir(sys_path, 0555) < 0 || make_dir(sys_fs_path, 0555) < 0 ||
+      make_dir(cgroup_path, 0555) < 0) return fail_errno("create_isolated_root_children", 1, 1);
+  if (mount("proc", proc_path, "proc", MS_NOSUID | MS_NODEV | MS_NOEXEC, NULL) < 0) return fail_errno("mount_fresh_proc", 1, 1);
+  if (mount("none", cgroup_path, "cgroup2", MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC, NULL) < 0) return fail_errno("mount_fresh_cgroup2_read_only", 1, 1);
+  if (chdir(new_root) < 0) return fail_errno("chdir_isolated_root", 1, 1);
+  if (syscall(SYS_pivot_root, ".", "oldroot") < 0) return fail_errno("pivot_isolated_root", 1, 1);
+  if (chdir("/") < 0) return fail_errno("chdir_new_root", 1, 1);
+  if (umount2("/oldroot", MNT_DETACH) < 0) return fail_errno("detach_inherited_root", 1, 1);
+  if (rmdir("/oldroot") < 0) return fail_errno("remove_old_root", 1, 1);
+
+  int inherited_mounts = inherited_proc + inherited_cgroup;
+  int detached = inherited_mounts;
+  int proc_count = -1;
+  int cgroup_count = -1;
+  if (mount_counts(&proc_count, &cgroup_count) < 0) return fail_errno("count_fresh_mounts", 1, 1);
+  if (proc_count != 1 || cgroup_count != 1) return fail_reason("fresh_mount_count", 0, "fresh proc/cgroup2 mount count is not one", 1, 1);
+  struct statvfs cgroup_vfs;
+  if (statvfs("/sys/fs/cgroup", &cgroup_vfs) < 0) return fail_errno("stat_fresh_cgroup2", 1, 1);
+  if ((cgroup_vfs.f_flag & ST_RDONLY) == 0) return fail_reason("fresh_cgroup2_read_only", 0, "fresh cgroup2 view is writable", 1, 1);
+  const char *host_pid = getenv("RELAY_PROBE_HOST_PID");
+  char host_fd[128];
+  snprintf(host_fd, sizeof(host_fd), "/proc/%s/fd", host_pid ? host_pid : "0");
+  struct stat st;
+  int host_proc_hidden = stat(host_fd, &st) < 0 && errno == ENOENT;
+  if (!host_proc_hidden) return fail_reason("hide_host_proc_pid_fd", errno, "host proc-pid-fd remains visible", 1, 1);
+  if (getpid() != 1) return fail_reason("namespace_pid_one", 0, "namespace init PID is not one", 1, 1);
   printf("{\"user_namespace\":true,\"mount_pid_cgroup_namespaces\":true,\"namespace_pid_is_one\":%s,\"inherited_proc_cgroup_mounts\":%d,\"detached_proc_cgroup_mounts\":%d,\"fresh_proc\":%s,\"fresh_cgroup2\":%s,\"cgroup2_read_only\":%s,\"proc_mount_count\":%d,\"cgroup2_mount_count\":%d,\"proc_pid_fd_authority_denied\":%s}\n",
-    getpid() == 1 ? "true" : "false", mounts, detached, fresh_proc ? "true" : "false", fresh_cgroup ? "true" : "false", cgroup_ro ? "true" : "false", proc_count, cgroup_count, host_proc_hidden ? "true" : "false");
-  return (fresh_proc && detached == mounts && getpid() == 1 && host_proc_hidden) ? 0 : 11;
+    "true", inherited_mounts, detached, "true", "true", "true", proc_count, cgroup_count, "true");
+  return 0;
 }
 `;
 
@@ -595,7 +624,12 @@ static void build(void) {
 #endif
   stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW);
 }
-static int install(void) { build(); struct sock_fprog prog = { used, code }; if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0) return -1; return prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog); }
+static int install(void) {
+  build();
+  struct sock_fprog prog = { used, code };
+  if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0) return -1;
+  return prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog);
+}
 static int raw_probe(void) {
   if (install() < 0) { perror("seccomp install"); return 2; }
   long clone3_rc = -1; int clone3_errno = ENOSYS;
@@ -606,7 +640,10 @@ static int raw_probe(void) {
   long clone_rc = -1; int clone_errno = ENOSYS;
 #ifdef __NR_clone
   errno = 0; clone_rc = syscall(__NR_clone, (unsigned long)(CLONE_NEWUSER | SIGCHLD), 0, 0, 0, 0); clone_errno = errno;
-  if (clone_rc == 0) _exit(98); if (clone_rc > 0) { (void)waitpid((pid_t)clone_rc, NULL, 0); }
+  if (clone_rc == 0) _exit(98);
+  if (clone_rc > 0) {
+    (void)waitpid((pid_t)clone_rc, NULL, 0);
+  }
 #endif
   printf("{\"clone3_rc\":%ld,\"clone3_errno\":%d,\"clone3_child_created\":%s,\"legacy_namespace_clone_denied\":%s,\"legacy_clone_errno\":%d}\n", clone3_rc, clone3_errno, clone3_rc > 0 ? "true" : "false", clone_rc == -1 && clone_errno == EPERM ? "true" : "false", clone_errno);
   return (clone3_rc == -1 && clone3_errno == ENOSYS && clone_rc == -1 && clone_errno == EPERM) ? 0 : 3;
@@ -648,8 +685,6 @@ int main(int argc, char **argv) {
 `;
 
 const helperPaths = {
-  authSource: path.join(dirs.helpers, 'auth-view.c'),
-  auth: path.join(dirs.helpers, 'auth-view'),
   namespaceSource: path.join(dirs.helpers, 'namespace-probe.c'),
   namespace: path.join(dirs.helpers, 'namespace-probe'),
   seccompSource: path.join(dirs.helpers, 'seccomp-probe.c'),
@@ -662,7 +697,6 @@ const codexConfigPath = path.join(dirs.codexHome, 'config.toml');
 const relayBin = path.join(PLUGIN, 'bin', 'relay');
 
 fs.writeFileSync(hookPath, HOOK_SOURCE, { flag: 'wx', mode: 0o500 });
-fs.writeFileSync(helperPaths.authSource, AUTH_VIEW_SOURCE, { flag: 'wx', mode: 0o400 });
 fs.writeFileSync(helperPaths.namespaceSource, NAMESPACE_SOURCE, { flag: 'wx', mode: 0o400 });
 fs.writeFileSync(helperPaths.seccompSource, SECCOMP_SOURCE, { flag: 'wx', mode: 0o400 });
 
@@ -695,11 +729,11 @@ async function compileHelper(id, category, source, output) {
   return record.derived.availability === 'available';
 }
 
-const authHelperAvailable = await compileHelper('helper.auth-view.compile', 'native_process', helperPaths.authSource, helperPaths.auth);
 const namespaceHelperAvailable = await compileHelper('helper.namespace.compile', 'namespace_isolation', helperPaths.namespaceSource, helperPaths.namespace);
 const seccompHelperAvailable = await compileHelper('helper.seccomp.compile', 'seccomp_filter', helperPaths.seccompSource, helperPaths.seccomp);
 
 const auth = {};
+const forwardedCredentials = [];
 function prepareAuth(runtime) {
   const envNames = runtime === 'claude' ? ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'CLAUDE_CODE_OAUTH_TOKEN'] : ['CODEX_API_KEY', 'CODEX_ACCESS_TOKEN'];
   const envName = envNames.find((name) => typeof ORIGINAL_ENV[name] === 'string' && ORIGINAL_ENV[name].length > 0);
@@ -708,23 +742,29 @@ function prepareAuth(runtime) {
   const source = runtime === 'claude'
     ? path.join(ORIGINAL_CLAUDE_CONFIG, '.credentials.json')
     : path.join(ORIGINAL_CODEX_HOME, 'auth.json');
-  if (process.platform === 'linux' && authHelperAvailable && exists(source)) {
+  if (exists(source)) {
     const target = runtime === 'claude' ? path.join(dirs.claudeConfig, '.credentials.json') : path.join(dirs.codexHome, 'auth.json');
-    if (!exists(target)) fs.writeFileSync(target, '', { flag: 'wx', mode: 0o600 });
-    return { kind: 'readonly_private_mount_reference', source, target, env: {} };
+    try {
+      fs.copyFileSync(source, target, fs.constants.COPYFILE_EXCL);
+      fs.chmodSync(target, 0o600);
+      forwardedCredentials.push(target);
+      return { kind: 'isolated_0600_copy', env: {} };
+    } catch (error) {
+      try { fs.rmSync(target, { force: true }); } catch {}
+      return { kind: 'unavailable', env: {}, reason: `credential copy into isolated runtime home failed: ${error.code || error.message || error}` };
+    }
   }
   if (process.platform === 'darwin') return { kind: 'os_keychain', env: {} };
-  return { kind: 'unavailable', env: {}, reason: exists(source) ? 'credential artifact exists but a private read-only mount namespace could not be created' : 'no allowlisted secret environment variable or supported credential artifact is present' };
+  return { kind: 'unavailable', env: {}, reason: 'no allowlisted secret environment variable or supported credential artifact is present' };
 }
 for (const runtime of RUNTIMES) auth[runtime] = prepareAuth(runtime);
 
 function runtimeCommand(runtime, prompt, { tools = false, seccomp = false } = {}) {
   const logical = runtime === 'claude'
     ? [
-      'claude', '-p', '--output-format', 'text', '--permission-mode', 'auto',
+      'claude', '-p', prompt, '--output-format', 'text', '--permission-mode', 'auto',
       '--no-session-persistence', '--setting-sources', 'user',
       ...(tools ? ['--tools', 'Bash', '--allowedTools', 'Bash'] : ['--tools', '']),
-      prompt,
     ]
     : [
       'codex', 'exec', '--sandbox', tools ? 'workspace-write' : 'read-only',
@@ -736,10 +776,6 @@ function runtimeCommand(runtime, prompt, { tools = false, seccomp = false } = {}
   if (seccomp) actual = [helperPaths.seccomp, '--exec', ...actual];
   const credential = auth[runtime];
   const extraEnv = { ...credential.env };
-  if (credential.kind === 'readonly_private_mount_reference') {
-    extraEnv.RELAY_PRIVATE_CREDENTIAL_SOURCE = credential.source;
-    actual = [helperPaths.auth, credential.target, ...actual];
-  }
   return { logical, actual, env: isolatedEnv(extraEnv), authSource: credential.kind };
 }
 
@@ -1123,7 +1159,10 @@ if (!namespaceHelperAvailable) {
   let facts = {};
   try { facts = JSON.parse(rawResult.stdout.toString('utf8')); } catch { facts = { helper_stdout_base64: rawResult.stdout.toString('base64') }; }
   const ok = rawResult.status === 0 && facts.user_namespace === true && facts.mount_pid_cgroup_namespaces === true && facts.namespace_pid_is_one === true && facts.inherited_proc_cgroup_mounts === facts.detached_proc_cgroup_mounts && facts.fresh_proc === true && facts.fresh_cgroup2 === true && facts.cgroup2_read_only === true && facts.proc_mount_count === 1 && facts.cgroup2_mount_count === 1 && facts.proc_pid_fd_authority_denied === true;
-  const wrapped = { availability: ok ? 'available' : 'unavailable', reason: ok ? 'unprivileged user plus mount/PID/cgroup namespaces, detach-all, fresh proc, and proc-pid-fd denial succeeded' : facts.reason || firstLine(rawResult.stderr) || 'namespace isolation prerequisite failed', facts: { ...facts, helper_stdout_base64: rawResult.stdout.toString('base64'), helper_stderr_base64: rawResult.stderr.toString('base64') } };
+  const failure = facts.failure_stage
+    ? `namespace isolation failed at ${facts.failure_stage}: errno=${facts.failure_errno} (${facts.failure_reason || 'reason unavailable'})`
+    : firstLine(rawResult.stderr) || 'namespace isolation prerequisite failed without structured helper output';
+  const wrapped = { availability: ok ? 'available' : 'unavailable', reason: ok ? 'unprivileged user plus mount/PID/cgroup namespaces, detach-all, fresh proc, and proc-pid-fd denial succeeded' : failure, facts: { ...facts, helper_stdout_base64: rawResult.stdout.toString('base64'), helper_stderr_base64: rawResult.stderr.toString('base64') } };
   namespaceRecord = addRecord({ id: 'host.namespace-isolation', category: 'namespace_isolation', runtime: 'host', argv: [helperPaths.namespace], result: { ...rawResult, stdout: jsonBuffer(wrapped), stderr: Buffer.alloc(0) }, parserId: 'namespace-isolation', parserRule: 'Reparse the base64 raw helper stdout and require user/mount/PID/cgroup namespaces, PID 1, detach-all inherited proc/cgroup mounts, fresh proc, one read-only cgroup view, and hidden host proc-pid-fd.' });
 }
 
@@ -1256,6 +1295,11 @@ async function runtimeSpawnRow(runtime) {
   return addRecord({ id: `spawn.${runtime}.candidate-filter`, category: 'runtime_spawn', runtime, runtimeVersion: versions[runtime], argv: command.logical, result: { ...runtimeResult, stdout: jsonBuffer(envelope), stderr: Buffer.alloc(0) }, parserId: 'runtime-spawn', parserRule: 'Require an external two-line child-complete then wait-complete sentinel, zero runtime exit, no surviving child, exact candidate-filter hash, and real CLI tool marker.' });
 }
 for (const runtime of RUNTIMES) spawnRecords[runtime] = await runtimeSpawnRow(runtime);
+
+for (const credential of forwardedCredentials) {
+  fs.rmSync(credential, { force: true });
+  assert.equal(exists(credential), false, 'forwarded credential copy must be removed before evidence sealing');
+}
 
 function buildSummary() {
   const appserver = records.find((record) => record.id === 'appserver.protocol.contract');
