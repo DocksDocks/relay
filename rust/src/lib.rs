@@ -1,3 +1,4 @@
+pub(crate) mod appserver;
 pub mod bus;
 pub mod cli;
 pub mod discover;
