@@ -891,7 +891,10 @@ async function timingRow(runtime, sample) {
       RELAY_PROBE_HOOK_LOG: log,
       RELAY_PROBE_RELAY_BIN: relayBin,
     };
+    const launchedAtMs = Date.now();
+    env.RELAY_PROBE_LAUNCHED_AT_MS = String(launchedAtMs);
     runtimeResult = await runProcess(command.actual, { env, timeoutMs: 180_000 });
+    runtimeResult.launchedAtMs = launchedAtMs;
     await contention.wait;
   }
   const envelope = {
