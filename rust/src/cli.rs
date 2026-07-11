@@ -138,6 +138,43 @@ struct AttachInvocation {
     rendered: String,
 }
 
+struct ParsedAttachArgs {
+    target: String,
+    execute: bool,
+}
+
+fn parse_attach_args(raw: &[String]) -> Result<ParsedAttachArgs, ()> {
+    let mut target = None;
+    let mut execute = false;
+    let mut options = true;
+    for arg in raw.iter().skip(1) {
+        if options && arg == "--" {
+            options = false;
+            continue;
+        }
+        if options && arg == "--exec" {
+            if execute {
+                return Err(());
+            }
+            execute = true;
+            continue;
+        }
+        if options && arg.starts_with('-') {
+            return Err(());
+        }
+        if arg.is_empty() {
+            return Err(());
+        }
+        if target.replace(arg.clone()).is_some() {
+            return Err(());
+        }
+    }
+    let Some(target) = target else {
+        return Err(());
+    };
+    Ok(ParsedAttachArgs { target, execute })
+}
+
 fn shell_word(value: &str) -> String {
     if !value.is_empty()
         && value
@@ -220,11 +257,15 @@ fn discovered_target(id: &str) -> Option<Target> {
 }
 
 fn attach(args: &Args) -> ! {
-    let pos = args.positionals(1);
-    let Some(who) = pos.first() else {
-        eprintln!("{ATTACH_WARNING}");
-        die("usage: relay attach <nameOrId> [--exec]");
+    let parsed = match parse_attach_args(&args.0) {
+        Ok(parsed) => parsed,
+        Err(()) => {
+            eprintln!("{ATTACH_WARNING}");
+            eprintln!("usage: relay attach <nameOrId> [--exec]");
+            std::process::exit(2);
+        }
     };
+    let who = parsed.target.as_str();
     let target = match store::resolve(who) {
         Some(entry) => from_entry(entry),
         None if store::is_uuid(who) => discovered_target(who).unwrap_or_else(|| {
@@ -250,13 +291,25 @@ fn attach(args: &Args) -> ! {
             target.tool
         ));
     }
-    if store::resume_status(&target.id) == store::LockStatus::Live {
-        eprintln!("{ATTACH_WARNING}");
-        eprintln!(
-            "attach refused: relay wake is in flight for {} (resume lock held)",
-            target.name.as_deref().unwrap_or(&target.id)
-        );
-        std::process::exit(3);
+    match store::resume_status(&target.id) {
+        store::LockStatus::Live => {
+            eprintln!("{ATTACH_WARNING}");
+            eprintln!(
+                "attach refused: relay wake is in flight for {} (resume lock held)",
+                target.name.as_deref().unwrap_or(&target.id)
+            );
+            std::process::exit(3);
+        }
+        store::LockStatus::Unknown => {
+            eprintln!("{ATTACH_WARNING}");
+            eprintln!(
+                "attach refused: cannot verify resume lock state for {}. Run relay doctor --id {} and restore lock access; remove a stale lock only after confirming no wake is running.",
+                target.name.as_deref().unwrap_or(&target.id),
+                target.id
+            );
+            std::process::exit(4);
+        }
+        store::LockStatus::Dead | store::LockStatus::Never => {}
     }
 
     let dir_exists = target
@@ -278,7 +331,7 @@ fn attach(args: &Args) -> ! {
         die(&e)
     });
 
-    if args.has("exec") {
+    if parsed.execute {
         eprintln!("{ATTACH_WARNING}");
         let Some(_) = target.dir.as_deref().filter(|_| dir_exists) else {
             die("attach --exec refused: stored dir does not exist");
@@ -1136,5 +1189,20 @@ mod tests {
             attach.rendered,
             "codex --remote 'unix:///tmp/codex app.sock'"
         );
+    }
+
+    #[test]
+    fn attach_parser_accepts_one_target_and_exec_only_before_terminator() {
+        let before = parse_attach_args(&strings(&["attach", "--exec", "worker"])).unwrap();
+        assert_eq!(before.target, "worker");
+        assert!(before.execute);
+
+        let after = parse_attach_args(&strings(&["attach", "worker", "--exec"])).unwrap();
+        assert_eq!(after.target, "worker");
+        assert!(after.execute);
+
+        assert!(parse_attach_args(&strings(&["attach", "worker", "extra"])).is_err());
+        assert!(parse_attach_args(&strings(&["attach", "worker", "--bogus"])).is_err());
+        assert!(parse_attach_args(&strings(&["attach", "worker", "--", "--exec"])).is_err());
     }
 }

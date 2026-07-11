@@ -264,6 +264,15 @@ check('attach --exec replaces the process with exact codex and claude argv/cwd',
   });
   assert.match(codex.stderr, /WARNING: split-brain risk/);
 
+  const codexBeforeRecord = path.join(HOME, 'attach-codex-before.json');
+  const codexBefore = relay(['attach', '--exec', 'codex-C'], {
+    env: { PATH: attachPath, ATTACH_STUB_OUTPUT: codexBeforeRecord },
+  });
+  assert.equal(codexBefore.status, 0, codexBefore.stderr);
+  assert.deepEqual(JSON.parse(fs.readFileSync(codexBeforeRecord, 'utf8')).argv, [
+    'resume', idC, '-C', dirC,
+  ]);
+
   const claudeRecord = path.join(HOME, 'attach-claude.json');
   const claude = relay(['attach', 'agent-A', '--exec'], {
     env: { PATH: attachPath, ATTACH_STUB_OUTPUT: claudeRecord },
@@ -274,6 +283,20 @@ check('attach --exec replaces the process with exact codex and claude argv/cwd',
     cwd: dirA,
   });
   assert.match(claude.stderr, /WARNING: split-brain risk/);
+});
+
+check('attach strictly rejects extra operands, unknown flags, and exec after --', () => {
+  const record = path.join(HOME, 'attach-strict.json');
+  for (const args of [
+    ['attach', 'codex-C', 'extra'],
+    ['attach', 'codex-C', '--bogus'],
+    ['attach', 'codex-C', '--', '--exec'],
+  ]) {
+    const r = relay(args, { env: { PATH: attachPath, ATTACH_STUB_OUTPUT: record } });
+    assert.equal(r.status, 2, `${args.join(' ')} exited ${r.status}: ${r.stderr}`);
+    assert.match(r.stderr, /usage: relay attach <nameOrId> \[--exec\]/);
+  }
+  assert.equal(fs.existsSync(record), false, '--exec after -- never replaced the process');
 });
 
 check('attach print mode tolerates a missing dir while --exec refuses it', () => {
@@ -299,6 +322,22 @@ check('attach rejects an unresolved non-UUID id', () => {
   const r = relay(['attach', 'not-a-session-id']);
   assert.equal(r.status, 1);
   assert.match(r.stderr, /session UUID/);
+});
+
+check('attach fails closed when the resume lock cannot be probed', () => {
+  const unknownId = '54545454-5454-4454-8454-545454545454';
+  assert.equal(relay(['register', 'unknown-attach-lock', '--id', unknownId, '--dir', dirA]).status, 0);
+  const lock = path.join(HOME, 'locks', `resume-${unknownId}.lock`);
+  fs.writeFileSync(lock, '{}', { mode: 0o000 });
+  try {
+    const r = relay(['attach', 'unknown-attach-lock']);
+    assert.equal(r.status, 4);
+    assert.match(r.stderr, /attach refused: cannot verify resume lock state/);
+    assert.match(r.stderr, /relay doctor --id/);
+    assert.match(r.stderr, /WARNING: split-brain risk/);
+  } finally {
+    fs.chmodSync(lock, 0o600);
+  }
 });
 
 // --- wake usage visibility: stubs exercise the doorbell seam without billing real tools ---
