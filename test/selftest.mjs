@@ -1797,6 +1797,16 @@ process.exit(hook.status ?? 1);
     );
     assert.equal(peek('wake-retry').count, 1, 'refused wake leaves mail durable');
     active.child.kill('SIGKILL');
+    waitFor(() => {
+      try {
+        const operations = Object.values(JSON.parse(
+          fs.readFileSync(path.join(HOME, 'registry.json'), 'utf8'),
+        ).active_operations ?? {});
+        return operations.every((operation) => operation.runtime_session_id !== id);
+      } catch {
+        return false;
+      }
+    }, 'the wake-retry supervisor to reap the cancelled wake');
     waitFor(() => peek('wake-retry').count === 0, 'watch retry delivery after lock release', 8000);
   } finally {
     active.child.kill('SIGKILL');

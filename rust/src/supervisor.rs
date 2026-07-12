@@ -385,7 +385,16 @@ pub fn run_supervisor(argv: &[String]) -> Result<(), String> {
                         startup_checkpoint(SupervisorStartupPhase::ControlAuthenticated, "before")?;
                         let mut response = identity_frame("control_authenticated", &args);
                         response.insert("role".into(), JsonValue::from("control".to_string()));
-                        write_frame(&mut stream, response)?;
+                        if write_frame(&mut stream, response).is_err() {
+                            store.record_child_start_abandoned(
+                                &args.operation_id,
+                                &args.operation_version,
+                                &args.supervisor_instance_id,
+                                "caller disconnected during control authentication",
+                            )?;
+                            fs::remove_file(&socket_path).ok();
+                            return Ok(());
+                        }
                         startup_checkpoint(SupervisorStartupPhase::ControlAuthenticated, "after")?;
                         break stream;
                     }
@@ -414,7 +423,19 @@ pub fn run_supervisor(argv: &[String]) -> Result<(), String> {
     stream
         .set_read_timeout(Some(Duration::from_millis(500)))
         .map_err(|error| format!("configure control GO timeout: {error}"))?;
-    let go = read_frame_unbuffered(&mut stream)?;
+    let go = match read_frame_unbuffered(&mut stream) {
+        Ok(go) => go,
+        Err(_) => {
+            store.record_child_start_abandoned(
+                &args.operation_id,
+                &args.operation_version,
+                &args.supervisor_instance_id,
+                "authenticated caller disconnected before control GO",
+            )?;
+            fs::remove_file(&socket_path).ok();
+            return Ok(());
+        }
+    };
     if frame_string(&go, "kind").as_deref() != Ok("control_go") {
         store.record_child_start_abandoned(
             &args.operation_id,
@@ -452,7 +473,16 @@ pub fn run_supervisor(argv: &[String]) -> Result<(), String> {
         heartbeat_at_ms: store::now_ms(),
     })?;
     stream.set_read_timeout(None).ok();
-    write_frame(&mut stream, identity_frame("control_bound", &args))?;
+    if write_frame(&mut stream, identity_frame("control_bound", &args)).is_err() {
+        store.record_child_start_abandoned(
+            &args.operation_id,
+            &args.operation_version,
+            &args.supervisor_instance_id,
+            "caller disconnected before control bound",
+        )?;
+        fs::remove_file(&socket_path).ok();
+        return Ok(());
+    }
     let outcome = supervise_connected(&store, &args, resolved, stream, control_rx);
     fs::remove_file(socket_path).ok();
     outcome
