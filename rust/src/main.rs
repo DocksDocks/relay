@@ -6,6 +6,8 @@
 //   relay watch …                  poll mailboxes, push into live Codex threads via app-server
 //   relay __spawn-log-writer <id>  hidden bounded stderr pump for detached spawn
 //   relay __appserver-spawn-pump    hidden bounded app-server first-turn pump
+//   relay __lifecycle-watchdog …    hidden detached supervisor owner
+//   relay __lifecycle-supervisor …  hidden exact child custodian
 //   relay __stress …               hidden test helper (cross-process lock race)
 
 use std::collections::HashMap;
@@ -30,6 +32,12 @@ fn main() {
             relay::spawn::run_log_writer(id);
         }
         Some("__appserver-spawn-pump") => relay::spawn::run_appserver_pump(),
+        Some("__lifecycle-watchdog") => {
+            relay::supervisor::run_watchdog(&argv[1..]).unwrap_or_else(|error| die(&error))
+        }
+        Some("__lifecycle-supervisor") => {
+            relay::supervisor::run_supervisor(&argv[1..]).unwrap_or_else(|error| die(&error))
+        }
         // __stress <recipient-id> <who> <k> — mirrors test/selftest.mjs's
         // stress worker: race k enqueues against k register upserts, plus one
         // unique-id register per iteration so a lost read-modify-write shows

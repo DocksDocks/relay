@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "cases": {
+    "lifecycle_managed": {
+      "tests": [
+        "managed_attach_claude_prebound_id_claims_active",
+        "managed_attach_closed_transition_graph_and_exact_versions",
+        "managed_attach_codex_claiming_invalidates_old_epoch_and_waits_for_drain",
+        "managed_attach_concurrent_exact_duplicate_joins_one_claim",
+        "managed_attach_conflicting_binding_refuses_second_worker",
+        "managed_attach_drain_timeout_binds_fencing_never_active",
+        "managed_attach_expiry_fences_worker_without_binding_session",
+        "managed_attach_hook_claims_before_register_and_drains_only_after_active",
+        "managed_attach_hook_refusal_stops_before_register_marker_or_mailbox_drain",
+        "managed_attach_replay_and_tuple_mismatches_fail_without_rebinding",
+        "managed_attach_resume_is_exact_and_does_not_churn_state",
+        "managed_gc_claimant_before_cas_preserves_every_candidate_byte",
+        "managed_gc_crash_after_first_delete_resumes_without_early_record_removal",
+        "managed_gc_crash_after_lock_unlink_keeps_record_until_final_cas",
+        "managed_gc_gcdel_wins_claimant_writes_nothing_and_exact_epoch_resumes",
+        "managed_gc_live_lock_and_malformed_binding_are_fail_closed",
+        "managed_gc_non_releasable_workers_pending_and_managed_bindings_survive_age",
+        "managed_gc_old_standalone_unmanaged_uses_gcdel_cas_and_removes_record_last"
+      ]
+    },
+    "lifecycle_supervisor": {
+      "tests": [
+        "lifecycle_supervisor_disconnect_linearizes_unmanaged_cancel_and_reap",
+        "lifecycle_supervisor_pipe_preserves_bytes_eof_streams_and_reap_custody",
+        "lifecycle_supervisor_wake_uses_closed_stdin_and_separate_output",
+        "lifecycle_supervisor_watchdog_first_loss_refuses_next_reentry",
+        "lifecycle_supervisor_watchdog_marks_managed_worker_on_supervisor_death",
+        "managed_attach_cancel_deadline_binds_fencing_unconfirmed_never_active",
+        "managed_attach_cancel_first_reap_transfers_waiting_claim_exactly_once"
+      ]
+    },
+    "lifecycle_admission": {
+      "tests": [
+        "lifecycle_admission_closed_launch_payload_rejects_invalid_and_mismatched_variants",
+        "lifecycle_admission_drain_receipt_rolls_back_exact_lines_before_new_mail",
+        "lifecycle_admission_drain_timeout_exact_cas_persists_active_operations",
+        "lifecycle_admission_guard_a_cannot_name_or_mutate_b",
+        "lifecycle_admission_publish_fence_precedes_exclusive_drain",
+        "lifecycle_admission_reentry_matrix",
+        "lifecycle_admission_revalidates_registry_tool_cwd_and_server_authority",
+        "lifecycle_admission_stale_unmanaged_guard_refuses_after_claiming",
+        "lifecycle_admission_unmanaged_attach_claiming_kills_waits_and_releases_guard",
+        "lifecycle_admission_unmanaged_guard_binds_target_kind_and_epoch"
+      ]
+    }
+  },
+  "startup_phases": [
+    "WatchdogBootstrap",
+    "SupervisorBootstrap",
+    "ListenerBound",
+    "GlobalQueuesReady",
+    "AcceptorsReady",
+    "ControlAuthenticated",
+    "OperationQueuesReady",
+    "ChildSpawned",
+    "ProxyThreadsReady",
+    "StartedPublished"
+  ]
+}

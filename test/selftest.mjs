@@ -1742,7 +1742,16 @@ check('wake refuses a concurrent relay-launched resume and proceeds after its lo
   assert.match(refused.stderr, /wake refused: resume already running/);
 
   active.child.kill('SIGKILL');
-  sleep(100);
+  waitFor(() => {
+    try {
+      const operations = Object.values(JSON.parse(
+        fs.readFileSync(path.join(HOME, 'registry.json'), 'utf8'),
+      ).active_operations ?? {});
+      return operations.every((operation) => operation.runtime_session_id !== idA);
+    } catch {
+      return false;
+    }
+  }, 'the detached supervisor to reap the cancelled wake');
   const after = relay(['wake', 'agent-A', '--model', 'opus', '--effort', 'max'], {
     env: { RELAY_WAKE_CMD_CLAUDE: wakeStub },
   });
@@ -2012,6 +2021,21 @@ check('doctor gives an actionable command for an unknown named identity', () => 
   const r = relay(['doctor', '--id', 'not-registered']);
   assert.equal(r.status, 1);
   assert.match(r.stdout, /FAIL identity: unknown session not-registered — fix: relay list/);
+});
+
+check('detached lifecycle supervisor preserves PTY and flood-disconnect custody', () => {
+  const result = spawnSync(
+    process.execPath,
+    [path.join(PLUGIN, 'test', 'supervisor-custody.mjs'), '--matrix'],
+    {
+      cwd: path.resolve(PLUGIN, '..', '..'),
+      env: { ...process.env, RELAY_BIN: BIN },
+      encoding: 'utf8',
+      timeout: 20000,
+    },
+  );
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+  assert.match(result.stdout, /SUPERVISOR_CUSTODY PASS/);
 });
 
 fs.rmSync(HOME, { recursive: true, force: true });

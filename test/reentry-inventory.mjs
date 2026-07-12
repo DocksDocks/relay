@@ -10,7 +10,7 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const plugin = path.resolve(here, '..');
 const repo = path.resolve(plugin, '..', '..');
 const fixture = JSON.parse(fs.readFileSync(path.join(here, 'fixtures', 'reentry-inventory.json'), 'utf8'));
-assert.equal(fixture.schema_version, 2);
+assert.equal(fixture.schema_version, 3);
 
 const rustFiles = fs.readdirSync(path.join(plugin, 'rust', 'src'))
   .filter((name) => name.endsWith('.rs'))
@@ -49,16 +49,26 @@ function functionByName(source, name) {
 
 function compileFail() {
   const manifest = path.join(here, 'fixtures', 'lifecycle-capability-bypass', 'Cargo.toml');
+  const binDir = path.join(here, 'fixtures', 'lifecycle-capability-bypass', 'src', 'bin');
+  const actualBins = fs.readdirSync(binDir)
+    .filter((name) => name.endsWith('.rs'))
+    .map((name) => name.slice(0, -3))
+    .sort();
+  const expectedBins = Object.keys(fixture.compile_fail_bins).sort();
+  assert.deepEqual(actualBins, expectedBins, 'compile-fail bin set drifted from its closed fixture');
   const target = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-capability-compile-fail-'));
   try {
-    for (const name of ['guardless', 'wrong-target', 'fence-reentry', 'reentry-fence']) {
+    for (const name of actualBins) {
       const run = spawnSync('cargo', ['check', '--manifest-path', manifest, '--bin', name], {
         cwd: path.join(plugin, 'rust'),
         encoding: 'utf8',
         env: { ...process.env, CARGO_TARGET_DIR: target },
       });
       assert.notEqual(run.status, 0, `${name} unexpectedly compiled`);
-      assert.match(run.stderr, /drain_with_guard|drain_prior_operations|mismatched types|arguments?/, `${name} failed for an unrelated reason:\n${run.stderr}`);
+      assert.ok(
+        run.stderr.includes(fixture.compile_fail_bins[name]),
+        `${name} failed with the wrong signature:\n${run.stderr}`,
+      );
       console.log(`PASS compile_fail bin=${name}`);
     }
   } finally {

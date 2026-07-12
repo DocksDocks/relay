@@ -8,7 +8,8 @@ publish = false
 
 [dependencies]
 tinyjson = "2.5"
-rustix = { version = "1.1", features = ["fs"] }
+libc = "0.2"
+rustix = { version = "1.1", features = ["fs", "net", "process"] }
 
 # Size-optimized static binary (min-sized-rust, all stable-channel).
 # codegen-units=1 is also a prerequisite for the reproducible-rebuild check.

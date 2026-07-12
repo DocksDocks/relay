@@ -8,4 +8,5 @@ pub mod lifecycle;
 pub(crate) mod sha256;
 pub mod spawn;
 pub mod store;
+pub mod supervisor;
 pub mod watch;

@@ -21,6 +21,9 @@ use tinyjson::JsonValue;
 pub const MANAGED_ATTACH_DEADLINE_MS: u64 = 4_360;
 pub const MANAGED_CANCEL_POLL_MS: u64 = 100;
 pub const MANAGED_CANCEL_GRACE_MS: u64 = 5_000;
+pub const SUPERVISOR_CONTROL_BIND_DEADLINE_MS: u64 = 5_000;
+pub const WATCHDOG_HEARTBEAT_INTERVAL_MS: u64 = 250;
+pub const WATCHDOG_STALE_AFTER_MS: i64 = 1_000;
 
 const WORKERS_KEY: &str = "managed_workers";
 const PENDING_KEY: &str = "pending_managed";
@@ -29,6 +32,9 @@ const TOMBSTONES_KEY: &str = "managed_tombstones";
 const AUDIT_KEY: &str = "lifecycle_audit";
 const GC_MANIFESTS_KEY: &str = "managed_gc_manifests";
 const ACTIVE_OPERATIONS_KEY: &str = "active_operations";
+const OPERATION_TOMBSTONES_KEY: &str = "operation_tombstones";
+const SUPERVISORS_KEY: &str = "lifecycle_supervisors";
+const WATCHDOGS_KEY: &str = "lifecycle_watchdogs";
 const GC_DAYS: u64 = 14;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -185,6 +191,11 @@ pub struct SessionBinding {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BindingState {
     Unmanaged,
+    UnmanagedCanceling {
+        operation_id: String,
+        operation_version: String,
+        binding_epoch: String,
+    },
     GcDeleting {
         gc_epoch: String,
         binding_epoch: String,
@@ -280,6 +291,247 @@ impl OperationKind {
             Self::InitialTurn => "InitialTurn",
         }
     }
+
+    fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "SessionStartDrain" => Self::SessionStartDrain,
+            "UserPromptDrain" => Self::UserPromptDrain,
+            "CliInboxDrain" => Self::CliInboxDrain,
+            "McpInboxDrain" => Self::McpInboxDrain,
+            "ChannelDeliver" => Self::ChannelDeliver,
+            "WatchInject" => Self::WatchInject,
+            "WatchAutoTurn" => Self::WatchAutoTurn,
+            "WatchAck" => Self::WatchAck,
+            "WatchWakeFallback" => Self::WatchWakeFallback,
+            "WakeAppServer" => Self::WakeAppServer,
+            "WakeCli" => Self::WakeCli,
+            "AttachResume" => Self::AttachResume,
+            "InitialTurn" => Self::InitialTurn,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum StartGeneration {
+    LinuxProcStartTicks(u64),
+    DarwinBsdStartTime { sec: i64, usec: i64 },
+    Unavailable,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProcessObservation {
+    pub pid: u32,
+    pub pgid: Option<i32>,
+    pub start: StartGeneration,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ExternalCustody {
+    None,
+    ChildStarting {
+        supervisor_instance_id: String,
+    },
+    ChildOwned {
+        supervisor_instance_id: String,
+        process: ProcessObservation,
+    },
+    ChildCancelRequested {
+        supervisor_instance_id: String,
+        process: ProcessObservation,
+        request_id: String,
+    },
+    ChildReaped {
+        supervisor_instance_id: String,
+        process: ProcessObservation,
+        exit_status: i32,
+    },
+    LostAuthority {
+        last_observation: Option<ProcessObservation>,
+        reason: LostAuthorityReason,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LostAuthorityReason {
+    CancelDeadline,
+    HandoffRebindFailed,
+    SupervisorLost,
+    CustodyLost,
+    ProxyStartupFailed,
+    AppServerClaimFailed,
+}
+
+impl LostAuthorityReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::CancelDeadline => "CancelDeadline",
+            Self::HandoffRebindFailed => "HandoffRebindFailed",
+            Self::SupervisorLost => "SupervisorLost",
+            Self::CustodyLost => "CustodyLost",
+            Self::ProxyStartupFailed => "ProxyStartupFailed",
+            Self::AppServerClaimFailed => "AppServerClaimFailed",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "CancelDeadline" => Self::CancelDeadline,
+            "HandoffRebindFailed" => Self::HandoffRebindFailed,
+            "SupervisorLost" => Self::SupervisorLost,
+            "CustodyLost" => Self::CustodyLost,
+            "ProxyStartupFailed" => Self::ProxyStartupFailed,
+            "AppServerClaimFailed" => Self::AppServerClaimFailed,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LostAuthorityEvidence {
+    pub operation_id: String,
+    pub operation_version: String,
+    pub reason: LostAuthorityReason,
+    pub observed_at: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum StdioEndpointMode {
+    Closed,
+    Pipe,
+    Pty {
+        terminal_group: String,
+        rows: u16,
+        cols: u16,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StdioProfile {
+    pub stdin: StdioEndpointMode,
+    pub stdout: StdioEndpointMode,
+    pub stderr: StdioEndpointMode,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActiveOperationRecord {
+    pub operation_id: String,
+    pub runtime_session_id: String,
+    pub worker_id: Option<String>,
+    pub generation: Option<String>,
+    pub binding_epoch: String,
+    pub lifecycle_version: Option<String>,
+    pub operation_version: String,
+    pub kind: OperationKind,
+    pub custody: ExternalCustody,
+    pub terminal: bool,
+    pub cancelled: bool,
+    reap_proof: Option<OwnedChildReapProof>,
+    launch_spec: Option<ChildLaunchSpec>,
+    stdio: Option<StdioProfile>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OwnedChildReapProof {
+    worker_id: String,
+    generation: String,
+    operation_id: String,
+    supervisor_instance_id: String,
+    pid: u32,
+    exit_status: i32,
+    operation_version: String,
+    _sealed: Sealed,
+}
+
+pub struct ChildCancellationPermit {
+    supervisor_instance_id: String,
+    operation_id: String,
+    operation_version: String,
+    child_slot: u64,
+    _sealed: Sealed,
+}
+
+impl ActiveOperationRecord {
+    pub fn reap_proof(&self) -> Option<&OwnedChildReapProof> {
+        self.reap_proof.as_ref()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SupervisorRecord {
+    pub supervisor_instance_id: String,
+    pub control_epoch: String,
+    pub control_nonce_sha256: String,
+    pub operation_id: String,
+    pub process: ProcessObservation,
+    pub socket_path: PathBuf,
+    pub socket_dev: u64,
+    pub socket_ino: u64,
+    pub version: String,
+    pub state: SupervisorState,
+    pub heartbeat_at: String,
+    pub heartbeat_at_ms: i64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SupervisorState {
+    Starting,
+    Ready,
+    LostAuthority,
+    Terminal,
+}
+
+impl SupervisorState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Starting => "Starting",
+            Self::Ready => "Ready",
+            Self::LostAuthority => "LostAuthority",
+            Self::Terminal => "Terminal",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "Starting" => Self::Starting,
+            "Ready" => Self::Ready,
+            "LostAuthority" => Self::LostAuthority,
+            "Terminal" => Self::Terminal,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SupervisorWatchdogRecord {
+    pub watchdog_instance_id: String,
+    pub supervisor_instance_id: String,
+    pub operation_id: String,
+    pub control_epoch: String,
+    pub control_nonce_sha256: String,
+    pub process: ProcessObservation,
+    pub heartbeat_at: String,
+    pub heartbeat_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PreparedSupervisorLaunch {
+    pub operation_id: String,
+    pub operation_version: String,
+    pub supervisor_instance_id: String,
+    pub root: PathBuf,
+    pub stdio: StdioProfile,
+    pub control_epoch: String,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ResolvedSupervisorLaunch {
+    pub operation: ActiveOperationRecord,
+    pub tool: String,
+    pub canonical_cwd: String,
+    pub server: Option<String>,
+    pub spec: ChildLaunchSpec,
+    pub stdio: StdioProfile,
 }
 
 #[derive(Debug)]
@@ -404,8 +656,6 @@ impl From<String> for DrainError {
 pub(crate) struct AuthorizedTarget {
     pub(crate) root: PathBuf,
     pub(crate) runtime_session_id: String,
-    pub(crate) worker_id: Option<String>,
-    pub(crate) generation: Option<String>,
     pub(crate) tool: String,
     pub(crate) canonical_cwd: String,
     pub(crate) server: Option<String>,
@@ -516,6 +766,90 @@ pub enum ChildLaunchSpec {
     WatchWakeFallback(DoorbellMessage),
 }
 
+impl ChildLaunchSpec {
+    fn to_json(&self) -> JsonValue {
+        let mut object = HashMap::new();
+        match self {
+            Self::AttachResume(options) => {
+                object.insert("kind".into(), JsonValue::from("AttachResume".to_string()));
+                object.insert(
+                    "model".into(),
+                    options
+                        .model()
+                        .map(|value| JsonValue::from(value.to_string()))
+                        .unwrap_or(JsonValue::from(())),
+                );
+                object.insert(
+                    "effort".into(),
+                    options
+                        .effort()
+                        .map(|value| JsonValue::from(value.to_string()))
+                        .unwrap_or(JsonValue::from(())),
+                );
+            }
+            Self::WakeDoorbell(message) | Self::WatchWakeFallback(message) => {
+                object.insert(
+                    "kind".into(),
+                    JsonValue::from(
+                        if matches!(self, Self::WakeDoorbell(_)) {
+                            "WakeDoorbell"
+                        } else {
+                            "WatchWakeFallback"
+                        }
+                        .to_string(),
+                    ),
+                );
+                object.insert(
+                    "message".into(),
+                    JsonValue::from(message.as_str().to_string()),
+                );
+                object.insert(
+                    "model".into(),
+                    message
+                        .model()
+                        .map(|value| JsonValue::from(value.to_string()))
+                        .unwrap_or(JsonValue::from(())),
+                );
+                object.insert(
+                    "effort".into(),
+                    message
+                        .effort()
+                        .map(|value| JsonValue::from(value.to_string()))
+                        .unwrap_or(JsonValue::from(())),
+                );
+            }
+        }
+        JsonValue::from(object)
+    }
+
+    fn from_json(value: &JsonValue) -> Option<Self> {
+        let object = value.get::<HashMap<String, JsonValue>>()?;
+        let model = optional_string_from(object, "model")
+            .map(|value| ValidatedModel::parse(&value))
+            .transpose()
+            .ok()?;
+        let effort = optional_string_from(object, "effort")
+            .map(|value| ValidatedEffort::parse(&value))
+            .transpose()
+            .ok()?;
+        match string(object, "kind")?.as_str() {
+            "AttachResume" => Some(Self::AttachResume(AttachOptions::new(model, effort))),
+            "WakeDoorbell" | "WatchWakeFallback" => {
+                let message = DoorbellMessage::parse(&string(object, "message")?)
+                    .ok()?
+                    .with_runtime_options(model, effort);
+                if string(object, "kind")? == "WakeDoorbell" {
+                    Some(Self::WakeDoorbell(message))
+                } else {
+                    Some(Self::WatchWakeFallback(message))
+                }
+            }
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Sealed(());
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -650,6 +984,7 @@ impl LifecycleStore {
         request: ClaimManagedAttach,
     ) -> Result<ClaimOutcome, String> {
         validate_claim(&request)?;
+        self.ensure_target_supervisor_live(&request.runtime_session_id)?;
         let canonical_cwd = canonical_cwd(&request.cwd);
         let token_sha256 = sha256_hex(request.raw_token.as_bytes());
         let start = self.transaction(|registry| {
@@ -666,6 +1001,18 @@ impl LifecycleStore {
                 &token_sha256,
                 &binding_epoch,
                 &claim_version,
+            ),
+            ClaimStart::WaitUnmanaged {
+                binding_epoch,
+                claim_version,
+                operation_id,
+            } => self.wait_unmanaged_cancel(
+                &request,
+                &canonical_cwd,
+                &token_sha256,
+                &binding_epoch,
+                &claim_version,
+                &operation_id,
             ),
             ClaimStart::Initial {
                 binding_epoch,
@@ -878,6 +1225,7 @@ impl LifecycleStore {
         session_or_worker: &str,
         kind: OperationKind,
     ) -> Result<Admission, String> {
+        self.ensure_target_supervisor_live(session_or_worker)?;
         let plan = self.transaction(|registry| {
             let workers = object_map(registry, WORKERS_KEY)?;
             let mut bindings = object_map(registry, BINDINGS_KEY)?;
@@ -915,6 +1263,9 @@ impl LifecycleStore {
             };
             let (worker_id, generation, lifecycle_version, managed) = match &binding.state {
                 BindingState::Unmanaged => (None, None, None, false),
+                BindingState::UnmanagedCanceling { .. } => {
+                    return Err("session has an unmanaged cancellation in progress".to_string());
+                }
                 BindingState::GcDeleting { .. } => {
                     return Err("session binding is being deleted".to_string());
                 }
@@ -1073,33 +1424,33 @@ impl LifecycleStore {
                     store::sanitize(&session_id),
                     binding_epoch
                 )),
-                worker_or_session_epoch: binding_epoch,
+                worker_or_session_epoch: binding_epoch.clone(),
             },
             operation_id: operation_id.clone(),
             _sealed: Sealed(()),
         };
         self.transaction(|registry| {
             let mut operations = object_map(registry, ACTIVE_OPERATIONS_KEY)?;
-            let mut row = HashMap::new();
-            row.insert("operation_id".into(), JsonValue::from(operation_id.clone()));
-            row.insert("kind".into(), JsonValue::from(kind.as_str().to_string()));
-            row.insert(
-                "runtime_session_id".into(),
-                JsonValue::from(session_id.clone()),
+            operations.insert(
+                operation_id.clone(),
+                ActiveOperationRecord {
+                    operation_id: operation_id.clone(),
+                    runtime_session_id: session_id.clone(),
+                    worker_id: target_worker_id(&guard.target).map(str::to_string),
+                    generation: target_generation(&guard.target).map(str::to_string),
+                    binding_epoch: binding_epoch.clone(),
+                    lifecycle_version: guard.lifecycle_version.clone(),
+                    operation_version: "1".to_string(),
+                    kind,
+                    custody: ExternalCustody::None,
+                    terminal: false,
+                    cancelled: false,
+                    reap_proof: None,
+                    launch_spec: None,
+                    stdio: None,
+                }
+                .to_json(),
             );
-            row.insert(
-                "worker_id".into(),
-                target_worker_id(&guard.target)
-                    .map(|value| JsonValue::from(value.to_string()))
-                    .unwrap_or(JsonValue::from(())),
-            );
-            row.insert(
-                "generation".into(),
-                target_generation(&guard.target)
-                    .map(|value| JsonValue::from(value.to_string()))
-                    .unwrap_or(JsonValue::from(())),
-            );
-            operations.insert(operation_id.clone(), JsonValue::from(row));
             set_object_map(registry, ACTIVE_OPERATIONS_KEY, operations);
             Ok(())
         })?;
@@ -1120,6 +1471,7 @@ impl LifecycleStore {
         if reason.is_empty() || reason.len() > 4096 {
             return Err("fence reason must be 1..=4096 bytes".to_string());
         }
+        self.ensure_target_supervisor_live(worker_id)?;
         self.transaction(|registry| {
             let mut workers = object_map(registry, WORKERS_KEY)?;
             let mut worker = workers
@@ -1868,6 +2220,1066 @@ impl LifecycleStore {
         }
     }
 
+    fn wait_unmanaged_cancel(
+        &self,
+        request: &ClaimManagedAttach,
+        canonical_cwd: &str,
+        token_sha256: &str,
+        binding_epoch: &str,
+        claim_version: &str,
+        operation_id: &str,
+    ) -> Result<ClaimOutcome, String> {
+        let deadline = Instant::now() + self.attach_deadline;
+        let next_epoch = next_version(binding_epoch)?;
+        loop {
+            let binding = self.read_binding(&request.runtime_session_id)?;
+            match binding {
+                Some(SessionBinding {
+                    binding_epoch: current_epoch,
+                    state:
+                        BindingState::Claiming {
+                            worker_id,
+                            generation,
+                            claim_version: current_claim,
+                        },
+                    ..
+                }) if current_epoch == next_epoch
+                    && worker_id == request.worker_id
+                    && generation == request.generation
+                    && current_claim == claim_version =>
+                {
+                    return self.finish_claim(
+                        request,
+                        canonical_cwd,
+                        token_sha256,
+                        &current_epoch,
+                        claim_version,
+                    );
+                }
+                Some(SessionBinding {
+                    binding_epoch: current_epoch,
+                    state:
+                        BindingState::UnmanagedCanceling {
+                            operation_id: current_operation,
+                            ..
+                        },
+                    ..
+                }) if current_epoch == binding_epoch && current_operation == operation_id => {}
+                Some(SessionBinding {
+                    state:
+                        BindingState::Managed {
+                            worker_id,
+                            generation,
+                        },
+                    ..
+                }) if worker_id == request.worker_id && generation == request.generation => {
+                    return self.join_claim(
+                        request,
+                        canonical_cwd,
+                        token_sha256,
+                        &next_epoch,
+                        claim_version,
+                    );
+                }
+                _ => return Err("unmanaged cancellation claim state changed".to_string()),
+            }
+            if Instant::now() >= deadline {
+                return self.expire_unmanaged_claim(
+                    request,
+                    canonical_cwd,
+                    token_sha256,
+                    binding_epoch,
+                    claim_version,
+                    operation_id,
+                );
+            }
+            thread::sleep(Duration::from_millis(MANAGED_CANCEL_POLL_MS.min(10)));
+        }
+    }
+
+    fn expire_unmanaged_claim(
+        &self,
+        request: &ClaimManagedAttach,
+        canonical_cwd: &str,
+        token_sha256: &str,
+        binding_epoch: &str,
+        claim_version: &str,
+        operation_id: &str,
+    ) -> Result<ClaimOutcome, String> {
+        self.transaction(|registry| {
+            let mut workers = object_map(registry, WORKERS_KEY)?;
+            let mut pending = object_map(registry, PENDING_KEY)?;
+            let mut bindings = object_map(registry, BINDINGS_KEY)?;
+            let mut operations = object_map(registry, ACTIVE_OPERATIONS_KEY)?;
+            let binding = bindings
+                .get(&request.runtime_session_id)
+                .and_then(SessionBinding::from_json)
+                .ok_or_else(|| "cancel-deadline binding disappeared".to_string())?;
+            if binding.binding_epoch != binding_epoch
+                || !matches!(
+                    binding.state,
+                    BindingState::UnmanagedCanceling { operation_id: ref current, .. }
+                        if current == operation_id
+                )
+            {
+                return Err("cancel-deadline binding changed".to_string());
+            }
+            let record = pending
+                .get(token_sha256)
+                .and_then(PendingRecord::from_json)
+                .ok_or_else(|| "cancel-deadline pending attach disappeared".to_string())?;
+            if record.claim_version.as_deref() != Some(claim_version)
+                || record.waiting_runtime_session_id.as_deref()
+                    != Some(request.runtime_session_id.as_str())
+            {
+                return Err("cancel-deadline claim version changed".to_string());
+            }
+            let mut operation = operations
+                .get(operation_id)
+                .and_then(ActiveOperationRecord::from_json)
+                .ok_or_else(|| "cancel-deadline operation disappeared".to_string())?;
+            if operation.terminal {
+                return Err("cancel-deadline raced terminal reap".to_string());
+            }
+            let mut worker = workers
+                .get(&request.worker_id)
+                .and_then(ManagedWorker::from_json)
+                .ok_or_else(|| "cancel-deadline worker disappeared".to_string())?;
+            if worker.generation != request.generation || worker.state != ManagedState::Attaching {
+                return Err("cancel-deadline worker changed".to_string());
+            }
+            worker.runtime_session_id = Some(request.runtime_session_id.clone());
+            worker.claimed_token_sha256 = Some(token_sha256.to_string());
+            worker.state = ManagedState::FencingUnconfirmed;
+            worker.version = next_version(&worker.version)?;
+            worker.fence_epoch = Some(store::uuid_v4());
+            worker.fence_reason = Some("unmanaged cancellation claim deadline expired".to_string());
+            worker.proof_gap = Some(format!(
+                "LostAuthority/CancelDeadline operation={operation_id}"
+            ));
+            operation.worker_id = Some(request.worker_id.clone());
+            operation.generation = Some(request.generation.clone());
+            operation.lifecycle_version = Some(worker.version.clone());
+            operation.operation_version = next_version(&operation.operation_version)?;
+            bindings.insert(
+                request.runtime_session_id.clone(),
+                SessionBinding {
+                    runtime_session_id: request.runtime_session_id.clone(),
+                    binding_epoch: next_version(binding_epoch)?,
+                    state: BindingState::Managed {
+                        worker_id: request.worker_id.clone(),
+                        generation: request.generation.clone(),
+                    },
+                }
+                .to_json(),
+            );
+            workers.insert(request.worker_id.clone(), worker.to_json());
+            operations.insert(operation_id.to_string(), operation.to_json());
+            pending.remove(token_sha256);
+            upsert_claimed_entry(registry, request, canonical_cwd);
+            set_object_map(registry, WORKERS_KEY, workers);
+            set_object_map(registry, PENDING_KEY, pending);
+            set_object_map(registry, BINDINGS_KEY, bindings);
+            set_object_map(registry, ACTIVE_OPERATIONS_KEY, operations);
+            Ok(refused(
+                &worker,
+                "unmanaged cancellation claim deadline expired",
+            ))
+        })
+    }
+
+    pub fn read_operations_for_session(
+        &self,
+        runtime_session_id: &str,
+    ) -> Result<Vec<ActiveOperationRecord>, String> {
+        self.read_transaction(|registry| {
+            let mut rows = object_map(registry, ACTIVE_OPERATIONS_KEY)?;
+            rows.extend(object_map(registry, OPERATION_TOMBSTONES_KEY)?);
+            let mut operations = rows
+                .into_values()
+                .filter_map(|value| ActiveOperationRecord::from_json(&value))
+                .filter(|operation| operation.runtime_session_id == runtime_session_id)
+                .collect::<Vec<_>>();
+            operations.sort_by(|left, right| left.operation_id.cmp(&right.operation_id));
+            Ok(operations)
+        })
+    }
+
+    pub fn read_supervisor_for_session(
+        &self,
+        runtime_session_id: &str,
+    ) -> Result<Option<SupervisorRecord>, String> {
+        self.read_transaction(|registry| {
+            let operations = object_map(registry, ACTIVE_OPERATIONS_KEY)?;
+            let supervisors = object_map(registry, SUPERVISORS_KEY)?;
+            Ok(supervisors
+                .values()
+                .filter_map(SupervisorRecord::from_json)
+                .find(|supervisor| {
+                    operations
+                        .get(&supervisor.operation_id)
+                        .and_then(ActiveOperationRecord::from_json)
+                        .is_some_and(|operation| {
+                            operation.runtime_session_id == runtime_session_id
+                                && !operation.terminal
+                        })
+                }))
+        })
+    }
+
+    pub fn read_watchdog_for_session(
+        &self,
+        runtime_session_id: &str,
+    ) -> Result<Option<SupervisorWatchdogRecord>, String> {
+        let supervisor = self.read_supervisor_for_session(runtime_session_id)?;
+        let Some(supervisor) = supervisor else {
+            return Ok(None);
+        };
+        self.read_transaction(|registry| {
+            Ok(object_map(registry, WATCHDOGS_KEY)?
+                .into_values()
+                .filter_map(|value| SupervisorWatchdogRecord::from_json(&value))
+                .find(|watchdog| {
+                    watchdog.supervisor_instance_id == supervisor.supervisor_instance_id
+                }))
+        })
+    }
+
+    fn ensure_target_supervisor_live(&self, session_or_worker: &str) -> Result<(), String> {
+        let health = self.read_transaction(|registry| {
+            let workers = object_map(registry, WORKERS_KEY)?;
+            let session = workers
+                .get(session_or_worker)
+                .and_then(ManagedWorker::from_json)
+                .and_then(|worker| worker.runtime_session_id)
+                .unwrap_or_else(|| session_or_worker.to_string());
+            let operations = object_map(registry, ACTIVE_OPERATIONS_KEY)?;
+            let supervisor = object_map(registry, SUPERVISORS_KEY)?
+                .into_values()
+                .filter_map(|value| SupervisorRecord::from_json(&value))
+                .find(|supervisor| {
+                    operations
+                        .get(&supervisor.operation_id)
+                        .and_then(ActiveOperationRecord::from_json)
+                        .is_some_and(|operation| {
+                            operation.runtime_session_id == session && !operation.terminal
+                        })
+                });
+            let Some(supervisor) = supervisor else {
+                return Ok(None);
+            };
+            let watchdog = object_map(registry, WATCHDOGS_KEY)?
+                .into_values()
+                .filter_map(|value| SupervisorWatchdogRecord::from_json(&value))
+                .find(|watchdog| {
+                    watchdog.supervisor_instance_id == supervisor.supervisor_instance_id
+                });
+            Ok(Some((supervisor, watchdog)))
+        })?;
+        let Some((supervisor, watchdog)) = health else {
+            return Ok(());
+        };
+        let watchdog_live = watchdog.as_ref().is_some_and(|watchdog| {
+            process_observation_is_live(&watchdog.process)
+                && store::now_ms().saturating_sub(watchdog.heartbeat_at_ms)
+                    <= WATCHDOG_STALE_AFTER_MS
+                && watchdog.control_epoch == supervisor.control_epoch
+                && watchdog.control_nonce_sha256 == supervisor.control_nonce_sha256
+        });
+        let supervisor_live = process_observation_is_live(&supervisor.process);
+        let socket_live = supervisor.state == SupervisorState::Ready
+            && store::now_ms().saturating_sub(supervisor.heartbeat_at_ms)
+                <= WATCHDOG_STALE_AFTER_MS
+            && ping_supervisor(&supervisor).is_ok();
+        if watchdog_live && supervisor_live && socket_live {
+            return Ok(());
+        }
+        self.mark_supervisor_lost(
+            &supervisor.supervisor_instance_id,
+            LostAuthorityReason::SupervisorLost,
+        )?;
+        Err("lifecycle supervisor/watchdog authority is unavailable".to_string())
+    }
+
+    pub(crate) fn read_supervisor_for_session_from_operation(
+        &self,
+        operation_id: &str,
+    ) -> Result<Option<SupervisorRecord>, String> {
+        self.read_transaction(|registry| {
+            Ok(object_map(registry, SUPERVISORS_KEY)?
+                .into_values()
+                .filter_map(|value| SupervisorRecord::from_json(&value))
+                .find(|record| record.operation_id == operation_id))
+        })
+    }
+
+    pub fn lifecycle_audit_contains(
+        &self,
+        event: &str,
+        runtime_session_id: &str,
+    ) -> Result<bool, String> {
+        self.read_transaction(|registry| {
+            Ok(registry
+                .extra
+                .get(AUDIT_KEY)
+                .and_then(|value| value.get::<Vec<JsonValue>>())
+                .is_some_and(|rows| {
+                    rows.iter().any(|row| {
+                        let Some(object) = row.get::<HashMap<String, JsonValue>>() else {
+                            return false;
+                        };
+                        optional_string_from(object, "event").as_deref() == Some(event)
+                            && optional_string_from(object, "runtime_session_id").as_deref()
+                                == Some(runtime_session_id)
+                    })
+                }))
+        })
+    }
+
+    pub(crate) fn resolve_supervisor_launch(
+        &self,
+        operation_id: &str,
+        operation_version: &str,
+        supervisor_instance_id: &str,
+    ) -> Result<ResolvedSupervisorLaunch, String> {
+        self.read_transaction(|registry| {
+            let operations = object_map(registry, ACTIVE_OPERATIONS_KEY)?;
+            let operation = operations
+                .get(operation_id)
+                .and_then(ActiveOperationRecord::from_json)
+                .ok_or_else(|| "supervisor operation is missing or malformed".to_string())?;
+            if operation.operation_version != operation_version
+                || !matches!(
+                    &operation.custody,
+                    ExternalCustody::ChildStarting {
+                        supervisor_instance_id: current,
+                    } if current == supervisor_instance_id
+                )
+            {
+                return Err("supervisor launch operation/version changed".to_string());
+            }
+            let entry = registry
+                .agents
+                .get(&operation.runtime_session_id)
+                .and_then(Entry::from_json)
+                .ok_or_else(|| "supervisor launch session is missing".to_string())?;
+            let spec = operation
+                .launch_spec
+                .clone()
+                .ok_or_else(|| "supervisor launch spec is missing".to_string())?;
+            let stdio = operation
+                .stdio
+                .clone()
+                .ok_or_else(|| "supervisor stdio profile is missing".to_string())?;
+            Ok(ResolvedSupervisorLaunch {
+                operation,
+                tool: entry.tool,
+                canonical_cwd: entry
+                    .dir
+                    .map(|dir| canonical_cwd(&dir))
+                    .ok_or_else(|| "supervisor launch cwd is missing".to_string())?,
+                server: entry.server,
+                spec,
+                stdio,
+            })
+        })
+    }
+
+    pub(crate) fn record_supervisor_ready(&self, record: SupervisorRecord) -> Result<(), String> {
+        self.transaction(|registry| {
+            let operations = object_map(registry, ACTIVE_OPERATIONS_KEY)?;
+            let operation = operations
+                .get(&record.operation_id)
+                .and_then(ActiveOperationRecord::from_json)
+                .ok_or_else(|| "supervisor ready operation is missing".to_string())?;
+            if !matches!(
+                operation.custody,
+                ExternalCustody::ChildStarting { ref supervisor_instance_id }
+                    if supervisor_instance_id == &record.supervisor_instance_id
+            ) {
+                return Err("supervisor ready instance is stale".to_string());
+            }
+            let mut supervisors = object_map(registry, SUPERVISORS_KEY)?;
+            supervisors.insert(record.supervisor_instance_id.clone(), record.to_json());
+            set_object_map(registry, SUPERVISORS_KEY, supervisors);
+            Ok(())
+        })
+    }
+
+    pub(crate) fn record_watchdog(
+        &self,
+        watchdog_instance_id: &str,
+        supervisor_instance_id: &str,
+        operation_id: &str,
+        control_epoch: &str,
+        control_nonce_sha256: &str,
+        process: &ProcessObservation,
+    ) -> Result<(), String> {
+        self.transaction(|registry| {
+            let mut watchdogs = object_map(registry, WATCHDOGS_KEY)?;
+            watchdogs.insert(
+                watchdog_instance_id.to_string(),
+                SupervisorWatchdogRecord {
+                    watchdog_instance_id: watchdog_instance_id.to_string(),
+                    supervisor_instance_id: supervisor_instance_id.to_string(),
+                    operation_id: operation_id.to_string(),
+                    control_epoch: control_epoch.to_string(),
+                    control_nonce_sha256: control_nonce_sha256.to_string(),
+                    process: process.clone(),
+                    heartbeat_at: store::iso_now(),
+                    heartbeat_at_ms: store::now_ms(),
+                }
+                .to_json(),
+            );
+            set_object_map(registry, WATCHDOGS_KEY, watchdogs);
+            Ok(())
+        })
+    }
+
+    pub(crate) fn validate_watchdog_bootstrap(
+        &self,
+        supervisor_instance_id: &str,
+        control_epoch: &str,
+        control_nonce_sha256: &str,
+    ) -> Result<(), String> {
+        self.read_transaction(|registry| {
+            let valid = object_map(registry, WATCHDOGS_KEY)?
+                .into_values()
+                .filter_map(|value| SupervisorWatchdogRecord::from_json(&value))
+                .any(|watchdog| {
+                    watchdog.supervisor_instance_id == supervisor_instance_id
+                        && watchdog.control_epoch == control_epoch
+                        && watchdog.control_nonce_sha256 == control_nonce_sha256
+                        && process_observation_is_live(&watchdog.process)
+                });
+            if valid {
+                Ok(())
+            } else {
+                Err("watchdog bootstrap authority changed".to_string())
+            }
+        })
+    }
+
+    pub(crate) fn heartbeat_watchdog(
+        &self,
+        watchdog_instance_id: &str,
+        supervisor_instance_id: &str,
+        control_epoch: &str,
+    ) -> Result<(), String> {
+        self.transaction(|registry| {
+            let mut watchdogs = object_map(registry, WATCHDOGS_KEY)?;
+            let mut watchdog = watchdogs
+                .get(watchdog_instance_id)
+                .and_then(SupervisorWatchdogRecord::from_json)
+                .ok_or_else(|| "watchdog heartbeat record is missing".to_string())?;
+            if watchdog.supervisor_instance_id != supervisor_instance_id
+                || watchdog.control_epoch != control_epoch
+            {
+                return Err("watchdog heartbeat authority changed".to_string());
+            }
+            watchdog.heartbeat_at = store::iso_now();
+            watchdog.heartbeat_at_ms = store::now_ms();
+            watchdogs.insert(watchdog_instance_id.to_string(), watchdog.to_json());
+            set_object_map(registry, WATCHDOGS_KEY, watchdogs);
+            Ok(())
+        })
+    }
+
+    pub(crate) fn heartbeat_supervisor(
+        &self,
+        supervisor_instance_id: &str,
+        operation_id: &str,
+    ) -> Result<(), String> {
+        self.transaction(|registry| {
+            let mut supervisors = object_map(registry, SUPERVISORS_KEY)?;
+            let mut supervisor = supervisors
+                .get(supervisor_instance_id)
+                .and_then(SupervisorRecord::from_json)
+                .ok_or_else(|| "supervisor heartbeat record is missing".to_string())?;
+            if supervisor.operation_id != operation_id || supervisor.state != SupervisorState::Ready
+            {
+                return Err("supervisor heartbeat authority changed".to_string());
+            }
+            supervisor.heartbeat_at = store::iso_now();
+            supervisor.heartbeat_at_ms = store::now_ms();
+            supervisor.version = next_version(&supervisor.version)?;
+            supervisors.insert(supervisor_instance_id.to_string(), supervisor.to_json());
+            set_object_map(registry, SUPERVISORS_KEY, supervisors);
+            Ok(())
+        })
+    }
+
+    pub(crate) fn finish_watchdog_service(&self, watchdog_instance_id: &str) -> Result<(), String> {
+        self.transaction(|registry| {
+            let mut watchdogs = object_map(registry, WATCHDOGS_KEY)?;
+            watchdogs.remove(watchdog_instance_id);
+            set_object_map(registry, WATCHDOGS_KEY, watchdogs);
+            Ok(())
+        })
+    }
+
+    pub(crate) fn finish_supervisor_service(
+        &self,
+        supervisor_instance_id: &str,
+        watchdog_instance_id: &str,
+    ) -> Result<(), String> {
+        self.transaction(|registry| {
+            let mut supervisors = object_map(registry, SUPERVISORS_KEY)?;
+            supervisors.remove(supervisor_instance_id);
+            let mut watchdogs = object_map(registry, WATCHDOGS_KEY)?;
+            watchdogs.remove(watchdog_instance_id);
+            set_object_map(registry, SUPERVISORS_KEY, supervisors);
+            set_object_map(registry, WATCHDOGS_KEY, watchdogs);
+            Ok(())
+        })
+    }
+
+    pub(crate) fn record_child_owned(
+        &self,
+        operation_id: &str,
+        expected_version: &str,
+        supervisor_instance_id: &str,
+        process: ProcessObservation,
+    ) -> Result<String, String> {
+        self.cas_operation(operation_id, expected_version, |operation| {
+            if !matches!(
+                &operation.custody,
+                ExternalCustody::ChildStarting {
+                    supervisor_instance_id: current,
+                } if current == supervisor_instance_id
+            ) {
+                return Err("child-owned transition has stale custody".to_string());
+            }
+            operation.custody = ExternalCustody::ChildOwned {
+                supervisor_instance_id: supervisor_instance_id.to_string(),
+                process: process.clone(),
+            };
+            Ok(())
+        })
+    }
+
+    pub(crate) fn record_child_start_abandoned(
+        &self,
+        operation_id: &str,
+        expected_version: &str,
+        supervisor_instance_id: &str,
+        _reason: &str,
+    ) -> Result<(), String> {
+        self.transaction(|registry| {
+            let mut operations = object_map(registry, ACTIVE_OPERATIONS_KEY)?;
+            let mut operation = operations
+                .get(operation_id)
+                .and_then(ActiveOperationRecord::from_json)
+                .ok_or_else(|| "abandoned child-start operation disappeared".to_string())?;
+            if operation.operation_version != expected_version
+                || !matches!(
+                    operation.custody,
+                    ExternalCustody::ChildStarting { supervisor_instance_id: ref current }
+                        if current == supervisor_instance_id
+                )
+            {
+                return Err("abandoned child-start authority is stale".to_string());
+            }
+            operation.operation_version = next_version(&operation.operation_version)?;
+            operation.cancelled = true;
+            operation.terminal = true;
+            operation.custody = ExternalCustody::LostAuthority {
+                last_observation: None,
+                reason: LostAuthorityReason::ProxyStartupFailed,
+            };
+            let mut bindings = object_map(registry, BINDINGS_KEY)?;
+            if let Some(binding) = bindings
+                .get(&operation.runtime_session_id)
+                .and_then(SessionBinding::from_json)
+            {
+                if matches!(binding.state, BindingState::Unmanaged)
+                    && binding.binding_epoch == operation.binding_epoch
+                {
+                    bindings.insert(
+                        operation.runtime_session_id.clone(),
+                        SessionBinding {
+                            runtime_session_id: operation.runtime_session_id.clone(),
+                            binding_epoch: next_version(&binding.binding_epoch)?,
+                            state: BindingState::Unmanaged,
+                        }
+                        .to_json(),
+                    );
+                }
+            }
+            operations.remove(operation_id);
+            let mut tombstones = object_map(registry, OPERATION_TOMBSTONES_KEY)?;
+            tombstones.insert(operation_id.to_string(), operation.to_json());
+            set_object_map(registry, BINDINGS_KEY, bindings);
+            set_object_map(registry, ACTIVE_OPERATIONS_KEY, operations);
+            set_object_map(registry, OPERATION_TOMBSTONES_KEY, tombstones);
+            Ok(())
+        })
+    }
+
+    pub(crate) fn publish_disconnect_cancel(
+        &self,
+        operation_id: &str,
+        expected_version: &str,
+        supervisor_instance_id: &str,
+    ) -> Result<String, String> {
+        self.transaction(|registry| {
+            let mut operations = object_map(registry, ACTIVE_OPERATIONS_KEY)?;
+            let mut operation = operations
+                .get(operation_id)
+                .and_then(ActiveOperationRecord::from_json)
+                .ok_or_else(|| "disconnect operation is missing".to_string())?;
+            if operation.operation_version != expected_version || operation.terminal {
+                return Err("disconnect operation version is stale".to_string());
+            }
+            let process = match &operation.custody {
+                ExternalCustody::ChildOwned {
+                    supervisor_instance_id: current,
+                    process,
+                } if current == supervisor_instance_id => process.clone(),
+                ExternalCustody::ChildCancelRequested {
+                    supervisor_instance_id: current,
+                    ..
+                } if current == supervisor_instance_id => {
+                    return Ok(operation.operation_version.clone());
+                }
+                _ => return Err("disconnect child custody is stale".to_string()),
+            };
+            let mut bindings = object_map(registry, BINDINGS_KEY)?;
+            let binding = bindings
+                .get(&operation.runtime_session_id)
+                .and_then(SessionBinding::from_json)
+                .ok_or_else(|| "disconnect binding is missing".to_string())?;
+            let next_operation_version = next_version(&operation.operation_version)?;
+            match binding.state {
+                BindingState::Unmanaged if binding.binding_epoch == operation.binding_epoch => {
+                    bindings.insert(
+                        operation.runtime_session_id.clone(),
+                        SessionBinding {
+                            runtime_session_id: operation.runtime_session_id.clone(),
+                            binding_epoch: binding.binding_epoch.clone(),
+                            state: BindingState::UnmanagedCanceling {
+                                operation_id: operation.operation_id.clone(),
+                                operation_version: next_operation_version.clone(),
+                                binding_epoch: binding.binding_epoch,
+                            },
+                        }
+                        .to_json(),
+                    );
+                    append_lifecycle_event(
+                        registry,
+                        "unmanaged-cancel-published",
+                        &operation.runtime_session_id,
+                        &operation.operation_id,
+                    );
+                }
+                BindingState::Claiming { .. } => {
+                    append_lifecycle_event(
+                        registry,
+                        "claim-cancel-published",
+                        &operation.runtime_session_id,
+                        &operation.operation_id,
+                    );
+                }
+                BindingState::Managed {
+                    ref worker_id,
+                    ref generation,
+                } => {
+                    let mut workers = object_map(registry, WORKERS_KEY)?;
+                    let mut worker = workers
+                        .get(worker_id)
+                        .and_then(ManagedWorker::from_json)
+                        .ok_or_else(|| "disconnect worker is missing".to_string())?;
+                    if worker.generation != *generation || worker.state != ManagedState::Active {
+                        return Err("disconnect managed authority is stale".to_string());
+                    }
+                    worker.state = ManagedState::Fencing;
+                    worker.version = next_version(&worker.version)?;
+                    worker.fence_epoch = Some(store::uuid_v4());
+                    worker.fence_reason = Some("supervisor caller disconnected".to_string());
+                    workers.insert(worker_id.clone(), worker.to_json());
+                    set_object_map(registry, WORKERS_KEY, workers);
+                }
+                BindingState::UnmanagedCanceling { .. } => {
+                    return Ok(operation.operation_version.clone());
+                }
+                BindingState::GcDeleting { .. } => {
+                    return Err("disconnect binding is being deleted".to_string());
+                }
+                BindingState::Unmanaged => {
+                    return Err("disconnect binding epoch changed".to_string());
+                }
+            }
+            let request_id = store::uuid_v4();
+            operation.operation_version = next_operation_version.clone();
+            operation.cancelled = true;
+            operation.custody = ExternalCustody::ChildCancelRequested {
+                supervisor_instance_id: supervisor_instance_id.to_string(),
+                process,
+                request_id,
+            };
+            operations.insert(operation.operation_id.clone(), operation.to_json());
+            set_object_map(registry, BINDINGS_KEY, bindings);
+            set_object_map(registry, ACTIVE_OPERATIONS_KEY, operations);
+            Ok(next_operation_version)
+        })
+    }
+
+    pub(crate) fn record_child_reaped(
+        &self,
+        operation_id: &str,
+        expected_version: &str,
+        supervisor_instance_id: &str,
+        exit_status: i32,
+    ) -> Result<String, String> {
+        self.transaction(|registry| {
+            let mut operations = object_map(registry, ACTIVE_OPERATIONS_KEY)?;
+            let mut operation = operations
+                .get(operation_id)
+                .and_then(ActiveOperationRecord::from_json)
+                .ok_or_else(|| "reaped operation is missing".to_string())?;
+            if operation.operation_version != expected_version || operation.terminal {
+                return Err("reaped operation version is stale".to_string());
+            }
+            let process = match &operation.custody {
+                ExternalCustody::ChildOwned {
+                    supervisor_instance_id: current,
+                    process,
+                }
+                | ExternalCustody::ChildCancelRequested {
+                    supervisor_instance_id: current,
+                    process,
+                    ..
+                } if current == supervisor_instance_id => process.clone(),
+                _ => return Err("reaped child custody is stale".to_string()),
+            };
+            let next = next_version(&operation.operation_version)?;
+            let reaped_pid = process.pid;
+            operation.operation_version = next.clone();
+            operation.terminal = true;
+            operation.custody = ExternalCustody::ChildReaped {
+                supervisor_instance_id: supervisor_instance_id.to_string(),
+                process,
+                exit_status,
+            };
+            if let (Some(worker_id), Some(generation)) =
+                (operation.worker_id.clone(), operation.generation.clone())
+            {
+                operation.reap_proof = Some(OwnedChildReapProof {
+                    worker_id,
+                    generation,
+                    operation_id: operation.operation_id.clone(),
+                    supervisor_instance_id: supervisor_instance_id.to_string(),
+                    pid: reaped_pid,
+                    exit_status,
+                    operation_version: next.clone(),
+                    _sealed: Sealed(()),
+                });
+            }
+            let mut bindings = object_map(registry, BINDINGS_KEY)?;
+            if let Some(binding) = bindings
+                .get(&operation.runtime_session_id)
+                .and_then(SessionBinding::from_json)
+            {
+                if matches!(
+                    binding.state,
+                    BindingState::UnmanagedCanceling { ref operation_id, .. }
+                        if operation_id == &operation.operation_id
+                ) {
+                    let next_epoch = next_version(&binding.binding_epoch)?;
+                    let waiting = object_map(registry, PENDING_KEY)?
+                        .into_values()
+                        .filter_map(|value| PendingRecord::from_json(&value))
+                        .find(|record| {
+                            record.waiting_runtime_session_id.as_deref()
+                                == Some(operation.runtime_session_id.as_str())
+                                && record.claim_version.is_some()
+                        });
+                    let state = if let Some(waiting) = waiting {
+                        BindingState::Claiming {
+                            worker_id: waiting.attach.worker_id,
+                            generation: waiting.attach.generation,
+                            claim_version: waiting
+                                .claim_version
+                                .expect("waiting claim has a version"),
+                        }
+                    } else {
+                        BindingState::Unmanaged
+                    };
+                    bindings.insert(
+                        operation.runtime_session_id.clone(),
+                        SessionBinding {
+                            runtime_session_id: operation.runtime_session_id.clone(),
+                            binding_epoch: next_epoch,
+                            state,
+                        }
+                        .to_json(),
+                    );
+                }
+            }
+            operations.remove(&operation.operation_id);
+            let mut tombstones = object_map(registry, OPERATION_TOMBSTONES_KEY)?;
+            tombstones.insert(operation.operation_id.clone(), operation.to_json());
+            set_object_map(registry, BINDINGS_KEY, bindings);
+            set_object_map(registry, ACTIVE_OPERATIONS_KEY, operations);
+            set_object_map(registry, OPERATION_TOMBSTONES_KEY, tombstones);
+            Ok(next)
+        })
+    }
+
+    pub(crate) fn mint_child_cancellation_permit(
+        &self,
+        operation_id: &str,
+        operation_version: &str,
+        supervisor_instance_id: &str,
+        child_slot: u64,
+    ) -> Result<ChildCancellationPermit, String> {
+        self.read_transaction(|registry| {
+            let operation = object_map(registry, ACTIVE_OPERATIONS_KEY)?
+                .get(operation_id)
+                .and_then(ActiveOperationRecord::from_json)
+                .ok_or_else(|| "child cancellation operation disappeared".to_string())?;
+            if operation.operation_version != operation_version
+                || !matches!(
+                    operation.custody,
+                    ExternalCustody::ChildCancelRequested { supervisor_instance_id: ref current, .. }
+                        if current == supervisor_instance_id
+                )
+            {
+                return Err("child cancellation authority is stale".to_string());
+            }
+            Ok(ChildCancellationPermit {
+                supervisor_instance_id: supervisor_instance_id.to_string(),
+                operation_id: operation_id.to_string(),
+                operation_version: operation_version.to_string(),
+                child_slot,
+                _sealed: Sealed(()),
+            })
+        })
+    }
+
+    pub(crate) fn authorize_child_cancellation(
+        &self,
+        permit: &ChildCancellationPermit,
+    ) -> Result<(), String> {
+        self.read_transaction(|registry| {
+            let operation = object_map(registry, ACTIVE_OPERATIONS_KEY)?
+                .get(&permit.operation_id)
+                .and_then(ActiveOperationRecord::from_json)
+                .ok_or_else(|| "child cancellation operation disappeared".to_string())?;
+            if operation.operation_version != permit.operation_version
+                || !matches!(
+                    operation.custody,
+                    ExternalCustody::ChildCancelRequested { ref supervisor_instance_id, ref process, .. }
+                        if supervisor_instance_id == &permit.supervisor_instance_id
+                            && u64::from(process.pid) == permit.child_slot
+                )
+            {
+                return Err("child cancellation permit is stale".to_string());
+            }
+            Ok(())
+        })
+    }
+
+    pub(crate) fn refresh_supervisor_operation_version(
+        &self,
+        operation_id: &str,
+        supervisor_instance_id: &str,
+    ) -> Result<String, String> {
+        self.read_transaction(|registry| {
+            let operation = object_map(registry, ACTIVE_OPERATIONS_KEY)?
+                .get(operation_id)
+                .and_then(ActiveOperationRecord::from_json)
+                .ok_or_else(|| "supervisor operation disappeared".to_string())?;
+            if operation.terminal
+                || !matches!(
+                    operation.custody,
+                    ExternalCustody::ChildOwned { supervisor_instance_id: ref current, .. }
+                        | ExternalCustody::ChildCancelRequested { supervisor_instance_id: ref current, .. }
+                        if current == supervisor_instance_id
+                )
+            {
+                return Err("supervisor no longer owns this operation".to_string());
+            }
+            Ok(operation.operation_version)
+        })
+    }
+
+    pub(crate) fn mark_supervisor_lost(
+        &self,
+        supervisor_instance_id: &str,
+        reason: LostAuthorityReason,
+    ) -> Result<(), String> {
+        self.transaction(|registry| {
+            let mut operations = object_map(registry, ACTIVE_OPERATIONS_KEY)?;
+            let mut bindings = object_map(registry, BINDINGS_KEY)?;
+            let mut workers = object_map(registry, WORKERS_KEY)?;
+            let mut changed = Vec::new();
+            let operation_ids = operations.keys().cloned().collect::<Vec<_>>();
+            for operation_id in operation_ids {
+                let Some(mut operation) = operations
+                    .get(&operation_id)
+                    .and_then(ActiveOperationRecord::from_json)
+                else {
+                    continue;
+                };
+                if operation.terminal {
+                    continue;
+                }
+                let observation = match &operation.custody {
+                    ExternalCustody::ChildOwned {
+                        supervisor_instance_id: current,
+                        process,
+                    }
+                    | ExternalCustody::ChildCancelRequested {
+                        supervisor_instance_id: current,
+                        process,
+                        ..
+                    } if current == supervisor_instance_id => Some(process.clone()),
+                    ExternalCustody::ChildStarting {
+                        supervisor_instance_id: current,
+                    } if current == supervisor_instance_id => None,
+                    ExternalCustody::LostAuthority { .. } => continue,
+                    _ => continue,
+                };
+                operation.operation_version = next_version(&operation.operation_version)?;
+                operation.custody = ExternalCustody::LostAuthority {
+                    last_observation: observation,
+                    reason,
+                };
+                changed.push((
+                    operation.runtime_session_id.clone(),
+                    operation.binding_epoch.clone(),
+                    operation.operation_id.clone(),
+                    operation.operation_version.clone(),
+                    operation.worker_id.clone(),
+                    operation.generation.clone(),
+                ));
+                operations.insert(operation_id, operation.to_json());
+            }
+
+            for (session, binding_epoch, operation_id, operation_version, worker_id, _generation) in
+                &changed
+            {
+                if worker_id.is_some() {
+                    continue;
+                }
+                if let Some(binding) = bindings.get(session).and_then(SessionBinding::from_json) {
+                    if matches!(binding.state, BindingState::Unmanaged)
+                        && binding.binding_epoch == *binding_epoch
+                    {
+                        bindings.insert(
+                            session.clone(),
+                            SessionBinding {
+                                runtime_session_id: session.clone(),
+                                binding_epoch: binding.binding_epoch.clone(),
+                                state: BindingState::UnmanagedCanceling {
+                                    operation_id: operation_id.clone(),
+                                    operation_version: operation_version.clone(),
+                                    binding_epoch: binding.binding_epoch,
+                                },
+                            }
+                            .to_json(),
+                        );
+                    }
+                }
+            }
+
+            for (_, _, _, _, worker_id, generation) in &changed {
+                let (Some(worker_id), Some(generation)) =
+                    (worker_id.as_deref(), generation.as_deref())
+                else {
+                    continue;
+                };
+                if let Some(mut worker) = workers
+                    .get(worker_id)
+                    .and_then(ManagedWorker::from_json)
+                    .filter(|worker| worker.generation == generation)
+                {
+                    if worker.state == ManagedState::Active {
+                        worker.state = ManagedState::Fencing;
+                        worker.version = next_version(&worker.version)?;
+                        worker.fence_epoch = Some(store::uuid_v4());
+                    }
+                    if worker.state == ManagedState::Fencing {
+                        worker.state = ManagedState::FencingUnconfirmed;
+                        worker.version = next_version(&worker.version)?;
+                        worker.proof_gap = Some(reason.as_str().to_string());
+                        workers.insert(worker_id.to_string(), worker.to_json());
+                    }
+                }
+            }
+
+            let mut supervisors = object_map(registry, SUPERVISORS_KEY)?;
+            if let Some(mut supervisor) = supervisors
+                .get(supervisor_instance_id)
+                .and_then(SupervisorRecord::from_json)
+            {
+                supervisor.state = SupervisorState::LostAuthority;
+                supervisor.version = next_version(&supervisor.version)?;
+                supervisor.heartbeat_at = store::iso_now();
+                supervisor.heartbeat_at_ms = store::now_ms();
+                supervisors.insert(supervisor_instance_id.to_string(), supervisor.to_json());
+            }
+            let mut audit = registry
+                .extra
+                .get(AUDIT_KEY)
+                .and_then(|value| value.get::<Vec<JsonValue>>())
+                .cloned()
+                .unwrap_or_default();
+            let mut row = HashMap::new();
+            row.insert(
+                "event".into(),
+                JsonValue::from("supervisor-loss-batch".to_string()),
+            );
+            row.insert(
+                "supervisor_instance_id".into(),
+                JsonValue::from(supervisor_instance_id.to_string()),
+            );
+            row.insert(
+                "reason".into(),
+                JsonValue::from(reason.as_str().to_string()),
+            );
+            row.insert(
+                "operation_count".into(),
+                JsonValue::from(changed.len().to_string()),
+            );
+            row.insert("observed_at".into(), JsonValue::from(store::iso_now()));
+            audit.push(JsonValue::from(row));
+            registry
+                .extra
+                .insert(AUDIT_KEY.to_string(), JsonValue::from(audit));
+            set_object_map(registry, ACTIVE_OPERATIONS_KEY, operations);
+            set_object_map(registry, BINDINGS_KEY, bindings);
+            set_object_map(registry, WORKERS_KEY, workers);
+            set_object_map(registry, SUPERVISORS_KEY, supervisors);
+            Ok(())
+        })
+    }
+
+    fn cas_operation(
+        &self,
+        operation_id: &str,
+        expected_version: &str,
+        update: impl FnOnce(&mut ActiveOperationRecord) -> Result<(), String>,
+    ) -> Result<String, String> {
+        self.transaction(|registry| {
+            let mut operations = object_map(registry, ACTIVE_OPERATIONS_KEY)?;
+            let mut operation = operations
+                .get(operation_id)
+                .and_then(ActiveOperationRecord::from_json)
+                .ok_or_else(|| "operation is missing or malformed".to_string())?;
+            if operation.operation_version != expected_version {
+                return Err("operation version is stale".to_string());
+            }
+            update(&mut operation)?;
+            operation.operation_version = next_version(&operation.operation_version)?;
+            let version = operation.operation_version.clone();
+            operations.insert(operation.operation_id.clone(), operation.to_json());
+            set_object_map(registry, ACTIVE_OPERATIONS_KEY, operations);
+            Ok(version)
+        })
+    }
+
     fn transaction<T>(
         &self,
         f: impl FnOnce(&mut Registry) -> Result<T, String>,
@@ -2004,38 +3416,6 @@ impl ReentryGuard {
             f(&target)
         })
     }
-
-    pub(crate) fn mark_cancellation_unconfirmed(&mut self, reason: &str) -> Result<(), String> {
-        let Some(worker_id) = target_worker_id(&self.target).map(str::to_string) else {
-            return Ok(());
-        };
-        let Some(generation) = target_generation(&self.target).map(str::to_string) else {
-            return Ok(());
-        };
-        self.store.transaction(|registry| {
-            let mut workers = object_map(registry, WORKERS_KEY)?;
-            let mut worker = workers
-                .get(&worker_id)
-                .and_then(ManagedWorker::from_json)
-                .ok_or_else(|| "cancelled operation worker is missing or malformed".to_string())?;
-            if worker.generation != generation {
-                return Err("cancelled operation generation changed".to_string());
-            }
-            if worker.state == ManagedState::FencingUnconfirmed {
-                return Ok(());
-            }
-            if worker.state != ManagedState::Fencing || worker.fence_epoch.is_none() {
-                return Err("cancelled operation is not in an exact fencing epoch".to_string());
-            }
-            worker.state = ManagedState::FencingUnconfirmed;
-            worker.version = next_version(&worker.version)?;
-            worker.proof_gap = Some(format!("{reason}; active_operations={}", self.operation_id));
-            workers.insert(worker_id.clone(), worker.to_json());
-            set_object_map(registry, WORKERS_KEY, workers);
-            Ok(())
-        })
-    }
-
     pub(crate) fn cancelled(&mut self) -> bool {
         let _ = (&self.cancel.path, &self.cancel.worker_or_session_epoch);
         self.authorize_use(self.allowed).is_err()
@@ -2044,6 +3424,42 @@ impl ReentryGuard {
     pub(crate) fn allowed(&self) -> OperationKind {
         self.allowed
     }
+
+    pub(crate) fn prepare_supervisor_launch(
+        &mut self,
+        spec: ChildLaunchSpec,
+        stdio: StdioProfile,
+    ) -> Result<PreparedSupervisorLaunch, String> {
+        self.authorize_use(self.allowed)?;
+        let operation_id = self.operation_id.clone();
+        let allowed = self.allowed;
+        let root = self.store.root.clone();
+        let supervisor_instance_id = store::uuid_v4();
+        let supervisor_for_cas = supervisor_instance_id.clone();
+        let stdio_for_cas = stdio.clone();
+        let version = self
+            .store
+            .cas_operation(&operation_id, "1", move |operation| {
+                if operation.kind != allowed || !matches!(operation.custody, ExternalCustody::None)
+                {
+                    return Err("supervisor launch operation is not pristine".to_string());
+                }
+                operation.launch_spec = Some(spec);
+                operation.stdio = Some(stdio_for_cas);
+                operation.custody = ExternalCustody::ChildStarting {
+                    supervisor_instance_id: supervisor_for_cas,
+                };
+                Ok(())
+            })?;
+        Ok(PreparedSupervisorLaunch {
+            operation_id,
+            operation_version: version,
+            supervisor_instance_id,
+            root,
+            stdio,
+            control_epoch: String::new(),
+        })
+    }
 }
 
 impl Drop for ReentryGuard {
@@ -2051,7 +3467,13 @@ impl Drop for ReentryGuard {
         let operation_id = self.operation_id.clone();
         let _ = self.store.transaction(|registry| {
             let mut operations = object_map(registry, ACTIVE_OPERATIONS_KEY)?;
-            operations.remove(&operation_id);
+            let removable = operations
+                .get(&operation_id)
+                .and_then(ActiveOperationRecord::from_json)
+                .is_some_and(|operation| matches!(operation.custody, ExternalCustody::None));
+            if removable {
+                operations.remove(&operation_id);
+            }
             set_object_map(registry, ACTIVE_OPERATIONS_KEY, operations);
             Ok(())
         });
@@ -2140,8 +3562,6 @@ fn authorized_target(target: &GuardTarget) -> AuthorizedTarget {
     match target {
         GuardTarget::Session {
             runtime_session_id,
-            worker_id,
-            generation,
             tool,
             canonical_cwd,
             server,
@@ -2150,8 +3570,6 @@ fn authorized_target(target: &GuardTarget) -> AuthorizedTarget {
         } => AuthorizedTarget {
             root: PathBuf::new(),
             runtime_session_id: runtime_session_id.clone(),
-            worker_id: worker_id.clone(),
-            generation: generation.clone(),
             tool: tool.clone(),
             canonical_cwd: canonical_cwd.clone(),
             server: server.clone(),
@@ -2160,8 +3578,6 @@ fn authorized_target(target: &GuardTarget) -> AuthorizedTarget {
         },
         GuardTarget::AppServerThread {
             runtime_session_id,
-            worker_id,
-            generation,
             tool,
             canonical_cwd,
             server,
@@ -2173,8 +3589,6 @@ fn authorized_target(target: &GuardTarget) -> AuthorizedTarget {
             AuthorizedTarget {
                 root: PathBuf::new(),
                 runtime_session_id: runtime_session_id.clone(),
-                worker_id: worker_id.clone(),
-                generation: generation.clone(),
                 tool: tool.clone(),
                 canonical_cwd: canonical_cwd.clone(),
                 server: Some(server.clone()),
@@ -2235,6 +3649,7 @@ impl BindingEpochGuard {
 struct PendingRecord {
     attach: PendingAttach,
     claim_version: Option<String>,
+    waiting_runtime_session_id: Option<String>,
 }
 
 impl PendingRecord {
@@ -2242,12 +3657,17 @@ impl PendingRecord {
         Self {
             attach,
             claim_version: None,
+            waiting_runtime_session_id: None,
         }
     }
 
     fn to_json(&self) -> JsonValue {
         let mut object = self.attach.to_object();
         object.insert("claim_version".into(), optional_string(&self.claim_version));
+        object.insert(
+            "waiting_runtime_session_id".into(),
+            optional_string(&self.waiting_runtime_session_id),
+        );
         JsonValue::from(object)
     }
 
@@ -2256,6 +3676,7 @@ impl PendingRecord {
         Some(Self {
             attach: PendingAttach::from_object(object)?,
             claim_version: optional_string_from(object, "claim_version"),
+            waiting_runtime_session_id: optional_string_from(object, "waiting_runtime_session_id"),
         })
     }
 }
@@ -2268,6 +3689,11 @@ enum ClaimStart {
     Join {
         binding_epoch: String,
         claim_version: String,
+    },
+    WaitUnmanaged {
+        binding_epoch: String,
+        claim_version: String,
+        operation_id: String,
     },
     Immediate(Box<ClaimOutcome>),
 }
@@ -2400,6 +3826,25 @@ fn begin_claim(
                     &worker,
                     "session has a conflicting managed claim",
                 ))));
+            }
+            BindingState::UnmanagedCanceling {
+                operation_id,
+                operation_version: _,
+                binding_epoch: cancelling_epoch,
+            } => {
+                if cancelling_epoch != binding.binding_epoch {
+                    return Err("unmanaged cancellation binding epoch is malformed".to_string());
+                }
+                let claim_version = record.claim_version.clone().unwrap_or_else(store::uuid_v4);
+                record.claim_version = Some(claim_version.clone());
+                record.waiting_runtime_session_id = Some(request.runtime_session_id.clone());
+                pending.insert(token_sha256.to_string(), record.to_json());
+                set_object_map(registry, PENDING_KEY, pending);
+                return Ok(ClaimStart::WaitUnmanaged {
+                    binding_epoch: binding.binding_epoch,
+                    claim_version,
+                    operation_id,
+                });
             }
             BindingState::Unmanaged => {}
         }
@@ -2587,6 +4032,35 @@ fn append_audit(registry: &mut Registry, event: &str, request: &ClaimManagedAtta
         .insert(AUDIT_KEY.into(), JsonValue::from(audit));
 }
 
+fn append_lifecycle_event(
+    registry: &mut Registry,
+    event: &str,
+    runtime_session_id: &str,
+    operation_id: &str,
+) {
+    let mut audit = registry
+        .extra
+        .get(AUDIT_KEY)
+        .and_then(|value| value.get::<Vec<JsonValue>>())
+        .cloned()
+        .unwrap_or_default();
+    let mut row = HashMap::new();
+    row.insert("event".into(), JsonValue::from(event.to_string()));
+    row.insert("at".into(), JsonValue::from(store::iso_now()));
+    row.insert(
+        "runtime_session_id".into(),
+        JsonValue::from(runtime_session_id.to_string()),
+    );
+    row.insert(
+        "operation_id".into(),
+        JsonValue::from(operation_id.to_string()),
+    );
+    audit.push(JsonValue::from(row));
+    registry
+        .extra
+        .insert(AUDIT_KEY.into(), JsonValue::from(audit));
+}
+
 fn object_map(registry: &Registry, key: &str) -> Result<HashMap<String, JsonValue>, String> {
     match registry.extra.get(key) {
         None => Ok(HashMap::new()),
@@ -2754,6 +4228,473 @@ fn optional_string(value: &Option<String>) -> JsonValue {
         .unwrap_or(JsonValue::from(()))
 }
 
+impl ProcessObservation {
+    fn to_json(&self) -> JsonValue {
+        let mut object = HashMap::new();
+        object.insert("pid".into(), JsonValue::from(self.pid.to_string()));
+        object.insert(
+            "pgid".into(),
+            self.pgid
+                .map(|value| JsonValue::from(value.to_string()))
+                .unwrap_or(JsonValue::from(())),
+        );
+        let mut start = HashMap::new();
+        match self.start {
+            StartGeneration::LinuxProcStartTicks(ticks) => {
+                start.insert(
+                    "kind".into(),
+                    JsonValue::from("LinuxProcStartTicks".to_string()),
+                );
+                start.insert("ticks".into(), JsonValue::from(ticks.to_string()));
+            }
+            StartGeneration::DarwinBsdStartTime { sec, usec } => {
+                start.insert(
+                    "kind".into(),
+                    JsonValue::from("DarwinBsdStartTime".to_string()),
+                );
+                start.insert("sec".into(), JsonValue::from(sec.to_string()));
+                start.insert("usec".into(), JsonValue::from(usec.to_string()));
+            }
+            StartGeneration::Unavailable => {
+                start.insert("kind".into(), JsonValue::from("Unavailable".to_string()));
+            }
+        }
+        object.insert("start".into(), JsonValue::from(start));
+        JsonValue::from(object)
+    }
+
+    fn from_json(value: &JsonValue) -> Option<Self> {
+        let object = value.get::<HashMap<String, JsonValue>>()?;
+        let start = object.get("start")?.get::<HashMap<String, JsonValue>>()?;
+        let start = match string(start, "kind")?.as_str() {
+            "LinuxProcStartTicks" => {
+                StartGeneration::LinuxProcStartTicks(string(start, "ticks")?.parse().ok()?)
+            }
+            "DarwinBsdStartTime" => StartGeneration::DarwinBsdStartTime {
+                sec: string(start, "sec")?.parse().ok()?,
+                usec: string(start, "usec")?.parse().ok()?,
+            },
+            "Unavailable" => StartGeneration::Unavailable,
+            _ => return None,
+        };
+        Some(Self {
+            pid: string(object, "pid")?.parse().ok()?,
+            pgid: optional_string_from(object, "pgid").and_then(|value| value.parse().ok()),
+            start,
+        })
+    }
+}
+
+impl ExternalCustody {
+    fn to_json(&self) -> JsonValue {
+        let mut object = HashMap::new();
+        let (kind, supervisor, process) = match self {
+            Self::None => ("None", None, None),
+            Self::ChildStarting {
+                supervisor_instance_id,
+            } => ("ChildStarting", Some(supervisor_instance_id), None),
+            Self::ChildOwned {
+                supervisor_instance_id,
+                process,
+            } => ("ChildOwned", Some(supervisor_instance_id), Some(process)),
+            Self::ChildCancelRequested {
+                supervisor_instance_id,
+                process,
+                request_id,
+            } => {
+                object.insert("request_id".into(), JsonValue::from(request_id.clone()));
+                (
+                    "ChildCancelRequested",
+                    Some(supervisor_instance_id),
+                    Some(process),
+                )
+            }
+            Self::ChildReaped {
+                supervisor_instance_id,
+                process,
+                exit_status,
+            } => {
+                object.insert(
+                    "exit_status".into(),
+                    JsonValue::from(exit_status.to_string()),
+                );
+                ("ChildReaped", Some(supervisor_instance_id), Some(process))
+            }
+            Self::LostAuthority {
+                last_observation,
+                reason,
+            } => {
+                object.insert(
+                    "reason".into(),
+                    JsonValue::from(reason.as_str().to_string()),
+                );
+                object.insert(
+                    "last_observation".into(),
+                    last_observation
+                        .as_ref()
+                        .map(ProcessObservation::to_json)
+                        .unwrap_or(JsonValue::from(())),
+                );
+                ("LostAuthority", None, None)
+            }
+        };
+        object.insert("kind".into(), JsonValue::from(kind.to_string()));
+        if let Some(supervisor) = supervisor {
+            object.insert(
+                "supervisor_instance_id".into(),
+                JsonValue::from(supervisor.clone()),
+            );
+        }
+        if let Some(process) = process {
+            object.insert("process".into(), process.to_json());
+        }
+        JsonValue::from(object)
+    }
+
+    fn from_json(value: &JsonValue) -> Option<Self> {
+        let object = value.get::<HashMap<String, JsonValue>>()?;
+        let supervisor = || string(object, "supervisor_instance_id");
+        let process = || {
+            object
+                .get("process")
+                .and_then(ProcessObservation::from_json)
+        };
+        match string(object, "kind")?.as_str() {
+            "None" => Some(Self::None),
+            "ChildStarting" => Some(Self::ChildStarting {
+                supervisor_instance_id: supervisor()?,
+            }),
+            "ChildOwned" => Some(Self::ChildOwned {
+                supervisor_instance_id: supervisor()?,
+                process: process()?,
+            }),
+            "ChildCancelRequested" => Some(Self::ChildCancelRequested {
+                supervisor_instance_id: supervisor()?,
+                process: process()?,
+                request_id: string(object, "request_id")?,
+            }),
+            "ChildReaped" => Some(Self::ChildReaped {
+                supervisor_instance_id: supervisor()?,
+                process: process()?,
+                exit_status: string(object, "exit_status")?.parse().ok()?,
+            }),
+            "LostAuthority" => Some(Self::LostAuthority {
+                last_observation: object
+                    .get("last_observation")
+                    .and_then(ProcessObservation::from_json),
+                reason: LostAuthorityReason::parse(&string(object, "reason")?)?,
+            }),
+            _ => None,
+        }
+    }
+}
+
+fn stdio_endpoint_to_json(endpoint: &StdioEndpointMode) -> JsonValue {
+    let mut object = HashMap::new();
+    match endpoint {
+        StdioEndpointMode::Closed => {
+            object.insert("kind".into(), JsonValue::from("Closed".to_string()));
+        }
+        StdioEndpointMode::Pipe => {
+            object.insert("kind".into(), JsonValue::from("Pipe".to_string()));
+        }
+        StdioEndpointMode::Pty {
+            terminal_group,
+            rows,
+            cols,
+        } => {
+            object.insert("kind".into(), JsonValue::from("Pty".to_string()));
+            object.insert(
+                "terminal_group".into(),
+                JsonValue::from(terminal_group.clone()),
+            );
+            object.insert("rows".into(), JsonValue::from(rows.to_string()));
+            object.insert("cols".into(), JsonValue::from(cols.to_string()));
+        }
+    }
+    JsonValue::from(object)
+}
+
+fn stdio_endpoint_from_json(value: &JsonValue) -> Option<StdioEndpointMode> {
+    let object = value.get::<HashMap<String, JsonValue>>()?;
+    match string(object, "kind")?.as_str() {
+        "Closed" => Some(StdioEndpointMode::Closed),
+        "Pipe" => Some(StdioEndpointMode::Pipe),
+        "Pty" => Some(StdioEndpointMode::Pty {
+            terminal_group: string(object, "terminal_group")?,
+            rows: string(object, "rows")?.parse().ok()?,
+            cols: string(object, "cols")?.parse().ok()?,
+        }),
+        _ => None,
+    }
+}
+
+impl StdioProfile {
+    fn to_json(&self) -> JsonValue {
+        let mut object = HashMap::new();
+        object.insert("stdin".into(), stdio_endpoint_to_json(&self.stdin));
+        object.insert("stdout".into(), stdio_endpoint_to_json(&self.stdout));
+        object.insert("stderr".into(), stdio_endpoint_to_json(&self.stderr));
+        JsonValue::from(object)
+    }
+
+    fn from_json(value: &JsonValue) -> Option<Self> {
+        let object = value.get::<HashMap<String, JsonValue>>()?;
+        Some(Self {
+            stdin: stdio_endpoint_from_json(object.get("stdin")?)?,
+            stdout: stdio_endpoint_from_json(object.get("stdout")?)?,
+            stderr: stdio_endpoint_from_json(object.get("stderr")?)?,
+        })
+    }
+}
+
+impl ActiveOperationRecord {
+    fn to_json(&self) -> JsonValue {
+        let mut object = HashMap::new();
+        object.insert(
+            "operation_id".into(),
+            JsonValue::from(self.operation_id.clone()),
+        );
+        object.insert(
+            "runtime_session_id".into(),
+            JsonValue::from(self.runtime_session_id.clone()),
+        );
+        object.insert("worker_id".into(), optional_string(&self.worker_id));
+        object.insert("generation".into(), optional_string(&self.generation));
+        object.insert(
+            "binding_epoch".into(),
+            JsonValue::from(self.binding_epoch.clone()),
+        );
+        object.insert(
+            "lifecycle_version".into(),
+            optional_string(&self.lifecycle_version),
+        );
+        object.insert(
+            "operation_version".into(),
+            JsonValue::from(self.operation_version.clone()),
+        );
+        object.insert(
+            "kind".into(),
+            JsonValue::from(self.kind.as_str().to_string()),
+        );
+        object.insert("custody".into(), self.custody.to_json());
+        object.insert("terminal".into(), JsonValue::from(self.terminal));
+        object.insert("cancelled".into(), JsonValue::from(self.cancelled));
+        object.insert(
+            "reap_proof".into(),
+            self.reap_proof
+                .as_ref()
+                .map(OwnedChildReapProof::to_json)
+                .unwrap_or(JsonValue::from(())),
+        );
+        object.insert(
+            "launch_spec".into(),
+            self.launch_spec
+                .as_ref()
+                .map(ChildLaunchSpec::to_json)
+                .unwrap_or(JsonValue::from(())),
+        );
+        object.insert(
+            "stdio".into(),
+            self.stdio
+                .as_ref()
+                .map(StdioProfile::to_json)
+                .unwrap_or(JsonValue::from(())),
+        );
+        JsonValue::from(object)
+    }
+
+    fn from_json(value: &JsonValue) -> Option<Self> {
+        let object = value.get::<HashMap<String, JsonValue>>()?;
+        let operation_version = string(object, "operation_version")?;
+        canonical_u64("operation_version", &operation_version).ok()?;
+        Some(Self {
+            operation_id: string(object, "operation_id")?,
+            runtime_session_id: string(object, "runtime_session_id")?,
+            worker_id: optional_string_from(object, "worker_id"),
+            generation: optional_string_from(object, "generation"),
+            binding_epoch: string(object, "binding_epoch")?,
+            lifecycle_version: optional_string_from(object, "lifecycle_version"),
+            operation_version,
+            kind: OperationKind::parse(&string(object, "kind")?)?,
+            custody: object.get("custody").and_then(ExternalCustody::from_json)?,
+            terminal: object.get("terminal")?.get::<bool>().copied()?,
+            cancelled: object.get("cancelled")?.get::<bool>().copied()?,
+            reap_proof: object
+                .get("reap_proof")
+                .and_then(OwnedChildReapProof::from_json),
+            launch_spec: object
+                .get("launch_spec")
+                .and_then(ChildLaunchSpec::from_json),
+            stdio: object.get("stdio").and_then(StdioProfile::from_json),
+        })
+    }
+}
+
+impl OwnedChildReapProof {
+    fn to_json(&self) -> JsonValue {
+        let mut object = HashMap::new();
+        object.insert("worker_id".into(), JsonValue::from(self.worker_id.clone()));
+        object.insert(
+            "generation".into(),
+            JsonValue::from(self.generation.clone()),
+        );
+        object.insert(
+            "operation_id".into(),
+            JsonValue::from(self.operation_id.clone()),
+        );
+        object.insert(
+            "supervisor_instance_id".into(),
+            JsonValue::from(self.supervisor_instance_id.clone()),
+        );
+        object.insert("pid".into(), JsonValue::from(self.pid.to_string()));
+        object.insert(
+            "exit_status".into(),
+            JsonValue::from(self.exit_status.to_string()),
+        );
+        object.insert(
+            "operation_version".into(),
+            JsonValue::from(self.operation_version.clone()),
+        );
+        JsonValue::from(object)
+    }
+
+    fn from_json(value: &JsonValue) -> Option<Self> {
+        let object = value.get::<HashMap<String, JsonValue>>()?;
+        Some(Self {
+            worker_id: string(object, "worker_id")?,
+            generation: string(object, "generation")?,
+            operation_id: string(object, "operation_id")?,
+            supervisor_instance_id: string(object, "supervisor_instance_id")?,
+            pid: string(object, "pid")?.parse().ok()?,
+            exit_status: string(object, "exit_status")?.parse().ok()?,
+            operation_version: string(object, "operation_version")?,
+            _sealed: Sealed(()),
+        })
+    }
+}
+
+impl SupervisorRecord {
+    fn to_json(&self) -> JsonValue {
+        let mut object = HashMap::new();
+        object.insert(
+            "supervisor_instance_id".into(),
+            JsonValue::from(self.supervisor_instance_id.clone()),
+        );
+        object.insert(
+            "control_epoch".into(),
+            JsonValue::from(self.control_epoch.clone()),
+        );
+        object.insert(
+            "control_nonce_sha256".into(),
+            JsonValue::from(self.control_nonce_sha256.clone()),
+        );
+        object.insert(
+            "operation_id".into(),
+            JsonValue::from(self.operation_id.clone()),
+        );
+        object.insert("process".into(), self.process.to_json());
+        object.insert(
+            "socket_path".into(),
+            JsonValue::from(self.socket_path.to_string_lossy().into_owned()),
+        );
+        object.insert(
+            "socket_dev".into(),
+            JsonValue::from(self.socket_dev.to_string()),
+        );
+        object.insert(
+            "socket_ino".into(),
+            JsonValue::from(self.socket_ino.to_string()),
+        );
+        object.insert("version".into(), JsonValue::from(self.version.clone()));
+        object.insert(
+            "state".into(),
+            JsonValue::from(self.state.as_str().to_string()),
+        );
+        object.insert(
+            "heartbeat_at".into(),
+            JsonValue::from(self.heartbeat_at.clone()),
+        );
+        object.insert(
+            "heartbeat_at_ms".into(),
+            JsonValue::from(self.heartbeat_at_ms.to_string()),
+        );
+        JsonValue::from(object)
+    }
+
+    fn from_json(value: &JsonValue) -> Option<Self> {
+        let object = value.get::<HashMap<String, JsonValue>>()?;
+        Some(Self {
+            supervisor_instance_id: string(object, "supervisor_instance_id")?,
+            control_epoch: string(object, "control_epoch")?,
+            control_nonce_sha256: string(object, "control_nonce_sha256")?,
+            operation_id: string(object, "operation_id")?,
+            process: object
+                .get("process")
+                .and_then(ProcessObservation::from_json)?,
+            socket_path: PathBuf::from(string(object, "socket_path")?),
+            socket_dev: string(object, "socket_dev")?.parse().ok()?,
+            socket_ino: string(object, "socket_ino")?.parse().ok()?,
+            version: string(object, "version")?,
+            state: SupervisorState::parse(&string(object, "state")?)?,
+            heartbeat_at: string(object, "heartbeat_at")?,
+            heartbeat_at_ms: string(object, "heartbeat_at_ms")?.parse().ok()?,
+        })
+    }
+}
+
+impl SupervisorWatchdogRecord {
+    fn to_json(&self) -> JsonValue {
+        let mut object = HashMap::new();
+        object.insert(
+            "watchdog_instance_id".into(),
+            JsonValue::from(self.watchdog_instance_id.clone()),
+        );
+        object.insert(
+            "supervisor_instance_id".into(),
+            JsonValue::from(self.supervisor_instance_id.clone()),
+        );
+        object.insert(
+            "operation_id".into(),
+            JsonValue::from(self.operation_id.clone()),
+        );
+        object.insert(
+            "control_epoch".into(),
+            JsonValue::from(self.control_epoch.clone()),
+        );
+        object.insert(
+            "control_nonce_sha256".into(),
+            JsonValue::from(self.control_nonce_sha256.clone()),
+        );
+        object.insert("process".into(), self.process.to_json());
+        object.insert(
+            "heartbeat_at".into(),
+            JsonValue::from(self.heartbeat_at.clone()),
+        );
+        object.insert(
+            "heartbeat_at_ms".into(),
+            JsonValue::from(self.heartbeat_at_ms.to_string()),
+        );
+        JsonValue::from(object)
+    }
+
+    fn from_json(value: &JsonValue) -> Option<Self> {
+        let object = value.get::<HashMap<String, JsonValue>>()?;
+        Some(Self {
+            watchdog_instance_id: string(object, "watchdog_instance_id")?,
+            supervisor_instance_id: string(object, "supervisor_instance_id")?,
+            operation_id: string(object, "operation_id")?,
+            control_epoch: string(object, "control_epoch")?,
+            control_nonce_sha256: string(object, "control_nonce_sha256")?,
+            process: object
+                .get("process")
+                .and_then(ProcessObservation::from_json)?,
+            heartbeat_at: string(object, "heartbeat_at")?,
+            heartbeat_at_ms: string(object, "heartbeat_at_ms")?.parse().ok()?,
+        })
+    }
+}
+
 impl PendingAttach {
     fn to_object(&self) -> HashMap<String, JsonValue> {
         let mut object = HashMap::new();
@@ -2888,6 +4829,25 @@ impl SessionBinding {
             BindingState::Unmanaged => {
                 state.insert("kind".into(), JsonValue::from("Unmanaged".to_string()));
             }
+            BindingState::UnmanagedCanceling {
+                operation_id,
+                operation_version,
+                binding_epoch,
+            } => {
+                state.insert(
+                    "kind".into(),
+                    JsonValue::from("UnmanagedCanceling".to_string()),
+                );
+                state.insert("operation_id".into(), JsonValue::from(operation_id.clone()));
+                state.insert(
+                    "operation_version".into(),
+                    JsonValue::from(operation_version.clone()),
+                );
+                state.insert(
+                    "binding_epoch".into(),
+                    JsonValue::from(binding_epoch.clone()),
+                );
+            }
             BindingState::GcDeleting {
                 gc_epoch,
                 binding_epoch,
@@ -2937,6 +4897,11 @@ impl SessionBinding {
         let state = object.get("state")?.get::<HashMap<String, JsonValue>>()?;
         let state = match string(state, "kind")?.as_str() {
             "Unmanaged" => BindingState::Unmanaged,
+            "UnmanagedCanceling" => BindingState::UnmanagedCanceling {
+                operation_id: string(state, "operation_id")?,
+                operation_version: string(state, "operation_version")?,
+                binding_epoch: string(state, "binding_epoch")?,
+            },
             "GcDeleting" => BindingState::GcDeleting {
                 gc_epoch: string(state, "gc_epoch")?,
                 binding_epoch: string(state, "binding_epoch")?,
@@ -3233,6 +5198,10 @@ fn lifecycle_references_session(registry: &Registry, id: &str) -> Result<bool, S
     for key in [
         TOMBSTONES_KEY,
         AUDIT_KEY,
+        ACTIVE_OPERATIONS_KEY,
+        OPERATION_TOMBSTONES_KEY,
+        SUPERVISORS_KEY,
+        WATCHDOGS_KEY,
         "fence_intents",
         "lifecycle_proofs",
     ] {
@@ -3269,6 +5238,72 @@ fn json_contains_string(value: &JsonValue, needle: &str) -> bool {
             .iter()
             .any(|value| json_contains_string(value, needle))
     })
+}
+
+fn process_observation_is_live(observation: &ProcessObservation) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let current = fs::read_to_string(format!("/proc/{}/stat", observation.pid))
+            .ok()
+            .and_then(|stat| {
+                let end = stat.rfind(") ")?;
+                let fields = stat[end + 2..].split_whitespace().collect::<Vec<_>>();
+                let state = *fields.first()?;
+                let start = fields.get(19)?.parse::<u64>().ok()?;
+                Some((state.to_string(), start))
+            });
+        match observation.start {
+            StartGeneration::LinuxProcStartTicks(expected) => {
+                current.is_some_and(|(state, start)| state != "Z" && start == expected)
+            }
+            _ => current.is_some_and(|(state, _)| state != "Z"),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // SAFETY: signal 0 is an observation-only existence/permission probe.
+        unsafe { libc::kill(observation.pid as i32, 0) == 0 }
+    }
+}
+
+fn ping_supervisor(supervisor: &SupervisorRecord) -> Result<(), String> {
+    let metadata = fs::metadata(&supervisor.socket_path)
+        .map_err(|error| format!("stat supervisor health socket: {error}"))?;
+    if metadata.dev() != supervisor.socket_dev || metadata.ino() != supervisor.socket_ino {
+        return Err("supervisor health socket identity changed".to_string());
+    }
+    let mut stream = std::os::unix::net::UnixStream::connect(&supervisor.socket_path)
+        .map_err(|error| format!("connect supervisor health socket: {error}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_millis(MANAGED_CANCEL_POLL_MS)))
+        .map_err(|error| format!("configure supervisor health timeout: {error}"))?;
+    let challenge_nonce = store::uuid_v4();
+    let request = format!(
+        "{{\"challenge_nonce\":\"{challenge_nonce}\",\"kind\":\"ping\",\"role\":\"health\"}}\n"
+    );
+    std::io::Write::write_all(&mut stream, request.as_bytes())
+        .map_err(|error| format!("write supervisor health ping: {error}"))?;
+    let mut line = String::new();
+    std::io::BufRead::read_line(&mut std::io::BufReader::new(stream), &mut line)
+        .map_err(|error| format!("read supervisor health pong: {error}"))?;
+    let value = line
+        .trim_end()
+        .parse::<JsonValue>()
+        .map_err(|error| format!("parse supervisor health pong: {error}"))?;
+    let object = value
+        .get::<HashMap<String, JsonValue>>()
+        .ok_or_else(|| "supervisor health pong is not an object".to_string())?;
+    if optional_string_from(object, "kind").as_deref() == Some("pong")
+        && optional_string_from(object, "role").as_deref() == Some("health")
+        && optional_string_from(object, "supervisor_instance_id").as_deref()
+            == Some(supervisor.supervisor_instance_id.as_str())
+        && optional_string_from(object, "challenge_nonce").as_deref()
+            == Some(challenge_nonce.as_str())
+    {
+        Ok(())
+    } else {
+        Err("supervisor health pong identity mismatch".to_string())
+    }
 }
 
 fn try_exclusive_file(path: &Path) -> Result<Option<fs::File>, String> {

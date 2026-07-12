@@ -339,6 +339,9 @@ fn managed_session_start(tool: &str, id: &str, dir: &str) -> Result<Option<Strin
     };
     match binding.state {
         BindingState::Unmanaged => Ok(None),
+        BindingState::UnmanagedCanceling { .. } => Ok(Some(
+            "session has an exact unmanaged cancellation in progress".to_string(),
+        )),
         BindingState::Managed { .. } => match store.resume_managed_attach(id, tool, dir) {
             Ok(ClaimOutcome::Active { .. }) => Ok(None),
             Ok(ClaimOutcome::Refused { state, reason, .. }) => Ok(Some(format!(
