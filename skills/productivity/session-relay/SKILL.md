@@ -5,8 +5,8 @@ user-invocable: true
 allowed-tools: Bash, Read
 metadata:
   pattern: tool-wrapper
-  updated: "2026-07-11"
-  content_hash: "df08a9bee008c439b3dabc0730d7d9c7e2667bd3619c04e0583ce0cc4fb30c43"
+  updated: "2026-07-12"
+  content_hash: "95861e99d5b75300cd97fc1429a7294f08933567339ebb77e169b6a123c2bb55"
 ---
 
 # Session relay
@@ -384,6 +384,17 @@ birth a real, resumable session there instead:
 
 Use this when a plan needs a two-model adversarial review. The orchestrator owns
 the plan and the final verdict; workers edit only their assigned sections.
+
+This is an ordinary collaborative debate, **not** Docks' canonical strong-default
+plan-policy review. Schema-v1 policy review requires a sealed non-git read-only
+bundle, one byte-identical request, structured findings, and no worker edits.
+Current `relay spawn` injects separate-branch/write guardrails and returns at
+birth registration, so it is deliberately rejected as a schema-v1 policy
+transport. Use the portable explicit-model CLI legs documented by plan-manager/
+plan-review instead. Skill prose cannot bypass the binary guardrail. A future
+dedicated non-writing relay reviewer mode requires binary implementation, tests,
+and its own approved release; do not simulate it with flags or an alternate
+export route.
 
 1. Create or open the plan via plan-manager. Add `## Debate` with `### [a-team]`
    and `### [b-team]`, then state the exact question.
