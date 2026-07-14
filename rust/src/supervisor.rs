@@ -1514,6 +1514,19 @@ fn open_pty(rows: u16, cols: u16) -> Result<(File, File), String> {
         ws_ypixel: 0,
     };
     // SAFETY: output pointers are valid and initialized only on success.
+    #[cfg(target_vendor = "apple")]
+    let result = unsafe {
+        let mut winsize = winsize;
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut winsize,
+        )
+    };
+    // SAFETY: output pointers are valid and initialized only on success.
+    #[cfg(not(target_vendor = "apple"))]
     let result = unsafe {
         libc::openpty(
             &mut master,
