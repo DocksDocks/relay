@@ -33,8 +33,10 @@ const statuses = Array.isArray(control.statuses) && control.statuses.length > 0
   : ['idle'];
 const elicitationServer = control.elicitationServer ?? 'bus';
 const threadId = control.threadId ?? '77777777-7777-4777-8777-777777777777';
+const turnId = control.turnId ?? 'turn-1';
 const elicitationDelayMs = Number(control.elicitationDelayMs ?? 0);
 const completionDelayMs = Number(control.completionDelayMs ?? 0);
+const interruptCompletionDelayMs = Number(control.interruptCompletionDelayMs ?? 0);
 let statusIndex = 0;
 
 const encodeText = (s) => {
@@ -66,6 +68,17 @@ function parseFrame(buf) {
 const server = net.createServer((c) => {
   let buf = Buffer.alloc(0);
   let upgraded = false;
+  let interrupted = false;
+  let activeThreadId = threadId;
+  const sendTurnCompleted = (completedThreadId = activeThreadId, completedTurnId = turnId) => {
+    if (!c.destroyed) c.write(encodeText(JSON.stringify({
+      method: 'turn/completed',
+      params: {
+        threadId: completedThreadId,
+        turn: { id: completedTurnId, status: 'completed' },
+      },
+    })));
+  };
   c.on('error', () => {});
   c.on('close', () => fs.appendFileSync(framesFile, `${JSON.stringify({ event: 'connection/closed' })}\n`));
   c.on('data', (d) => {
@@ -93,7 +106,7 @@ const server = net.createServer((c) => {
         // response to OUR elicitation request → the turn may finish
         if (msg.id === 990 && !control.neverComplete) {
           setTimeout(() => {
-            if (!c.destroyed) c.write(encodeText(JSON.stringify({ method: 'turn/completed', params: { turnId: 'turn-1' } })));
+            sendTurnCompleted();
           }, completionDelayMs);
         }
         continue;
@@ -116,7 +129,9 @@ const server = net.createServer((c) => {
           break;
         case 'thread/resume': reply({ thread: { id: msg.params?.threadId ?? null } }); break;
         case 'thread/read': {
-          const type = statuses[Math.min(statusIndex, statuses.length - 1)];
+          const type = interrupted && control.idleAfterInterrupt
+            ? 'idle'
+            : statuses[Math.min(statusIndex, statuses.length - 1)];
           statusIndex += 1;
           const status = type === 'active' ? { type, activeFlags: [] } : { type };
           reply({ thread: { id: msg.params?.threadId ?? null, status, turns: [] } });
@@ -128,11 +143,36 @@ const server = net.createServer((c) => {
             fail(control.turnStartError);
             break;
           }
-          reply({ turn: { id: 'turn-1', status: 'inProgress' } });
-          c.write(encodeText(JSON.stringify({ method: 'turn/started', params: { turnId: 'turn-1', threadId: msg.params?.threadId ?? null } })));
+          activeThreadId = msg.params?.threadId ?? threadId;
+          reply({ turn: { id: turnId, status: 'inProgress' } });
+          c.write(encodeText(JSON.stringify({
+            method: 'turn/started',
+            params: {
+              threadId: msg.params?.threadId ?? null,
+              turn: { id: turnId, status: 'inProgress' },
+            },
+          })));
+          if (control.disconnectAfterTurnStart) {
+            setTimeout(() => c.destroy(), 10);
+            break;
+          }
           setTimeout(() => {
-            if (!c.destroyed) c.write(encodeText(JSON.stringify({ id: 990, method: 'mcpServer/elicitation/request', params: { threadId: msg.params?.threadId ?? null, turnId: 'turn-1', serverName: elicitationServer, mode: 'form', _meta: { codex_approval_kind: 'mcp_tool_call' } } })));
+            if (!c.destroyed) c.write(encodeText(JSON.stringify({ id: 990, method: 'mcpServer/elicitation/request', params: { threadId: msg.params?.threadId ?? null, turnId, serverName: elicitationServer, mode: 'form', _meta: { codex_approval_kind: 'mcp_tool_call' } } })));
           }, elicitationDelayMs);
+          break;
+        case 'turn/interrupt':
+          if (msg.params?.threadId !== activeThreadId || msg.params?.turnId !== turnId) {
+            fail('turn interrupt identity mismatch');
+            break;
+          }
+          interrupted = true;
+          reply({});
+          if (control.interruptMismatchedCompletion) {
+            sendTurnCompleted(activeThreadId, `${turnId}-mismatch`);
+          }
+          if (!control.interruptNeverComplete) {
+            setTimeout(() => sendTurnCompleted(), interruptCompletionDelayMs);
+          }
           break;
         default: reply({});
       }

@@ -26,6 +26,7 @@ function resolveBin() {
   const arch = { x64: 'x86_64', arm64: 'aarch64' }[process.arch];
   const triple = process.platform === 'darwin' ? `${arch}-apple-darwin` : `${arch}-unknown-linux-musl`;
   for (const c of [
+    path.join(PLUGIN, 'rust', 'target', 'debug', 'relay'),
     path.join(PLUGIN, 'rust', 'target', triple, 'release', 'relay'),
     path.join(PLUGIN, 'bin', `relay-${triple}`),
     path.join(PLUGIN, 'bin', 'relay'),
@@ -41,12 +42,15 @@ if (!BIN) {
 }
 
 const HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'session-relay-test-'));
+const lifecycleState = () => JSON.parse(
+  fs.readFileSync(path.join(HOME, 'lifecycle-v1.json'), 'utf8'),
+).state;
 
 // Every spawn gets an isolated env: the throwaway store via the LEGACY alias
 // (proves SESSION_RELAY_HOME still works), host discovery/store vars scrubbed.
 function envFor(extra = {}) {
   const env = { ...process.env };
-  for (const k of ['AGENT_RELAY_HOME', 'AGENT_RELAY_GC_DAYS', 'RELAY_CLAUDE_PROJECTS', 'RELAY_CODEX_SESSIONS', 'CLAUDE_CONFIG_DIR', 'CLAUDE_PROJECT_DIR', 'CLAUDE_CODE_SESSION_ID', 'CODEX_HOME', 'RELAY_NO_WATCH', 'RELAY_APP_SERVER', 'RELAY_CHANNEL_POLL_MS', 'RELAY_CHANNEL_REGISTER_TIMEOUT_MS', 'RELAY_TURN_SETTLE_MS', 'RELAY_TURN_WAIT_MS', 'RELAY_SPAWN_CMD_CLAUDE', 'RELAY_SPAWN_CMD_CODEX', 'RELAY_WAKE_CMD_CLAUDE', 'RELAY_WAKE_CMD_CODEX', 'RELAY_SPAWN_TOOL', 'STUB_RELAY_BIN', 'STUB_TOOL', 'STUB_RECORD', 'STUB_DELAY_MS', 'STUB_EXIT', 'STUB_SKIP_HOOK', 'STUB_STDERR_BYTES', 'WAKE_STUB_DELAY_MS', 'WAKE_STUB_RECORD', 'ATTACH_STUB_OUTPUT']) delete env[k];
+  for (const k of ['AGENT_RELAY_HOME', 'AGENT_RELAY_GC_DAYS', 'RELAY_CLAUDE_PROJECTS', 'RELAY_CODEX_SESSIONS', 'CLAUDE_CONFIG_DIR', 'CLAUDE_PROJECT_DIR', 'CLAUDE_CODE_SESSION_ID', 'CODEX_HOME', 'RELAY_NO_WATCH', 'RELAY_APP_SERVER', 'RELAY_CHANNEL_POLL_MS', 'RELAY_CHANNEL_REGISTER_TIMEOUT_MS', 'RELAY_TURN_SETTLE_MS', 'RELAY_TURN_WAIT_MS', 'RELAY_SPAWN_CMD_CLAUDE', 'RELAY_SPAWN_CMD_CODEX', 'RELAY_WAKE_CMD_CLAUDE', 'RELAY_WAKE_CMD_CODEX', 'RELAY_SPAWN_TOOL', 'STUB_RELAY_BIN', 'STUB_TOOL', 'STUB_RECORD', 'STUB_DELAY_MS', 'STUB_EXIT', 'STUB_SKIP_HOOK', 'STUB_STDERR_BYTES', 'WAKE_STUB_DELAY_MS', 'WAKE_STUB_RECORD', 'ATTACH_STUB_OUTPUT', 'ATTACH_STUB_INTERACTIVE']) delete env[k];
   return { ...env, SESSION_RELAY_HOME: HOME, ...extra };
 }
 const relay = (args, opts = {}) => spawnSync(BIN, args, { encoding: 'utf8', input: opts.input, cwd: opts.cwd, env: envFor(opts.env) });
@@ -230,37 +234,26 @@ check('wake --dry maps --model/--effort for codex and claude targets', () => {
   assert.ok(a.args.indexOf('--') > resume + 6, 'claude model flags stay before the prompt fence');
 });
 
-check('attach resolves registered names and ids into per-tool takeover commands', () => {
-  const byName = relay(['attach', 'codex-C']);
-  assert.equal(byName.status, 0, byName.stderr);
-  assert.match(byName.stdout, new RegExp(`command: codex resume ${idC} -C `));
-  assert.match(byName.stdout, /session: name=codex-C tool=codex dir=/);
-  assert.match(byName.stdout, /WARNING: split-brain risk/);
-
-  const byId = relay(['attach', idC]);
-  assert.equal(byId.status, 0, byId.stderr);
-  assert.match(byId.stdout, new RegExp(`command: codex resume ${idC} -C `));
-
-  const claude = relay(['attach', 'agent-A']);
-  assert.equal(claude.status, 0, claude.stderr);
-  assert.match(claude.stdout, new RegExp(`command: cd .* && claude --resume ${idA}`));
-  assert.match(claude.stdout, /WARNING: split-brain risk/);
-});
-
 const attachStubDir = path.join(HOME, 'attach-stubs');
 fs.mkdirSync(attachStubDir);
 const attachStub = `#!/usr/bin/env node
 const fs = require('node:fs');
-fs.writeFileSync(process.env.ATTACH_STUB_OUTPUT, JSON.stringify({ argv: process.argv.slice(2), cwd: process.cwd() }));
+const interactive = process.env.ATTACH_STUB_INTERACTIVE === '1';
+const stdin = interactive ? fs.readFileSync(0, 'utf8') : '';
+if (interactive) {
+  process.stdout.write('attach-stdout');
+  process.stderr.write('attach-stderr');
+}
+fs.writeFileSync(process.env.ATTACH_STUB_OUTPUT, JSON.stringify({ argv: process.argv.slice(2), cwd: process.cwd(), ...(interactive ? { stdin } : {}) }));
 `;
 for (const tool of ['codex', 'claude']) {
   fs.writeFileSync(path.join(attachStubDir, tool), attachStub, { mode: 0o755 });
 }
 const attachPath = `${attachStubDir}${path.delimiter}${process.env.PATH}`;
 
-check('attach --exec replaces the process with exact codex and claude argv/cwd', () => {
+check('attach always runs as a guarded spawn+wait and prints no copyable command', () => {
   const codexRecord = path.join(HOME, 'attach-codex.json');
-  const codex = relay(['attach', 'codex-C', '--exec'], {
+  const codex = relay(['attach', 'codex-C'], {
     env: { PATH: attachPath, ATTACH_STUB_OUTPUT: codexRecord },
   });
   assert.equal(codex.status, 0, codex.stderr);
@@ -269,18 +262,19 @@ check('attach --exec replaces the process with exact codex and claude argv/cwd',
     cwd: process.cwd(),
   });
   assert.match(codex.stderr, /WARNING: split-brain risk/);
+  assert.doesNotMatch(codex.stdout, /command:/);
 
-  const codexBeforeRecord = path.join(HOME, 'attach-codex-before.json');
-  const codexBefore = relay(['attach', '--exec', 'codex-C'], {
-    env: { PATH: attachPath, ATTACH_STUB_OUTPUT: codexBeforeRecord },
+  const byIdRecord = path.join(HOME, 'attach-codex-id.json');
+  const byId = relay(['attach', idC], {
+    env: { PATH: attachPath, ATTACH_STUB_OUTPUT: byIdRecord },
   });
-  assert.equal(codexBefore.status, 0, codexBefore.stderr);
-  assert.deepEqual(JSON.parse(fs.readFileSync(codexBeforeRecord, 'utf8')).argv, [
+  assert.equal(byId.status, 0, byId.stderr);
+  assert.deepEqual(JSON.parse(fs.readFileSync(byIdRecord, 'utf8')).argv, [
     'resume', idC, '-C', dirC,
   ]);
 
   const claudeRecord = path.join(HOME, 'attach-claude.json');
-  const claude = relay(['attach', 'agent-A', '--exec'], {
+  const claude = relay(['attach', 'agent-A'], {
     env: { PATH: attachPath, ATTACH_STUB_OUTPUT: claudeRecord },
   });
   assert.equal(claude.status, 0, claude.stderr);
@@ -289,6 +283,41 @@ check('attach --exec replaces the process with exact codex and claude argv/cwd',
     cwd: dirA,
   });
   assert.match(claude.stderr, /WARNING: split-brain risk/);
+});
+
+check('legacy attach --exec is accepted but still uses guarded spawn+wait', () => {
+  for (const args of [
+    ['attach', 'codex-C', '--exec'],
+    ['attach', '--exec', 'codex-C'],
+  ]) {
+    const record = path.join(HOME, `attach-legacy-${args[1] === '--exec' ? 'before' : 'after'}.json`);
+    const result = relay(args, {
+      env: { PATH: attachPath, ATTACH_STUB_OUTPUT: record },
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(JSON.parse(fs.readFileSync(record, 'utf8')).argv, [
+      'resume', idC, '-C', dirC,
+    ]);
+    assert.match(result.stderr, /--exec is deprecated/);
+    assert.doesNotMatch(result.stdout, /command:/);
+  }
+});
+
+check('guarded attach inherits stdin/stdout/stderr while the relay parent waits', () => {
+  const record = path.join(HOME, 'attach-interactive.json');
+  const result = relay(['attach', 'agent-A'], {
+    input: 'interactive-input',
+    env: {
+      PATH: attachPath,
+      ATTACH_STUB_OUTPUT: record,
+      ATTACH_STUB_INTERACTIVE: '1',
+    },
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(JSON.parse(fs.readFileSync(record, 'utf8')).stdin, 'interactive-input');
+  assert.match(result.stdout, /attach-stdout/);
+  assert.match(result.stderr, /attach-stderr/);
+  assert.deepEqual(lifecycleState().active_operations ?? {}, {}, 'attach releases its durable operation id before exit');
 });
 
 check('attach strictly rejects extra operands, unknown flags, and exec after --', () => {
@@ -305,23 +334,17 @@ check('attach strictly rejects extra operands, unknown flags, and exec after --'
   assert.equal(fs.existsSync(record), false, '--exec after -- never replaced the process');
 });
 
-check('attach print mode tolerates a missing dir while --exec refuses it', () => {
+check('attach refuses a missing stored dir before guarded spawn', () => {
   const missingId = '53535353-5353-4353-8353-535353535353';
   const missingDir = path.join(HOME, 'missing-attach-dir');
   assert.equal(relay(['register', 'missing-attach', '--id', missingId, '--dir', missingDir, '--tool', 'codex']).status, 0);
-  const printed = relay(['attach', 'missing-attach']);
-  assert.equal(printed.status, 0, printed.stderr);
-  assert.match(printed.stdout, new RegExp(`command: codex resume ${missingId}`));
-  assert.doesNotMatch(printed.stdout, / -C /);
-  assert.match(printed.stdout, /WARNING: split-brain risk/);
-
-  const record = path.join(HOME, 'attach-missing.json');
-  const executed = relay(['attach', 'missing-attach', '--exec'], {
-    env: { PATH: attachPath, ATTACH_STUB_OUTPUT: record },
-  });
-  assert.equal(executed.status, 1);
-  assert.match(executed.stderr, /stored dir does not exist/);
-  assert.equal(fs.existsSync(record), false);
+  for (const args of [['attach', 'missing-attach'], ['attach', 'missing-attach', '--exec']]) {
+    const record = path.join(HOME, `attach-missing-${args.length}.json`);
+    const result = relay(args, { env: { PATH: attachPath, ATTACH_STUB_OUTPUT: record } });
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /stored dir does not exist/);
+    assert.equal(fs.existsSync(record), false);
+  }
 });
 
 check('attach rejects an unresolved non-UUID id', () => {
@@ -896,6 +919,17 @@ check('register records a per-session server and hook refresh preserves it', () 
   assert.equal(registry.agents[idW].server, sock);
 });
 
+check('attach derives registered codex app-server authority into guarded --remote mode', () => {
+  const record = path.join(HOME, 'attach-codex-remote.json');
+  const r = relay(['attach', 'codex-W'], {
+    env: { PATH: attachPath, ATTACH_STUB_OUTPUT: record },
+  });
+  assert.equal(r.status, 0, `remote attach exited ${r.status}: ${r.stderr}`);
+  assert.deepEqual(JSON.parse(fs.readFileSync(record, 'utf8')).argv, [
+    '--remote', `unix://${sock}`,
+  ]);
+});
+
 check('watch prefers the registered server over the RELAY_APP_SERVER fallback', () => {
   assert.equal(relay(['send', 'codex-W', '--', 'watch push test']).status, 0);
   const r = relay(['watch', 'codex-W', '--once'], { env: { RELAY_APP_SERVER: path.join(HOME, 'wrong.sock') } });
@@ -932,7 +966,7 @@ check('wake prefers a reachable registered app-server and an empty retry is a cl
   const wakeRecord = path.join(HOME, 'appserver-wake-fallback-record.json');
   assert.equal(relay(['send', 'codex-W', '--', 'wake push']).status, 0);
   const r = relay(['wake', 'codex-W'], {
-    env: { RELAY_WAKE_CMD_CODEX: wakeStub, WAKE_STUB_RECORD: wakeRecord, RELAY_TURN_SETTLE_MS: '20', RELAY_TURN_WAIT_MS: '8000' },
+    env: { RELAY_APP_SERVER: path.join(HOME, 'wrong-wake.sock'), RELAY_WAKE_CMD_CODEX: wakeStub, WAKE_STUB_RECORD: wakeRecord, RELAY_TURN_SETTLE_MS: '20', RELAY_TURN_WAIT_MS: '8000' },
   });
   assert.equal(r.status, 0, `wake exited ${r.status}: ${r.stderr}`);
   const first = readFrames();
@@ -1039,6 +1073,25 @@ check('watch uses RELAY_APP_SERVER when a registry entry has no server', () => {
   assert.equal(r.status, 0, `watch exited ${r.status}: ${r.stderr}`);
   assert.equal(peek('codex-env').count, 0);
 });
+check('wake uses RELAY_APP_SERVER when a registry entry has no server', () => {
+  fs.writeFileSync(framesFile, '');
+  const id = '67676767-6767-4767-8767-676767676767';
+  const wakeRecord = path.join(HOME, 'wake-env-fallback-record.json');
+  assert.equal(relay(['register', 'codex-wake-env', '--id', id, '--dir', dirW, '--tool', 'codex']).status, 0);
+  assert.equal(relay(['send', 'codex-wake-env', '--', 'wake env fallback']).status, 0);
+  const r = relay(['wake', 'codex-wake-env'], {
+    env: {
+      RELAY_APP_SERVER: sock,
+      RELAY_WAKE_CMD_CODEX: wakeStub,
+      WAKE_STUB_RECORD: wakeRecord,
+      RELAY_TURN_SETTLE_MS: '20',
+    },
+  });
+  assert.equal(r.status, 0, `wake env fallback exited ${r.status}: ${r.stderr}`);
+  assert.equal(peek('codex-wake-env').count, 0, 'wake env fallback drains through app-server');
+  assert.ok(readFrames().some((frame) => frame.method === 'thread/inject_items'));
+  assert.equal(fs.existsSync(wakeRecord), false, 'wake env fallback never launched codex exec');
+});
 check('doctor initializes and reports a registered app-server', () => {
   const watched = spawnToFiles(['watch', '--follow', idW, '--tool', 'codex'], {}, 'doctor-appserver-watch');
   const lock = path.join(HOME, 'watchers', `${idW}.lock`);
@@ -1085,6 +1138,22 @@ check('wake preserves a custom message through codex exec resume when the regist
   });
   assert.equal(r.status, 0, `custom fallback exited ${r.status}: ${r.stderr}`);
   assert.deepEqual(JSON.parse(fs.readFileSync(wakeRecord, 'utf8')).at(-1), 'custom fallback nudge');
+});
+check('wake does not persist an unreachable RELAY_APP_SERVER fallback into session authority', () => {
+  const id = '68686868-6868-4868-8868-686868686868';
+  const wakeRecord = path.join(HOME, 'env-unreachable-record.json');
+  assert.equal(relay(['register', 'codex-env-unreachable', '--id', id, '--dir', dirW, '--tool', 'codex']).status, 0);
+  const r = relay(['wake', 'codex-env-unreachable'], {
+    env: {
+      RELAY_APP_SERVER: path.join(HOME, 'env-no-such.sock'),
+      RELAY_WAKE_CMD_CODEX: wakeStub,
+      WAKE_STUB_RECORD: wakeRecord,
+    },
+  });
+  assert.equal(r.status, 0, `unreachable env fallback exited ${r.status}: ${r.stderr}`);
+  assert.ok(fs.existsSync(wakeRecord), 'unreachable env fallback uses codex exec');
+  const registry = JSON.parse(fs.readFileSync(path.join(HOME, 'registry.json'), 'utf8'));
+  assert.equal(registry.agents[id].server, null, 'unreachable env socket never becomes sealed authority');
 });
 fakeSrv.kill();
 
@@ -1459,8 +1528,32 @@ check('spawn births a claude child via the pre-mint path and registers its name'
     { env: { RELAY_SPAWN_CMD_CLAUDE: stub, STUB_RELAY_BIN: BIN } });
   assert.equal(r.status, 0, `spawn exited ${r.status}: ${r.stderr}`);
   assert.ok(/^spawned w1 \([0-9a-f-]{36}\)/.test(r.stdout), `birth line: ${r.stdout}`);
+  const id = /^spawned w1 \(([0-9a-f-]{36})\)/.exec(r.stdout)?.[1];
+  const lifecycle = lifecycleState();
+  const managed = Object.values(lifecycle.managed_workers ?? {}).find((worker) => worker.runtime_session_id === id);
+  assert.ok(managed, 'classic Claude birth claims its pre-created managed worker');
+  assert.equal(managed.state, 'Active');
+  assert.equal(lifecycle.session_bindings?.[id]?.state?.kind, 'Managed');
+  assert.deepEqual(lifecycle.pending_managed ?? {}, {}, 'successful Claude claim consumes its pending token');
   assert.equal(relay(['send', 'w1', '--', 'hello worker']).status, 0);
   assert.equal(peek('w1').count, 1, 'named worker is a routable bus target');
+});
+check('spawn births a classic codex child through an exact managed hook claim', () => {
+  const dirS = path.join(HOME, 'proj-s1-codex');
+  fs.mkdirSync(dirS, { recursive: true });
+  const r = relay(['spawn', dirS, '--tool', 'codex', '--name', 'w1-codex', '--reply-to', 'agent-A', '--timeout', '5', '--', 'task one codex'], {
+    env: { RELAY_SPAWN_CMD_CODEX: stub, STUB_RELAY_BIN: BIN, STUB_TOOL: 'codex' },
+  });
+  assert.equal(r.status, 0, `spawn exited ${r.status}: ${r.stderr}`);
+  const id = /^spawned w1-codex \(([0-9a-f-]{36})\)/.exec(r.stdout)?.[1];
+  assert.ok(id, `birth line: ${r.stdout}`);
+  const lifecycle = lifecycleState();
+  const managed = Object.values(lifecycle.managed_workers ?? {}).find((worker) => worker.runtime_session_id === id);
+  assert.ok(managed, 'classic Codex birth claims its pre-created managed worker');
+  assert.equal(managed.state, 'Active');
+  assert.equal(managed.execution, 'ObservationOnly');
+  assert.equal(lifecycle.session_bindings?.[id]?.state?.kind, 'Managed');
+  assert.deepEqual(lifecycle.pending_managed ?? {}, {}, 'successful Codex claim consumes its pending token');
 });
 check('app-server spawn returns before turn completion while its detached pump later accepts bus elicitation', () => {
   const dirS = path.join(HOME, 'proj-s2');
@@ -1502,7 +1595,13 @@ check('app-server spawn returns before turn completion while its detached pump l
     let registry = JSON.parse(fs.readFileSync(path.join(HOME, 'registry.json'), 'utf8'));
     assert.equal(registry.names.w2, id);
     assert.equal(registry.agents[id].server, fake.sock);
-    assert.equal(registry.agents[id].spawned_via, 'app-server', 'origin is registered before the first turn');
+    assert.equal(registry.agents[id].spawned_via, 'app-server', 'origin is published with the managed claim before the first turn');
+    const lifecycle = lifecycleState();
+    const managed = Object.values(lifecycle.managed_workers ?? {}).find((worker) => worker.runtime_session_id === id);
+    assert.ok(managed, 'app-server thread birth claims a managed lifecycle worker');
+    assert.equal(managed.state, 'Active');
+    assert.equal(lifecycle.session_bindings?.[id]?.state?.kind, 'Managed');
+    assert.deepEqual(lifecycle.pending_managed ?? {}, {}, 'Codex claim consumes its pending token before turn/start');
 
     waitFor(
       () => fake.frames().some((frame) => frame.id === 990 && frame.result?.action === 'accept'),
@@ -1543,7 +1642,12 @@ check('app-server spawn surfaces initial turn/start failure synchronously withou
     assert.notEqual(r.status, 0);
     assert.match(r.stderr, /initial turn rejected/);
     assert.equal(fake.frames().filter((frame) => frame.method === 'turn/start').length, 1);
+    assert.equal(fake.frames().some((frame) => frame.method === 'turn/interrupt'), false, 'unknown turn identity is never interrupted');
     assert.equal(fake.frames().some((frame) => frame.id === 990 && frame.result), false, 'no detached elicitation pump exists');
+    const lifecycle = lifecycleState();
+    const managed = Object.values(lifecycle.managed_workers ?? {}).find((worker) => worker.runtime_session_id === id);
+    assert.equal(managed?.state, 'FencingUnconfirmed', 'rejected turn/start does not leave the managed worker Active');
+    assert.match(managed?.proof_gap ?? '', /turn.*identity|turn\/start/i);
     waitFor(() => fake.frames().some((frame) => frame.event === 'connection/closed'), 'failed turn/start connection close');
   } finally {
     fake.child.kill('SIGKILL');
@@ -1565,10 +1669,43 @@ check('app-server spawn --watch blocks until the detached pump reports turn comp
     fake.child.kill('SIGKILL');
   }
 });
+check('app-server pump failure after turn/start retains fail-closed lifecycle authority', () => {
+  const dirS = path.join(HOME, 'proj-spawn-appserver-disconnect');
+  const id = '73737373-7373-4373-8373-737373737374';
+  const fake = startFakeAppServer('spawn-appserver-disconnect', {
+    threadId: id,
+    turnId: 'turn-disconnected',
+    disconnectAfterTurnStart: true,
+  });
+  fs.mkdirSync(dirS, { recursive: true });
+  try {
+    const r = relay(['spawn', dirS, '--tool', 'codex', '--name', 'appserver-disconnect', '--server', fake.sock, '--reply-to', 'agent-A', '--timeout', '3', '--watch', '--', 'disconnect']);
+    assert.notEqual(r.status, 0);
+    assert.match(r.stdout, /first turn failed/i);
+    const lifecycle = lifecycleState();
+    const managed = Object.values(lifecycle.managed_workers ?? {}).find((worker) => worker.runtime_session_id === id);
+    assert.equal(managed?.state, 'FencingUnconfirmed');
+    assert.match(managed?.proof_gap ?? '', /connection|terminal state is unknown/i);
+    assert.equal(
+      Object.values(lifecycle.active_operations ?? {}).some((operation) => operation.runtime_session_id === id),
+      false,
+      'failed pump consumes its own active-operation guard',
+    );
+  } finally {
+    fake.child.kill('SIGKILL');
+  }
+});
 check('app-server spawn pump exits and closes its connection at the spawn timeout', () => {
   const dirS = path.join(HOME, 'proj-spawn-appserver-timeout');
   const id = '74747474-7474-4474-8474-747474747474';
-  const fake = startFakeAppServer('spawn-appserver-timeout', { threadId: id, neverComplete: true });
+  const exactTurnId = 'turn-timeout-exact';
+  const fake = startFakeAppServer('spawn-appserver-timeout', {
+    threadId: id,
+    turnId: exactTurnId,
+    neverComplete: true,
+    interruptMismatchedCompletion: true,
+    interruptCompletionDelayMs: 150,
+  });
   fs.mkdirSync(dirS, { recursive: true });
   try {
     const started = Date.now();
@@ -1577,7 +1714,40 @@ check('app-server spawn pump exits and closes its connection at the spawn timeou
     assert.notEqual(r.status, 0, 'timed-out pump is not a successful watched turn');
     assert.ok(elapsedMs >= 900 && elapsedMs < 3000, `pump honored the one-second cap (${elapsedMs}ms)`);
     assert.match(r.stdout, /first turn failed/);
+    const frames = fake.frames();
+    const turnStart = frames.find((frame) => frame.method === 'turn/start');
+    const interrupt = frames.find((frame) => frame.method === 'turn/interrupt');
+    assert.ok(frames.indexOf(interrupt) > frames.indexOf(turnStart), 'interrupt follows the exact started turn');
+    assert.deepEqual(interrupt.params, { threadId: id, turnId: exactTurnId });
+    const lifecycle = lifecycleState();
+    const managed = Object.values(lifecycle.managed_workers ?? {}).find((worker) => worker.runtime_session_id === id);
+    assert.equal(managed?.state, 'Fenced', 'matching completion confirms the published timeout fence');
     waitFor(() => fake.frames().some((frame) => frame.event === 'connection/closed'), 'timed-out pump connection close');
+  } finally {
+    fake.child.kill('SIGKILL');
+  }
+});
+check('app-server timeout retains FencingUnconfirmed when exact interrupt cannot be proven', () => {
+  const dirS = path.join(HOME, 'proj-spawn-appserver-unconfirmed');
+  const id = '75757575-7575-4575-8575-757575757575';
+  const exactTurnId = 'turn-unconfirmed-exact';
+  const fake = startFakeAppServer('spawn-appserver-unconfirmed', {
+    threadId: id,
+    turnId: exactTurnId,
+    neverComplete: true,
+    interruptNeverComplete: true,
+    statuses: ['active'],
+  });
+  fs.mkdirSync(dirS, { recursive: true });
+  try {
+    const r = relay(['spawn', dirS, '--tool', 'codex', '--name', 'appserver-unconfirmed', '--server', fake.sock, '--reply-to', 'agent-A', '--timeout', '1', '--watch', '--', 'stay uncertain']);
+    assert.notEqual(r.status, 0);
+    const interrupt = fake.frames().find((frame) => frame.method === 'turn/interrupt');
+    assert.deepEqual(interrupt?.params, { threadId: id, turnId: exactTurnId });
+    const lifecycle = lifecycleState();
+    const managed = Object.values(lifecycle.managed_workers ?? {}).find((worker) => worker.runtime_session_id === id);
+    assert.equal(managed?.state, 'FencingUnconfirmed');
+    assert.match(managed?.proof_gap ?? '', /interrupt|idle|completion/i);
   } finally {
     fake.child.kill('SIGKILL');
   }
@@ -1675,7 +1845,14 @@ check('wake refuses a concurrent relay-launched resume and proceeds after its lo
   assert.match(refused.stderr, /wake refused: resume already running/);
 
   active.child.kill('SIGKILL');
-  sleep(100);
+  waitFor(() => {
+    try {
+      const operations = Object.values(lifecycleState().active_operations ?? {});
+      return operations.every((operation) => operation.runtime_session_id !== idA);
+    } catch {
+      return false;
+    }
+  }, 'the detached supervisor to reap the cancelled wake');
   const after = relay(['wake', 'agent-A', '--model', 'opus', '--effort', 'max'], {
     env: { RELAY_WAKE_CMD_CLAUDE: wakeStub },
   });
@@ -1721,6 +1898,14 @@ process.exit(hook.status ?? 1);
     );
     assert.equal(peek('wake-retry').count, 1, 'refused wake leaves mail durable');
     active.child.kill('SIGKILL');
+    waitFor(() => {
+      try {
+        const operations = Object.values(lifecycleState().active_operations ?? {});
+        return operations.every((operation) => operation.runtime_session_id !== id);
+      } catch {
+        return false;
+      }
+    }, 'the wake-retry supervisor to reap the cancelled wake');
     waitFor(() => peek('wake-retry').count === 0, 'watch retry delivery after lock release', 8000);
   } finally {
     active.child.kill('SIGKILL');
@@ -1945,6 +2130,21 @@ check('doctor gives an actionable command for an unknown named identity', () => 
   const r = relay(['doctor', '--id', 'not-registered']);
   assert.equal(r.status, 1);
   assert.match(r.stdout, /FAIL identity: unknown session not-registered — fix: relay list/);
+});
+
+check('detached lifecycle supervisor preserves PTY and flood-disconnect custody', () => {
+  const result = spawnSync(
+    process.execPath,
+    [path.join(PLUGIN, 'test', 'supervisor-custody.mjs'), '--matrix'],
+    {
+      cwd: path.resolve(PLUGIN, '..', '..'),
+      env: { ...process.env, RELAY_BIN: BIN },
+      encoding: 'utf8',
+      timeout: 20000,
+    },
+  );
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+  assert.match(result.stdout, /SUPERVISOR_CUSTODY PASS/);
 });
 
 fs.rmSync(HOME, { recursive: true, force: true });

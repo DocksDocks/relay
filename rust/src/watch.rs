@@ -30,9 +30,11 @@
 // final: only a failure before inject succeeds may re-enqueue mail.
 
 use crate::appserver;
-use crate::cli::Args;
+use crate::cli::{Args, DEFAULT_NUDGE};
 use crate::hook;
+use crate::lifecycle::{self, ChildLaunchSpec, DoorbellMessage, OperationKind};
 use crate::sha256::Sha256;
+use crate::spawn;
 use crate::store;
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -183,6 +185,43 @@ fn resolve_targets(args: &Args, server: Option<&str>) -> Vec<Target> {
         .collect()
 }
 
+fn materialize_appserver_authority(target: &Target) -> Result<(), String> {
+    let Some(server) = target.server.as_deref() else {
+        return Ok(());
+    };
+    if let Some(entry) = store::resolve(&target.id) {
+        if entry.server.as_deref() == Some(server) {
+            return Ok(());
+        }
+        store::register(
+            &target.id,
+            entry.dir.as_deref(),
+            None,
+            Some(&entry.tool),
+            Some(server),
+        )?;
+        return Ok(());
+    }
+    if crate::lifecycle::LifecycleStore::default()
+        .read_binding(&target.id)?
+        .is_some()
+    {
+        return Err("app-server target has lifecycle state but no registry entry".to_string());
+    }
+    let dir = target
+        .dir
+        .as_deref()
+        .ok_or_else(|| "unregistered app-server target requires --dir".to_string())?;
+    store::register(
+        &target.id,
+        Some(dir),
+        None,
+        Some(&target.tool),
+        Some(server),
+    )?;
+    Ok(())
+}
+
 pub fn run(raw: Vec<String>) -> ! {
     let args = Args(raw);
     if let Some(id) = args.flag("follow") {
@@ -226,6 +265,8 @@ pub fn run(raw: Vec<String>) -> ! {
             active_targets.push(target);
             continue;
         }
+        materialize_appserver_authority(&target)
+            .unwrap_or_else(|error| die(&format!("cannot bind app-server authority: {error}")));
         let mode = if once { "once" } else { "doorbell" };
         match store::acquire_watcher_lock(&target.id, &target.tool, mode) {
             Ok(guard) => {
@@ -264,7 +305,19 @@ pub fn run(raw: Vec<String>) -> ! {
                 if appserver::probe(server).is_err() {
                     continue;
                 }
-                match appserver::acknowledge(server, &t.id, t.allow_bus) {
+                let mut guard = match lifecycle::admit_operation(&t.id, OperationKind::WatchAck)
+                    .and_then(lifecycle::Admission::into_guard)
+                {
+                    Ok(guard) => guard,
+                    Err(error) => {
+                        eprintln!(
+                            "[relay watch] acknowledgement for {} refused: {error}",
+                            t.id
+                        );
+                        continue;
+                    }
+                };
+                match appserver::acknowledge_with_guard(&mut guard, t.allow_bus) {
                     Ok(appserver::DeliveryOutcome::Delivered) => {
                         pending_ack.remove(&t.id);
                     }
@@ -346,7 +399,7 @@ pub fn run(raw: Vec<String>) -> ! {
                                 .min(WAKE_RETRY_MAX_MS);
                             retry.next_at = Instant::now() + Duration::from_millis(delay_ms);
                             eprintln!(
-                                "[relay watch] wake fallback for {} refused; retrying in {}ms",
+                                "[relay watch] wake refused for {} (fallback); retrying in {}ms",
                                 t.id, delay_ms
                             );
                         }
@@ -575,17 +628,23 @@ fn push_target(
         Ok(appserver::ThreadState::Idle) => {}
         Err(e) => return Err(format!("cannot read thread status for {}: {e}", t.id)),
     }
-    let msgs = store::drain(&t.id)?;
-    if msgs.is_empty() {
+    let kind = if auto_turn {
+        OperationKind::WatchAutoTurn
+    } else {
+        OperationKind::WatchInject
+    };
+    let mut guard = lifecycle::admit_operation(&t.id, kind)?.into_guard()?;
+    let drained = store::drain_with_guard(&mut guard)?;
+    if drained.messages().is_empty() {
         return Ok(PushOutcome::Delivered);
     }
-    let block = hook::mail_block(&msgs, &t.id);
-    match appserver::deliver(server, &t.id, &block, auto_turn, settle_ms, t.allow_bus) {
+    let block = hook::mail_block(drained.messages(), &t.id);
+    match appserver::deliver_with_guard(&mut guard, &block, auto_turn, settle_ms, t.allow_bus) {
         Ok(outcome) => {
             println!(
                 "{}",
                 str_obj(&[
-                    ("delivered", &msgs.len().to_string()),
+                    ("delivered", &drained.messages().len().to_string()),
                     ("to", &t.id),
                     ("mode", if auto_turn { "auto-turn" } else { "inject" }),
                 ])
@@ -596,19 +655,13 @@ fn push_target(
             }
         }
         Err(appserver::DeliveryError::BeforeInject(e)) => {
-            for m in &msgs {
-                if let Some(mo) = m.get::<HashMap<String, JsonValue>>() {
-                    let _ = store::enqueue(&t.id, mo);
-                }
-            }
+            drained.rollback()?;
             Err(format!("push to {} failed ({e}); mail re-enqueued", t.id))
         }
         Err(appserver::DeliveryError::AfterInject(e)) => Ok(PushOutcome::AckDeferred(Some(e))),
     }
 }
 
-// Doorbell fallback via self-exec: `wake` lives in cli::run, which never
-// returns, so reuse it as a child process rather than a call.
 fn wake_fallback(t: &Target, dry: bool) -> WakeOutcome {
     if dry {
         println!(
@@ -621,28 +674,45 @@ fn wake_fallback(t: &Target, dry: bool) -> WakeOutcome {
         );
         return WakeOutcome::Delivered;
     }
-    let exe = std::env::current_exe().unwrap_or_else(|_| "relay".into());
-    let mut c = std::process::Command::new(exe);
-    c.arg("wake")
-        .arg("--id")
-        .arg(&t.id)
-        .arg("--tool")
-        .arg(&t.tool);
-    if let Some(d) = &t.dir {
-        c.arg("--dir").arg(d);
-    }
-    match c.status() {
-        Ok(s) if s.success() => WakeOutcome::Delivered,
-        Ok(s) if s.code() == Some(3) => WakeOutcome::Refused,
-        Ok(s) => {
-            eprintln!("[relay watch] wake fallback for {} exited {s}", t.id);
-            WakeOutcome::Failed
+    let message = match DoorbellMessage::parse(DEFAULT_NUDGE) {
+        Ok(message) => message,
+        Err(error) => {
+            eprintln!("[relay watch] invalid wake fallback message: {error}");
+            return WakeOutcome::Failed;
         }
-        Err(e) => {
+    };
+    let mut guard = match lifecycle::admit_operation(&t.id, OperationKind::WatchWakeFallback)
+        .and_then(lifecycle::Admission::into_guard)
+    {
+        Ok(guard) => guard,
+        Err(error) => {
+            eprintln!("[relay watch] wake fallback for {} refused: {error}", t.id);
+            return WakeOutcome::Refused;
+        }
+    };
+    let _resume_guard = match store::acquire_resume_lock(&t.id, &t.tool) {
+        Ok(lock) => lock,
+        Err(store::LockAcquireError::Busy(_)) => return WakeOutcome::Refused,
+        Err(store::LockAcquireError::Io(error)) => {
             eprintln!(
-                "[relay watch] wake fallback for {} failed to spawn: {e}",
+                "[relay watch] wake fallback for {} cannot acquire resume lock: {error}",
                 t.id
             );
+            return WakeOutcome::Failed;
+        }
+    };
+    match spawn::run_child_with_guard(&mut guard, ChildLaunchSpec::WatchWakeFallback(message)) {
+        Ok(output) if output.status.success() => WakeOutcome::Delivered,
+        Ok(output) if output.status.code() == Some(3) => WakeOutcome::Refused,
+        Ok(output) => {
+            eprintln!(
+                "[relay watch] wake fallback for {} exited {}",
+                t.id, output.status
+            );
+            WakeOutcome::Failed
+        }
+        Err(error) => {
+            eprintln!("[relay watch] wake fallback for {} failed: {error}", t.id);
             WakeOutcome::Failed
         }
     }

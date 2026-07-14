@@ -5,8 +5,8 @@ user-invocable: true
 allowed-tools: Bash, Read
 metadata:
   pattern: tool-wrapper
-  updated: "2026-07-12"
-  content_hash: "95861e99d5b75300cd97fc1429a7294f08933567339ebb77e169b6a123c2bb55"
+  updated: "2026-07-14"
+  content_hash: "df73198debc7b4a5a83d90bbcaffc775df04cdce3b7aa19dc02a1938f26253cd"
 ---
 
 # Session relay
@@ -30,7 +30,7 @@ Relay children and doorbell wakes run unattended and can reprocess full transcri
 | Piece | What it does | Where |
 |---|---|---|
 | Bus MCP server | `whoami` / `register` / `roster` / `send` / `inbox` / `discover` tools over the shared store | namespaced `mcp__plugin_session-relay_bus__*` |
-| Shared store | registry, JSONL inboxes, liveness locks, watcher offsets, and bounded spawn logs | `~/.agent-relay/` (override: `AGENT_RELAY_HOME`) |
+| Shared store | discovery registry, `lifecycle-v1.json` managed authority, JSONL inboxes, liveness locks, watcher offsets, and bounded spawn logs | `~/.agent-relay/` (override: `AGENT_RELAY_HOME`) |
 | SessionStart hook | auto-registers each session (Claude **or** Codex) and injects pending mail on start/resume; on Claude it also nudges the agent to arm `relay watch --follow <id>` as its Monitor | runs automatically |
 | UserPromptSubmit hook | drains pending mail into context on every user turn (both tools) — a live session sees mail without being woken | runs automatically |
 | Live discovery | `discover` scans the raw Claude + Codex session stores → sessions running now, even ones that never joined the bus | `discover` tool / `bin/relay discover` |
@@ -47,7 +47,7 @@ Delivery matrix — how mail reaches a recipient in each state:
 
 ## Store hygiene
 
-`relay hook` and `relay bus` opportunistically sweep the shared store at most once every 6 hours. A session is removed only when its registry activity and every mailbox/marker/watcher/lock/spawn-log surface are all older than 14 days and neither watcher nor resume lock is held; the invoking session is never collected. Set `AGENT_RELAY_GC_DAYS` to another non-negative day count, or `0` to disable GC. Spawn stderr keeps flowing through a bounded pump that retains the newest diagnostic tail at approximately 4 MiB per log.
+`relay hook` and `relay bus` opportunistically sweep the shared store at most once every 6 hours. A session is removed only when its discovery activity and every mailbox/marker/watcher/lock/spawn-log surface are all older than 14 days, lifecycle authority does not retain it, and neither watcher nor resume lock is held; the invoking session is never collected. Managed state lives in the separate mode-0600 `lifecycle-v1.json`, so an older relay process rewriting `registry.json` cannot erase it. Malformed lifecycle authority fails closed. Set `AGENT_RELAY_GC_DAYS` to another non-negative day count, or `0` to disable GC. Spawn stderr keeps flowing through a bounded pump that retains the newest diagnostic tail at approximately 4 MiB per log.
 
 ## Token discipline
 
@@ -275,10 +275,11 @@ on a private socket because other relay sessions still control mail content.
 
 Socket precedence is per-session registry `server` first, then the invocation's
 `--server`, then the store-wide `RELAY_APP_SERVER` fallback. A SessionStart hook
-refresh preserves the registered socket. `relay spawn --server <socket>` records
-the returned thread id itself with `spawned_via: app-server`, then starts the
-first worker turn on that same server-owned connection; no `codex exec` process
-or SessionStart hook is involved.
+refresh preserves the registered socket. `relay spawn --server <socket>`
+atomically binds the returned thread id to its managed worker and publishes its
+discovery entry with `spawned_via: app-server`, then starts the first worker turn
+on that same server-owned connection; no `codex exec` process or SessionStart
+hook is involved.
 With no configured socket, or when the configured socket cannot complete a
 WebSocket initialize handshake, watch/wake use the existing locked tool-aware
 doorbell. A reachable app-server always owns Codex delivery; even an explicit
@@ -315,7 +316,8 @@ doorbell behavior.
 - Watch stays attached to a started turn because MCP calls elicit approval from
   the connected client regardless of `approvalPolicy: never`. Joined/foreign
   threads decline every elicitation, including `bus`; only relay-spawned threads
-  may accept their own bus server once the registry origin marker is present.
+  may accept their own bus server once the managed claim and origin marker have
+  been published together.
 - Claude sessions and Codex entries without a reachable server use the locked
   `relay wake` doorbell. `--once` does a single poll+deliver+exit (cron/tests).
 - Each long-running target holds `~/.agent-relay/watchers/<id>.lock`; `--all`
@@ -343,12 +345,14 @@ birth a real, resumable session there instead:
 - **Model discipline:** pass `--model`/`--effort` every time. As of 2026-07, use
   `--model opus --effort max` for a Claude child or `--model gpt-5.6-sol --effort
   xhigh` for a Codex child unless the user's current tier list says otherwise.
-- With no app-server, the child launches detached and spawn returns as soon as
-  the child's SessionStart hook registers it on the bus (typically <1s), long
-  before the task finishes. With Codex `--server <socket>`, relay instead calls
-  `thread/start`, self-registers the returned id and relay-owned origin, builds
-  the first prompt with that id, and synchronously confirms `turn/start` before
-  returning. No `codex exec` process or hook runs on this path.
+- **Managed birth:** before launching a classic Claude/Codex child, relay writes
+  a pending worker and passes one exact claim token only to that child. Its
+  SessionStart hook must bind the observed session id `Active` before spawn
+  reports birth; a registration without that claim is killed and refused. With
+  Codex `--server <socket>`, relay instead orders `pending → thread/start →
+  atomic exact claim + discovery → guarded turn/start`. No `codex exec` process
+  or hook runs on the app-server path, and first-turn bytes cannot precede
+  `Active`.
 - The first prompt carries a standing prefix: report results/questions to
   `--reply-to` (default: this session's bus name) via the absolute relay binary
   path — so the reply loop works even in a project where session-relay isn't
@@ -359,8 +363,14 @@ birth a real, resumable session there instead:
   elicitations. `--watch` waits for that helper instead. The helper accepts
   `bus` only because the relay registered the thread's origin before starting
   the turn; joined/foreign threads still decline all elicitations. The existing
-  `--timeout` (30 seconds by default) is a hard pump cap: completion, socket/
-  protocol error, or timeout closes the connection and exits the helper.
+  `--timeout` (30 seconds by default) is a hard pump cap. At timeout relay first
+  publishes a lifecycle fence, then interrupts only the exact recorded
+  `{threadId, turnId}` under the drained fence permit. Matching completion or an
+  idle exact thread confirms `Fenced`; missing/mismatched evidence stays
+  `FencingUnconfirmed` and refuses re-entry. The cancellation wait is capped at
+  five seconds. A failed `turn/start` has no safe turn id, so it fences
+  unconfirmed and emits no interrupt. A connection/pump failure after
+  `turn/start` also fences unconfirmed because terminal state cannot be proven.
 - **Completion signal:** add `--watch` to keep the spawn caller attached to the
   direct child process until its first turn exits. The relay exit mirrors the
   child and stdout reports `first turn complete` or `first turn failed`; without

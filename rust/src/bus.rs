@@ -10,6 +10,7 @@
 // writes — the MCP protocol never hands a server the host's session id.
 
 use crate::discover;
+use crate::lifecycle::{self, OperationKind};
 use crate::store;
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
@@ -137,6 +138,15 @@ fn text(payload: JsonValue, is_error: bool) -> JsonValue {
 enum ToolErr {
     Rpc(f64, String),
     Soft(String),
+}
+
+fn drain_inbox(id: &str) -> Result<Vec<JsonValue>, ToolErr> {
+    let mut guard = lifecycle::admit_operation(id, OperationKind::McpInboxDrain)
+        .and_then(lifecycle::Admission::into_guard)
+        .map_err(ToolErr::Soft)?;
+    store::drain_with_guard(&mut guard)
+        .map(store::DrainReceipt::into_messages)
+        .map_err(ToolErr::Soft)
 }
 
 fn arg_str(args: &HashMap<String, JsonValue>, key: &str) -> Option<String> {
@@ -292,7 +302,7 @@ fn call_tool(
                         true,
                     ));
                 };
-                let messages = store::drain(&e.id).map_err(ToolErr::Soft)?;
+                let messages = drain_inbox(&e.id)?;
                 return Ok(text(
                     obj(vec![
                         ("count", JsonValue::from(messages.len() as f64)),
@@ -311,7 +321,7 @@ fn call_tool(
                     false,
                 ));
             };
-            let messages = store::drain(&id).map_err(ToolErr::Soft)?;
+            let messages = drain_inbox(&id)?;
             Ok(text(
                 obj(vec![
                     ("count", JsonValue::from(messages.len() as f64)),

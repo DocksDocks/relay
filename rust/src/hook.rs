@@ -14,9 +14,13 @@
 // Never blocks the session: any error is logged to stderr and we exit 0.
 
 use crate::cli::Args;
+use crate::lifecycle::{
+    Admission, BindingState, ClaimManagedAttach, ClaimOutcome, LifecycleStore, ManagedState,
+    OperationKind,
+};
 use crate::store;
 use std::collections::HashMap;
-use std::io::Read;
+use std::io::{Read, Write};
 use tinyjson::JsonValue;
 
 #[derive(Clone, Copy, PartialEq)]
@@ -216,6 +220,12 @@ fn inner(tool: &str, event: HookEvent, input: &str) -> Result<(), String> {
                 .map(|d| d.to_string_lossy().into_owned())
                 .unwrap_or_else(|_| ".".to_string())
         });
+    if event == HookEvent::SessionStart {
+        if let Some(reason) = managed_session_start(tool, &id, &dir)? {
+            print_managed_stop(&reason)?;
+            return Ok(());
+        }
+    }
     if let Err(e) = store::gc(std::time::SystemTime::now(), Some(&id)) {
         eprintln!("[session-relay/hook] GC skipped: {e}");
     }
@@ -225,11 +235,28 @@ fn inner(tool: &str, event: HookEvent, input: &str) -> Result<(), String> {
     // kernel flock is held. On crash/SIGKILL the OS releases that lock and the
     // next prompt automatically resumes the normal hook drain. SessionStart
     // still wins startup mail before a channel finishes initializing.
-    let msgs = if event == HookEvent::Prompt && store::live_watcher_mode(&id, "channel") {
-        Vec::new()
-    } else {
-        store::drain(&id)?
-    };
+    let (msgs, guarded_emission, drained_receipt) =
+        if event == HookEvent::Prompt && store::live_watcher_mode(&id, "channel") {
+            (Vec::new(), None, None)
+        } else {
+            let kind = match event {
+                HookEvent::SessionStart => OperationKind::SessionStartDrain,
+                HookEvent::Prompt => OperationKind::UserPromptDrain,
+            };
+            let mut guard = match LifecycleStore::default().admit_operation(&id, kind)? {
+                Admission::Unmanaged(guard) | Admission::Managed(guard) => guard,
+                Admission::Refused { state, reason, .. } => {
+                    print_managed_stop(&format!(
+                        "managed worker {}: {reason}",
+                        managed_state_name(state)
+                    ))?;
+                    return Ok(());
+                }
+            };
+            let drained = store::drain_with_guard(&mut guard)?;
+            let msgs = drained.messages().to_vec();
+            (msgs, Some((guard, kind)), Some(drained))
+        };
     let no_watch = std::env::var("RELAY_NO_WATCH").as_deref() == Ok("1");
     let relay_exe = std::env::current_exe()
         .map(|p| p.to_string_lossy().into_owned())
@@ -253,7 +280,105 @@ fn inner(tool: &str, event: HookEvent, input: &str) -> Result<(), String> {
     let out = JsonValue::from(root)
         .stringify()
         .map_err(|e| format!("serialize hook output: {e}"))?;
-    print!("{out}");
+    if let Some((mut guard, kind)) = guarded_emission {
+        if let Err(error) = guard.authorize_use(kind) {
+            if let Some(receipt) = drained_receipt {
+                receipt.rollback()?;
+            }
+            print_managed_stop(&format!(
+                "hook emission refused after lifecycle changed: {error}"
+            ))?;
+            return Ok(());
+        }
+    }
+    if let Err(error) = std::io::stdout().write_all(out.as_bytes()) {
+        if let Some(receipt) = drained_receipt {
+            receipt.rollback()?;
+        }
+        return Err(format!("write hook output: {error}"));
+    }
+    if let Some(receipt) = drained_receipt {
+        receipt.commit();
+    }
+    Ok(())
+}
+
+fn managed_session_start(tool: &str, id: &str, dir: &str) -> Result<Option<String>, String> {
+    let worker_id = std::env::var("RELAY_MANAGED_WORKER_ID").ok();
+    let generation = std::env::var("RELAY_MANAGED_GENERATION").ok();
+    let raw_token = std::env::var("RELAY_MANAGED_ATTACH_TOKEN").ok();
+    let supplied = [
+        worker_id.is_some(),
+        generation.is_some(),
+        raw_token.is_some(),
+    ];
+    let store = LifecycleStore::default();
+    if supplied.iter().any(|present| *present) {
+        if !supplied.iter().all(|present| *present) {
+            return Ok(Some(
+                "managed attach metadata is incomplete; refusing SessionStart".to_string(),
+            ));
+        }
+        let request = ClaimManagedAttach {
+            raw_token: raw_token.expect("checked above"),
+            worker_id: worker_id.expect("checked above"),
+            generation: generation.expect("checked above"),
+            runtime_session_id: id.to_string(),
+            tool: tool.to_string(),
+            cwd: dir.to_string(),
+        };
+        return match store.claim_managed_attach(request) {
+            Ok(ClaimOutcome::Active { .. }) => Ok(None),
+            Ok(ClaimOutcome::Refused { reason, .. }) => Ok(Some(reason)),
+            Err(error) => Ok(Some(format!("managed attach refused: {error}"))),
+        };
+    }
+
+    let Some(binding) = store.read_binding(id)? else {
+        return Ok(None);
+    };
+    match binding.state {
+        BindingState::Unmanaged => Ok(None),
+        BindingState::UnmanagedCanceling { .. } => Ok(Some(
+            "session has an exact unmanaged cancellation in progress".to_string(),
+        )),
+        BindingState::Managed { .. } => match store.resume_managed_attach(id, tool, dir) {
+            Ok(ClaimOutcome::Active { .. }) => Ok(None),
+            Ok(ClaimOutcome::Refused { state, reason, .. }) => Ok(Some(format!(
+                "managed worker {}: {reason}",
+                managed_state_name(state)
+            ))),
+            Err(error) => Ok(Some(format!("managed resume refused: {error}"))),
+        },
+        BindingState::Claiming { .. } => Ok(Some(
+            "managed attach is still Claiming; refusing duplicate prompt start".to_string(),
+        )),
+        BindingState::GcDeleting { .. } => Ok(Some(
+            "session binding is being garbage-collected; refusing SessionStart".to_string(),
+        )),
+    }
+}
+
+fn managed_state_name(state: ManagedState) -> &'static str {
+    match state {
+        ManagedState::Attaching => "Attaching",
+        ManagedState::Active => "Active",
+        ManagedState::Fencing => "Fencing",
+        ManagedState::FencingUnconfirmed => "FencingUnconfirmed",
+        ManagedState::Fenced => "Fenced",
+        ManagedState::TerminalRetained => "TerminalRetained",
+        ManagedState::TerminalReleasable => "TerminalReleasable",
+    }
+}
+
+fn print_managed_stop(reason: &str) -> Result<(), String> {
+    let mut root = HashMap::new();
+    root.insert("continue".into(), JsonValue::from(false));
+    root.insert("stopReason".into(), JsonValue::from(reason.to_string()));
+    let output = JsonValue::from(root)
+        .stringify()
+        .map_err(|error| format!("serialize managed hook stop: {error}"))?;
+    print!("{output}");
     Ok(())
 }
 

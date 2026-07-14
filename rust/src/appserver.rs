@@ -19,7 +19,10 @@
 //     only when the registry proves the relay spawned the thread; joined or
 //     foreign threads decline every elicitation.
 
+use crate::lifecycle::{OperationKind, ReentryGuard};
+use crate::sha256::Sha256;
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
@@ -47,9 +50,25 @@ pub(crate) enum DeliveryError {
     AfterInject(String),
 }
 
+enum GuardedRequestError {
+    BeforeSend(String),
+    AfterSend(String),
+}
+
+impl GuardedRequestError {
+    fn into_message(self) -> String {
+        match self {
+            Self::BeforeSend(message) | Self::AfterSend(message) => message,
+        }
+    }
+}
+
 pub(crate) struct SpawnedThread {
     ws: WsConn,
     id: String,
+    turn_id: Option<String>,
+    server: String,
+    server_fingerprint: String,
 }
 
 impl SpawnedThread {
@@ -57,22 +76,64 @@ impl SpawnedThread {
         &self.id
     }
 
-    pub(crate) fn start_initial_turn(
+    pub(crate) fn turn_id(&self) -> Option<&str> {
+        self.turn_id.as_deref()
+    }
+
+    pub(crate) fn start_initial_turn_with_guard(
         &mut self,
+        guard: &mut ReentryGuard,
         prompt: &str,
         model: Option<&str>,
         effort: Option<&str>,
     ) -> Result<(), String> {
-        self.ws.request(
-            2,
-            "turn/start",
-            initial_turn_params(&self.id, prompt, model, effort),
-        )?;
+        let target = guard.authorize_use(OperationKind::InitialTurn)?;
+        if target.thread_id.as_deref() != Some(self.id.as_str())
+            || target.server_fingerprint.as_deref() != Some(self.server_fingerprint.as_str())
+        {
+            return Err("initial-turn guard does not match spawned thread authority".to_string());
+        }
+        let result = self
+            .ws
+            .request_with_guard(
+                2,
+                "turn/start",
+                initial_turn_params(&self.id, prompt, model, effort),
+                guard,
+                OperationKind::InitialTurn,
+            )
+            .map_err(GuardedRequestError::into_message)?;
+        let turn_id = turn_id_from_start_result(&result)?;
+        self.turn_id = Some(turn_id);
         Ok(())
     }
 
-    pub(crate) fn pump(mut self, timeout_ms: u64) -> Result<bool, String> {
-        self.ws.pump_turn(timeout_ms, true)
+    pub(crate) fn pump_with_guard(
+        &mut self,
+        guard: &mut ReentryGuard,
+        timeout_ms: u64,
+    ) -> Result<bool, String> {
+        guard.authorize_use(OperationKind::InitialTurn)?;
+        let turn_id = self
+            .turn_id
+            .as_deref()
+            .ok_or_else(|| "initial turn identity was not recorded".to_string())?;
+        self.ws
+            .pump_turn_with_guard(timeout_ms, true, guard, &self.id, turn_id)
+    }
+
+    pub(crate) fn interrupt_initial_turn(&mut self, timeout_ms: u64) -> Result<bool, String> {
+        let turn_id = self
+            .turn_id
+            .as_deref()
+            .ok_or_else(|| "initial turn identity was not recorded".to_string())?;
+        if self
+            .ws
+            .interrupt_and_confirm(3, &self.id, turn_id, timeout_ms)?
+        {
+            return Ok(true);
+        }
+        Ok(thread_state(&self.server, &self.id)? == ThreadState::Idle)
     }
 }
 
@@ -81,30 +142,81 @@ fn die(msg: &str) -> ! {
     std::process::exit(1);
 }
 
-pub(crate) fn deliver(
-    server: &str,
-    thread_id: &str,
+pub(crate) fn deliver_with_guard(
+    guard: &mut ReentryGuard,
     block: &str,
     auto_turn: bool,
     settle_ms: u64,
     allow_bus: bool,
 ) -> Result<DeliveryOutcome, DeliveryError> {
-    let mut ws = connect_initialized(server, "session-relay", "session-relay delivery")
+    let kind = guard.allowed();
+    if !matches!(
+        kind,
+        OperationKind::WatchInject | OperationKind::WatchAutoTurn | OperationKind::WakeAppServer
+    ) || (kind == OperationKind::WatchInject && auto_turn)
+        || (kind == OperationKind::WatchAutoTurn && !auto_turn)
+        || (kind == OperationKind::WakeAppServer && !auto_turn)
+    {
+        return Err(DeliveryError::BeforeInject(format!(
+            "{} cannot authorize this delivery mode",
+            kind.as_str()
+        )));
+    }
+    let target = guard
+        .authorize_use(kind)
         .map_err(DeliveryError::BeforeInject)?;
-    ws.request(
-        1,
-        "thread/resume",
-        sobj(vec![("threadId", JsonValue::from(thread_id.to_string()))]),
+    let server = target
+        .server
+        .ok_or_else(|| DeliveryError::BeforeInject("guard has no app-server".to_string()))?;
+    let thread_id = target
+        .thread_id
+        .ok_or_else(|| DeliveryError::BeforeInject("guard has no app-server thread".to_string()))?;
+    let mut ws = connect_initialized_with_guard(
+        &server,
+        "session-relay",
+        "session-relay delivery",
+        guard,
+        kind,
     )
     .map_err(DeliveryError::BeforeInject)?;
-    ws.request(2, "thread/inject_items", inject_params(thread_id, block))
-        .map_err(DeliveryError::BeforeInject)?;
+    ws.request_with_guard(
+        1,
+        "thread/resume",
+        sobj(vec![("threadId", JsonValue::from(thread_id.clone()))]),
+        guard,
+        kind,
+    )
+    .map_err(|error| DeliveryError::BeforeInject(error.into_message()))?;
+    ws.request_with_guard(
+        2,
+        "thread/inject_items",
+        inject_params(&thread_id, block),
+        guard,
+        kind,
+    )
+    .map_err(|error| match error {
+        GuardedRequestError::BeforeSend(message) => DeliveryError::BeforeInject(message),
+        GuardedRequestError::AfterSend(message) => DeliveryError::AfterInject(message),
+    })?;
     if auto_turn {
-        std::thread::sleep(Duration::from_millis(settle_ms));
-        match read_status(&mut ws, 3, thread_id).map_err(DeliveryError::AfterInject)? {
+        let settle_deadline = Instant::now() + Duration::from_millis(settle_ms);
+        while Instant::now() < settle_deadline {
+            if guard.cancelled() {
+                return Err(DeliveryError::AfterInject(
+                    "delivery cancelled during settle".to_string(),
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        guard
+            .authorize_use(kind)
+            .map_err(DeliveryError::AfterInject)?;
+        match read_status_with_guard(&mut ws, 3, &thread_id, guard, kind)
+            .map_err(DeliveryError::AfterInject)?
+        {
             ThreadState::Active => return Ok(DeliveryOutcome::AckDeferred),
             ThreadState::Idle => {
-                start_ack_turn(&mut ws, 4, thread_id, allow_bus)
+                start_ack_turn_with_guard(&mut ws, 4, &thread_id, allow_bus, guard, kind)
                     .map_err(DeliveryError::AfterInject)?;
             }
         }
@@ -132,34 +244,83 @@ pub(crate) fn start_thread(
         .and_then(|id| id.get::<String>())
         .cloned()
         .ok_or_else(|| "thread/start response missing thread.id".to_string())?;
-    Ok(SpawnedThread { ws, id })
+    Ok(SpawnedThread {
+        ws,
+        id,
+        turn_id: None,
+        server: server.to_string(),
+        server_fingerprint: sha256_hex(server.as_bytes()),
+    })
+}
+
+fn turn_event_identity(object: &HashMap<String, JsonValue>) -> Option<(String, String)> {
+    let params = object.get("params")?.get::<HashMap<String, JsonValue>>()?;
+    let thread_id = params.get("threadId")?.get::<String>()?.clone();
+    let turn_id = params
+        .get("turn")?
+        .get::<HashMap<String, JsonValue>>()?
+        .get("id")?
+        .get::<String>()?
+        .clone();
+    (!thread_id.is_empty() && !turn_id.is_empty()).then_some((thread_id, turn_id))
+}
+
+fn turn_id_from_start_result(result: &JsonValue) -> Result<String, String> {
+    result
+        .get::<HashMap<String, JsonValue>>()
+        .and_then(|result| result.get("turn"))
+        .and_then(|turn| turn.get::<HashMap<String, JsonValue>>())
+        .and_then(|turn| turn.get("id"))
+        .and_then(|id| id.get::<String>())
+        .filter(|id| !id.is_empty())
+        .cloned()
+        .ok_or_else(|| "turn/start response missing turn.id".to_string())
 }
 
 pub(crate) fn thread_state(server: &str, thread_id: &str) -> Result<ThreadState, String> {
     let mut ws = connect_initialized(server, "session-relay", "session-relay status")?;
-    ws.request(
-        1,
-        "thread/resume",
-        sobj(vec![("threadId", JsonValue::from(thread_id.to_string()))]),
-    )?;
-    read_status(&mut ws, 2, thread_id)
+    read_status(&mut ws, 1, thread_id)
 }
 
-pub(crate) fn acknowledge(
-    server: &str,
-    thread_id: &str,
+pub(crate) fn acknowledge_with_guard(
+    guard: &mut ReentryGuard,
     allow_bus: bool,
 ) -> Result<DeliveryOutcome, String> {
-    let mut ws = connect_initialized(server, "session-relay", "session-relay acknowledgement")?;
-    ws.request(
+    let target = guard.authorize_use(OperationKind::WatchAck)?;
+    let server = target
+        .server
+        .ok_or_else(|| "guard has no app-server".to_string())?;
+    let thread_id = target
+        .thread_id
+        .ok_or_else(|| "guard has no app-server thread".to_string())?;
+    let mut ws = connect_initialized_with_guard(
+        &server,
+        "session-relay",
+        "session-relay acknowledgement",
+        guard,
+        OperationKind::WatchAck,
+    )?;
+    ws.request_with_guard(
         1,
         "thread/resume",
-        sobj(vec![("threadId", JsonValue::from(thread_id.to_string()))]),
-    )?;
-    if read_status(&mut ws, 2, thread_id)? == ThreadState::Active {
+        sobj(vec![("threadId", JsonValue::from(thread_id.clone()))]),
+        guard,
+        OperationKind::WatchAck,
+    )
+    .map_err(GuardedRequestError::into_message)?;
+    if read_status_with_guard(&mut ws, 2, &thread_id, guard, OperationKind::WatchAck)?
+        == ThreadState::Active
+    {
         return Ok(DeliveryOutcome::AckDeferred);
     }
-    start_ack_turn(&mut ws, 3, thread_id, allow_bus)?;
+    start_ack_turn_with_guard(
+        &mut ws,
+        3,
+        &thread_id,
+        allow_bus,
+        guard,
+        OperationKind::WatchAck,
+    )?;
     Ok(DeliveryOutcome::Delivered)
 }
 
@@ -181,6 +342,36 @@ fn connect_initialized(server: &str, name: &str, title: &str) -> Result<WsConn, 
         )]),
     )?;
     ws.notify("initialized", JsonValue::from(HashMap::new()))?;
+    Ok(ws)
+}
+
+fn connect_initialized_with_guard(
+    server: &str,
+    name: &str,
+    title: &str,
+    guard: &mut ReentryGuard,
+    kind: OperationKind,
+) -> Result<WsConn, String> {
+    let mut ws = WsConn::connect_with_guard(server, guard, kind)?;
+    ws.request_with_guard(
+        0,
+        "initialize",
+        sobj(vec![(
+            "clientInfo",
+            sobj(vec![
+                ("name", JsonValue::from(name.to_string())),
+                ("title", JsonValue::from(title.to_string())),
+                (
+                    "version",
+                    JsonValue::from(env!("CARGO_PKG_VERSION").to_string()),
+                ),
+            ]),
+        )]),
+        guard,
+        kind,
+    )
+    .map_err(GuardedRequestError::into_message)?;
+    ws.notify_with_guard("initialized", JsonValue::from(HashMap::new()), guard, kind)?;
     Ok(ws)
 }
 
@@ -220,25 +411,79 @@ fn read_status(ws: &mut WsConn, id: u64, thread_id: &str) -> Result<ThreadState,
     }
 }
 
-fn start_ack_turn(
+fn read_status_with_guard(
+    ws: &mut WsConn,
+    id: u64,
+    thread_id: &str,
+    guard: &mut ReentryGuard,
+    kind: OperationKind,
+) -> Result<ThreadState, String> {
+    let result = ws
+        .request_with_guard(
+            id,
+            "thread/read",
+            sobj(vec![("threadId", JsonValue::from(thread_id.to_string()))]),
+            guard,
+            kind,
+        )
+        .map_err(GuardedRequestError::into_message)?;
+    parse_thread_state(result)
+}
+
+fn parse_thread_state(result: JsonValue) -> Result<ThreadState, String> {
+    let status_type = result
+        .get::<HashMap<String, JsonValue>>()
+        .and_then(|result| result.get("thread"))
+        .and_then(|thread| thread.get::<HashMap<String, JsonValue>>())
+        .and_then(|thread| thread.get("status"))
+        .and_then(|status| status.get::<HashMap<String, JsonValue>>())
+        .and_then(|status| status.get("type"))
+        .and_then(|kind| kind.get::<String>())
+        .map(String::as_str)
+        .ok_or_else(|| "thread/read response missing thread.status.type".to_string())?;
+    match status_type {
+        "idle" => Ok(ThreadState::Idle),
+        "active" => Ok(ThreadState::Active),
+        other => Err(format!(
+            "thread is not ready for relay delivery (status {other})"
+        )),
+    }
+}
+
+fn start_ack_turn_with_guard(
     ws: &mut WsConn,
     id: u64,
     thread_id: &str,
     allow_bus: bool,
+    guard: &mut ReentryGuard,
+    kind: OperationKind,
 ) -> Result<(), String> {
-    ws.request(id, "turn/start", turn_params(thread_id))?;
-    // Stay attached: MCP tool calls elicit approval from the CONNECTED client
-    // no matter the approvalPolicy; detaching here can wedge the turn.
+    let result = ws
+        .request_with_guard(id, "turn/start", turn_params(thread_id), guard, kind)
+        .map_err(GuardedRequestError::into_message)?;
+    let turn_id = turn_id_from_start_result(&result)?;
     let wait_ms: u64 = std::env::var("RELAY_TURN_WAIT_MS")
         .ok()
-        .and_then(|v| v.parse().ok())
+        .and_then(|value| value.parse().ok())
         .unwrap_or(DEFAULT_TURN_WAIT_MS);
-    if !ws.pump_turn(wait_ms, allow_bus)? {
+    if !ws.pump_turn_with_guard(wait_ms, allow_bus, guard, thread_id, &turn_id)? {
         eprintln!(
             "[relay] turn on {thread_id} still running after {wait_ms}ms — detaching (a later MCP call may wedge it)"
         );
     }
     Ok(())
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hasher
+        .digest()
+        .iter()
+        .fold(String::with_capacity(64), |mut hex, byte| {
+            write!(hex, "{byte:02x}").expect("writing to String cannot fail");
+            hex
+        })
 }
 
 // ---- JSON-RPC param builders (pure — unit-tested shapes) ----
@@ -439,23 +684,52 @@ struct WsConn {
 
 impl WsConn {
     fn connect(path: &str) -> Result<Self, String> {
+        Self::connect_checked(path, || Ok(()))
+    }
+
+    fn connect_with_guard(
+        path: &str,
+        guard: &mut ReentryGuard,
+        kind: OperationKind,
+    ) -> Result<Self, String> {
+        Self::connect_checked(path, || guard.authorize_use(kind).map(|_| ()))
+    }
+
+    fn connect_checked(
+        path: &str,
+        mut check: impl FnMut() -> Result<(), String>,
+    ) -> Result<Self, String> {
+        check()?;
         let mut s = UnixStream::connect(path).map_err(|e| format!("connect {path}: {e}"))?;
         s.set_read_timeout(Some(Duration::from_millis(100))).ok();
         let key = b64(&urandom(16));
+        check()?;
         s.write_all(upgrade_request(&key).as_bytes())
             .map_err(|e| format!("upgrade write: {e}"))?;
         let mut hdr: Vec<u8> = Vec::new();
         let mut chunk = [0u8; 512];
+        let deadline = Instant::now() + Duration::from_secs(RPC_TIMEOUT_SECS);
         let end = loop {
+            check()?;
+            if Instant::now() >= deadline {
+                return Err("app-server upgrade response timeout".to_string());
+            }
             if let Some(pos) = hdr.windows(4).position(|w| w == b"\r\n\r\n") {
                 break pos + 4;
             }
             if hdr.len() > 16384 {
                 return Err("oversized upgrade response".into());
             }
-            let n = s
-                .read(&mut chunk)
-                .map_err(|e| format!("upgrade read: {e}"))?;
+            let n = match s.read(&mut chunk) {
+                Ok(n) => n,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        || error.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(format!("upgrade read: {error}")),
+            };
             if n == 0 {
                 return Err("connection closed during upgrade".into());
             }
@@ -525,11 +799,75 @@ impl WsConn {
         }
     }
 
+    fn recv_text_with_guard(
+        &mut self,
+        guard: &mut ReentryGuard,
+        kind: OperationKind,
+    ) -> Result<Option<String>, String> {
+        let mut assembled: Vec<u8> = Vec::new();
+        let mut in_text = false;
+        loop {
+            guard.authorize_use(kind)?;
+            if let Some((fin, opcode, payload, used)) = parse_frame(&self.buf) {
+                self.buf.drain(..used);
+                match opcode {
+                    0x1 => {
+                        assembled = payload;
+                        if fin {
+                            return Ok(Some(String::from_utf8_lossy(&assembled).into_owned()));
+                        }
+                        in_text = true;
+                    }
+                    0x0 if in_text => {
+                        assembled.extend_from_slice(&payload);
+                        if fin {
+                            return Ok(Some(String::from_utf8_lossy(&assembled).into_owned()));
+                        }
+                    }
+                    0x9 => {
+                        guard.authorize_use(kind)?;
+                        self.send_frame(0xA, &payload)?;
+                    }
+                    0x8 => return Err("server closed the connection".into()),
+                    _ => {}
+                }
+                continue;
+            }
+            let mut chunk = [0u8; 4096];
+            match self.s.read(&mut chunk) {
+                Ok(0) => return Err("connection closed".into()),
+                Ok(n) => self.buf.extend_from_slice(&chunk[..n]),
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        || error.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    return Ok(None);
+                }
+                Err(error) => return Err(format!("ws read: {error}")),
+            }
+        }
+    }
+
     fn notify(&mut self, method: &str, params: JsonValue) -> Result<(), String> {
         let msg = sobj(vec![
             ("method", JsonValue::from(method.to_string())),
             ("params", params),
         ]);
+        self.send_frame(0x1, msg.stringify().map_err(|e| format!("{e}"))?.as_bytes())
+    }
+
+    fn notify_with_guard(
+        &mut self,
+        method: &str,
+        params: JsonValue,
+        guard: &mut ReentryGuard,
+        kind: OperationKind,
+    ) -> Result<(), String> {
+        let msg = sobj(vec![
+            ("method", JsonValue::from(method.to_string())),
+            ("params", params),
+        ]);
+        guard.authorize_use(kind)?;
         self.send_frame(0x1, msg.stringify().map_err(|e| format!("{e}"))?.as_bytes())
     }
 
@@ -570,17 +908,43 @@ impl WsConn {
         }
     }
 
-    // Pump the event stream until the turn ends. Ok(true) = turn/completed or
-    // turn/failed seen; Ok(false) = still running at the deadline. Server->
-    // client `mcpServer/elicitation/request`s are answered per
-    // `elicitation_action`; other server requests are left alone.
-    fn pump_turn(&mut self, ms: u64, allow_bus: bool) -> Result<bool, String> {
-        let deadline = Instant::now() + Duration::from_millis(ms);
+    fn request_with_guard(
+        &mut self,
+        id: u64,
+        method: &str,
+        params: JsonValue,
+        guard: &mut ReentryGuard,
+        kind: OperationKind,
+    ) -> Result<JsonValue, GuardedRequestError> {
+        let msg = sobj(vec![
+            ("id", JsonValue::from(id as f64)),
+            ("method", JsonValue::from(method.to_string())),
+            ("params", params),
+        ]);
+        let encoded = msg
+            .stringify()
+            .map_err(|error| GuardedRequestError::BeforeSend(format!("{error}")))?;
+        guard
+            .authorize_use(kind)
+            .map_err(GuardedRequestError::BeforeSend)?;
+        self.send_frame(0x1, encoded.as_bytes())
+            .map_err(GuardedRequestError::AfterSend)?;
+        let deadline = Instant::now() + Duration::from_secs(RPC_TIMEOUT_SECS);
         loop {
-            if Instant::now() > deadline {
-                return Ok(false);
+            if guard.cancelled() {
+                return Err(GuardedRequestError::AfterSend(format!(
+                    "{method}: cancelled"
+                )));
             }
-            let Some(text) = self.recv_text()? else {
+            if Instant::now() > deadline {
+                return Err(GuardedRequestError::AfterSend(format!(
+                    "{method}: response timeout"
+                )));
+            }
+            let Some(text) = self
+                .recv_text_with_guard(guard, kind)
+                .map_err(GuardedRequestError::AfterSend)?
+            else {
                 continue;
             };
             let Ok(v) = text.parse::<JsonValue>() else {
@@ -589,32 +953,169 @@ impl WsConn {
             let Some(o) = v.get::<HashMap<String, JsonValue>>() else {
                 continue;
             };
-            let method = o.get("method").and_then(|m| m.get::<String>().cloned());
+            let got_id = o.get("id").and_then(|x| x.get::<f64>().copied());
+            if got_id != Some(id as f64) {
+                continue;
+            }
+            if let Some(err) = o.get("error") {
+                let emsg = err
+                    .get::<HashMap<String, JsonValue>>()
+                    .and_then(|e| e.get("message"))
+                    .and_then(|m| m.get::<String>().cloned())
+                    .unwrap_or_else(|| "unknown error".into());
+                return Err(GuardedRequestError::AfterSend(format!("{method}: {emsg}")));
+            }
+            return Ok(o.get("result").cloned().unwrap_or(JsonValue::from(())));
+        }
+    }
+
+    fn pump_turn_with_guard(
+        &mut self,
+        ms: u64,
+        allow_bus: bool,
+        guard: &mut ReentryGuard,
+        expected_thread_id: &str,
+        expected_turn_id: &str,
+    ) -> Result<bool, String> {
+        let deadline = Instant::now() + Duration::from_millis(ms);
+        loop {
+            if guard.cancelled() {
+                return Err("app-server turn pump cancelled".to_string());
+            }
+            if Instant::now() > deadline {
+                return Ok(false);
+            }
+            let kind = guard.allowed();
+            let Some(text) = self.recv_text_with_guard(guard, kind)? else {
+                continue;
+            };
+            let Ok(value) = text.parse::<JsonValue>() else {
+                continue;
+            };
+            let Some(object) = value.get::<HashMap<String, JsonValue>>() else {
+                continue;
+            };
+            let method = object
+                .get("method")
+                .and_then(|value| value.get::<String>().cloned());
             match method.as_deref() {
-                Some("turn/completed") | Some("turn/failed") => return Ok(true),
+                Some("turn/completed")
+                    if turn_event_identity(object).as_ref()
+                        == Some(&(
+                            expected_thread_id.to_string(),
+                            expected_turn_id.to_string(),
+                        )) =>
+                {
+                    return Ok(true);
+                }
                 Some("mcpServer/elicitation/request") => {
-                    let Some(req_id) = o.get("id").cloned() else {
+                    let Some(request_id) = object.get("id").cloned() else {
                         continue;
                     };
-                    let server_name = o
+                    let server_name = object
                         .get("params")
-                        .and_then(|p| p.get::<HashMap<String, JsonValue>>())
-                        .and_then(|p| p.get("serverName"))
-                        .and_then(|s| s.get::<String>().cloned())
+                        .and_then(|value| value.get::<HashMap<String, JsonValue>>())
+                        .and_then(|params| params.get("serverName"))
+                        .and_then(|value| value.get::<String>().cloned())
                         .unwrap_or_default();
                     let action = elicitation_action(&server_name, allow_bus);
-                    let msg = sobj(vec![
-                        ("id", req_id),
+                    let message = sobj(vec![
+                        ("id", request_id),
                         (
                             "result",
                             sobj(vec![("action", JsonValue::from(action.to_string()))]),
                         ),
                     ]);
-                    self.send_frame(0x1, msg.stringify().map_err(|e| format!("{e}"))?.as_bytes())?;
+                    guard.authorize_use(guard.allowed())?;
+                    self.send_frame(
+                        0x1,
+                        message
+                            .stringify()
+                            .map_err(|error| format!("{error}"))?
+                            .as_bytes(),
+                    )?;
                 }
                 _ => {}
             }
         }
+    }
+
+    fn interrupt_and_confirm(
+        &mut self,
+        id: u64,
+        thread_id: &str,
+        turn_id: &str,
+        timeout_ms: u64,
+    ) -> Result<bool, String> {
+        let message = sobj(vec![
+            ("id", JsonValue::from(id as f64)),
+            ("method", JsonValue::from("turn/interrupt".to_string())),
+            (
+                "params",
+                sobj(vec![
+                    ("threadId", JsonValue::from(thread_id.to_string())),
+                    ("turnId", JsonValue::from(turn_id.to_string())),
+                ]),
+            ),
+        ]);
+        self.send_frame(
+            0x1,
+            message
+                .stringify()
+                .map_err(|error| format!("turn/interrupt: {error}"))?
+                .as_bytes(),
+        )?;
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        let mut response_seen = false;
+        let mut completion_seen = false;
+        while Instant::now() <= deadline {
+            let Some(text) = self.recv_text()? else {
+                continue;
+            };
+            let Ok(value) = text.parse::<JsonValue>() else {
+                continue;
+            };
+            let Some(object) = value.get::<HashMap<String, JsonValue>>() else {
+                continue;
+            };
+            if object
+                .get("id")
+                .and_then(|value| value.get::<f64>())
+                .copied()
+                == Some(id as f64)
+            {
+                if let Some(error) = object.get("error") {
+                    let message = error
+                        .get::<HashMap<String, JsonValue>>()
+                        .and_then(|error| error.get("message"))
+                        .and_then(|message| message.get::<String>())
+                        .cloned()
+                        .unwrap_or_else(|| "unknown error".to_string());
+                    return Err(format!("turn/interrupt: {message}"));
+                }
+                let result = object
+                    .get("result")
+                    .and_then(|result| result.get::<HashMap<String, JsonValue>>())
+                    .ok_or_else(|| "turn/interrupt response was not an object".to_string())?;
+                if !result.is_empty() {
+                    return Err("turn/interrupt response was not empty".to_string());
+                }
+                response_seen = true;
+            } else if object.get("method").and_then(|value| value.get::<String>())
+                == Some(&"turn/completed".to_string())
+                && turn_event_identity(object).as_ref()
+                    == Some(&(thread_id.to_string(), turn_id.to_string()))
+            {
+                completion_seen = true;
+            }
+            if response_seen && completion_seen {
+                return Ok(true);
+            }
+        }
+        if !response_seen {
+            return Err("turn/interrupt response timeout".to_string());
+        }
+        Ok(false)
     }
 }
 

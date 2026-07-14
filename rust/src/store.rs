@@ -1,6 +1,7 @@
 // store.rs — shared on-disk state for the session-relay bus (port of lib/store.mjs).
 // Holds three things, all under one fixed home so every component agrees:
 //   registry.json      id -> { id, dir, name, tool, lastSeen } + a name -> id index
+//   lifecycle-v1.json durable lifecycle authority, isolated from legacy writers
 //   mailbox/<id>.jsonl one append-only inbox per recipient session id
 //   markers/<cwd>      the session id last registered for a project dir
 //
@@ -56,6 +57,9 @@ pub fn home_dir() -> PathBuf {
 fn registry_path() -> PathBuf {
     home_dir().join("registry.json")
 }
+
+const LIFECYCLE_AUTHORITY_FILE: &str = "lifecycle-v1.json";
+const LIFECYCLE_AUTHORITY_SCHEMA: &str = "1";
 pub(crate) fn mailbox_path(id: &str) -> PathBuf {
     home_dir()
         .join("mailbox")
@@ -64,10 +68,6 @@ pub(crate) fn mailbox_path(id: &str) -> PathBuf {
 fn marker_path(dir: &str) -> PathBuf {
     home_dir().join("markers").join(encode_dir(dir))
 }
-fn lock_path() -> PathBuf {
-    home_dir().join(".lock")
-}
-
 pub fn watcher_lock_path(id: &str) -> PathBuf {
     home_dir()
         .join("watchers")
@@ -109,9 +109,9 @@ pub fn sanitize(s: &str) -> String {
         .collect()
 }
 
-fn ensure_dirs() -> Result<(), String> {
+fn ensure_dirs_at(root: &Path) -> Result<(), String> {
     for d in ["mailbox", "markers", "watchers", "locks"] {
-        let path = home_dir().join(d);
+        let path = root.join(d);
         fs::create_dir_all(&path).map_err(|e| format!("mkdir {d}: {e}"))?;
         if matches!(d, "watchers" | "locks") {
             fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
@@ -119,6 +119,10 @@ fn ensure_dirs() -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn ensure_dirs() -> Result<(), String> {
+    ensure_dirs_at(&home_dir())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -443,12 +447,53 @@ fn atomic_write(file: &Path, text: &str) -> Result<(), String> {
     fs::rename(&tmp, file).map_err(|e| format!("rename to {}: {e}", file.display()))
 }
 
+fn atomic_write_private(file: &Path, text: &str) -> Result<(), String> {
+    let tmp = PathBuf::from(format!(
+        "{}.{}.{}.tmp",
+        file.display(),
+        std::process::id(),
+        random_hex(4)
+    ));
+    let result = (|| {
+        let mut output = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&tmp)
+            .map_err(|error| format!("create {}: {error}", tmp.display()))?;
+        output
+            .write_all(text.as_bytes())
+            .map_err(|error| format!("write {}: {error}", tmp.display()))?;
+        output
+            .sync_all()
+            .map_err(|error| format!("sync {}: {error}", tmp.display()))?;
+        fs::rename(&tmp, file).map_err(|error| format!("rename to {}: {error}", file.display()))?;
+        if let Some(parent) = file.parent() {
+            fs::File::open(parent)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|error| format!("sync {}: {error}", parent.display()))?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
 /// Run `f` holding an exclusive kernel flock on <home>/.lock.
 /// Fail-fast contract preserved from the Node store: give up after 3s of
 /// live contention. Crashed holders need no reclaim — the kernel releases.
 pub fn with_lock<T>(f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
-    ensure_dirs()?;
-    let lock = lock_path();
+    with_lock_at(&home_dir(), f)
+}
+
+pub(crate) fn with_lock_at<T>(
+    root: &Path,
+    f: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    ensure_dirs_at(root)?;
+    let lock = root.join(".lock");
     // Migration: the v1 mkdir-mutex left `.lock` as a DIRECTORY. After the
     // one-commit flip every store toucher is this binary, so a dir here is by
     // definition abandoned — remove it so open() below doesn't fail EISDIR.
@@ -529,7 +574,7 @@ impl Entry {
         JsonValue::from(m)
     }
 
-    fn from_json(v: &JsonValue) -> Option<Entry> {
+    pub(crate) fn from_json(v: &JsonValue) -> Option<Entry> {
         let obj: &HashMap<String, JsonValue> = v.get()?;
         let s = |k: &str| -> Option<String> { obj.get(k)?.get::<String>().cloned() };
         Some(Entry {
@@ -544,52 +589,118 @@ impl Entry {
     }
 }
 
-type Registry = (HashMap<String, JsonValue>, HashMap<String, JsonValue>);
+#[derive(Clone, Default)]
+pub(crate) struct Registry {
+    pub(crate) agents: HashMap<String, JsonValue>,
+    pub(crate) names: HashMap<String, JsonValue>,
+    pub(crate) extra: HashMap<String, JsonValue>,
+}
 
 // Any read/parse failure yields an empty registry — mirrors readJSON(file, fallback).
 fn read_registry() -> Registry {
-    parse_registry(fs::read_to_string(registry_path()).ok().as_deref())
+    read_registry_at(&home_dir())
+}
+
+pub(crate) fn read_registry_at(root: &Path) -> Registry {
+    parse_registry(
+        fs::read_to_string(root.join("registry.json"))
+            .ok()
+            .as_deref(),
+    )
 }
 
 fn parse_registry(raw: Option<&str>) -> Registry {
-    let mut agents = HashMap::new();
-    let mut names = HashMap::new();
+    let mut registry = Registry::default();
     if let Some(raw) = raw {
         if let Ok(v) = raw.parse::<JsonValue>() {
             if let Some(obj) = v.get::<HashMap<String, JsonValue>>() {
+                registry.extra = obj.clone();
                 if let Some(a) = obj
                     .get("agents")
                     .and_then(|x| x.get::<HashMap<String, JsonValue>>())
                 {
-                    agents = a.clone();
+                    registry.agents = a.clone();
                 }
                 if let Some(n) = obj
                     .get("names")
                     .and_then(|x| x.get::<HashMap<String, JsonValue>>())
                 {
-                    names = n.clone();
+                    registry.names = n.clone();
                 }
+                registry.extra.remove("agents");
+                registry.extra.remove("names");
             }
         }
     }
-    (agents, names)
+    registry
 }
 
-fn write_registry(
-    agents: HashMap<String, JsonValue>,
-    names: HashMap<String, JsonValue>,
-) -> Result<(), String> {
-    let text = format_registry(agents, names)?;
+fn write_registry(registry: Registry) -> Result<(), String> {
+    let text = format_registry(registry)?;
     atomic_write(&registry_path(), &text)
 }
 
-fn format_registry(
-    agents: HashMap<String, JsonValue>,
-    names: HashMap<String, JsonValue>,
-) -> Result<String, String> {
-    let mut root: HashMap<String, JsonValue> = HashMap::new();
-    root.insert("agents".into(), JsonValue::from(agents));
-    root.insert("names".into(), JsonValue::from(names));
+pub(crate) fn write_registry_at(root: &Path, registry: Registry) -> Result<(), String> {
+    let text = format_registry(registry)?;
+    atomic_write(&root.join("registry.json"), &text)
+}
+
+pub(crate) fn read_lifecycle_authority_at(
+    root: &Path,
+) -> Result<Option<HashMap<String, JsonValue>>, String> {
+    let path = root.join(LIFECYCLE_AUTHORITY_FILE);
+    let raw = match fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "read lifecycle authority {}: {error}",
+                path.display()
+            ));
+        }
+    };
+    let value = raw
+        .parse::<JsonValue>()
+        .map_err(|error| format!("malformed lifecycle authority: {error}"))?;
+    let object = value
+        .get::<HashMap<String, JsonValue>>()
+        .ok_or_else(|| "malformed lifecycle authority: root is not an object".to_string())?;
+    if object.len() != 2
+        || object
+            .get("schema_version")
+            .and_then(JsonValue::get::<String>)
+            .map(String::as_str)
+            != Some(LIFECYCLE_AUTHORITY_SCHEMA)
+    {
+        return Err("malformed lifecycle authority: unsupported or inexact schema".to_string());
+    }
+    let state = object
+        .get("state")
+        .and_then(JsonValue::get::<HashMap<String, JsonValue>>)
+        .ok_or_else(|| "malformed lifecycle authority: state is not an object".to_string())?;
+    Ok(Some(state.clone()))
+}
+
+pub(crate) fn write_lifecycle_authority_at(
+    root: &Path,
+    state: HashMap<String, JsonValue>,
+) -> Result<(), String> {
+    let mut object = HashMap::new();
+    object.insert(
+        "schema_version".to_string(),
+        JsonValue::from(LIFECYCLE_AUTHORITY_SCHEMA.to_string()),
+    );
+    object.insert("state".to_string(), JsonValue::from(state));
+    let text = JsonValue::from(object)
+        .format()
+        .map_err(|error| format!("lifecycle authority serialize: {error}"))?;
+    atomic_write_private(&root.join(LIFECYCLE_AUTHORITY_FILE), &text)
+}
+
+fn format_registry(mut registry: Registry) -> Result<String, String> {
+    let mut root = std::mem::take(&mut registry.extra);
+    root.insert("agents".into(), JsonValue::from(registry.agents));
+    root.insert("names".into(), JsonValue::from(registry.names));
     JsonValue::from(root)
         .format() // pretty, 2-space — same shape JSON.stringify(reg, null, 2) wrote
         .map_err(|e| format!("registry serialize: {e}"))
@@ -1042,6 +1153,24 @@ pub fn gc(now: SystemTime, self_id: Option<&str>) -> Result<usize, String> {
     // Validate and pin every present surface before the GC lock can create its
     // file. A symlinked surface refuses the whole sweep without chmod/create.
     let surface_dirs = open_gc_surface_dirs(&root_fd)?;
+    let throttled = with_gc_lock(&root_fd, || {
+        let Some(stat) = stat_regular_at(&root_fd, "gc-stamp")? else {
+            return Ok(false);
+        };
+        let modified = UNIX_EPOCH
+            .checked_add(Duration::new(
+                stat.st_mtime.max(0) as u64,
+                stat.st_mtime_nsec.clamp(0, 999_999_999) as u32,
+            ))
+            .unwrap_or(UNIX_EPOCH);
+        Ok(now.duration_since(modified).unwrap_or(Duration::ZERO) < GC_INTERVAL)
+    })?;
+    if throttled {
+        return Ok(0);
+    }
+    let lifecycle_removed = crate::lifecycle::LifecycleStore::default()
+        .gc_unmanaged_excluding(now, crate::lifecycle::GcControl::RunToCompletion, self_id)?
+        .removed_candidates;
     let age = Duration::from_secs(
         days.checked_mul(SECONDS_PER_DAY)
             .ok_or_else(|| "AGENT_RELAY_GC_DAYS is too large".to_string())?,
@@ -1054,7 +1183,7 @@ pub fn gc(now: SystemTime, self_id: Option<&str>) -> Result<usize, String> {
         .min(i64::MAX as u128) as i64;
     let cutoff_iso = iso_from_unix_ms(cutoff_ms);
 
-    with_gc_lock(&root_fd, || {
+    let legacy_removed = with_gc_lock(&root_fd, || {
         let Some((locked_root, locked_resolved_root)) = safe_existing_root()? else {
             return Ok(0);
         };
@@ -1087,10 +1216,14 @@ pub fn gc(now: SystemTime, self_id: Option<&str>) -> Result<usize, String> {
         }
 
         let registry_raw = read_text_at(&root_fd, "registry.json")?;
-        let (mut agents, mut names) = parse_registry(registry_raw.as_deref());
+        let mut registry = parse_registry(registry_raw.as_deref());
+        let mut protection_registry = registry.clone();
+        if let Some(authority) = read_lifecycle_authority_at(&locked_resolved_root)? {
+            protection_registry.extra.extend(authority);
+        }
         let inventory = known_gc_surfaces(&surface_dirs, cutoff)?;
         let mut candidates: HashMap<String, GcCandidate> = HashMap::new();
-        for (registry_key, value) in &agents {
+        for (registry_key, value) in &registry.agents {
             let Some(entry) = Entry::from_json(value) else {
                 continue; // malformed registry state is preserved, never guessed old
             };
@@ -1137,6 +1270,9 @@ pub fn gc(now: SystemTime, self_id: Option<&str>) -> Result<usize, String> {
                 continue;
             }
             if let Some(id) = candidate.id.as_deref() {
+                if crate::lifecycle::registry_protects_session(&protection_registry, id)? {
+                    continue;
+                }
                 let watcher = format!("{id}.lock");
                 let resume = format!("resume-{id}.lock");
                 if matches!(
@@ -1190,19 +1326,20 @@ pub fn gc(now: SystemTime, self_id: Option<&str>) -> Result<usize, String> {
         // a later pass can retry, never invisible orphan files.
         if !removed_registry_ids.is_empty() {
             for id in &removed_registry_ids {
-                agents.remove(id);
+                registry.agents.remove(id);
             }
-            names.retain(|_, value| {
+            registry.names.retain(|_, value| {
                 value
                     .get::<String>()
                     .is_none_or(|id| !removed_registry_ids.contains(id))
             });
-            let registry = format_registry(agents, names)?;
-            atomic_write_at(&root_fd, "registry.json", &registry)?;
+            let registry_text = format_registry(registry)?;
+            atomic_write_at(&root_fd, "registry.json", &registry_text)?;
         }
         atomic_write_at(&root_fd, "gc-stamp", &format!("{}\n", iso_now()))?;
         Ok(removed_files + removed_registry_ids.len())
-    })
+    })?;
+    Ok(lifecycle_removed + legacy_removed)
 }
 
 /// Upsert a session. Missing fields are preserved from any prior entry, so the
@@ -1229,8 +1366,8 @@ pub fn register_with_origin(
         return Err("register requires an id".to_string());
     }
     with_lock(|| {
-        let (mut agents, mut names) = read_registry();
-        let prev = agents.get(id).and_then(Entry::from_json);
+        let mut registry = read_registry();
+        let prev = registry.agents.get(id).and_then(Entry::from_json);
         let entry = Entry {
             id: id.to_string(),
             dir: dir
@@ -1256,20 +1393,28 @@ pub fn register_with_origin(
                 .map(str::to_string)
                 .or_else(|| prev.as_ref().and_then(|p| p.spawned_via.clone())),
         };
-        agents.insert(id.to_string(), entry.to_json());
+        registry.agents.insert(id.to_string(), entry.to_json());
         if let Some(n) = &entry.name {
             // drop a renamed alias: any other name bound to this id
-            names.retain(|k, v| !(v.get::<String>().map(|s| s == id).unwrap_or(false) && k != n));
-            names.insert(n.clone(), JsonValue::from(id.to_string()));
+            registry
+                .names
+                .retain(|k, v| !(v.get::<String>().map(|s| s == id).unwrap_or(false) && k != n));
+            registry
+                .names
+                .insert(n.clone(), JsonValue::from(id.to_string()));
         }
-        write_registry(agents, names)?;
+        write_registry(registry)?;
         Ok(entry)
     })
 }
 
 pub fn roster() -> Vec<Entry> {
-    let (agents, _) = read_registry();
-    let mut out: Vec<Entry> = agents.values().filter_map(Entry::from_json).collect();
+    let registry = read_registry();
+    let mut out: Vec<Entry> = registry
+        .agents
+        .values()
+        .filter_map(Entry::from_json)
+        .collect();
     out.sort_by(|a, b| {
         let ka = a.name.as_deref().unwrap_or(&a.id);
         let kb = b.name.as_deref().unwrap_or(&b.id);
@@ -1283,12 +1428,12 @@ pub fn resolve(name_or_id: &str) -> Option<Entry> {
     if name_or_id.is_empty() {
         return None;
     }
-    let (agents, names) = read_registry();
-    if let Some(e) = agents.get(name_or_id).and_then(Entry::from_json) {
+    let registry = read_registry();
+    if let Some(e) = registry.agents.get(name_or_id).and_then(Entry::from_json) {
         return Some(e);
     }
-    let id = names.get(name_or_id)?.get::<String>()?.clone();
-    agents.get(&id).and_then(Entry::from_json)
+    let id = registry.names.get(name_or_id)?.get::<String>()?.clone();
+    registry.agents.get(&id).and_then(Entry::from_json)
 }
 
 pub fn set_marker(dir: &str, id: &str) -> Result<(), String> {
@@ -1338,17 +1483,74 @@ fn parse_lines(raw: &str) -> Vec<JsonValue> {
         .collect()
 }
 
-/// Read AND clear a recipient's inbox in one locked step.
-pub fn drain(recipient_id: &str) -> Result<Vec<JsonValue>, String> {
-    with_lock(|| {
-        let path = mailbox_path(recipient_id);
-        let raw = match fs::read_to_string(&path) {
-            Ok(r) => r,
-            Err(_) => return Ok(Vec::new()),
-        };
+/// Read AND clear the guard-bound inbox in one locked step. The recipient is
+/// derived from the sealed lifecycle capability; callers cannot supply one.
+pub struct DrainReceipt {
+    messages: Vec<JsonValue>,
+    raw: String,
+    path: PathBuf,
+    root: PathBuf,
+    _sealed: (),
+}
+
+impl DrainReceipt {
+    pub fn messages(&self) -> &[JsonValue] {
+        &self.messages
+    }
+
+    pub fn into_messages(self) -> Vec<JsonValue> {
+        self.messages
+    }
+
+    pub fn commit(self) {}
+
+    pub fn rollback(self) -> Result<(), String> {
+        with_lock_at(&self.root, || {
+            let current = fs::read_to_string(&self.path).unwrap_or_default();
+            let mut restored = self.raw;
+            restored.push_str(&current);
+            if restored.is_empty() {
+                return Ok(());
+            }
+            fs::write(&self.path, restored).map_err(|error| {
+                format!("restore drained mailbox {}: {error}", self.path.display())
+            })
+        })
+    }
+}
+
+pub fn drain_with_guard(
+    guard: &mut crate::lifecycle::ReentryGuard,
+) -> Result<DrainReceipt, String> {
+    let kind = guard.allowed();
+    if !matches!(
+        kind,
+        crate::lifecycle::OperationKind::SessionStartDrain
+            | crate::lifecycle::OperationKind::UserPromptDrain
+            | crate::lifecycle::OperationKind::CliInboxDrain
+            | crate::lifecycle::OperationKind::McpInboxDrain
+            | crate::lifecycle::OperationKind::ChannelDeliver
+            | crate::lifecycle::OperationKind::WatchInject
+            | crate::lifecycle::OperationKind::WatchAutoTurn
+            | crate::lifecycle::OperationKind::WakeAppServer
+    ) {
+        return Err(format!("{} cannot drain a mailbox", kind.as_str()));
+    }
+    guard.with_authorized(kind, |target| {
+        let path = target
+            .root
+            .join("mailbox")
+            .join(format!("{}.jsonl", sanitize(&target.runtime_session_id)));
+        let raw = fs::read_to_string(&path).unwrap_or_default();
         let msgs = parse_lines(&raw);
         let _ = fs::remove_file(&path);
-        Ok(msgs)
+        Ok(DrainReceipt {
+            messages: msgs,
+            raw,
+            path,
+            root: target.root.clone(),
+            _sealed: (),
+        })
     })
 }
 

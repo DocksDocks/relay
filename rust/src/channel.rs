@@ -7,6 +7,7 @@
 // two sessions may share one project directory, so that fallback can drain the
 // wrong mailbox.
 
+use crate::lifecycle::{self, OperationKind};
 use crate::{hook, store};
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
@@ -175,7 +176,8 @@ fn emit_mail(id: &str) -> Result<(), String> {
     if !store::mailbox_has_content(id) {
         return Ok(());
     }
-    let messages = store::drain(id)?;
+    let mut guard = lifecycle::admit_operation(id, OperationKind::ChannelDeliver)?.into_guard()?;
+    let messages = store::drain_with_guard(&mut guard)?.into_messages();
     for message in messages {
         let content = hook::mail_block(std::slice::from_ref(&message), id);
         send_frame(object(vec![

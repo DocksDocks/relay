@@ -1,0 +1,61 @@
+{
+  "schema_version": 3,
+  "compile_fail_bins": {
+    "child-cancel-reentry": "cannot construct `ChildCancellationPermit` with struct literal syntax due to private fields",
+    "fabricated-owned-proof": "cannot construct `OwnedChildReapProof` with struct literal syntax due to private fields",
+    "fence-reentry": "expected `&mut ReentryGuard`, found `&mut FencePermit`",
+    "guardless": "this function takes 1 argument but 0 arguments were supplied",
+    "reentry-fence": "expected `FenceIntent`, found `ReentryGuard`",
+    "wrong-target": "this function takes 1 argument but 2 arguments were supplied"
+  },
+  "forbidden_calls": [
+    { "pattern": "store::drain\\(", "reason": "drain must derive its session from ReentryGuard" },
+    { "pattern": "CommandExt", "reason": "transition-capable attach/resume may never exec" },
+    { "pattern": "\\.exec\\(", "reason": "transition-capable attach/resume may never exec" },
+    { "pattern": "appserver::deliver\\(", "reason": "app-server mutation must use a guarded wrapper" },
+    { "pattern": "appserver::acknowledge\\(", "reason": "pending acknowledgement must use a guarded wrapper" }
+  ],
+  "guarded_apis": [
+    "store::drain_with_guard",
+    "appserver::deliver_with_guard",
+    "appserver::acknowledge_with_guard",
+    "spawn::run_child_with_guard"
+  ],
+  "read_only_apis": [
+    "store::peek",
+    "store::mailbox_has_content",
+    "appserver::probe",
+    "appserver::thread_state"
+  ],
+  "process_function_classes": {
+    "guarded_reentry": ["run_child_with_guard", "spawn_watchdog", "spawn_owned_child", "supervise_connected"],
+    "non_reentry_creation": ["run"],
+    "internal_helper": ["start_log_pump", "run_appserver_spawn", "run_watchdog"]
+  },
+  "guarded_helpers": [],
+  "appserver_function_classes": {
+    "guarded_reentry": [
+      "deliver_with_guard",
+      "acknowledge_with_guard",
+      "start_initial_turn_with_guard",
+      "start_ack_turn_with_guard"
+    ],
+    "non_reentry_creation": ["start_thread"]
+  },
+  "births": [
+    {
+      "id": "runtime-cli-birth",
+      "file": "plugins/session-relay/rust/src/spawn.rs",
+      "function": "run",
+      "anchor": "let mut command = Command::new(&cmd);",
+      "evidence": ["--session-id", "marker_before", "child.try_wait()"]
+    },
+    {
+      "id": "appserver-thread-birth",
+      "file": "plugins/session-relay/rust/src/appserver.rs",
+      "function": "start_thread",
+      "anchor": "\"thread/start\"",
+      "evidence": ["thread_start_params", "thread.id", "Ok(SpawnedThread"]
+    }
+  ]
+}

@@ -1,0 +1,32 @@
+[package]
+name = "lifecycle-capability-bypass"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+relay = { path = "../../../rust" }
+
+[[bin]]
+name = "guardless"
+path = "src/bin/guardless.rs"
+
+[[bin]]
+name = "wrong-target"
+path = "src/bin/wrong-target.rs"
+
+[[bin]]
+name = "fence-reentry"
+path = "src/bin/fence-reentry.rs"
+
+[[bin]]
+name = "reentry-fence"
+path = "src/bin/reentry-fence.rs"
+
+[[bin]]
+name = "child-cancel-reentry"
+path = "src/bin/child-cancel-reentry.rs"
+
+[[bin]]
+name = "fabricated-owned-proof"
+path = "src/bin/fabricated-owned-proof.rs"

@@ -21,13 +21,18 @@
 
 use crate::appserver;
 use crate::cli::Args;
+use crate::lifecycle::{
+    ChildLaunchSpec, ClaimManagedAttach, ClaimOutcome, ExecutionBackend, LifecycleStore,
+    MANAGED_CANCEL_GRACE_MS, ManagedState, OperationKind, PendingAttachSpec, ReentryGuard,
+    RequiredScope,
+};
 use crate::store;
 use rustix::fs::{FlockOperation, flock};
 use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
-use std::os::unix::process::{CommandExt, ExitStatusExt};
-use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
+use std::os::unix::process::*;
+use std::process::{Child, ChildStdin, Command, ExitStatus, Output, Stdio};
 use std::time::{Duration, Instant};
 use tinyjson::JsonValue;
 
@@ -36,6 +41,132 @@ const BIRTH_POLL_MS: u64 = 250;
 const SPAWN_LOG_MAX_BYTES: u64 = 4 * 1024 * 1024;
 const SPAWN_LOG_RETAIN_BYTES: u64 = 3 * 1024 * 1024;
 const SPAWN_LOG_BUFFER_BYTES: usize = 64 * 1024;
+
+struct ManagedBirth {
+    worker_id: String,
+    generation: String,
+    raw_token: String,
+}
+
+fn create_managed_birth(
+    store: &LifecycleStore,
+    expected_runtime_session_id: Option<&str>,
+    tool: &str,
+    cwd: &str,
+    expires_at_ms: i64,
+    execution: ExecutionBackend,
+) -> Result<ManagedBirth, String> {
+    let birth = ManagedBirth {
+        worker_id: store::uuid_v4(),
+        generation: store::uuid_v4(),
+        raw_token: format!("{}{}", store::uuid_v4(), store::uuid_v4()),
+    };
+    store.create_pending(
+        PendingAttachSpec {
+            worker_id: birth.worker_id.clone(),
+            generation: birth.generation.clone(),
+            expected_runtime_session_id: expected_runtime_session_id.map(str::to_string),
+            expected_tool: tool.to_string(),
+            expected_cwd: cwd.to_string(),
+            expires_at_ms,
+            required_scope: RequiredScope::ProcessOnly,
+            execution,
+        },
+        &birth.raw_token,
+    )?;
+    Ok(birth)
+}
+
+fn claim_managed_appserver_birth(
+    store: &LifecycleStore,
+    birth: &ManagedBirth,
+    runtime_session_id: &str,
+    cwd: &str,
+    name: Option<&str>,
+    server: &str,
+) -> Result<(), String> {
+    match store.claim_managed_appserver_attach(
+        ClaimManagedAttach {
+            raw_token: birth.raw_token.clone(),
+            worker_id: birth.worker_id.clone(),
+            generation: birth.generation.clone(),
+            runtime_session_id: runtime_session_id.to_string(),
+            tool: "codex".to_string(),
+            cwd: cwd.to_string(),
+        },
+        name,
+        server,
+    )? {
+        ClaimOutcome::Active { worker, duplicate }
+            if !duplicate
+                && worker.worker_id == birth.worker_id
+                && worker.generation == birth.generation
+                && worker.runtime_session_id.as_deref() == Some(runtime_session_id)
+                && worker.state == ManagedState::Active =>
+        {
+            Ok(())
+        }
+        ClaimOutcome::Active { .. } => {
+            Err("managed app-server birth claim returned different authority".to_string())
+        }
+        ClaimOutcome::Refused { reason, .. } => {
+            Err(format!("managed app-server birth claim refused: {reason}"))
+        }
+    }
+}
+
+fn managed_birth_expiry(timeout_secs: u64) -> i64 {
+    let timeout_ms = i64::try_from(timeout_secs.saturating_mul(1000)).unwrap_or(i64::MAX);
+    store::now_ms().saturating_add(timeout_ms)
+}
+
+pub(crate) const CHILD_ENV_ALLOWLIST: &[&str] = &[
+    "PATH",
+    "HOME",
+    "CODEX_HOME",
+    "CLAUDE_CONFIG_DIR",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "TMPDIR",
+    "TERM",
+    "LANG",
+    "LC_ALL",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "ANTHROPIC_API_KEY",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "OPENAI_API_KEY",
+    "AGENT_RELAY_HOME",
+    "SESSION_RELAY_HOME",
+    "RELAY_PLUGIN_ROOT",
+    "RELAY_MANAGED_WORKER_ID",
+    "RELAY_MANAGED_GENERATION",
+    "RELAY_MANAGED_ATTACH_TOKEN",
+    "RELAY_TEST_SENTINEL",
+    "ATTACH_STUB_OUTPUT",
+    "ATTACH_STUB_INTERACTIVE",
+    "WAKE_STUB_DELAY_MS",
+    "WAKE_STUB_FILE",
+    "WAKE_STUB_RECORD",
+    "WAKE_STUB_STATUS",
+    "WAKE_STUB_STDERR",
+    "WAKE_STUB_STDOUT",
+    "STUB_RELAY_BIN",
+];
+
+/// Spawn, poll, cancel, and reap a transition-capable runtime child while the
+/// sealed guard retains its binding/activity locks. Target authority and the
+/// executable are derived exclusively from the guard.
+pub fn run_child_with_guard(
+    guard: &mut ReentryGuard,
+    spec: ChildLaunchSpec,
+) -> Result<Output, String> {
+    crate::supervisor::run_child_with_guard(guard, spec)
+}
 
 fn die(msg: &str) -> ! {
     eprintln!("{msg}");
@@ -367,37 +498,132 @@ pub fn run_appserver_pump() -> ! {
         .map(|value| value as u64)
         .unwrap_or(DEFAULT_TIMEOUT_SECS);
 
+    let lifecycle = LifecycleStore::default();
+    let birth = create_managed_birth(
+        &lifecycle,
+        None,
+        "codex",
+        &dir,
+        managed_birth_expiry(timeout_secs),
+        ExecutionBackend::SharedAppServer,
+    )
+    .unwrap_or_else(|error| pump_fail(&error));
     let mut spawned = appserver::start_thread(&server, &dir, model.as_deref(), &sandbox)
         .unwrap_or_else(|e| pump_fail(&e));
     let id = spawned.id().to_string();
-    store::register_with_origin(
-        &id,
-        Some(&dir),
-        name.as_deref(),
-        Some("codex"),
-        Some(&server),
-        Some("app-server"),
-    )
-    .unwrap_or_else(|e| pump_fail(&e));
+    claim_managed_appserver_birth(&lifecycle, &birth, &id, &dir, name.as_deref(), &server)
+        .unwrap_or_else(|error| pump_fail(&error));
+    let mut guard = crate::lifecycle::admit_operation(&birth.worker_id, OperationKind::InitialTurn)
+        .and_then(crate::lifecycle::Admission::into_guard)
+        .unwrap_or_else(|error| pump_fail(&error));
     let abs_relay = std::env::current_exe()
         .ok()
         .map(|path| path.to_string_lossy().to_string())
         .unwrap_or_else(|| "relay".to_string());
     let prompt = build_prompt(&reply_to, &abs_relay, Some(&id), &task);
-    spawned
-        .start_initial_turn(&prompt, model.as_deref(), effort.as_deref())
-        .unwrap_or_else(|e| pump_fail(&e));
+    if let Err(error) = spawned.start_initial_turn_with_guard(
+        &mut guard,
+        &prompt,
+        model.as_deref(),
+        effort.as_deref(),
+    ) {
+        let intent = guard
+            .into_fence_intent("initial app-server turn/start failed")
+            .unwrap_or_else(|fence_error| {
+                pump_fail(&format!(
+                    "publish failed turn/start fence after {error}: {fence_error}"
+                ))
+            });
+        let permit =
+            crate::lifecycle::drain_prior_operations(intent).unwrap_or_else(|drain_error| {
+                pump_fail(&format!(
+                    "drain failed turn/start fence after {error}: {drain_error:?}"
+                ))
+            });
+        permit
+            .mark_turn_unconfirmed(
+                "turn/start failed before an exact turn identity could be recorded; no interrupt was attempted",
+            )
+            .unwrap_or_else(|mark_error| {
+                pump_fail(&format!(
+                    "retain unconfirmed turn/start fence after {error}: {mark_error}"
+                ))
+            });
+        pump_fail(&error);
+    }
 
     pump_report("started", &id);
-    match spawned.pump(timeout_secs.saturating_mul(1000)) {
+    match spawned.pump_with_guard(&mut guard, timeout_secs.saturating_mul(1000)) {
         Ok(true) => std::process::exit(0),
         Ok(false) => {
+            let turn_id = spawned
+                .turn_id()
+                .unwrap_or_else(|| pump_fail("initial turn identity was not recorded"))
+                .to_string();
+            let intent = guard
+                .into_fence_intent("initial app-server turn timed out")
+                .unwrap_or_else(|error| {
+                    pump_fail(&format!("publish app-server timeout fence: {error}"))
+                });
+            let permit = crate::lifecycle::drain_prior_operations(intent).unwrap_or_else(|error| {
+                pump_fail(&format!("drain app-server timeout fence: {error:?}"))
+            });
+            match spawned.interrupt_initial_turn(MANAGED_CANCEL_GRACE_MS) {
+                Ok(true) => {
+                    permit
+                        .confirm_turn_terminal(&id, &turn_id, &id, &turn_id)
+                        .unwrap_or_else(|error| {
+                            pump_fail(&format!("confirm interrupted app-server turn: {error}"))
+                        });
+                }
+                Ok(false) => {
+                    permit
+                        .mark_turn_unconfirmed(
+                            "turn/interrupt returned but no matching turn/completed or idle state was observed",
+                        )
+                        .unwrap_or_else(|error| {
+                            pump_fail(&format!("retain unconfirmed app-server fence: {error}"))
+                        });
+                }
+                Err(error) => {
+                    permit
+                        .mark_turn_unconfirmed(&format!(
+                            "turn/interrupt could not be confirmed: {error}"
+                        ))
+                        .unwrap_or_else(|mark_error| {
+                            pump_fail(&format!(
+                                "retain unconfirmed app-server fence: {mark_error}"
+                            ))
+                        });
+                }
+            }
             eprintln!("app-server first turn timed out after {timeout_secs}s");
             std::process::exit(124);
         }
-        Err(e) => {
-            eprintln!("app-server first turn pump failed: {e}");
-            std::process::exit(1);
+        Err(error) => {
+            let intent = guard
+                .into_fence_intent("initial app-server turn pump failed")
+                .unwrap_or_else(|fence_error| {
+                    pump_fail(&format!(
+                        "publish app-server pump failure fence after {error}: {fence_error}"
+                    ))
+                });
+            let permit =
+                crate::lifecycle::drain_prior_operations(intent).unwrap_or_else(|drain_error| {
+                    pump_fail(&format!(
+                        "drain app-server pump failure fence after {error}: {drain_error:?}"
+                    ))
+                });
+            permit
+                .mark_turn_unconfirmed(&format!(
+                    "app-server connection failed after turn/start; terminal state is unknown: {error}"
+                ))
+                .unwrap_or_else(|mark_error| {
+                    pump_fail(&format!(
+                        "retain unconfirmed app-server pump failure after {error}: {mark_error}"
+                    ))
+                });
+            pump_fail(&format!("app-server first turn pump failed: {error}"));
         }
     }
 }
@@ -704,6 +930,19 @@ pub fn run(raw: Vec<String>) -> ! {
         std::process::exit(0);
     }
 
+    let lifecycle = LifecycleStore::default();
+    let managed_birth = Some(
+        create_managed_birth(
+            &lifecycle,
+            premint.as_deref(),
+            &tool,
+            &dir_s,
+            managed_birth_expiry(timeout_secs),
+            ExecutionBackend::ObservationOnly,
+        )
+        .unwrap_or_else(|error| die(&format!("create managed {tool} birth: {error}"))),
+    );
+
     // stderr → a spawn-log so a child that execs then dies fast (bad flag,
     // auth failure) stays diagnosable; stdout/stdin are null by design.
     let log_id = premint.clone().unwrap_or_else(store::uuid_v4);
@@ -718,6 +957,19 @@ pub fn run(raw: Vec<String>) -> ! {
         .stdout(Stdio::null())
         .stderr(Stdio::from(log_stdin))
         .process_group(0);
+    for key in [
+        "RELAY_MANAGED_WORKER_ID",
+        "RELAY_MANAGED_GENERATION",
+        "RELAY_MANAGED_ATTACH_TOKEN",
+    ] {
+        command.env_remove(key);
+    }
+    if let Some(birth) = managed_birth.as_ref() {
+        command
+            .env("RELAY_MANAGED_WORKER_ID", &birth.worker_id)
+            .env("RELAY_MANAGED_GENERATION", &birth.generation)
+            .env("RELAY_MANAGED_ATTACH_TOKEN", &birth.raw_token);
+    }
     let launched_at = Instant::now();
     let mut child = command
         .spawn()
@@ -764,6 +1016,24 @@ pub fn run(raw: Vec<String>) -> ! {
             log_path.display()
         ));
     };
+    if let Some(birth) = managed_birth.as_ref() {
+        let active = lifecycle
+            .read_worker(&birth.worker_id)
+            .ok()
+            .flatten()
+            .is_some_and(|worker| {
+                worker.generation == birth.generation
+                    && worker.runtime_session_id.as_deref() == Some(id.as_str())
+                    && worker.state == ManagedState::Active
+            });
+        if !active {
+            let _ = child.kill();
+            let _ = child.wait();
+            die(&format!(
+                "{tool} SessionStart registered without completing its exact managed claim"
+            ));
+        }
+    }
     associate_spawn_log(&log_path, &id);
     let name = args.flag("name");
     if name.is_some() || server.is_some() {
