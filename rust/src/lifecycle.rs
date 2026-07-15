@@ -6,11 +6,10 @@
 //! them. Session binding locks are separate kernel locks; the global store lock
 //! is never held while waiting for one.
 
-use crate::sha256::Sha256;
+use crate::sha256::hex_digest;
 use crate::store::{self, Entry, Registry};
 use rustix::fs::{FlockOperation, flock};
 use std::collections::HashMap;
-use std::fmt::Write as _;
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::OpenOptionsExt;
@@ -1010,7 +1009,7 @@ impl LifecycleStore {
         if raw_token.is_empty() {
             return Err("managed attach token is empty".to_string());
         }
-        let token_sha256 = sha256_hex(raw_token.as_bytes());
+        let token_sha256 = hex_digest(raw_token.as_bytes());
         let expected_cwd = canonical_cwd(&spec.expected_cwd);
         let pending = PendingAttach {
             worker_id: spec.worker_id.clone(),
@@ -1242,7 +1241,7 @@ impl LifecycleStore {
         validate_claim(&request)?;
         self.ensure_target_supervisor_live(&request.runtime_session_id)?;
         let canonical_cwd = canonical_cwd(&request.cwd);
-        let token_sha256 = sha256_hex(request.raw_token.as_bytes());
+        let token_sha256 = hex_digest(request.raw_token.as_bytes());
         let start = self.transaction(|registry| {
             begin_claim(registry, &request, &canonical_cwd, &token_sha256)
         })?;
@@ -1434,7 +1433,7 @@ impl LifecycleStore {
     }
 
     pub fn read_pending_by_token(&self, raw_token: &str) -> Result<Option<PendingAttach>, String> {
-        let token_sha256 = sha256_hex(raw_token.as_bytes());
+        let token_sha256 = hex_digest(raw_token.as_bytes());
         self.read_transaction(|registry| {
             let pending = object_map(registry, PENDING_KEY)?;
             pending
@@ -1544,7 +1543,7 @@ impl LifecycleStore {
                             "abandon requires a Fenced or FencingUnconfirmed worker".to_string()
                         );
                     }
-                    sha256_hex(format!("abandon-v1:{worker_id}:{generation}:{reason}").as_bytes())
+                    hex_digest(format!("abandon-v1:{worker_id}:{generation}:{reason}").as_bytes())
                 }
             };
             worker.version = next_version(&worker.version)?;
@@ -1699,7 +1698,7 @@ impl LifecycleStore {
                             .dir
                             .map(|dir| canonical_cwd(&dir))
                             .ok_or_else(|| "operation target has no cwd".to_string())?,
-                        server_fingerprint: sha256_hex(server.as_bytes()),
+                        server_fingerprint: hex_digest(server.as_bytes()),
                         server,
                         thread_id: runtime_session_id,
                     }
@@ -1719,7 +1718,7 @@ impl LifecycleStore {
                         .ok_or_else(|| "operation target has no cwd".to_string())?,
                     server_fingerprint: selected_server
                         .as_ref()
-                        .map(|server| sha256_hex(server.as_bytes())),
+                        .map(|server| hex_digest(server.as_bytes())),
                     server: selected_server,
                 }
             };
@@ -2128,7 +2127,7 @@ impl LifecycleStore {
                 entry_version: entry
                     .as_ref()
                     .map(entry_version)
-                    .unwrap_or_else(|| sha256_hex(b"absent-entry")),
+                    .unwrap_or_else(|| hex_digest(b"absent-entry")),
                 entry,
                 surfaces,
                 deletion_started: false,
@@ -3808,7 +3807,7 @@ impl ReentryGuard {
             || entry
                 .server
                 .as_deref()
-                .map(|server| sha256_hex(server.as_bytes()))
+                .map(|server| hex_digest(server.as_bytes()))
                 != expected.server_fingerprint
         {
             return Err("operation registry authority changed".to_string());
@@ -4472,7 +4471,7 @@ fn owned_process_release_evidence(
         {
             return Ok(None);
         }
-        evidence.push(sha256_hex(
+        evidence.push(hex_digest(
             format!(
                 "owned-child-reap-v1:{}:{}:{}:{}:{}:{}:{}",
                 proof.worker_id,
@@ -4490,7 +4489,7 @@ fn owned_process_release_evidence(
     if evidence.is_empty() {
         return Ok(None);
     }
-    Ok(Some(sha256_hex(
+    Ok(Some(hex_digest(
         format!("owned-child-reap-set-v1:{}", evidence.join(":"),).as_bytes(),
     )))
 }
@@ -4779,18 +4778,6 @@ fn next_version(value: &str) -> Result<String, String> {
         .checked_add(1)
         .map(|version| version.to_string())
         .ok_or_else(|| "version overflow".to_string())
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    hasher
-        .digest()
-        .iter()
-        .fold(String::with_capacity(64), |mut hex, byte| {
-            write!(hex, "{byte:02x}").expect("writing to String cannot fail");
-            hex
-        })
 }
 
 fn string(object: &HashMap<String, JsonValue>, key: &str) -> Option<String> {
@@ -5960,5 +5947,5 @@ fn entry_version(value: &JsonValue) -> String {
     let bytes = value
         .stringify()
         .unwrap_or_else(|_| "malformed".to_string());
-    sha256_hex(bytes.as_bytes())
+    hex_digest(bytes.as_bytes())
 }

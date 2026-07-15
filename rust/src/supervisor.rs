@@ -10,7 +10,7 @@ use crate::lifecycle::{
     ResolvedSupervisorLaunch, StartGeneration, StdioEndpointMode, StdioProfile, SupervisorRecord,
     SupervisorState,
 };
-use crate::sha256::Sha256;
+use crate::sha256::hex_digest;
 use crate::spawn::CHILD_ENV_ALLOWLIST;
 use crate::store;
 use std::collections::HashMap;
@@ -236,7 +236,7 @@ pub fn run_watchdog(argv: &[String]) -> Result<(), String> {
     let watchdog_instance_id = store::uuid_v4();
     let control_epoch = store::uuid_v4();
     let control_nonce = random_hex(32)?;
-    let control_nonce_sha256 = sha256_hex(control_nonce.as_bytes());
+    let control_nonce_sha256 = hex_digest(control_nonce.as_bytes());
     store.record_watchdog(
         &watchdog_instance_id,
         &args.supervisor_instance_id,
@@ -322,7 +322,7 @@ pub fn run_supervisor(argv: &[String]) -> Result<(), String> {
     store.validate_watchdog_bootstrap(
         &args.supervisor_instance_id,
         &args.control_epoch,
-        &sha256_hex(control_nonce.as_bytes()),
+        &hex_digest(control_nonce.as_bytes()),
     )?;
     startup_checkpoint(SupervisorStartupPhase::SupervisorBootstrap, "after")?;
     let resolved = store.resolve_supervisor_launch(
@@ -461,7 +461,7 @@ pub fn run_supervisor(argv: &[String]) -> Result<(), String> {
     store.record_supervisor_ready(SupervisorRecord {
         supervisor_instance_id: args.supervisor_instance_id.clone(),
         control_epoch: args.control_epoch.clone(),
-        control_nonce_sha256: sha256_hex(control_nonce.as_bytes()),
+        control_nonce_sha256: hex_digest(control_nonce.as_bytes()),
         operation_id: args.operation_id.clone(),
         process: observe_process(std::process::id()),
         socket_path: socket_path.clone(),
@@ -1490,18 +1490,6 @@ fn random_hex(bytes: usize) -> Result<String, String> {
         .and_then(|mut source| source.read_exact(&mut random))
         .map_err(|error| format!("read lifecycle control nonce: {error}"))?;
     Ok(encode_hex(&random))
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    hasher
-        .digest()
-        .into_iter()
-        .fold(String::with_capacity(64), |mut output, byte| {
-            write!(output, "{byte:02x}").expect("write to String");
-            output
-        })
 }
 
 fn open_pty(rows: u16, cols: u16) -> Result<(File, File), String> {

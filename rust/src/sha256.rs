@@ -1,6 +1,8 @@
 // Minimal incremental SHA-256 for follow-file integrity checks. Keeping this
 // in-tree avoids adding a dependency to the single-static-binary relay crate.
 
+use std::fmt::Write as _;
+
 const INITIAL_STATE: [u32; 8] = [
     0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
 ];
@@ -136,19 +138,21 @@ impl Sha256 {
     }
 }
 
+pub(crate) fn hex_digest(input: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(input);
+    hasher
+        .digest()
+        .iter()
+        .fold(String::with_capacity(64), |mut hex, byte| {
+            write!(hex, "{byte:02x}").expect("writing to a String cannot fail");
+            hex
+        })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::Sha256;
-    use std::fmt::Write;
-
-    fn hex(bytes: [u8; 32]) -> String {
-        bytes
-            .iter()
-            .fold(String::with_capacity(64), |mut hex, byte| {
-                write!(hex, "{byte:02x}").expect("writing to a String cannot fail");
-                hex
-            })
-    }
+    use super::{Sha256, hex_digest};
 
     #[test]
     fn matches_standard_vectors() {
@@ -166,9 +170,7 @@ mod tests {
                 "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1",
             ),
         ] {
-            let mut hasher = Sha256::new();
-            hasher.update(input.as_bytes());
-            assert_eq!(hex(hasher.digest()), expected);
+            assert_eq!(hex_digest(input.as_bytes()), expected);
         }
     }
 
@@ -186,13 +188,8 @@ mod tests {
 
     #[test]
     fn matches_million_a_multiblock_vector() {
-        let mut hasher = Sha256::new();
-        let chunk = [b'a'; 1000];
-        for _ in 0..1000 {
-            hasher.update(&chunk);
-        }
         assert_eq!(
-            hex(hasher.digest()),
+            hex_digest(&vec![b'a'; 1_000_000]),
             "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"
         );
     }

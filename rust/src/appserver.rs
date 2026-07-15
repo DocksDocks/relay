@@ -20,9 +20,8 @@
 //     foreign threads decline every elicitation.
 
 use crate::lifecycle::{OperationKind, ReentryGuard};
-use crate::sha256::Sha256;
+use crate::sha256::hex_digest;
 use std::collections::HashMap;
-use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
@@ -249,7 +248,7 @@ pub(crate) fn start_thread(
         id,
         turn_id: None,
         server: server.to_string(),
-        server_fingerprint: sha256_hex(server.as_bytes()),
+        server_fingerprint: hex_digest(server.as_bytes()),
     })
 }
 
@@ -472,18 +471,6 @@ fn start_ack_turn_with_guard(
         );
     }
     Ok(())
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    hasher
-        .digest()
-        .iter()
-        .fold(String::with_capacity(64), |mut hex, byte| {
-            write!(hex, "{byte:02x}").expect("writing to String cannot fail");
-            hex
-        })
 }
 
 // ---- JSON-RPC param builders (pure — unit-tested shapes) ----
