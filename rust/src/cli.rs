@@ -31,7 +31,7 @@ use tinyjson::JsonValue;
 
 pub(crate) const DEFAULT_NUDGE: &str = "You have new session-relay mail. Use the session-relay skill: call inbox to read your pending messages and act on them.";
 const DEFAULT_TURN_SETTLE_MS: u64 = 5000;
-const BOOL_FLAGS: [&str; 8] = [
+const BOOL_FLAGS: [&str; 10] = [
     "dry",
     "json",
     "auto-turn",
@@ -40,6 +40,8 @@ const BOOL_FLAGS: [&str; 8] = [
     "read-only",
     "full-access",
     "watch",
+    "fanout",
+    "worktree",
 ];
 
 fn die(msg: &str) -> ! {

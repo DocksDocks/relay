@@ -3,6 +3,7 @@ pub mod bus;
 pub mod channel;
 pub mod cli;
 pub mod discover;
+pub mod fanout;
 pub mod hook;
 pub mod lifecycle;
 pub(crate) mod sha256;

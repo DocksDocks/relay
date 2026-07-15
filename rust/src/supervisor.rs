@@ -1581,7 +1581,7 @@ fn set_terminal_size(fd: i32, rows: u16, cols: u16) -> Result<(), String> {
     }
 }
 
-fn observe_process(pid: u32) -> ProcessObservation {
+pub(crate) fn observe_process(pid: u32) -> ProcessObservation {
     #[cfg(target_os = "linux")]
     let start = fs::read_to_string(format!("/proc/{pid}/stat"))
         .ok()

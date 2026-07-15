@@ -21,10 +21,11 @@
 
 use crate::appserver;
 use crate::cli::Args;
+use crate::fanout::{self, FanoutMode, FanoutState, FanoutStore};
 use crate::lifecycle::{
     ChildLaunchSpec, ClaimManagedAttach, ClaimOutcome, ExecutionBackend, LifecycleStore,
     MANAGED_CANCEL_GRACE_MS, ManagedState, OperationKind, PendingAttachSpec, ReentryGuard,
-    RequiredScope,
+    RequiredScope, TerminalAction,
 };
 use crate::store;
 use rustix::fs::{FlockOperation, flock};
@@ -46,6 +47,119 @@ struct ManagedBirth {
     worker_id: String,
     generation: String,
     raw_token: String,
+}
+
+struct FanoutSpawnConfig {
+    reservation_id: String,
+    cwd: String,
+    tool: String,
+    command: String,
+    arguments: Vec<String>,
+    preminted_session_id: Option<String>,
+    name: Option<String>,
+    timeout_secs: u64,
+}
+
+struct FanoutLaunchOptions<'a> {
+    repository: &'a std::path::Path,
+    mode: FanoutMode,
+    parent_session_id: &'a str,
+    tool: &'a str,
+    model: Option<&'a str>,
+    effort: Option<&'a str>,
+    name: Option<&'a str>,
+    reply_to: &'a str,
+    timeout_secs: u64,
+    permissions: &'a [String; 2],
+    task: &'a str,
+}
+
+enum WorkerWorkspace<'a> {
+    CreateBranch,
+    AssignedFanoutWorktree { handback_session_id: &'a str },
+}
+
+impl FanoutSpawnConfig {
+    fn to_json(&self) -> String {
+        let mut object = HashMap::new();
+        for (key, value) in [
+            ("reservation_id", Some(self.reservation_id.as_str())),
+            ("cwd", Some(self.cwd.as_str())),
+            ("tool", Some(self.tool.as_str())),
+            ("command", Some(self.command.as_str())),
+            ("preminted_session_id", self.preminted_session_id.as_deref()),
+            ("name", self.name.as_deref()),
+        ] {
+            object.insert(
+                key.to_string(),
+                value
+                    .map(|value| JsonValue::from(value.to_string()))
+                    .unwrap_or(JsonValue::from(())),
+            );
+        }
+        object.insert(
+            "arguments".into(),
+            JsonValue::from(
+                self.arguments
+                    .iter()
+                    .cloned()
+                    .map(JsonValue::from)
+                    .collect::<Vec<_>>(),
+            ),
+        );
+        object.insert(
+            "timeout_secs".into(),
+            JsonValue::from(self.timeout_secs as f64),
+        );
+        JsonValue::from(object)
+            .stringify()
+            .unwrap_or_else(|_| "{}".to_string())
+    }
+
+    fn from_stdin() -> Result<Self, String> {
+        let mut input = String::new();
+        std::io::stdin()
+            .read_to_string(&mut input)
+            .map_err(|error| format!("read fanout supervisor config: {error}"))?;
+        let object = input
+            .parse::<JsonValue>()
+            .ok()
+            .and_then(|value| value.get::<HashMap<String, JsonValue>>().cloned())
+            .ok_or_else(|| "invalid fanout supervisor config".to_string())?;
+        let required = |key: &str| {
+            config_string(&object, key)
+                .ok_or_else(|| format!("fanout supervisor config missing {key}"))
+        };
+        let arguments = object
+            .get("arguments")
+            .and_then(|value| value.get::<Vec<JsonValue>>())
+            .ok_or_else(|| "fanout supervisor config missing arguments".to_string())?
+            .iter()
+            .map(|value| {
+                value
+                    .get::<String>()
+                    .cloned()
+                    .ok_or_else(|| "fanout supervisor argument is not a string".to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let timeout_secs = object
+            .get("timeout_secs")
+            .and_then(|value| value.get::<f64>())
+            .copied()
+            .map(|value| value as u64)
+            .filter(|value| *value > 0)
+            .ok_or_else(|| "fanout supervisor timeout is invalid".to_string())?;
+        Ok(Self {
+            reservation_id: required("reservation_id")?,
+            cwd: required("cwd")?,
+            tool: required("tool")?,
+            command: required("command")?,
+            arguments,
+            preminted_session_id: config_string(&object, "preminted_session_id"),
+            name: config_string(&object, "name"),
+            timeout_secs,
+        })
+    }
 }
 
 fn create_managed_birth(
@@ -173,7 +287,7 @@ fn die(msg: &str) -> ! {
     std::process::exit(1);
 }
 
-const USAGE: &str = "usage: relay spawn <dir> [--tool claude|codex] [--model <m>] [--effort <e>] [--name <busName>] [--server <unix-socket>] [--reply-to <nameOrId>] [--timeout <sec>] [--read-only] [--full-access] [--watch] [--dry] [--] <first task>";
+const USAGE: &str = "usage: relay spawn <dir> [--fanout|--worktree --from <session>] [--tool claude|codex] [--model <m>] [--effort <e>] [--name <busName>] [--server <unix-socket>] [--reply-to <nameOrId>] [--timeout <sec>] [--read-only] [--full-access] [--watch] [--dry] [--] <first task>";
 
 fn exit_code(status: &ExitStatus) -> i32 {
     status
@@ -387,26 +501,86 @@ fn resolve_spawn_tool(
 // worker even when the shared-dir marker has moved on; codex workers learn
 // theirs from the identity line the hook injects at session start.
 fn build_prompt(reply_to: &str, abs_relay: &str, premint: Option<&str>, task: &str) -> String {
+    build_worker_prompt(
+        reply_to,
+        abs_relay,
+        premint,
+        WorkerWorkspace::CreateBranch,
+        task,
+    )
+}
+
+fn build_fanout_prompt(
+    reply_to: &str,
+    abs_relay: &str,
+    premint: Option<&str>,
+    task: &str,
+) -> String {
+    build_worker_prompt(
+        reply_to,
+        abs_relay,
+        premint,
+        WorkerWorkspace::AssignedFanoutWorktree {
+            handback_session_id: premint.unwrap_or("<session-relay-id>"),
+        },
+        task,
+    )
+}
+
+fn build_worker_prompt(
+    reply_to: &str,
+    abs_relay: &str,
+    premint: Option<&str>,
+    workspace: WorkerWorkspace<'_>,
+    task: &str,
+) -> String {
     let from = premint
         .map(|id| format!("--from {id} "))
         .unwrap_or_default();
+    let (report_rule, workspace_rule, completion) = match workspace {
+        WorkerWorkspace::CreateBranch => (
+            format!(
+                "When you finish, or if you need a decision, report to \"{reply_to}\" over the bus."
+            ),
+            "Always create and work on a separate git branch; never commit directly to the\n   default branch.".to_string(),
+            String::new(),
+        ),
+        WorkerWorkspace::AssignedFanoutWorktree {
+            handback_session_id,
+        } => (
+            format!(
+                "If you need a decision, report to \"{reply_to}\" over the bus and wait for its reply."
+            ),
+            "Work only in the already assigned isolated worktree and branch; do not create or\n   switch branches.".to_string(),
+            format!(
+                r#"
+Completion contract:
+1. You must commit all intended changes on the assigned branch.
+2. You must verify the worktree is clean.
+3. Run:
+   {abs_relay} handback --from {handback_session_id} --status completed --note "<brief note>"
+   Replace <session-relay-id> with the identity supplied at SessionStart when needed.
+This must be your final action; do not write to the worktree afterward.
+"#
+            ),
+        ),
+    };
     format!(
         r#"You are a session-relay bus worker spawned by "{reply_to}". You are running in a
 fresh session in this project — its CLAUDE.md/AGENTS.md, skills, and plugins apply.
-When you finish, or if you need a decision, report to "{reply_to}" over the bus.
+{report_rule}
 PRIMARY (works even if session-relay isn't installed in this project) — run:
   {abs_relay} send "{reply_to}" {from}-- "<your message>"
 (that is the absolute path to the relay binary that spawned you). If this project has
 session-relay installed, the session-relay skill's send tool works too.
 
 Guardrail rules (non-negotiable):
-1. Always create and work on a separate git branch; never commit directly to the
-   default branch.
+1. {workspace_rule}
 2. Never modify live/production systems (e.g. over ssh). Read-only probes are
    allowed; mutations are not.
 3. Destructive or irreversible operations require asking "{reply_to}" over the bus
    first and waiting for approval.
-
+{completion}
 Your task:
 
 {task}"#
@@ -776,6 +950,473 @@ fn default_reply_to() -> Option<String> {
     Some(name.unwrap_or(id))
 }
 
+fn run_fanout_spawn(options: FanoutLaunchOptions<'_>) -> ! {
+    let fanout_store = FanoutStore::new(store::home_dir());
+    let reservation = fanout::prepare_worktree(
+        &fanout_store,
+        options.repository,
+        options.parent_session_id,
+        options.mode,
+    )
+    .unwrap_or_else(|error| die(&error));
+    let preminted_session_id = (options.tool != "codex").then(store::uuid_v4);
+    let relay = std::env::current_exe()
+        .ok()
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "relay".to_string());
+    let prompt = build_fanout_prompt(
+        options.reply_to,
+        &relay,
+        preminted_session_id.as_deref(),
+        options.task,
+    );
+    let config = FanoutSpawnConfig {
+        reservation_id: reservation.reservation_id,
+        cwd: reservation.worktree.clone(),
+        tool: options.tool.to_string(),
+        command: child_cmd(options.tool),
+        arguments: child_args(
+            options.tool,
+            options.permissions,
+            preminted_session_id.as_deref(),
+            false,
+            options.model,
+            options.effort,
+            &prompt,
+        ),
+        preminted_session_id,
+        name: options.name.map(str::to_string),
+        timeout_secs: options.timeout_secs,
+    };
+    let executable = std::env::current_exe()
+        .unwrap_or_else(|error| die(&format!("resolve relay executable: {error}")));
+    let mut supervisor = Command::new(executable)
+        .arg("__fanout-supervisor")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+        .unwrap_or_else(|error| die(&format!("launch fanout supervisor: {error}")));
+    let mut input = supervisor
+        .stdin
+        .take()
+        .unwrap_or_else(|| die("fanout supervisor stdin unavailable"));
+    input
+        .write_all(config.to_json().as_bytes())
+        .unwrap_or_else(|error| die(&format!("write fanout supervisor config: {error}")));
+    drop(input);
+    let output = supervisor
+        .stdout
+        .take()
+        .unwrap_or_else(|| die("fanout supervisor stdout unavailable"));
+    let mut line = String::new();
+    BufReader::new(output)
+        .read_line(&mut line)
+        .unwrap_or_else(|error| die(&format!("read fanout supervisor result: {error}")));
+    let report = line
+        .parse::<JsonValue>()
+        .ok()
+        .and_then(|value| value.get::<HashMap<String, JsonValue>>().cloned())
+        .unwrap_or_default();
+    if let Some(error) = config_string(&report, "error") {
+        let _ = supervisor.wait();
+        die(&error);
+    }
+    let id = config_string(&report, "started").unwrap_or_else(|| {
+        let status = supervisor.wait().ok();
+        die(&format!(
+            "fanout supervisor exited before confirming an Active birth{}",
+            status
+                .as_ref()
+                .map(|status| format!(" ({})", exit_code(status)))
+                .unwrap_or_default()
+        ));
+    });
+    drop(supervisor);
+    if let Some(name) = options.name {
+        println!("spawned {name} ({id}) in {}", reservation.worktree);
+    } else {
+        println!("spawned {id} in {}", reservation.worktree);
+    }
+    std::process::exit(0);
+}
+
+fn terminate_owned_child(child: &mut Child) -> Result<ExitStatus, String> {
+    if child
+        .try_wait()
+        .map_err(|error| format!("inspect fanout child: {error}"))?
+        .is_none()
+    {
+        child
+            .kill()
+            .map_err(|error| format!("terminate exact fanout child: {error}"))?;
+    }
+    child
+        .wait()
+        .map_err(|error| format!("reap exact fanout child: {error}"))
+}
+
+fn release_reaped_fanout_worker(
+    lifecycle: &LifecycleStore,
+    birth: &ManagedBirth,
+    custody: &crate::lifecycle::OwnedProcessCustody,
+    status: &ExitStatus,
+    release: bool,
+) -> Result<(), String> {
+    lifecycle.record_owned_process_reaped(custody, exit_code(status))?;
+    let intent = lifecycle.publish_fence(
+        &birth.worker_id,
+        &birth.generation,
+        if release {
+            "fanout handback"
+        } else {
+            "fanout process exited without handback"
+        },
+    )?;
+    let permit = lifecycle
+        .drain_prior_operations(intent)
+        .map_err(|error| format!("drain fanout worker: {error:?}"))?;
+    let fenced = permit.confirm_process_terminal()?;
+    lifecycle.terminalize_worker(
+        &birth.worker_id,
+        &birth.generation,
+        &fenced.version,
+        if release {
+            TerminalAction::Release
+        } else {
+            TerminalAction::Abandon
+        },
+        if release {
+            "fanout process reaped"
+        } else {
+            "fanout process exited without handback"
+        },
+    )?;
+    if release {
+        Ok(())
+    } else {
+        Err("fanout process exited without handback; capacity retained".to_string())
+    }
+}
+
+fn retain_reaped_fanout_worker(
+    lifecycle: &LifecycleStore,
+    birth: &ManagedBirth,
+    reason: &str,
+) -> Result<(), String> {
+    let mut worker = lifecycle
+        .read_worker(&birth.worker_id)?
+        .ok_or_else(|| "fanout worker disappeared after reap".to_string())?;
+    if worker.state == ManagedState::Active {
+        let intent = lifecycle.publish_fence(&birth.worker_id, &birth.generation, reason)?;
+        worker = lifecycle
+            .drain_prior_operations(intent)
+            .map_err(|error| format!("drain reaped fanout worker: {error:?}"))?
+            .confirm_process_terminal()?;
+    }
+    if matches!(
+        worker.state,
+        ManagedState::Fenced | ManagedState::FencingUnconfirmed
+    ) {
+        lifecycle.terminalize_worker(
+            &birth.worker_id,
+            &birth.generation,
+            &worker.version,
+            TerminalAction::Abandon,
+            reason,
+        )?;
+    }
+    Ok(())
+}
+
+fn terminate_and_retain_fanout_child(
+    lifecycle: &LifecycleStore,
+    birth: &ManagedBirth,
+    custody: &crate::lifecycle::OwnedProcessCustody,
+    child: &mut Child,
+    reason: &str,
+) {
+    if let Ok(status) = terminate_owned_child(child) {
+        if lifecycle
+            .record_owned_process_reaped(custody, exit_code(&status))
+            .is_ok()
+        {
+            let _ = retain_reaped_fanout_worker(lifecycle, birth, reason);
+        }
+    }
+}
+
+fn supervise_fanout_child(
+    fanout_store: &FanoutStore,
+    lifecycle: &LifecycleStore,
+    config: &FanoutSpawnConfig,
+    birth: &ManagedBirth,
+    custody: &crate::lifecycle::OwnedProcessCustody,
+    child: &mut Child,
+) -> Result<(), String> {
+    loop {
+        let record = fanout_store
+            .read(&config.reservation_id)?
+            .ok_or_else(|| "fanout reservation disappeared".to_string())?;
+        if record.state == FanoutState::HandedBack {
+            let permit = lifecycle
+                .publish_fence(&birth.worker_id, &birth.generation, "fanout handback")
+                .and_then(|intent| {
+                    lifecycle
+                        .drain_prior_operations(intent)
+                        .map_err(|error| format!("drain fanout handback: {error:?}"))
+                });
+            let status = terminate_owned_child(child)?;
+            lifecycle.record_owned_process_reaped(custody, exit_code(&status))?;
+            let permit = match permit {
+                Ok(permit) => permit,
+                Err(error) => {
+                    let _ = retain_reaped_fanout_worker(
+                        lifecycle,
+                        birth,
+                        "fanout handback drain was not proven",
+                    );
+                    return Err(format!(
+                        "{error}; exact process reaped but capacity retained"
+                    ));
+                }
+            };
+            let fenced = permit.confirm_process_terminal()?;
+            lifecycle.terminalize_worker(
+                &birth.worker_id,
+                &birth.generation,
+                &fenced.version,
+                TerminalAction::Release,
+                "fanout process reaped",
+            )?;
+            return Ok(());
+        }
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| format!("inspect fanout child: {error}"))?
+        {
+            let release = fanout_store
+                .read(&config.reservation_id)?
+                .is_some_and(|current| current.state == FanoutState::HandedBack);
+            return release_reaped_fanout_worker(lifecycle, birth, custody, &status, release);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+pub fn run_fanout_supervisor() -> ! {
+    let config = FanoutSpawnConfig::from_stdin().unwrap_or_else(|error| pump_fail(&error));
+    let fanout_store = FanoutStore::new(store::home_dir());
+    let lifecycle = LifecycleStore::default();
+    let birth = create_managed_birth(
+        &lifecycle,
+        config.preminted_session_id.as_deref(),
+        &config.tool,
+        &config.cwd,
+        managed_birth_expiry(config.timeout_secs),
+        ExecutionBackend::SupervisorOwnedProcess,
+    )
+    .unwrap_or_else(|error| pump_fail(&format!("create fanout managed birth: {error}")));
+    fanout_store
+        .bind_managed(&config.reservation_id, &birth.worker_id, &birth.generation)
+        .unwrap_or_else(|error| pump_fail(&format!("bind fanout managed birth: {error}")));
+    let log_id = config
+        .preminted_session_id
+        .clone()
+        .unwrap_or_else(|| config.reservation_id.clone());
+    let (mut log_writer, log_stdin, log_path) = match start_log_pump(&log_id) {
+        Ok(log) => log,
+        Err(error) => {
+            let rollback = fanout::rollback_before_process_start(
+                &fanout_store,
+                &config.reservation_id,
+                &birth.worker_id,
+                &birth.generation,
+                &error,
+            );
+            pump_fail(&match rollback {
+                Ok(_) => error,
+                Err(rollback_error) => {
+                    format!("{error}; rollback retained capacity: {rollback_error}")
+                }
+            });
+        }
+    };
+    let marker_before = store::id_for_dir(&config.cwd);
+    let mut command = Command::new(&config.command);
+    command
+        .args(&config.arguments)
+        .current_dir(&config.cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(log_stdin))
+        .process_group(0);
+    for key in [
+        "RELAY_MANAGED_WORKER_ID",
+        "RELAY_MANAGED_GENERATION",
+        "RELAY_MANAGED_ATTACH_TOKEN",
+    ] {
+        command.env_remove(key);
+    }
+    command
+        .env("RELAY_MANAGED_WORKER_ID", &birth.worker_id)
+        .env("RELAY_MANAGED_GENERATION", &birth.generation)
+        .env("RELAY_MANAGED_ATTACH_TOKEN", &birth.raw_token);
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            drop(command);
+            let _ = log_writer.wait();
+            let message = format!("failed to launch {}: {error}", config.command);
+            let rollback = fanout::rollback_before_process_start(
+                &fanout_store,
+                &config.reservation_id,
+                &birth.worker_id,
+                &birth.generation,
+                &message,
+            );
+            pump_fail(&match rollback {
+                Ok(_) => message,
+                Err(rollback_error) => {
+                    format!("{message}; rollback retained capacity: {rollback_error}")
+                }
+            });
+        }
+    };
+    drop(command);
+    let supervisor_instance_id = store::uuid_v4();
+    let custody = match lifecycle.begin_owned_process_custody(
+        &birth.worker_id,
+        &birth.generation,
+        &supervisor_instance_id,
+        crate::supervisor::observe_process(child.id()),
+    ) {
+        Ok(custody) => custody,
+        Err(error) => {
+            let _ = terminate_owned_child(&mut child);
+            let _ = log_writer.wait();
+            let message = format!("publish fanout process custody: {error}");
+            let _ = fanout_store.record_error(&config.reservation_id, &message);
+            pump_fail(&message);
+        }
+    };
+    let deadline = Instant::now() + Duration::from_secs(config.timeout_secs);
+    let id = loop {
+        let born = match config.preminted_session_id.as_ref() {
+            Some(id) => store::resolve(id).map(|entry| entry.id),
+            None => match store::id_for_dir(&config.cwd) {
+                Some(id) if Some(&id) != marker_before.as_ref() && store::is_uuid(&id) => Some(id),
+                _ => None,
+            },
+        };
+        if let Some(id) = born {
+            break id;
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let _ = lifecycle.record_owned_process_reaped(&custody, exit_code(&status));
+                let _ = log_writer.wait();
+                let message = format!(
+                    "fanout child exited before birth registration ({}) — see {}",
+                    exit_code(&status),
+                    log_path.display()
+                );
+                let _ = fanout_store.record_error(&config.reservation_id, &message);
+                pump_fail(&message);
+            }
+            Ok(None) => {}
+            Err(error) => pump_fail(&format!("inspect fanout child birth: {error}")),
+        }
+        if Instant::now() >= deadline {
+            let status = terminate_owned_child(&mut child);
+            if let Ok(status) = &status {
+                let _ = lifecycle.record_owned_process_reaped(&custody, exit_code(status));
+            }
+            let _ = log_writer.wait();
+            let message = format!(
+                "no fanout birth registration within {}s — see {}",
+                config.timeout_secs,
+                log_path.display()
+            );
+            let _ = fanout_store.record_error(&config.reservation_id, &message);
+            pump_fail(&message);
+        }
+        std::thread::sleep(Duration::from_millis(BIRTH_POLL_MS));
+    };
+    let active = lifecycle
+        .read_worker(&birth.worker_id)
+        .ok()
+        .flatten()
+        .is_some_and(|worker| {
+            worker.generation == birth.generation
+                && worker.runtime_session_id.as_deref() == Some(id.as_str())
+                && worker.state == ManagedState::Active
+        });
+    if !active {
+        terminate_and_retain_fanout_child(
+            &lifecycle,
+            &birth,
+            &custody,
+            &mut child,
+            "fanout managed claim was not exact",
+        );
+        let _ = log_writer.wait();
+        let message = "fanout SessionStart did not complete its exact managed claim";
+        let _ = fanout_store.record_error(&config.reservation_id, message);
+        pump_fail(message);
+    }
+    if let Err(error) = fanout_store.attach_runtime(&config.reservation_id, &id) {
+        terminate_and_retain_fanout_child(
+            &lifecycle,
+            &birth,
+            &custody,
+            &mut child,
+            "fanout runtime attachment failed",
+        );
+        let _ = log_writer.wait();
+        let message = format!("attach fanout runtime: {error}");
+        let _ = fanout_store.record_error(&config.reservation_id, &message);
+        pump_fail(&message);
+    }
+    associate_spawn_log(&log_path, &id);
+    if config.name.is_some() {
+        if let Err(error) = store::register(
+            &id,
+            Some(&config.cwd),
+            config.name.as_deref(),
+            Some(&config.tool),
+            None,
+        ) {
+            terminate_and_retain_fanout_child(
+                &lifecycle,
+                &birth,
+                &custody,
+                &mut child,
+                "fanout name registration failed",
+            );
+            let _ = log_writer.wait();
+            let _ = fanout_store.record_error(&config.reservation_id, &error);
+            pump_fail(&error);
+        }
+    }
+    pump_report("started", &id);
+    let result = supervise_fanout_child(
+        &fanout_store,
+        &lifecycle,
+        &config,
+        &birth,
+        &custody,
+        &mut child,
+    );
+    let _ = log_writer.wait();
+    if let Err(error) = result {
+        let _ = fanout_store.record_error(&config.reservation_id, &error);
+        std::process::exit(1);
+    }
+    std::process::exit(0);
+}
+
 pub fn run(raw: Vec<String>) -> ! {
     let args = Args(raw);
     let pos = args.positionals(1);
@@ -831,6 +1472,7 @@ pub fn run(raw: Vec<String>) -> ! {
     let reply_to = args
         .flag("reply-to")
         .map(str::to_string)
+        .or_else(|| args.flag("from").map(str::to_string))
         .or_else(default_reply_to)
         .unwrap_or_else(|| {
             die("no --reply-to given and this directory has no registered session; pass --reply-to <name-or-id> (see `relay whoami`)")
@@ -842,6 +1484,42 @@ pub fn run(raw: Vec<String>) -> ! {
         .unwrap_or_else(|| "relay".to_string());
 
     let perm = perm_args(&tool, read_only, full_access);
+    let fanout_mode = match (args.has("fanout"), args.has("worktree")) {
+        (true, false) => Some(FanoutMode::Root),
+        (false, true) => Some(FanoutMode::Child),
+        (false, false) => None,
+        (true, true) => die("--fanout and --worktree are mutually exclusive"),
+    };
+    if let Some(mode) = fanout_mode {
+        let parent_session_id = args
+            .flag("from")
+            .unwrap_or_else(|| die("fanout spawn requires --from <session UUID>"));
+        if server.is_some() {
+            die("fanout spawn does not support --server");
+        }
+        if read_only {
+            die("fanout spawn does not support --read-only");
+        }
+        if args.has("dry") {
+            die("fanout spawn does not support --dry");
+        }
+        if watch {
+            die("fanout spawn returns after exact Active birth; --watch is not supported");
+        }
+        run_fanout_spawn(FanoutLaunchOptions {
+            repository: &dir,
+            mode,
+            parent_session_id,
+            tool: &tool,
+            model,
+            effort,
+            name: args.flag("name"),
+            reply_to: &reply_to,
+            timeout_secs,
+            permissions: &perm,
+            task: &task,
+        });
+    }
     if tool == "codex" {
         if let Some(server) = server {
             if args.has("dry") {
@@ -1132,6 +1810,20 @@ mod tests {
     fn prompt_bakes_the_preminted_id_into_the_reply_command_as_from() {
         let p = build_prompt("boss", "/opt/bin/relay", Some("u-7"), "t");
         assert!(p.contains(r#"/opt/bin/relay send "boss" --from u-7 -- "#));
+    }
+
+    #[test]
+    fn fanout_prompt_requires_a_clean_committed_handback_as_the_final_action() {
+        let p = build_fanout_prompt("boss", "/opt/bin/relay", Some("u-7"), "do the thing");
+        assert!(p.contains("already assigned isolated worktree and branch"));
+        assert!(!p.contains("Always create and work on a separate git branch"));
+        assert!(p.contains("commit all intended changes"));
+        assert!(p.contains("verify the worktree is clean"));
+        assert!(p.contains(
+            r#"/opt/bin/relay handback --from u-7 --status completed --note "<brief note>""#
+        ));
+        assert!(p.contains("must be your final action; do not write to the worktree afterward"));
+        assert!(p.trim_end().ends_with("do the thing"));
     }
 
     #[test]

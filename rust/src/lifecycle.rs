@@ -356,6 +356,14 @@ pub struct ProcessObservation {
     pub start: StartGeneration,
 }
 
+#[doc(hidden)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OwnedProcessCustody {
+    operation_id: String,
+    operation_version: String,
+    supervisor_instance_id: String,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ExternalCustody {
     None,
@@ -666,6 +674,11 @@ impl FencePermit {
 
     pub fn generation(&self) -> &str {
         &self.intent.generation
+    }
+
+    #[doc(hidden)]
+    pub fn confirm_process_terminal(self) -> Result<ManagedWorker, String> {
+        self.finish_turn_fence(ManagedState::Fenced, None)
     }
 
     pub(crate) fn confirm_turn_terminal(
@@ -1056,6 +1069,143 @@ impl LifecycleStore {
             set_object_map(registry, WORKERS_KEY, workers);
             set_object_map(registry, PENDING_KEY, pending_map);
             Ok(pending.clone())
+        })
+    }
+
+    #[doc(hidden)]
+    pub fn begin_owned_process_custody(
+        &self,
+        worker_id: &str,
+        generation: &str,
+        supervisor_instance_id: &str,
+        process: ProcessObservation,
+    ) -> Result<OwnedProcessCustody, String> {
+        validate_uuid("worker_id", worker_id)?;
+        validate_uuid("generation", generation)?;
+        validate_uuid("supervisor_instance_id", supervisor_instance_id)?;
+        if process.pid == 0 {
+            return Err("owned process pid must be nonzero".to_string());
+        }
+        let operation_id = store::uuid_v4();
+        self.transaction(|registry| {
+            let workers = object_map(registry, WORKERS_KEY)?;
+            let worker = workers
+                .get(worker_id)
+                .and_then(ManagedWorker::from_json)
+                .ok_or_else(|| "owned process worker is missing or malformed".to_string())?;
+            if worker.generation != generation
+                || !matches!(worker.state, ManagedState::Attaching | ManagedState::Active)
+                || worker.required_scope != RequiredScope::ProcessOnly
+                || worker.execution != ExecutionBackend::SupervisorOwnedProcess
+            {
+                return Err("worker does not admit supervisor-owned process custody".to_string());
+            }
+            let mut operations = object_map(registry, ACTIVE_OPERATIONS_KEY)?;
+            for value in operations.values() {
+                let current = ActiveOperationRecord::from_json(value)
+                    .ok_or_else(|| "malformed active operation".to_string())?;
+                if current.worker_id.as_deref() == Some(worker_id)
+                    && current.generation.as_deref() == Some(generation)
+                {
+                    return Err("worker already has active process custody".to_string());
+                }
+            }
+            let runtime_session_id = worker
+                .runtime_session_id
+                .clone()
+                .unwrap_or_else(|| worker_id.to_string());
+            let binding_epoch = object_map(registry, BINDINGS_KEY)?
+                .get(&runtime_session_id)
+                .and_then(SessionBinding::from_json)
+                .map(|binding| binding.binding_epoch)
+                .unwrap_or_else(|| "0".to_string());
+            operations.insert(
+                operation_id.clone(),
+                ActiveOperationRecord {
+                    operation_id: operation_id.clone(),
+                    runtime_session_id,
+                    worker_id: Some(worker_id.to_string()),
+                    generation: Some(generation.to_string()),
+                    binding_epoch,
+                    lifecycle_version: Some(worker.version),
+                    operation_version: "1".to_string(),
+                    kind: OperationKind::InitialTurn,
+                    custody: ExternalCustody::ChildOwned {
+                        supervisor_instance_id: supervisor_instance_id.to_string(),
+                        process: process.clone(),
+                    },
+                    terminal: false,
+                    cancelled: false,
+                    reap_proof: None,
+                    launch_spec: None,
+                    stdio: None,
+                }
+                .to_json(),
+            );
+            set_object_map(registry, ACTIVE_OPERATIONS_KEY, operations);
+            Ok(OwnedProcessCustody {
+                operation_id: operation_id.clone(),
+                operation_version: "1".to_string(),
+                supervisor_instance_id: supervisor_instance_id.to_string(),
+            })
+        })
+    }
+
+    #[doc(hidden)]
+    pub fn record_owned_process_reaped(
+        &self,
+        custody: &OwnedProcessCustody,
+        exit_status: i32,
+    ) -> Result<String, String> {
+        self.record_child_reaped(
+            &custody.operation_id,
+            &custody.operation_version,
+            &custody.supervisor_instance_id,
+            exit_status,
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn discard_unclaimed_owned_process_worker(
+        &self,
+        worker_id: &str,
+        generation: &str,
+    ) -> Result<(), String> {
+        validate_uuid("worker_id", worker_id)?;
+        validate_uuid("generation", generation)?;
+        self.transaction(|registry| {
+            let mut workers = object_map(registry, WORKERS_KEY)?;
+            let worker = workers
+                .get(worker_id)
+                .and_then(ManagedWorker::from_json)
+                .ok_or_else(|| "unclaimed worker is missing or malformed".to_string())?;
+            if worker.generation != generation
+                || worker.runtime_session_id.is_some()
+                || worker.state != ManagedState::Attaching
+                || worker.required_scope != RequiredScope::ProcessOnly
+                || worker.execution != ExecutionBackend::SupervisorOwnedProcess
+            {
+                return Err("worker is not an unclaimed supervisor-owned process".to_string());
+            }
+            let operations = object_map(registry, ACTIVE_OPERATIONS_KEY)?;
+            if operations.values().any(|value| {
+                ActiveOperationRecord::from_json(value).is_some_and(|operation| {
+                    operation.worker_id.as_deref() == Some(worker_id)
+                        && operation.generation.as_deref() == Some(generation)
+                })
+            }) {
+                return Err("unclaimed worker has process custody".to_string());
+            }
+            workers.remove(worker_id);
+            let mut pending = object_map(registry, PENDING_KEY)?;
+            pending.retain(|_, value| {
+                PendingRecord::from_json(value).is_none_or(|record| {
+                    record.attach.worker_id != worker_id || record.attach.generation != generation
+                })
+            });
+            set_object_map(registry, WORKERS_KEY, workers);
+            set_object_map(registry, PENDING_KEY, pending);
+            Ok(())
         })
     }
 

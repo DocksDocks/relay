@@ -10,12 +10,23 @@ Cross-session / cross-project / cross-tool agent message bus — the repo's seco
 | `bin/` | four committed target binaries (`relay-<triple>` for x86_64/aarch64 × linux-musl/apple-darwin), the POSIX-sh arch-dispatch launcher `relay` (shellcheck-linted by CI), and `SHA256SUMS` |
 | `hooks/` | `hooks.json` (Claude: SessionStart + UserPromptSubmit → `${CLAUDE_PLUGIN_ROOT}/bin/relay hook`) + `codex-hooks.json` (Codex parallel) |
 | `skills/` | the cross-tool `session-relay` skill (productivity) |
-| `test/` | `selftest.mjs` (the plugin's runnable self-test, wired as the registry `selftest` capability) + `fake-app-server.mjs` (stubs the Codex app-server for watch-leg tests) |
+| `test/` | `selftest.mjs` (the plugin's runnable self-test), `fanout-smoke.mjs` (two-leaf lifecycle smoke), and `fake-app-server.mjs` (Codex app-server stub) |
 | `.claude-plugin/` + `.codex-plugin/` | manifests — versions kept in lockstep with the marketplace entry by `ci.mjs`'s per-plugin gate and `release.mjs` |
 
 ## Store hygiene
 
 The shared store defaults to `~/.agent-relay` (`AGENT_RELAY_HOME`, then legacy `SESSION_RELAY_HOME`, override it). `relay hook` and `relay bus` run a six-hour-throttled sweep: the default inactivity threshold is 14 days, `AGENT_RELAY_GC_DAYS=<days>` overrides it, and `0` disables GC. Collection is all-surfaces-old and held-lock-safe; it enumerates only relay-owned mailbox/marker/watcher/resume-lock/spawn-log files, never the invoking id, and removes registry/name entries last. Spawn stderr is pumped independently of the short-lived parent and compacted from just over 4 MiB to the newest 3 MiB; `File::create` still truncates the new target before child launch.
+
+## Worktree fan-out boundary
+
+`relay spawn --fanout|--worktree --from <session>` is a fixed process-only
+lifecycle: one isolated root, at most two depth-1 leaves, explicit clean
+`handback`, and parent-owned `collect`. Capacity is released only after the
+detached supervisor reaps the exact CLI child and lifecycle records
+`TerminalReleasable`; uncertainty remains counted. This does not prove
+descendant-tree containment and does not promise historical recovery, automatic
+GC, app-server fan-out, or depth greater than one. Durable fan-out authority
+lives in mode-0600 `fanout-v1.json`, separate from `lifecycle-v1.json`.
 
 ## Binary release discipline
 

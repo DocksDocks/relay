@@ -8,6 +8,7 @@
 //   relay __appserver-spawn-pump    hidden bounded app-server first-turn pump
 //   relay __lifecycle-watchdog …    hidden detached supervisor owner
 //   relay __lifecycle-supervisor …  hidden exact child custodian
+//   relay __fanout-supervisor        hidden exact fan-out child custodian
 //   relay __stress …               hidden test helper (cross-process lock race)
 
 use std::collections::HashMap;
@@ -25,6 +26,8 @@ fn main() {
         ) => relay::cli::run(cmd, argv.clone()),
         Some("watch") => relay::watch::run(argv.clone()),
         Some("spawn") => relay::spawn::run(argv.clone()),
+        Some("handback") => relay::fanout::run_handback(argv.clone()),
+        Some("collect") => relay::fanout::run_collect(argv.clone()),
         Some("__spawn-log-writer") => {
             let Some(id) = argv.get(1) else {
                 die("usage: relay __spawn-log-writer <uuid>");
@@ -32,6 +35,7 @@ fn main() {
             relay::spawn::run_log_writer(id);
         }
         Some("__appserver-spawn-pump") => relay::spawn::run_appserver_pump(),
+        Some("__fanout-supervisor") => relay::spawn::run_fanout_supervisor(),
         Some("__lifecycle-watchdog") => {
             relay::supervisor::run_watchdog(&argv[1..]).unwrap_or_else(|error| die(&error))
         }
@@ -62,7 +66,7 @@ fn main() {
             }
         }
         _ => die(
-            "usage: relay bus | channel | hook [codex] [--event prompt] | discover [--within min] [--tool t] | list | register <name> --id <uuid> [--dir <path>] [--server <sock>] | send <to> [--] <msg> | inbox <who> | peek <who> | attach <who> [--exec] | wake <who> [--model m] [--effort e] [msg] | doctor [--id <session>] | watch <who>...|--all [--server <sock>] [--auto-turn] [--once] | spawn <dir> [--tool t] [--model m] [--effort e] [--name n] [--server <sock>] [--watch] [--] <task>",
+            "usage: relay bus | channel | hook [codex] [--event prompt] | discover [--within min] [--tool t] | list | register <name> --id <uuid> [--dir <path>] [--server <sock>] | send <to> [--] <msg> | inbox <who> | peek <who> | attach <who> [--exec] | wake <who> [--model m] [--effort e] [msg] | doctor [--id <session>] | watch <who>...|--all [--server <sock>] [--auto-turn] [--once] | spawn <dir> [--fanout|--worktree --from <session>] [options] -- <task> | handback --from <session> --status completed|failed [--note <text>] | collect <session> --from <parent>",
         ),
     }
 }

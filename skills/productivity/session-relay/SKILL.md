@@ -6,7 +6,7 @@ allowed-tools: Bash, Read
 metadata:
   pattern: tool-wrapper
   updated: "2026-07-14"
-  content_hash: "df73198debc7b4a5a83d90bbcaffc775df04cdce3b7aa19dc02a1938f26253cd"
+  content_hash: "8ac0bf82f9be760b57c7e563033a7fe429c26e7201141fc39ea0557b1183c39b"
 ---
 
 # Session relay
@@ -390,6 +390,13 @@ birth a real, resumable session there instead:
   (Claude OAuth / ChatGPT login) — heavier than a wake; spawn deliberately, never
   in loops.
 
+## Bounded worktree fan-out
+
+Use fan-out when one relay-managed root needs at most two isolated Git worktree
+children and explicit commit collection. The CLI, process-only lifecycle
+guarantee, refusal cases, and cleanup boundaries are in
+[`references/fanout.md`](references/fanout.md).
+
 ## Red-team pair spawn
 
 Use this when a plan needs a two-model adversarial review. The orchestrator owns
@@ -459,7 +466,7 @@ cd "$(<plugin>/bin/relay list | awk '$1=="agent-B"{print $4}')" \
 - The only bus tools: `whoami`, `register`, `roster`, `send`, `inbox`, `discover`. If the tools aren't available, the plugin isn't enabled here.
 - `discover` infers liveness from session-file recency (mtime), not a live handshake — a just-idle session can still appear; a long-dead one won't (it falls outside the window).
 - There is no live session-to-session socket. Even `relay watch` is queue + push-into-thread: mail always lands in the shared store first, and only Codex-under-app-server targets take a push — Claude live delivery is the Monitor watch or the next prompt.
-- `relay watch` flags: `--server`, `--tool`, `--auto-turn`, `--once`, `--all`, `--dry`, `--id`, `--follow <id>`. `relay wake` flags: `--id`, `--dir`, `--tool`, `--model`, `--effort`, `--dry`. `relay spawn` flags: `--tool`, `--model`, `--effort`, `--name`, `--server`, `--reply-to`, `--timeout`, `--read-only`, `--full-access`, `--watch`, `--dry`. `relay register` accepts optional `--server <unix-socket>`. `relay doctor` takes optional `--id <session-id-or-name>`. `relay send` identity flag: `--from <name-or-id>`. Do not invent others; there is no `--interval`, `--wait`, or daemon-mode config.
+- `relay watch` flags: `--server`, `--tool`, `--auto-turn`, `--once`, `--all`, `--dry`, `--id`, `--follow <id>`. `relay wake` flags: `--id`, `--dir`, `--tool`, `--model`, `--effort`, `--dry`. `relay spawn` also accepts `--fanout|--worktree --from <session>` for CLI-process fan-out; fan-out rejects `--server`, `--read-only`, `--watch`, and `--dry`. `relay handback` takes `--from`, `--status`, and optional `--note`; `relay collect` takes one session plus `--from <parent>`. Ordinary spawn keeps `--tool`, `--model`, `--effort`, `--name`, `--server`, `--reply-to`, `--timeout`, `--read-only`, `--full-access`, `--watch`, `--dry`. Do not invent `--interval`, `--wait`, or daemon-mode config.
 - `relay attach` takes one name-or-UUID and optional `--exec`; print mode is the default. There is no attach picker or co-driving mode.
 - Identity params: `send` takes optional `from`, `inbox` takes optional `id` — both must name a REGISTERED session (id or name) and both mean "act as / drain this session". There is no `--as`, no `sender:` field, and no way to send as an unregistered identity.
 
