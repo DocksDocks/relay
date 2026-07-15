@@ -14,6 +14,7 @@
 // Never blocks the session: any error is logged to stderr and we exit 0.
 
 use crate::cli::Args;
+use crate::gc;
 use crate::lifecycle::{
     self, Admission, BindingState, ClaimManagedAttach, ClaimOutcome, LifecycleStore, ManagedState,
     OperationKind,
@@ -226,7 +227,7 @@ fn inner(tool: &str, event: HookEvent, input: &str) -> Result<(), String> {
             return Ok(());
         }
     }
-    if let Err(e) = store::gc(std::time::SystemTime::now(), Some(&id)) {
+    if let Err(e) = gc::run(std::time::SystemTime::now(), Some(&id)) {
         eprintln!("[session-relay/hook] GC skipped: {e}");
     }
     store::set_marker(&dir, &id)?;

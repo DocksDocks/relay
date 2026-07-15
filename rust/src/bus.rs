@@ -10,6 +10,7 @@
 // writes — the MCP protocol never hands a server the host's session id.
 
 use crate::discover;
+use crate::gc;
 use crate::lifecycle::{self, OperationKind};
 use crate::store;
 use std::collections::HashMap;
@@ -467,7 +468,7 @@ fn handle(msg: &JsonValue, pdir: &str) {
 pub fn run() -> ! {
     let pdir = project_dir();
     let self_id = store::id_for_dir(&pdir);
-    if let Err(e) = store::gc(std::time::SystemTime::now(), self_id.as_deref()) {
+    if let Err(e) = gc::run(std::time::SystemTime::now(), self_id.as_deref()) {
         log(&format!("GC skipped: {e}"));
     }
     log(&format!("ready (project dir: {pdir})"));

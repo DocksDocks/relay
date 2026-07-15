@@ -972,6 +972,22 @@ pub struct LifecycleStore {
     cancel_grace: Duration,
 }
 
+pub(crate) struct GcProtectionSnapshot {
+    registry: Registry,
+}
+
+impl GcProtectionSnapshot {
+    pub(crate) fn load(root: &Path) -> Result<Self, String> {
+        let mut registry = Registry::default();
+        hydrate_lifecycle_authority(root, &mut registry)?;
+        Ok(Self { registry })
+    }
+
+    pub(crate) fn protects_session(&self, id: &str) -> Result<bool, String> {
+        registry_protects_session(&self.registry, id)
+    }
+}
+
 impl Default for LifecycleStore {
     fn default() -> Self {
         Self::new(store::home_dir())

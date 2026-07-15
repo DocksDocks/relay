@@ -743,6 +743,14 @@ struct GcInventory {
     fresh_unknown_markers: HashMap<String, GcSurface>,
 }
 
+pub(crate) struct LegacyGc {
+    root: PathBuf,
+    resolved_root: PathBuf,
+    root_fd: OwnedFd,
+    surface_dirs: Vec<GcSurfaceDir>,
+    days: u64,
+}
+
 fn gc_days() -> Result<u64, String> {
     match std::env::var("AGENT_RELAY_GC_DAYS") {
         Ok(raw) if !raw.is_empty() => raw
@@ -1109,6 +1117,19 @@ fn with_gc_lock<T>(root_fd: &OwnedFd, f: impl FnOnce() -> Result<T, String>) -> 
     out
 }
 
+fn gc_stamp_is_fresh(root_fd: &OwnedFd, now: SystemTime) -> Result<bool, String> {
+    let Some(stat) = stat_regular_at(root_fd, "gc-stamp")? else {
+        return Ok(false);
+    };
+    let modified = UNIX_EPOCH
+        .checked_add(Duration::new(
+            stat.st_mtime.max(0) as u64,
+            stat.st_mtime_nsec.clamp(0, 999_999_999) as u32,
+        ))
+        .unwrap_or(UNIX_EPOCH);
+    Ok(now.duration_since(modified).unwrap_or(Duration::ZERO) < GC_INTERVAL)
+}
+
 fn remove_gc_surface(dirs: &[GcSurfaceDir], surface: &GcSurface) -> Result<bool, String> {
     let Some(dir) = gc_surface_dir(dirs, surface.directory) else {
         return Ok(false);
@@ -1138,215 +1159,242 @@ fn remove_gc_surface(dirs: &[GcSurfaceDir], surface: &GcSurface) -> Result<bool,
     Ok(true)
 }
 
-/// Opportunistically remove sessions whose every known surface is older than
-/// the configured threshold. `self_id` is belt-and-braces: a shared-dir bus may
-/// resolve the marker owner's id rather than this process's id, so fresh
-/// last_seen/mtimes and held locks remain the primary liveness protections.
-/// `None` means identity unknown, not "skip GC".
-pub fn gc(now: SystemTime, self_id: Option<&str>) -> Result<usize, String> {
-    let days = gc_days()?;
-    if days == 0 {
-        return Ok(0);
-    }
-    let Some((root, resolved_root)) = safe_existing_root()? else {
-        return Ok(0);
-    };
-    let root_fd = open(
-        &resolved_root,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .map_err(|e| format!("refusing GC: open pinned relay store root: {e}"))?;
-    // Validate and pin every present surface before the GC lock can create its
-    // file. A symlinked surface refuses the whole sweep without chmod/create.
-    let surface_dirs = open_gc_surface_dirs(&root_fd)?;
-    let throttled = with_gc_lock(&root_fd, || {
-        let Some(stat) = stat_regular_at(&root_fd, "gc-stamp")? else {
-            return Ok(false);
+impl LegacyGc {
+    pub(crate) fn prepare() -> Result<Option<Self>, String> {
+        let days = gc_days()?;
+        if days == 0 {
+            return Ok(None);
+        }
+        let Some((root, resolved_root)) = safe_existing_root()? else {
+            return Ok(None);
         };
-        let modified = UNIX_EPOCH
-            .checked_add(Duration::new(
-                stat.st_mtime.max(0) as u64,
-                stat.st_mtime_nsec.clamp(0, 999_999_999) as u32,
-            ))
-            .unwrap_or(UNIX_EPOCH);
-        Ok(now.duration_since(modified).unwrap_or(Duration::ZERO) < GC_INTERVAL)
-    })?;
-    if throttled {
-        return Ok(0);
+        Self::open(root, resolved_root, days).map(Some)
     }
-    let lifecycle_removed = crate::lifecycle::LifecycleStore::default()
-        .gc_unmanaged_excluding(now, crate::lifecycle::GcControl::RunToCompletion, self_id)?
-        .removed_candidates;
-    let age = Duration::from_secs(
-        days.checked_mul(SECONDS_PER_DAY)
-            .ok_or_else(|| "AGENT_RELAY_GC_DAYS is too large".to_string())?,
-    );
-    let cutoff = now.checked_sub(age).unwrap_or(UNIX_EPOCH);
-    let cutoff_ms = cutoff
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or(Duration::ZERO)
-        .as_millis()
-        .min(i64::MAX as u128) as i64;
-    let cutoff_iso = iso_from_unix_ms(cutoff_ms);
 
-    let legacy_removed = with_gc_lock(&root_fd, || {
-        let Some((locked_root, locked_resolved_root)) = safe_existing_root()? else {
-            return Ok(0);
-        };
-        if locked_root != root || locked_resolved_root != resolved_root {
+    fn open(root: PathBuf, resolved_root: PathBuf, days: u64) -> Result<Self, String> {
+        let root_fd = open(
+            &resolved_root,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|e| format!("refusing GC: open pinned relay store root: {e}"))?;
+        // Validate and pin every present surface before the GC lock can create
+        // its file. A symlinked surface refuses the whole sweep without
+        // chmod/create.
+        let surface_dirs = open_gc_surface_dirs(&root_fd)?;
+        Ok(Self {
+            root,
+            resolved_root,
+            root_fd,
+            surface_dirs,
+            days,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(root: &Path, days: u64) -> Result<Self, String> {
+        let root = std::path::absolute(root)
+            .map_err(|error| format!("resolve relay store root: {error}"))?;
+        let resolved_root = fs::canonicalize(&root)
+            .map_err(|error| format!("canonicalize relay store root: {error}"))?;
+        Self::open(root, resolved_root, days)
+    }
+
+    pub(crate) fn preflight_throttled(&self, now: SystemTime) -> Result<bool, String> {
+        with_gc_lock(&self.root_fd, || gc_stamp_is_fresh(&self.root_fd, now))
+    }
+
+    fn reopen_validated_root(&self) -> Result<Option<OwnedFd>, String> {
+        let current_root = std::path::absolute(&self.root)
+            .map_err(|error| format!("resolve relay store root: {error}"))?;
+        match fs::symlink_metadata(&current_root) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(format!(
+                    "stat relay store root {}: {error}",
+                    current_root.display()
+                ));
+            }
+        }
+        let current_resolved_root = fs::canonicalize(&current_root)
+            .map_err(|error| format!("canonicalize relay store root: {error}"))?;
+        if current_root != self.root || current_resolved_root != self.resolved_root {
             return Err("refusing GC: relay store root changed during sweep".to_string());
         }
         let current_root_fd = open(
-            &locked_resolved_root,
+            &current_resolved_root,
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::empty(),
         )
         .map_err(|e| format!("refusing GC: re-open relay store root: {e}"))?;
-        let pinned = fstat(&root_fd).map_err(|e| format!("stat pinned relay store root: {e}"))?;
+        let pinned =
+            fstat(&self.root_fd).map_err(|e| format!("stat pinned relay store root: {e}"))?;
         let current = fstat(&current_root_fd).map_err(|e| format!("stat relay store root: {e}"))?;
         if i128::from(pinned.st_dev) != i128::from(current.st_dev)
             || i128::from(pinned.st_ino) != i128::from(current.st_ino)
         {
             return Err("refusing GC: relay store root changed during sweep".to_string());
         }
-        if let Some(stat) = stat_regular_at(&root_fd, "gc-stamp")? {
-            let modified = UNIX_EPOCH
-                .checked_add(Duration::new(
-                    stat.st_mtime.max(0) as u64,
-                    stat.st_mtime_nsec.clamp(0, 999_999_999) as u32,
-                ))
-                .unwrap_or(UNIX_EPOCH);
-            if now.duration_since(modified).unwrap_or(Duration::ZERO) < GC_INTERVAL {
+        Ok(Some(current_root_fd))
+    }
+
+    /// Remove legacy sessions whose every known surface is old. The protection
+    /// loader runs exactly once while the legacy lock is held, after the second
+    /// throttle observation and before inventory or deletion.
+    pub(crate) fn collect<L, P>(
+        &self,
+        now: SystemTime,
+        self_id: Option<&str>,
+        load_protection: L,
+    ) -> Result<usize, String>
+    where
+        L: FnOnce(&Path) -> Result<P, String>,
+        P: FnMut(&str) -> Result<bool, String>,
+    {
+        let age = Duration::from_secs(
+            self.days
+                .checked_mul(SECONDS_PER_DAY)
+                .ok_or_else(|| "AGENT_RELAY_GC_DAYS is too large".to_string())?,
+        );
+        let cutoff = now.checked_sub(age).unwrap_or(UNIX_EPOCH);
+        let cutoff_ms = cutoff
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_millis()
+            .min(i64::MAX as u128) as i64;
+        let cutoff_iso = iso_from_unix_ms(cutoff_ms);
+
+        with_gc_lock(&self.root_fd, || {
+            let Some(_current_root_fd) = self.reopen_validated_root()? else {
+                return Ok(0);
+            };
+            if gc_stamp_is_fresh(&self.root_fd, now)? {
                 return Ok(0);
             }
-        }
 
-        let registry_raw = read_text_at(&root_fd, "registry.json")?;
-        let mut registry = parse_registry(registry_raw.as_deref());
-        let mut protection_registry = registry.clone();
-        if let Some(authority) = read_lifecycle_authority_at(&locked_resolved_root)? {
-            protection_registry.extra.extend(authority);
-        }
-        let inventory = known_gc_surfaces(&surface_dirs, cutoff)?;
-        let mut candidates: HashMap<String, GcCandidate> = HashMap::new();
-        for (registry_key, value) in &registry.agents {
-            let Some(entry) = Entry::from_json(value) else {
-                continue; // malformed registry state is preserved, never guessed old
-            };
-            if !is_uuid(registry_key) || entry.id != *registry_key {
-                continue;
-            }
-            let candidate = candidates
-                .entry(format!("session:{registry_key}"))
-                .or_default();
-            candidate.id = Some(registry_key.clone());
-            candidate.registry_key = Some(registry_key.clone());
-            if let Some(dir) = entry.dir.as_deref() {
-                if let Some(marker) = inventory.fresh_unknown_markers.get(&encode_dir(dir)) {
-                    candidate.surfaces.push(marker.clone());
-                }
-            }
-            candidate.last_seen = Some(entry.last_seen);
-        }
-        for (id, orphan_key, surface) in inventory.surfaces {
-            add_gc_surface(&mut candidates, id, orphan_key, surface);
-        }
-
-        let mut eligible = Vec::new();
-        for (key, candidate) in &candidates {
-            if candidate
-                .id
-                .as_deref()
-                .is_some_and(|id| Some(id) == self_id)
-            {
-                continue;
-            }
-            if candidate
-                .last_seen
-                .as_ref()
-                .is_some_and(|last_seen| last_seen.is_empty() || last_seen > &cutoff_iso)
-            {
-                continue;
-            }
-            if !candidate
-                .surfaces
-                .iter()
-                .all(|surface| surface_is_old(surface, cutoff))
-            {
-                continue;
-            }
-            if let Some(id) = candidate.id.as_deref() {
-                if crate::lifecycle::registry_protects_session(&protection_registry, id)? {
-                    continue;
-                }
-                let watcher = format!("{id}.lock");
-                let resume = format!("resume-{id}.lock");
-                if matches!(
-                    lock_status_at(gc_surface_dir(&surface_dirs, "watchers"), &watcher),
-                    LockStatus::Live | LockStatus::Unknown
-                ) || matches!(
-                    lock_status_at(gc_surface_dir(&surface_dirs, "locks"), &resume),
-                    LockStatus::Live | LockStatus::Unknown
-                ) {
-                    continue;
-                }
-            }
-            eligible.push(key.clone());
-        }
-
-        let mut removed_files = 0;
-        let mut removed_registry_ids = HashSet::new();
-        'candidate: for key in &eligible {
-            let candidate = &candidates[key];
-            let mut spawn_log_guards = Vec::new();
-            for surface in candidate
-                .surfaces
-                .iter()
-                .filter(|surface| surface.directory == "spawn-logs")
-            {
-                let Some(guard) = acquire_gc_spawn_log_guard(
-                    gc_surface_dir(&surface_dirs, "spawn-logs"),
-                    &surface.name,
-                ) else {
-                    continue 'candidate;
+            let mut protects_session = load_protection(&self.resolved_root)?;
+            let registry_raw = read_text_at(&self.root_fd, "registry.json")?;
+            let mut registry = parse_registry(registry_raw.as_deref());
+            let inventory = known_gc_surfaces(&self.surface_dirs, cutoff)?;
+            let mut candidates: HashMap<String, GcCandidate> = HashMap::new();
+            for (registry_key, value) in &registry.agents {
+                let Some(entry) = Entry::from_json(value) else {
+                    continue; // malformed registry state is preserved, never guessed old
                 };
-                spawn_log_guards.push(guard);
-            }
-            // All-or-nothing preflight: a surface that became fresh or was
-            // replaced since enumeration preserves the whole candidate.
-            if !candidate_surfaces_still_eligible(&surface_dirs, candidate, cutoff)? {
-                continue;
-            }
-            for surface in &candidate.surfaces {
-                if remove_gc_surface(&surface_dirs, surface)? {
-                    removed_files += 1;
+                if !is_uuid(registry_key) || entry.id != *registry_key {
+                    continue;
                 }
+                let candidate = candidates
+                    .entry(format!("session:{registry_key}"))
+                    .or_default();
+                candidate.id = Some(registry_key.clone());
+                candidate.registry_key = Some(registry_key.clone());
+                if let Some(dir) = entry.dir.as_deref() {
+                    if let Some(marker) = inventory.fresh_unknown_markers.get(&encode_dir(dir)) {
+                        candidate.surfaces.push(marker.clone());
+                    }
+                }
+                candidate.last_seen = Some(entry.last_seen);
             }
-            if let Some(registry_key) = &candidate.registry_key {
-                removed_registry_ids.insert(registry_key.clone());
+            for (id, orphan_key, surface) in inventory.surfaces {
+                add_gc_surface(&mut candidates, id, orphan_key, surface);
             }
-            drop(spawn_log_guards);
-        }
 
-        // Registry is last: an interrupted sweep leaves visible entries that
-        // a later pass can retry, never invisible orphan files.
-        if !removed_registry_ids.is_empty() {
-            for id in &removed_registry_ids {
-                registry.agents.remove(id);
+            let mut eligible = Vec::new();
+            for (key, candidate) in &candidates {
+                if candidate
+                    .id
+                    .as_deref()
+                    .is_some_and(|id| Some(id) == self_id)
+                {
+                    continue;
+                }
+                if candidate
+                    .last_seen
+                    .as_ref()
+                    .is_some_and(|last_seen| last_seen.is_empty() || last_seen > &cutoff_iso)
+                {
+                    continue;
+                }
+                if !candidate
+                    .surfaces
+                    .iter()
+                    .all(|surface| surface_is_old(surface, cutoff))
+                {
+                    continue;
+                }
+                if let Some(id) = candidate.id.as_deref() {
+                    if protects_session(id)? {
+                        continue;
+                    }
+                    let watcher = format!("{id}.lock");
+                    let resume = format!("resume-{id}.lock");
+                    if matches!(
+                        lock_status_at(gc_surface_dir(&self.surface_dirs, "watchers"), &watcher),
+                        LockStatus::Live | LockStatus::Unknown
+                    ) || matches!(
+                        lock_status_at(gc_surface_dir(&self.surface_dirs, "locks"), &resume),
+                        LockStatus::Live | LockStatus::Unknown
+                    ) {
+                        continue;
+                    }
+                }
+                eligible.push(key.clone());
             }
-            registry.names.retain(|_, value| {
-                value
-                    .get::<String>()
-                    .is_none_or(|id| !removed_registry_ids.contains(id))
-            });
-            let registry_text = format_registry(registry)?;
-            atomic_write_at(&root_fd, "registry.json", &registry_text)?;
-        }
-        atomic_write_at(&root_fd, "gc-stamp", &format!("{}\n", iso_now()))?;
-        Ok(removed_files + removed_registry_ids.len())
-    })?;
-    Ok(lifecycle_removed + legacy_removed)
+
+            let mut removed_files = 0;
+            let mut removed_registry_ids = HashSet::new();
+            'candidate: for key in &eligible {
+                let candidate = &candidates[key];
+                let mut spawn_log_guards = Vec::new();
+                for surface in candidate
+                    .surfaces
+                    .iter()
+                    .filter(|surface| surface.directory == "spawn-logs")
+                {
+                    let Some(guard) = acquire_gc_spawn_log_guard(
+                        gc_surface_dir(&self.surface_dirs, "spawn-logs"),
+                        &surface.name,
+                    ) else {
+                        continue 'candidate;
+                    };
+                    spawn_log_guards.push(guard);
+                }
+                // All-or-nothing preflight: a surface that became fresh or was
+                // replaced since enumeration preserves the whole candidate.
+                if !candidate_surfaces_still_eligible(&self.surface_dirs, candidate, cutoff)? {
+                    continue;
+                }
+                for surface in &candidate.surfaces {
+                    if remove_gc_surface(&self.surface_dirs, surface)? {
+                        removed_files += 1;
+                    }
+                }
+                if let Some(registry_key) = &candidate.registry_key {
+                    removed_registry_ids.insert(registry_key.clone());
+                }
+                drop(spawn_log_guards);
+            }
+
+            // Registry is last: an interrupted sweep leaves visible entries
+            // that a later pass can retry, never invisible orphan files.
+            if !removed_registry_ids.is_empty() {
+                for id in &removed_registry_ids {
+                    registry.agents.remove(id);
+                }
+                registry.names.retain(|_, value| {
+                    value
+                        .get::<String>()
+                        .is_none_or(|id| !removed_registry_ids.contains(id))
+                });
+                let registry_text = format_registry(registry)?;
+                atomic_write_at(&self.root_fd, "registry.json", &registry_text)?;
+            }
+            atomic_write_at(&self.root_fd, "gc-stamp", &format!("{}\n", iso_now()))?;
+            Ok(removed_files + removed_registry_ids.len())
+        })
+    }
 }
 
 /// Upsert a session. Missing fields are preserved from any prior entry, so the
