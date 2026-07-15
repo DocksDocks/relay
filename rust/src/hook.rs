@@ -15,7 +15,7 @@
 
 use crate::cli::Args;
 use crate::lifecycle::{
-    Admission, BindingState, ClaimManagedAttach, ClaimOutcome, LifecycleStore, ManagedState,
+    self, Admission, BindingState, ClaimManagedAttach, ClaimOutcome, LifecycleStore, ManagedState,
     OperationKind,
 };
 use crate::store;
@@ -253,7 +253,7 @@ fn inner(tool: &str, event: HookEvent, input: &str) -> Result<(), String> {
                     return Ok(());
                 }
             };
-            let drained = store::drain_with_guard(&mut guard)?;
+            let drained = lifecycle::drain_with_guard(&mut guard)?;
             let msgs = drained.messages().to_vec();
             (msgs, Some((guard, kind)), Some(drained))
         };

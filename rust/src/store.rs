@@ -1490,8 +1490,6 @@ fn parse_lines(raw: &str) -> Vec<JsonValue> {
         .collect()
 }
 
-/// Read AND clear the guard-bound inbox in one locked step. The recipient is
-/// derived from the sealed lifecycle capability; callers cannot supply one.
 pub struct DrainReceipt {
     messages: Vec<JsonValue>,
     raw: String,
@@ -1526,38 +1524,37 @@ impl DrainReceipt {
     }
 }
 
-pub fn drain_with_guard(
-    guard: &mut crate::lifecycle::ReentryGuard,
-) -> Result<DrainReceipt, String> {
-    let kind = guard.allowed();
-    if !matches!(
-        kind,
-        crate::lifecycle::OperationKind::SessionStartDrain
-            | crate::lifecycle::OperationKind::UserPromptDrain
-            | crate::lifecycle::OperationKind::CliInboxDrain
-            | crate::lifecycle::OperationKind::McpInboxDrain
-            | crate::lifecycle::OperationKind::ChannelDeliver
-            | crate::lifecycle::OperationKind::WatchInject
-            | crate::lifecycle::OperationKind::WatchAutoTurn
-            | crate::lifecycle::OperationKind::WakeAppServer
-    ) {
-        return Err(format!("{} cannot drain a mailbox", kind.as_str()));
+pub(crate) struct AuthorizedMailboxTarget<'a> {
+    root: &'a Path,
+    runtime_session_id: &'a str,
+}
+
+impl<'a> AuthorizedMailboxTarget<'a> {
+    pub(crate) fn new(root: &'a Path, runtime_session_id: &'a str) -> Self {
+        Self {
+            root,
+            runtime_session_id,
+        }
     }
-    guard.with_authorized(kind, |target| {
-        let path = target
-            .root
-            .join("mailbox")
-            .join(format!("{}.jsonl", sanitize(&target.runtime_session_id)));
-        let raw = fs::read_to_string(&path).unwrap_or_default();
-        let msgs = parse_lines(&raw);
-        let _ = fs::remove_file(&path);
-        Ok(DrainReceipt {
-            messages: msgs,
-            raw,
-            path,
-            root: target.root.clone(),
-            _sealed: (),
-        })
+}
+
+/// Read and clear one lifecycle-authorized inbox in a locked step.
+pub(crate) fn drain_authorized_mailbox(
+    target: AuthorizedMailboxTarget<'_>,
+) -> Result<DrainReceipt, String> {
+    let path = target
+        .root
+        .join("mailbox")
+        .join(format!("{}.jsonl", sanitize(target.runtime_session_id)));
+    let raw = fs::read_to_string(&path).unwrap_or_default();
+    let messages = parse_lines(&raw);
+    let _ = fs::remove_file(&path);
+    Ok(DrainReceipt {
+        messages,
+        raw,
+        path,
+        root: target.root.to_path_buf(),
+        _sealed: (),
     })
 }
 

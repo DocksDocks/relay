@@ -3842,7 +3842,7 @@ impl ReentryGuard {
         Ok(authorized_target(&self.target))
     }
 
-    pub(crate) fn with_authorized<T>(
+    fn with_authorized<T>(
         &mut self,
         expected: OperationKind,
         f: impl FnOnce(&AuthorizedTarget) -> Result<T, String>,
@@ -3916,6 +3916,29 @@ impl Drop for ReentryGuard {
             Ok(())
         });
     }
+}
+
+pub fn drain_with_guard(guard: &mut ReentryGuard) -> Result<store::DrainReceipt, String> {
+    let kind = guard.allowed();
+    if !matches!(
+        kind,
+        OperationKind::SessionStartDrain
+            | OperationKind::UserPromptDrain
+            | OperationKind::CliInboxDrain
+            | OperationKind::McpInboxDrain
+            | OperationKind::ChannelDeliver
+            | OperationKind::WatchInject
+            | OperationKind::WatchAutoTurn
+            | OperationKind::WakeAppServer
+    ) {
+        return Err(format!("{} cannot drain a mailbox", kind.as_str()));
+    }
+    guard.with_authorized(kind, |target| {
+        store::drain_authorized_mailbox(store::AuthorizedMailboxTarget::new(
+            &target.root,
+            &target.runtime_session_id,
+        ))
+    })
 }
 
 pub fn admit_operation(session_or_worker: &str, kind: OperationKind) -> Result<Admission, String> {

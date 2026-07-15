@@ -1,8 +1,8 @@
 pub mod support;
 
 use relay::lifecycle::{
-    Admission, AttachOptions, BindingState, ChildLaunchSpec, ClaimManagedAttach, ClaimOutcome,
-    DoorbellMessage, ExecutionBackend, LifecycleStore, ManagedState, OperationKind,
+    self, Admission, AttachOptions, BindingState, ChildLaunchSpec, ClaimManagedAttach,
+    ClaimOutcome, DoorbellMessage, ExecutionBackend, LifecycleStore, ManagedState, OperationKind,
     PendingAttachSpec, RequiredScope, ValidatedEffort, ValidatedModel,
 };
 use std::collections::HashMap;
@@ -144,7 +144,7 @@ fn lifecycle_admission_unmanaged_guard_binds_target_kind_and_epoch() {
     assert_eq!(guard.binding_epoch(), "0");
     assert!(guard.validate_kind(OperationKind::CliInboxDrain).is_ok());
     assert!(guard.validate_kind(OperationKind::McpInboxDrain).is_err());
-    let messages = relay::store::drain_with_guard(&mut guard)
+    let messages = lifecycle::drain_with_guard(&mut guard)
         .unwrap()
         .into_messages();
     assert_eq!(messages.len(), 1);
@@ -173,7 +173,7 @@ fn lifecycle_admission_drain_receipt_rolls_back_exact_lines_before_new_mail() {
     else {
         panic!("expected unmanaged admission");
     };
-    let receipt = relay::store::drain_with_guard(&mut guard).unwrap();
+    let receipt = lifecycle::drain_with_guard(&mut guard).unwrap();
     fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -252,7 +252,7 @@ fn lifecycle_admission_revalidates_registry_tool_cwd_and_server_authority() {
         }
         fs::write(home.join("registry.json"), registry.format().unwrap()).unwrap();
         assert!(
-            relay::store::drain_with_guard(&mut guard).is_err(),
+            lifecycle::drain_with_guard(&mut guard).is_err(),
             "{mutate} mutation retained stale authority"
         );
         fs::remove_dir_all(home).ok();
@@ -296,7 +296,7 @@ fn lifecycle_admission_guard_a_cannot_name_or_mutate_b() {
         panic!("expected unmanaged admission");
     };
     assert!(
-        relay::store::drain_with_guard(&mut guard_a)
+        lifecycle::drain_with_guard(&mut guard_a)
             .unwrap()
             .messages()
             .is_empty()
@@ -362,7 +362,7 @@ fn lifecycle_admission_stale_unmanaged_guard_refuses_after_claiming() {
         },
         "binding never reached Claiming",
     );
-    assert!(relay::store::drain_with_guard(&mut guard).is_err());
+    assert!(lifecycle::drain_with_guard(&mut guard).is_err());
     assert!(
         fs::read_to_string(&mailbox).unwrap().contains("must-stay"),
         "stale guard must preserve the mailbox after Claiming publication"
@@ -632,7 +632,7 @@ fn lifecycle_admission_reentry_matrix() {
             let mailbox = home.join("mailbox").join(format!("{session}.jsonl"));
             fs::write(&mailbox, "{\"body\":\"matrix\"}\n").unwrap();
             let mut guard = guard;
-            let receipt = relay::store::drain_with_guard(&mut guard).unwrap();
+            let receipt = lifecycle::drain_with_guard(&mut guard).unwrap();
             assert_eq!(receipt.messages().len(), 1);
             assert!(!mailbox.exists());
             "drain_with_guard"
@@ -640,6 +640,38 @@ fn lifecycle_admission_reentry_matrix() {
             "dedicated_behavior_test"
         };
         println!("PASS reentry kind={} lower={lower}", kind.as_str());
+        fs::remove_dir_all(home).ok();
+    }
+}
+
+#[test]
+fn lifecycle_admission_disallowed_drain_kinds_preserve_mailbox_bytes() {
+    let kinds = [
+        OperationKind::WatchAck,
+        OperationKind::WatchWakeFallback,
+        OperationKind::WakeCli,
+        OperationKind::AttachResume,
+        OperationKind::InitialTurn,
+    ];
+    let seeded = b"{\"body\":\"first\"}\n\n{\"body\":\"second\"}\n";
+    for (index, kind) in kinds.into_iter().enumerate() {
+        let home = fresh_home(&format!("drain-denied-{index}"));
+        let cwd = home.join("project");
+        let session = format!("8{index:07}-1111-4111-8111-111111111111");
+        seed_entry(&home, &session, "claude", &cwd);
+        let mailbox = home.join("mailbox").join(format!("{session}.jsonl"));
+        fs::write(&mailbox, seeded).unwrap();
+        let store = LifecycleStore::new(home.clone());
+        let Admission::Unmanaged(mut guard) = store.admit_operation(&session, kind).unwrap() else {
+            panic!("expected unmanaged admission");
+        };
+
+        let error = match lifecycle::drain_with_guard(&mut guard) {
+            Ok(_) => panic!("{} unexpectedly drained a mailbox", kind.as_str()),
+            Err(error) => error,
+        };
+        assert_eq!(error, format!("{} cannot drain a mailbox", kind.as_str()));
+        assert_eq!(fs::read(&mailbox).unwrap(), seeded);
         fs::remove_dir_all(home).ok();
     }
 }

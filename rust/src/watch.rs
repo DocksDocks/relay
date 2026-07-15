@@ -634,7 +634,7 @@ fn push_target(
         OperationKind::WatchInject
     };
     let mut guard = lifecycle::admit_operation(&t.id, kind)?.into_guard()?;
-    let drained = store::drain_with_guard(&mut guard)?;
+    let drained = lifecycle::drain_with_guard(&mut guard)?;
     if drained.messages().is_empty() {
         return Ok(PushOutcome::Delivered);
     }

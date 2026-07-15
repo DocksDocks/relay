@@ -816,7 +816,7 @@ pub fn run(cmd: &str, raw: Vec<String>) -> ! {
             let mut guard = lifecycle::admit_operation(&target.id, OperationKind::CliInboxDrain)
                 .and_then(lifecycle::Admission::into_guard)
                 .unwrap_or_else(|error| die(&error));
-            let msgs = match store::drain_with_guard(&mut guard) {
+            let msgs = match lifecycle::drain_with_guard(&mut guard) {
                 Ok(receipt) => receipt.into_messages(),
                 Err(error) => {
                     drop(guard);
@@ -939,7 +939,7 @@ pub fn run(cmd: &str, raw: Vec<String>) -> ! {
                     }
                 }
 
-                let drained = match store::drain_with_guard(&mut guard) {
+                let drained = match lifecycle::drain_with_guard(&mut guard) {
                     Ok(receipt) => receipt,
                     Err(error) => {
                         drop(guard);
