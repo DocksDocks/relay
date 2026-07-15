@@ -76,12 +76,12 @@ fn seed_entry(home: &Path, id: &str, cwd: &Path) {
     fs::write(registry_path, JsonValue::from(root).format().unwrap()).unwrap();
 }
 
-fn activate_managed_fanout_worker(
+fn bind_pending_managed_fanout_worker(
     fanout: &FanoutStore,
     record_id: &str,
     runtime_session_id: &str,
     cwd: &Path,
-) -> (String, String) {
+) -> (String, String, String) {
     let worker = store::uuid_v4();
     let generation = store::uuid_v4();
     let token = format!("{}{}", store::uuid_v4(), store::uuid_v4());
@@ -104,6 +104,18 @@ fn activate_managed_fanout_worker(
     fanout
         .bind_managed(record_id, &worker, &generation)
         .unwrap();
+    (worker, generation, token)
+}
+
+fn activate_managed_fanout_worker(
+    fanout: &FanoutStore,
+    record_id: &str,
+    runtime_session_id: &str,
+    cwd: &Path,
+) -> (String, String) {
+    let (worker, generation, token) =
+        bind_pending_managed_fanout_worker(fanout, record_id, runtime_session_id, cwd);
+    let lifecycle = LifecycleStore::new(fanout.root().to_path_buf());
     assert!(matches!(
         lifecycle
             .claim_managed_attach(ClaimManagedAttach {
@@ -245,6 +257,49 @@ fn authority_cap_is_atomic_and_child_ancestry_is_derived() {
             .count(),
         3,
         "root plus exactly two leaf branches"
+    );
+    fs::remove_dir_all(home).ok();
+}
+
+#[test]
+fn authority_reserved_and_running_records_remain_counted_after_lifecycle_disagreement() {
+    let (home, repo, store, root, root_session) = setup_root("cross-authority-cap");
+
+    let reserved =
+        fanout::prepare_worktree(&store, &repo, &root_session, FanoutMode::Child).unwrap();
+    let (reserved_worker, _, _) = bind_pending_managed_fanout_worker(
+        &store,
+        &reserved.reservation_id,
+        "33333333-3333-4333-8333-333333333333",
+        Path::new(&reserved.worktree),
+    );
+    force_terminal_releasable_via_authority_edit_for_test(&home, &reserved_worker);
+    assert_eq!(
+        store.read(&reserved.reservation_id).unwrap().unwrap().state,
+        FanoutState::Reserved
+    );
+    assert_eq!(store.active_leaf_count(&root.reservation_id).unwrap(), 1);
+
+    let running =
+        fanout::prepare_worktree(&store, &repo, &root_session, FanoutMode::Child).unwrap();
+    let (running_worker, _) = activate_managed_fanout_worker(
+        &store,
+        &running.reservation_id,
+        "44444444-4444-4444-8444-444444444444",
+        Path::new(&running.worktree),
+    );
+    force_terminal_releasable_via_authority_edit_for_test(&home, &running_worker);
+    assert_eq!(
+        store.read(&running.reservation_id).unwrap().unwrap().state,
+        FanoutState::Running
+    );
+    assert_eq!(store.active_leaf_count(&root.reservation_id).unwrap(), 2);
+
+    let error =
+        fanout::prepare_worktree(&store, &repo, &root_session, FanoutMode::Child).unwrap_err();
+    assert!(
+        error.contains("fanout cap reached (2 active descendants)"),
+        "{error}"
     );
     fs::remove_dir_all(home).ok();
 }
@@ -438,6 +493,8 @@ fn custody_exact_owned_process_reap_is_required_before_slot_release() {
             },
         )
         .unwrap();
+    let handback = fanout::handback(&store, child_session, "completed", "ready").unwrap();
+    assert_eq!(handback.state, FanoutState::HandedBack);
     let fence = lifecycle
         .publish_fence(&worker_id, &generation, "fanout handback")
         .unwrap();

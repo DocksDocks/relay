@@ -500,19 +500,19 @@ fn active_leaf_count(
 }
 
 fn slot_consuming(record: &FanoutRecord, lifecycle: &HashMap<String, JsonValue>) -> bool {
-    if matches!(
-        record.state,
-        FanoutState::Collected | FanoutState::FailedNoProcess
-    ) {
-        return false;
+    match record.state {
+        FanoutState::Reserved | FanoutState::Running => true,
+        FanoutState::Collected | FanoutState::FailedNoProcess => false,
+        FanoutState::HandedBack | FanoutState::Collecting => {
+            let Some(worker_id) = record.worker_id.as_deref() else {
+                return true;
+            };
+            lifecycle_worker(lifecycle, worker_id)
+                .and_then(|worker| optional_string(worker, "state"))
+                .as_deref()
+                != Some("TerminalReleasable")
+        }
     }
-    let Some(worker_id) = record.worker_id.as_deref() else {
-        return true;
-    };
-    lifecycle_worker(lifecycle, worker_id)
-        .and_then(|worker| optional_string(worker, "state"))
-        .as_deref()
-        != Some("TerminalReleasable")
 }
 
 pub(super) fn lifecycle_worker<'a>(
