@@ -447,7 +447,16 @@ fn atomic_write(file: &Path, text: &str) -> Result<(), String> {
     fs::rename(&tmp, file).map_err(|e| format!("rename to {}: {e}", file.display()))
 }
 
-fn atomic_write_private(file: &Path, text: &str) -> Result<(), String> {
+pub(crate) fn atomic_write_private(file: &Path, text: &str) -> Result<(), String> {
+    let parent = file
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| {
+            format!(
+                "private atomic write target {} has no parent",
+                file.display()
+            )
+        })?;
     let tmp = PathBuf::from(format!(
         "{}.{}.{}.tmp",
         file.display(),
@@ -468,11 +477,9 @@ fn atomic_write_private(file: &Path, text: &str) -> Result<(), String> {
             .sync_all()
             .map_err(|error| format!("sync {}: {error}", tmp.display()))?;
         fs::rename(&tmp, file).map_err(|error| format!("rename to {}: {error}", file.display()))?;
-        if let Some(parent) = file.parent() {
-            fs::File::open(parent)
-                .and_then(|directory| directory.sync_all())
-                .map_err(|error| format!("sync {}: {error}", parent.display()))?;
-        }
+        fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| format!("sync {}: {error}", parent.display()))?;
         Ok(())
     })();
     if result.is_err() {
@@ -1572,6 +1579,46 @@ pub fn mailbox_has_content(recipient_id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn private_atomic_write_replaces_with_0600_and_cleans_failed_temp() {
+        let root = std::env::temp_dir().join(format!("relay-atomic-write-{}", uuid_v4()));
+        fs::create_dir_all(&root).expect("create atomic-write fixture");
+        let target = root.join("authority.json");
+        fs::write(&target, "old").expect("write old authority");
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o644))
+            .expect("set old authority mode");
+
+        atomic_write_private(&target, "new").expect("replace private authority");
+        assert_eq!(fs::read_to_string(&target).unwrap(), "new");
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        let blocked_target = root.join("blocked");
+        fs::create_dir(&blocked_target).expect("create rename blocker");
+        let error = atomic_write_private(&blocked_target, "unwritten").unwrap_err();
+        assert!(
+            error.contains(&format!("rename to {}", blocked_target.display())),
+            "{error}"
+        );
+        assert!(blocked_target.is_dir());
+        assert!(
+            fs::read_dir(&root).unwrap().all(|entry| {
+                let name = entry.unwrap().file_name();
+                let name = name.to_string_lossy();
+                !name.starts_with("blocked.") || !name.ends_with(".tmp")
+            }),
+            "failed replace must remove its private temp file"
+        );
+
+        let parentless = PathBuf::from(format!("relay-parentless-{}", uuid_v4()));
+        let error = atomic_write_private(&parentless, "unwritten").unwrap_err();
+        assert!(error.contains("has no parent"), "{error}");
+        assert!(!parentless.exists());
+        fs::remove_dir_all(root).expect("remove atomic-write fixture");
+    }
 
     #[test]
     fn sanitize_maps_traversal_to_dashes() {

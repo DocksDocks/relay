@@ -10,7 +10,6 @@ use crate::store::{self, Entry};
 use rustix::fs::{FlockOperation, flock};
 use std::collections::HashMap;
 use std::fs;
-use std::io::Write;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -1078,41 +1077,7 @@ fn write_records(root: &Path, records: &HashMap<String, FanoutRecord>) -> Result
     let text = JsonValue::from(object)
         .format()
         .map_err(|error| format!("fanout authority serialize: {error}"))?;
-    atomic_write_private(&root.join(FANOUT_FILE), &text)
-}
-
-fn atomic_write_private(path: &Path, text: &str) -> Result<(), String> {
-    let temp = PathBuf::from(format!(
-        "{}.{}.{}.tmp",
-        path.display(),
-        std::process::id(),
-        store::uuid_v4()
-    ));
-    let result = (|| {
-        let mut output = fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .mode(0o600)
-            .open(&temp)
-            .map_err(|error| format!("create {}: {error}", temp.display()))?;
-        output
-            .write_all(text.as_bytes())
-            .map_err(|error| format!("write {}: {error}", temp.display()))?;
-        output
-            .sync_all()
-            .map_err(|error| format!("sync {}: {error}", temp.display()))?;
-        fs::rename(&temp, path).map_err(|error| format!("rename {}: {error}", path.display()))?;
-        fs::File::open(
-            path.parent()
-                .ok_or_else(|| "fanout authority has no parent".to_string())?,
-        )
-        .and_then(|directory| directory.sync_all())
-        .map_err(|error| format!("sync fanout authority parent: {error}"))
-    })();
-    if result.is_err() {
-        fs::remove_file(temp).ok();
-    }
-    result
+    store::atomic_write_private(&root.join(FANOUT_FILE), &text)
 }
 
 fn increment_record_version(record: &mut FanoutRecord) -> Result<(), String> {
