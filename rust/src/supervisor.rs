@@ -92,6 +92,18 @@ fn startup_checkpoint(phase: SupervisorStartupPhase, edge: &str) -> Result<(), S
     Ok(())
 }
 
+fn bootstrap_disconnect_test_delay(multiplier: u64) {
+    let Ok(delay_ms) = std::env::var("RELAY_TEST_WATCHDOG_CALLER_DISCONNECT_MS") else {
+        return;
+    };
+    let Ok(delay_ms) = delay_ms.parse::<u64>() else {
+        return;
+    };
+    thread::sleep(Duration::from_millis(
+        delay_ms.saturating_mul(multiplier).min(5_000),
+    ));
+}
+
 pub fn run_child_with_guard(
     guard: &mut ReentryGuard,
     spec: ChildLaunchSpec,
@@ -273,16 +285,16 @@ pub fn run_watchdog(argv: &[String]) -> Result<(), String> {
         .flush()
         .map_err(|error| format!("flush supervisor nonce bootstrap: {error}"))?;
     drop(supervisor_nonce_write);
+    bootstrap_disconnect_test_delay(1);
     let response = format!(
         "{{\"control_epoch\":\"{control_epoch}\",\"control_nonce\":\"{control_nonce}\",\"kind\":\"watchdog_bootstrap\",\"supervisor_instance_id\":\"{}\"}}\n",
         args.supervisor_instance_id
     );
-    caller_bootstrap
+    // Spawning the supervisor transfers custody to the watchdog. A caller
+    // disconnect must not make the watchdog abandon that owned process.
+    let _ = caller_bootstrap
         .write_all(response.as_bytes())
-        .map_err(|error| format!("write caller watchdog bootstrap: {error}"))?;
-    caller_bootstrap
-        .flush()
-        .map_err(|error| format!("flush caller watchdog bootstrap: {error}"))?;
+        .and_then(|()| caller_bootstrap.flush());
     drop(caller_bootstrap);
 
     let status = loop {
@@ -318,6 +330,7 @@ pub fn run_supervisor(argv: &[String]) -> Result<(), String> {
     if control_nonce.is_empty() {
         return Err("supervisor control nonce bootstrap is empty".to_string());
     }
+    bootstrap_disconnect_test_delay(2);
     let store = LifecycleStore::new(args.root.clone());
     store.validate_watchdog_bootstrap(
         &args.supervisor_instance_id,

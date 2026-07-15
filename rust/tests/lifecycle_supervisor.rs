@@ -2,7 +2,8 @@ pub mod support;
 
 use relay::lifecycle::{
     BindingState, ClaimManagedAttach, ClaimOutcome, ExecutionBackend, ExternalCustody,
-    LifecycleStore, ManagedState, OperationKind, PendingAttachSpec, RequiredScope, SupervisorState,
+    LifecycleStore, LostAuthorityReason, ManagedState, OperationKind, PendingAttachSpec,
+    RequiredScope, SupervisorState,
 };
 use std::collections::HashMap;
 use std::fs;
@@ -48,6 +49,29 @@ fn wait_until(timeout: Duration, message: &str, mut predicate: impl FnMut() -> b
         assert!(Instant::now() < deadline, "{message}");
         thread::sleep(Duration::from_millis(20));
     }
+}
+
+fn bootstrap_watchdog_heartbeat(home: &Path) -> Option<i64> {
+    let root = fs::read_to_string(home.join("lifecycle-v1.json"))
+        .ok()?
+        .parse::<JsonValue>()
+        .ok()?;
+    let state = root
+        .get::<HashMap<String, JsonValue>>()?
+        .get("state")?
+        .get::<HashMap<String, JsonValue>>()?;
+    state
+        .get("lifecycle_watchdogs")?
+        .get::<HashMap<String, JsonValue>>()?
+        .values()
+        .find_map(|watchdog| {
+            watchdog
+                .get::<HashMap<String, JsonValue>>()?
+                .get("heartbeat_at_ms")?
+                .get::<String>()?
+                .parse()
+                .ok()
+        })
 }
 
 fn pending(worker: &str, generation: &str, session: &str, cwd: &Path) -> PendingAttachSpec {
@@ -157,6 +181,95 @@ fn lifecycle_supervisor_wake_uses_closed_stdin_and_separate_output() {
             if operation.kind == OperationKind::WakeCli
                 && matches!(operation.custody, ExternalCustody::ChildReaped { .. })
     ));
+    fs::remove_dir_all(home).ok();
+}
+
+#[test]
+fn watchdog_retires_bootstrap_when_the_caller_disconnects_before_reply() {
+    let home = fresh_home("bootstrap-disconnect");
+    let cwd = home.join("project");
+    let session = "29111111-1111-4111-8111-111111111111";
+    seed_entry(&home, session, "claude", &cwd);
+    let stub = home.join("wake-stub");
+    let child_started = home.join("child-started");
+    write_executable(
+        &stub,
+        "#!/bin/sh\nprintf started > \"$RELAY_TEST_SENTINEL\"\n",
+    );
+    let mut wake = Command::new(env!("CARGO_BIN_EXE_relay"))
+        .args(["wake", session, "doorbell"])
+        .env("AGENT_RELAY_HOME", &home)
+        .env("RELAY_WAKE_CMD_CLAUDE", &stub)
+        .env("RELAY_TEST_SENTINEL", &child_started)
+        .env("RELAY_TEST_WATCHDOG_CALLER_DISCONNECT_MS", "500")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let store = LifecycleStore::new(home.clone());
+    wait_until(
+        Duration::from_secs(3),
+        "watchdog record never appeared during bootstrap",
+        || bootstrap_watchdog_heartbeat(&home).is_some(),
+    );
+    let initial_heartbeat = bootstrap_watchdog_heartbeat(&home).unwrap();
+    wake.kill().unwrap();
+    wake.wait().unwrap();
+
+    wait_until(
+        Duration::from_secs(3),
+        "watchdog stopped owning the supervisor after caller disconnect",
+        || {
+            bootstrap_watchdog_heartbeat(&home)
+                .is_some_and(|heartbeat| heartbeat > initial_heartbeat)
+        },
+    );
+    wait_until(
+        Duration::from_secs(4),
+        "bootstrap disconnect did not retire lifecycle authority",
+        || {
+            fs::read_to_string(home.join("lifecycle-v1.json"))
+                .is_ok_and(|state| !state.contains("\"ChildStarting\""))
+                && bootstrap_watchdog_heartbeat(&home).is_none()
+        },
+    );
+    let operations = store.read_operations_for_session(session).unwrap();
+    assert!(operations.iter().any(|operation| {
+        operation.cancelled
+            && operation.terminal
+            && matches!(
+                operation.custody,
+                ExternalCustody::LostAuthority {
+                    reason: LostAuthorityReason::ProxyStartupFailed,
+                    ..
+                }
+            )
+    }));
+    assert!(bootstrap_watchdog_heartbeat(&home).is_none());
+    assert!(
+        store
+            .read_supervisor_for_session(session)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        !child_started.exists(),
+        "disconnected wake child must not start"
+    );
+
+    let retry = Command::new(env!("CARGO_BIN_EXE_relay"))
+        .args(["wake", session, "doorbell"])
+        .env("AGENT_RELAY_HOME", &home)
+        .env("RELAY_WAKE_CMD_CLAUDE", &stub)
+        .env("RELAY_TEST_SENTINEL", &child_started)
+        .output()
+        .unwrap();
+    assert!(
+        retry.status.success(),
+        "{}",
+        String::from_utf8_lossy(&retry.stderr)
+    );
     fs::remove_dir_all(home).ok();
 }
 
