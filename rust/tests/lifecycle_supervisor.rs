@@ -1,3 +1,5 @@
+pub mod support;
+
 use relay::lifecycle::{
     BindingState, ClaimManagedAttach, ClaimOutcome, ExecutionBackend, ExternalCustody,
     LifecycleStore, ManagedState, OperationKind, PendingAttachSpec, RequiredScope, SupervisorState,
@@ -5,22 +7,12 @@ use relay::lifecycle::{
 use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
-use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
+use support::{fresh_home, write_executable};
 use tinyjson::JsonValue;
-
-fn fresh_home(tag: &str) -> PathBuf {
-    let home = std::env::temp_dir().join(format!(
-        "relay-supervisor-{tag}-{}-{}",
-        std::process::id(),
-        relay::store::uuid_v4()
-    ));
-    fs::create_dir_all(&home).unwrap();
-    home
-}
 
 fn seed_entry(home: &Path, id: &str, tool: &str, cwd: &Path) {
     fs::create_dir_all(cwd).unwrap();
@@ -48,11 +40,6 @@ fn seed_entry(home: &Path, id: &str, tool: &str, cwd: &Path) {
         JsonValue::from(root).format().unwrap(),
     )
     .unwrap();
-}
-
-fn write_executable(path: &Path, body: &str) {
-    fs::write(path, body).unwrap();
-    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
 fn wait_until(timeout: Duration, message: &str, mut predicate: impl FnMut() -> bool) {

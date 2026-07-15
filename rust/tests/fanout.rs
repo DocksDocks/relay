@@ -1,3 +1,5 @@
+pub mod support;
+
 use relay::fanout::{self, FanoutMode, FanoutState, FanoutStore};
 use relay::lifecycle::{
     ClaimManagedAttach, ClaimOutcome, ExecutionBackend, LifecycleStore, ManagedState,
@@ -12,17 +14,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Barrier};
 use std::thread;
+use support::fresh_home;
 use tinyjson::JsonValue;
-
-fn fresh_home(tag: &str) -> PathBuf {
-    let home = std::env::temp_dir().join(format!(
-        "relay-fanout-{tag}-{}-{}",
-        std::process::id(),
-        store::uuid_v4()
-    ));
-    fs::create_dir_all(&home).unwrap();
-    home
-}
 
 fn git(cwd: &Path, args: &[&str]) -> String {
     let output = Command::new("git")

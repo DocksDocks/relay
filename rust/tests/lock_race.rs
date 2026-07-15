@@ -3,21 +3,13 @@
 // `relay` child processes (env!("CARGO_BIN_EXE_relay")) with AGENT_RELAY_HOME
 // set per child — no in-process env mutation, so tests can run in parallel.
 
+pub mod support;
+
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::PathBuf;
 use std::process::Command;
+use support::fresh_home;
 use tinyjson::JsonValue;
-
-fn fresh_home(tag: &str) -> PathBuf {
-    let home = std::env::temp_dir().join(format!(
-        "relay-test-{tag}-{}-{}",
-        std::process::id(),
-        relay::store::uuid_v4()
-    ));
-    fs::create_dir_all(&home).unwrap();
-    home
-}
 
 fn obj(v: &JsonValue) -> &HashMap<String, JsonValue> {
     v.get::<HashMap<String, JsonValue>>().expect("object")

@@ -1,3 +1,5 @@
+pub mod support;
+
 use relay::lifecycle::{
     Admission, AttachOptions, BindingState, ChildLaunchSpec, ClaimManagedAttach, ClaimOutcome,
     DoorbellMessage, ExecutionBackend, LifecycleStore, ManagedState, OperationKind,
@@ -7,22 +9,13 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
+use support::fresh_home;
 use tinyjson::JsonValue;
-
-fn fresh_home(tag: &str) -> PathBuf {
-    let home = std::env::temp_dir().join(format!(
-        "relay-admission-{tag}-{}-{}",
-        std::process::id(),
-        relay::store::uuid_v4()
-    ));
-    fs::create_dir_all(&home).unwrap();
-    home
-}
 
 fn seed_entry(home: &Path, id: &str, tool: &str, cwd: &Path) {
     fs::create_dir_all(cwd).unwrap();

@@ -1,25 +1,18 @@
+pub mod support;
+
 use relay::lifecycle::{
     BindingState, ClaimManagedAttach, ClaimOutcome, ExecutionBackend, GcCheckpoint, GcControl,
     LifecycleStore, ManagedState, PendingAttachSpec, RequiredScope,
 };
 use std::fs;
 use std::fs::FileTimes;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
+use support::fresh_home;
 use tinyjson::JsonValue;
-
-fn fresh_home(tag: &str) -> PathBuf {
-    let home = std::env::temp_dir().join(format!(
-        "relay-lifecycle-{tag}-{}-{}",
-        std::process::id(),
-        relay::store::uuid_v4()
-    ));
-    fs::create_dir_all(&home).unwrap();
-    home
-}
 
 fn pending(
     worker_id: &str,
