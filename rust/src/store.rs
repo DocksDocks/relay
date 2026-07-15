@@ -749,6 +749,13 @@ pub(crate) struct LegacyGc {
     root_fd: OwnedFd,
     surface_dirs: Vec<GcSurfaceDir>,
     days: u64,
+    root_source: GcRootSource,
+}
+
+enum GcRootSource {
+    Configured,
+    #[cfg(test)]
+    ExplicitTest,
 }
 
 fn gc_days() -> Result<u64, String> {
@@ -763,12 +770,8 @@ fn gc_days() -> Result<u64, String> {
     }
 }
 
-/// Resolve an existing store without creating anything. An explicit relay-home
-/// override is the authority for its own root (including test roots in /tmp);
-/// the default root must resolve beneath the configured HOME.
-fn safe_existing_root() -> Result<Option<(PathBuf, PathBuf)>, String> {
-    let raw =
-        std::path::absolute(home_dir()).map_err(|e| format!("resolve relay store root: {e}"))?;
+fn resolve_existing_root(root: &Path) -> Result<Option<(PathBuf, PathBuf)>, String> {
+    let raw = std::path::absolute(root).map_err(|e| format!("resolve relay store root: {e}"))?;
     match fs::symlink_metadata(&raw) {
         Ok(_) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -782,6 +785,16 @@ fn safe_existing_root() -> Result<Option<(PathBuf, PathBuf)>, String> {
             resolved.display()
         ));
     }
+    Ok(Some((raw, resolved)))
+}
+
+/// Resolve an existing store without creating anything. An explicit relay-home
+/// override is the authority for its own root (including test roots in /tmp);
+/// the default root must resolve beneath the configured HOME.
+fn safe_existing_root() -> Result<Option<(PathBuf, PathBuf)>, String> {
+    let Some((raw, resolved)) = resolve_existing_root(&home_dir())? else {
+        return Ok(None);
+    };
     if home_override().is_none() {
         let home = std::env::var("HOME").map_err(|_| {
             "refusing GC: HOME is unavailable for default-root validation".to_string()
@@ -1168,10 +1181,15 @@ impl LegacyGc {
         let Some((root, resolved_root)) = safe_existing_root()? else {
             return Ok(None);
         };
-        Self::open(root, resolved_root, days).map(Some)
+        Self::open(root, resolved_root, days, GcRootSource::Configured).map(Some)
     }
 
-    fn open(root: PathBuf, resolved_root: PathBuf, days: u64) -> Result<Self, String> {
+    fn open(
+        root: PathBuf,
+        resolved_root: PathBuf,
+        days: u64,
+        root_source: GcRootSource,
+    ) -> Result<Self, String> {
         let root_fd = open(
             &resolved_root,
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
@@ -1188,6 +1206,7 @@ impl LegacyGc {
             root_fd,
             surface_dirs,
             days,
+            root_source,
         })
     }
 
@@ -1197,7 +1216,7 @@ impl LegacyGc {
             .map_err(|error| format!("resolve relay store root: {error}"))?;
         let resolved_root = fs::canonicalize(&root)
             .map_err(|error| format!("canonicalize relay store root: {error}"))?;
-        Self::open(root, resolved_root, days)
+        Self::open(root, resolved_root, days, GcRootSource::ExplicitTest)
     }
 
     pub(crate) fn preflight_throttled(&self, now: SystemTime) -> Result<bool, String> {
@@ -1205,20 +1224,14 @@ impl LegacyGc {
     }
 
     fn reopen_validated_root(&self) -> Result<Option<OwnedFd>, String> {
-        let current_root = std::path::absolute(&self.root)
-            .map_err(|error| format!("resolve relay store root: {error}"))?;
-        match fs::symlink_metadata(&current_root) {
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => {
-                return Err(format!(
-                    "stat relay store root {}: {error}",
-                    current_root.display()
-                ));
-            }
-        }
-        let current_resolved_root = fs::canonicalize(&current_root)
-            .map_err(|error| format!("canonicalize relay store root: {error}"))?;
+        let current = match self.root_source {
+            GcRootSource::Configured => safe_existing_root()?,
+            #[cfg(test)]
+            GcRootSource::ExplicitTest => resolve_existing_root(&self.root)?,
+        };
+        let Some((current_root, current_resolved_root)) = current else {
+            return Ok(None);
+        };
         if current_root != self.root || current_resolved_root != self.resolved_root {
             return Err("refusing GC: relay store root changed during sweep".to_string());
         }
