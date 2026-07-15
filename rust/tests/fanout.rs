@@ -485,6 +485,115 @@ fn custody_exact_owned_process_reap_is_required_before_slot_release() {
 }
 
 #[test]
+fn custody_collection_waits_for_exact_owned_process_reap() {
+    let (home, _repo, store, root, root_session) = setup_root("custody-collect");
+    let root_dir = PathBuf::from(&root.worktree);
+    let child =
+        fanout::prepare_worktree(&store, &root_dir, &root_session, FanoutMode::Child).unwrap();
+    let child_session = "73333333-3333-4333-8333-333333333333";
+    let (worker_id, generation) = activate(
+        &store,
+        &child.reservation_id,
+        child_session,
+        Path::new(&child.worktree),
+    );
+    let lifecycle = LifecycleStore::new(home.clone());
+    let custody = lifecycle
+        .begin_owned_process_custody(
+            &worker_id,
+            &generation,
+            &store::uuid_v4(),
+            ProcessObservation {
+                pid: std::process::id(),
+                pgid: None,
+                start: StartGeneration::Unavailable,
+            },
+        )
+        .unwrap();
+
+    fs::write(
+        Path::new(&child.worktree).join("custody.txt"),
+        "exact reap result\n",
+    )
+    .unwrap();
+    git(Path::new(&child.worktree), &["add", "custody.txt"]);
+    git(
+        Path::new(&child.worktree),
+        &["commit", "-qm", "exact reap result"],
+    );
+    let handback = fanout::handback(&store, child_session, "completed", "ready").unwrap();
+    assert_eq!(handback.state, FanoutState::HandedBack);
+    let parent_head_before = git(&root_dir, &["rev-parse", "HEAD"]);
+
+    let collect_error = fanout::collect(&store, child_session, &root_session).unwrap_err();
+    assert!(
+        collect_error.contains("not TerminalReleasable"),
+        "{collect_error}"
+    );
+    assert_eq!(
+        store.read(&child.reservation_id).unwrap().unwrap().state,
+        FanoutState::HandedBack
+    );
+    assert_eq!(store.active_leaf_count(&root.reservation_id).unwrap(), 1);
+    assert!(Path::new(&child.worktree).is_dir());
+    assert_eq!(git(&root_dir, &["rev-parse", "HEAD"]), parent_head_before);
+
+    let fence = lifecycle
+        .publish_fence(&worker_id, &generation, "fanout handback")
+        .unwrap();
+    let fenced = lifecycle
+        .drain_prior_operations(fence)
+        .unwrap()
+        .confirm_process_terminal()
+        .unwrap();
+    let release_error = lifecycle
+        .terminalize_worker(
+            &worker_id,
+            &generation,
+            &fenced.version,
+            TerminalAction::Release,
+            "fanout process reaped",
+        )
+        .unwrap_err();
+    assert!(
+        release_error.contains("exact supervisor-owned process reap proof"),
+        "{release_error}"
+    );
+    let collect_error = fanout::collect(&store, child_session, &root_session).unwrap_err();
+    assert!(
+        collect_error.contains("not TerminalReleasable"),
+        "{collect_error}"
+    );
+    assert_eq!(
+        store.read(&child.reservation_id).unwrap().unwrap().state,
+        FanoutState::HandedBack
+    );
+    assert_eq!(store.active_leaf_count(&root.reservation_id).unwrap(), 1);
+    assert!(Path::new(&child.worktree).is_dir());
+    assert_eq!(git(&root_dir, &["rev-parse", "HEAD"]), parent_head_before);
+
+    lifecycle.record_owned_process_reaped(&custody, 0).unwrap();
+    let released = lifecycle
+        .terminalize_worker(
+            &worker_id,
+            &generation,
+            &fenced.version,
+            TerminalAction::Release,
+            "fanout process reaped",
+        )
+        .unwrap();
+    assert_eq!(released.state, ManagedState::TerminalReleasable);
+
+    let collected = fanout::collect(&store, child_session, &root_session).unwrap();
+    assert_eq!(collected.state, FanoutState::Collected);
+    assert!(root_dir.join("custody.txt").is_file());
+    assert!(!Path::new(&child.worktree).exists());
+    assert_ne!(git(&root_dir, &["rev-parse", "HEAD"]), parent_head_before);
+    assert_eq!(store.active_leaf_count(&root.reservation_id).unwrap(), 0);
+    fs::remove_dir_all(home).ok();
+}
+
+#[test]
 fn custody_uncertain_process_state_keeps_the_slot_counted() {
     let (home, repo, store, root, root_session) = setup_root("custody-uncertain");
     let child = fanout::prepare_worktree(&store, &repo, &root_session, FanoutMode::Child).unwrap();
