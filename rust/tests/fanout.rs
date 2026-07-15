@@ -83,7 +83,7 @@ fn seed_entry(home: &Path, id: &str, cwd: &Path) {
     fs::write(registry_path, JsonValue::from(root).format().unwrap()).unwrap();
 }
 
-fn activate(
+fn activate_managed_fanout_worker(
     fanout: &FanoutStore,
     record_id: &str,
     runtime_session_id: &str,
@@ -130,7 +130,7 @@ fn activate(
     (worker, generation)
 }
 
-fn force_terminal_releasable(home: &Path, worker: &str) {
+fn force_terminal_releasable_via_authority_edit_for_test(home: &Path, worker: &str) {
     let path = home.join("lifecycle-v1.json");
     let value: JsonValue = fs::read_to_string(&path).unwrap().parse().unwrap();
     let mut authority = value.get::<HashMap<String, JsonValue>>().unwrap().clone();
@@ -186,7 +186,7 @@ fn setup_root(tag: &str) -> (PathBuf, PathBuf, FanoutStore, fanout::FanoutRecord
     seed_entry(&home, invoker, &repo);
     let store = FanoutStore::new(home.clone());
     let root = fanout::prepare_worktree(&store, &repo, invoker, FanoutMode::Root).unwrap();
-    activate(
+    activate_managed_fanout_worker(
         &store,
         &root.reservation_id,
         root_session,
@@ -309,7 +309,7 @@ fn authority_terminal_root_cannot_admit_a_new_leaf() {
         .unwrap()
         .worker_id
         .unwrap();
-    force_terminal_releasable(&home, &root_worker);
+    force_terminal_releasable_via_authority_edit_for_test(&home, &root_worker);
     let branches_before = git(&repo, &["branch", "--list", "relay/fanout-*"]);
     let worktrees_before = fs::read_dir(home.join("worktrees")).unwrap().count();
 
@@ -426,7 +426,7 @@ fn custody_exact_owned_process_reap_is_required_before_slot_release() {
     let (home, repo, store, root, root_session) = setup_root("custody-reap");
     let child = fanout::prepare_worktree(&store, &repo, &root_session, FanoutMode::Child).unwrap();
     let child_session = "53333333-3333-4333-8333-333333333333";
-    let (worker_id, generation) = activate(
+    let (worker_id, generation) = activate_managed_fanout_worker(
         &store,
         &child.reservation_id,
         child_session,
@@ -491,7 +491,7 @@ fn custody_collection_waits_for_exact_owned_process_reap() {
     let child =
         fanout::prepare_worktree(&store, &root_dir, &root_session, FanoutMode::Child).unwrap();
     let child_session = "73333333-3333-4333-8333-333333333333";
-    let (worker_id, generation) = activate(
+    let (worker_id, generation) = activate_managed_fanout_worker(
         &store,
         &child.reservation_id,
         child_session,
@@ -598,7 +598,7 @@ fn custody_uncertain_process_state_keeps_the_slot_counted() {
     let (home, repo, store, root, root_session) = setup_root("custody-uncertain");
     let child = fanout::prepare_worktree(&store, &repo, &root_session, FanoutMode::Child).unwrap();
     let child_session = "63333333-3333-4333-8333-333333333333";
-    let (worker_id, generation) = activate(
+    let (worker_id, generation) = activate_managed_fanout_worker(
         &store,
         &child.reservation_id,
         child_session,
@@ -648,7 +648,7 @@ fn worktree_handback_and_collect_merge_once_then_remove_exact_tree() {
     let child =
         fanout::prepare_worktree(&store, &root_dir, &root_session, FanoutMode::Child).unwrap();
     let child_session = "33333333-3333-4333-8333-333333333333";
-    let (worker, _) = activate(
+    let (worker, _) = activate_managed_fanout_worker(
         &store,
         &child.reservation_id,
         child_session,
@@ -662,7 +662,7 @@ fn worktree_handback_and_collect_merge_once_then_remove_exact_tree() {
     );
     let handback = fanout::handback(&store, child_session, "completed", "ready").unwrap();
     assert_eq!(handback.state, FanoutState::HandedBack);
-    force_terminal_releasable(&home, &worker);
+    force_terminal_releasable_via_authority_edit_for_test(&home, &worker);
 
     let collected = fanout::collect(&store, child_session, &root_session).unwrap();
     assert_eq!(collected.state, FanoutState::Collected);
@@ -681,7 +681,7 @@ fn worktree_head_changed_after_handback_is_refused_without_removal() {
     let child =
         fanout::prepare_worktree(&store, &root_dir, &root_session, FanoutMode::Child).unwrap();
     let child_session = "93333333-3333-4333-8333-333333333333";
-    let (worker, _) = activate(
+    let (worker, _) = activate_managed_fanout_worker(
         &store,
         &child.reservation_id,
         child_session,
@@ -694,7 +694,7 @@ fn worktree_head_changed_after_handback_is_refused_without_removal() {
     fs::write(Path::new(&child.worktree).join("late.txt"), "late\n").unwrap();
     git(Path::new(&child.worktree), &["add", "late.txt"]);
     git(Path::new(&child.worktree), &["commit", "-qm", "late"]);
-    force_terminal_releasable(&home, &worker);
+    force_terminal_releasable_via_authority_edit_for_test(&home, &worker);
 
     let error = fanout::collect(&store, child_session, &root_session).unwrap_err();
 
@@ -719,7 +719,7 @@ fn worktree_collection_lock_refuses_a_concurrent_collector_before_git_changes() 
     let child =
         fanout::prepare_worktree(&store, &root_dir, &root_session, FanoutMode::Child).unwrap();
     let child_session = "a3333333-3333-4333-8333-333333333333";
-    let (worker, _) = activate(
+    let (worker, _) = activate_managed_fanout_worker(
         &store,
         &child.reservation_id,
         child_session,
@@ -729,7 +729,7 @@ fn worktree_collection_lock_refuses_a_concurrent_collector_before_git_changes() 
     git(Path::new(&child.worktree), &["add", "leaf.txt"]);
     git(Path::new(&child.worktree), &["commit", "-qm", "leaf"]);
     fanout::handback(&store, child_session, "completed", "ready").unwrap();
-    force_terminal_releasable(&home, &worker);
+    force_terminal_releasable_via_authority_edit_for_test(&home, &worker);
     let lock_path = home
         .join("locks")
         .join(format!("fanout-collect-{}.lock", child.reservation_id));
@@ -758,7 +758,7 @@ fn worktree_collect_recovers_when_removal_preceded_the_phase_write() {
     let child =
         fanout::prepare_worktree(&store, &root_dir, &root_session, FanoutMode::Child).unwrap();
     let child_session = "b3333333-3333-4333-8333-333333333333";
-    let (worker, _) = activate(
+    let (worker, _) = activate_managed_fanout_worker(
         &store,
         &child.reservation_id,
         child_session,
@@ -768,7 +768,7 @@ fn worktree_collect_recovers_when_removal_preceded_the_phase_write() {
     git(Path::new(&child.worktree), &["add", "leaf.txt"]);
     git(Path::new(&child.worktree), &["commit", "-qm", "leaf"]);
     fanout::handback(&store, child_session, "completed", "ready").unwrap();
-    force_terminal_releasable(&home, &worker);
+    force_terminal_releasable_via_authority_edit_for_test(&home, &worker);
     let head = store
         .read(&child.reservation_id)
         .unwrap()
@@ -794,7 +794,7 @@ fn worktree_dirty_handback_is_refused_without_publishing_merge_authority() {
     let child =
         fanout::prepare_worktree(&store, &root_dir, &root_session, FanoutMode::Child).unwrap();
     let child_session = "73333333-3333-4333-8333-333333333333";
-    activate(
+    activate_managed_fanout_worker(
         &store,
         &child.reservation_id,
         child_session,
@@ -823,7 +823,7 @@ fn worktree_dirty_parent_blocks_collection_until_the_same_checkout_is_clean() {
     let child =
         fanout::prepare_worktree(&store, &root_dir, &root_session, FanoutMode::Child).unwrap();
     let child_session = "83333333-3333-4333-8333-333333333333";
-    let (worker, _) = activate(
+    let (worker, _) = activate_managed_fanout_worker(
         &store,
         &child.reservation_id,
         child_session,
@@ -833,7 +833,7 @@ fn worktree_dirty_parent_blocks_collection_until_the_same_checkout_is_clean() {
     git(Path::new(&child.worktree), &["add", "leaf.txt"]);
     git(Path::new(&child.worktree), &["commit", "-qm", "leaf"]);
     fanout::handback(&store, child_session, "completed", "ready").unwrap();
-    force_terminal_releasable(&home, &worker);
+    force_terminal_releasable_via_authority_edit_for_test(&home, &worker);
     let dirty = root_dir.join("uncommitted.txt");
     fs::write(&dirty, "dirty\n").unwrap();
 
@@ -864,7 +864,7 @@ fn worktree_merge_conflict_aborts_cleanly_and_returns_to_handback() {
     let child =
         fanout::prepare_worktree(&store, &root_dir, &root_session, FanoutMode::Child).unwrap();
     let child_session = "43333333-3333-4333-8333-333333333333";
-    let (worker, _) = activate(
+    let (worker, _) = activate_managed_fanout_worker(
         &store,
         &child.reservation_id,
         child_session,
@@ -877,7 +877,7 @@ fn worktree_merge_conflict_aborts_cleanly_and_returns_to_handback() {
         &["commit", "-qm", "child change"],
     );
     fanout::handback(&store, child_session, "completed", "conflicts").unwrap();
-    force_terminal_releasable(&home, &worker);
+    force_terminal_releasable_via_authority_edit_for_test(&home, &worker);
 
     fs::write(root_dir.join("shared.txt"), "root\n").unwrap();
     git(&root_dir, &["add", "shared.txt"]);

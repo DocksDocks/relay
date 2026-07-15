@@ -253,7 +253,7 @@ impl FanoutStore {
                 .get_mut(reservation_id)
                 .ok_or_else(|| "fanout reservation not found".to_string())?;
             record.last_error = Some(bounded);
-            bump(record)?;
+            increment_record_version(record)?;
             Ok(record.clone())
         })
     }
@@ -290,7 +290,7 @@ impl FanoutStore {
             }
             record.worker_id = Some(worker_id.to_string());
             record.generation = Some(generation.to_string());
-            bump(&mut record)?;
+            increment_record_version(&mut record)?;
             records.insert(reservation_id.to_string(), record.clone());
             Ok(record)
         })
@@ -332,7 +332,7 @@ impl FanoutStore {
             }
             record.runtime_session_id = Some(runtime_session_id.to_string());
             record.state = FanoutState::Running;
-            bump(&mut record)?;
+            increment_record_version(&mut record)?;
             records.insert(reservation_id.to_string(), record.clone());
             Ok(record)
         })
@@ -503,7 +503,7 @@ pub fn prepare_worktree(
         let _ = fanout.transaction(|records, _, _| {
             if let Some(record) = records.get_mut(&reservation_id) {
                 record.last_error = Some(format!("git worktree add failed: {error}"));
-                bump(record)?;
+                increment_record_version(record)?;
             }
             Ok(())
         });
@@ -568,7 +568,7 @@ pub(crate) fn rollback_before_process_start(
         }
         current.state = FanoutState::FailedNoProcess;
         current.last_error = Some(format!("spawn never returned a child: {reason}"));
-        bump(current)?;
+        increment_record_version(current)?;
         Ok(current.clone())
     })
 }
@@ -586,7 +586,7 @@ pub fn handback(
         return Err("handback note must be at most 4096 bytes without NUL".to_string());
     }
     let snapshot = fanout.read_transaction(|records, _| {
-        let record = by_runtime(records, runtime_session_id)?;
+        let record = record_by_runtime_session_id(records, runtime_session_id)?;
         if record.state == FanoutState::HandedBack {
             return Ok(record.clone());
         }
@@ -625,7 +625,7 @@ pub fn handback(
         record.handback_head = Some(head);
         record.handback_status = Some(status.to_string());
         record.handback_note = Some(note.to_string());
-        bump(&mut record)?;
+        increment_record_version(&mut record)?;
         records.insert(record.reservation_id.clone(), record.clone());
         Ok(record)
     })
@@ -637,7 +637,7 @@ pub fn collect(
     parent_session_id: &str,
 ) -> Result<FanoutRecord, String> {
     let reservation_id = fanout.read_transaction(|records, _| {
-        let record = by_runtime(records, runtime_session_id)?;
+        let record = record_by_runtime_session_id(records, runtime_session_id)?;
         if record.parent_session_id != parent_session_id {
             return Err("fanout collect parent does not own this worker".to_string());
         }
@@ -645,7 +645,7 @@ pub fn collect(
     })?;
     let _collection_lock = acquire_collection_lock(fanout.root(), &reservation_id)?;
     let mut record = fanout.transaction(|records, lifecycle, registry| {
-        let mut record = by_runtime(records, runtime_session_id)?.clone();
+        let mut record = record_by_runtime_session_id(records, runtime_session_id)?.clone();
         if record.parent_session_id != parent_session_id {
             return Err("fanout collect parent does not own this worker".to_string());
         }
@@ -677,7 +677,7 @@ pub fn collect(
         if record.state == FanoutState::HandedBack {
             record.state = FanoutState::Collecting;
             record.collection_phase = Some(CollectionPhase::Prepared);
-            bump(&mut record)?;
+            increment_record_version(&mut record)?;
             records.insert(record.reservation_id.clone(), record.clone());
         }
         Ok(record)
@@ -730,7 +730,7 @@ pub fn collect(
                     current.state = FanoutState::HandedBack;
                     current.collection_phase = None;
                     current.last_error = Some("merge failed and was aborted".to_string());
-                    bump(current)?;
+                    increment_record_version(current)?;
                     Ok(())
                 })?;
                 return Err(format!("merge failed and was aborted: {merge_error}"));
@@ -788,7 +788,7 @@ pub fn collect(
                 return Err("fanout collection authority changed before finalize".to_string());
             }
             current.state = FanoutState::Collected;
-            bump(current)?;
+            increment_record_version(current)?;
             Ok(current.clone())
         })?;
     }
@@ -862,7 +862,7 @@ fn advance_collection(
             return Err("fanout collection authority changed".to_string());
         }
         current.collection_phase = Some(phase);
-        bump(current)?;
+        increment_record_version(current)?;
         Ok(current.clone())
     })
 }
@@ -935,7 +935,7 @@ fn resolve_entry(registry: &store::Registry, session_id: &str) -> Option<Entry> 
     registry.agents.get(session_id).and_then(Entry::from_json)
 }
 
-fn by_runtime<'a>(
+fn record_by_runtime_session_id<'a>(
     records: &'a HashMap<String, FanoutRecord>,
     runtime_session_id: &str,
 ) -> Result<&'a FanoutRecord, String> {
@@ -1115,7 +1115,7 @@ fn atomic_write_private(path: &Path, text: &str) -> Result<(), String> {
     result
 }
 
-fn bump(record: &mut FanoutRecord) -> Result<(), String> {
+fn increment_record_version(record: &mut FanoutRecord) -> Result<(), String> {
     record.version = canonical_version(&record.version)?
         .checked_add(1)
         .ok_or_else(|| "fanout version overflow".to_string())?
