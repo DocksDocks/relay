@@ -5,8 +5,8 @@ user-invocable: true
 allowed-tools: Bash, Read
 metadata:
   pattern: tool-wrapper
-  updated: "2026-07-14"
-  content_hash: "8ac0bf82f9be760b57c7e563033a7fe429c26e7201141fc39ea0557b1183c39b"
+  updated: "2026-07-15"
+  content_hash: "26fc7db7d839f7d781e546711ec6c01da29199945e4dbaa6010f7a1c5f9ff051"
 ---
 
 # Session relay
@@ -24,6 +24,37 @@ The Claude doorbell (`claude -p --resume <id>`) MUST run from the recipient's ow
 <constraint>
 Relay children and doorbell wakes run unattended and can reprocess full transcripts. ALWAYS pin `--model`/`--effort` on `relay spawn` and `relay wake`; never use Fable or another top interactive default for a relay child or wake. Current examples as of 2026-07: Claude `--model opus --effort max`, Codex `--model gpt-5.6-sol --effort xhigh`; check your own tier list before copying them.
 </constraint>
+
+## Pick the transport deliberately
+
+Relay is an orchestration and lifecycle layer over the native Claude/Codex
+commands, not an alternate model runner. It adds no model entitlement, review
+quality, authentication, usage discount, or host-policy bypass.
+
+| Need | Use | Not |
+|---|---|---|
+| Canonical Docks plan review with sealed input and closed structured evidence | plan-manager/plan-review's direct explicit-model CLI | `relay spawn` (resumable bus output is not the canonical receipt boundary) |
+| Small one-shot task in the current project | the current agent or a direct CLI | relay (persistent-session overhead adds no value) |
+| Cross-provider implementation needing an isolated committed handback | `relay spawn --fanout` → `handback` → parent `collect` | a bare writable CLI against the shared worktree |
+| Long-running/resumable worker or later human takeover | `relay spawn`, then `send`/`wake`/`attach` | a one-shot command whose process exit loses addressability |
+| Ask another project's agent and get its answer | `send` → tool-aware `relay wake` (or wait for its next prompt) | a subagent (can't leave this session) |
+| Fire-and-forget note picked up later | `send` (delivered at recipient's next SessionStart) | the doorbell (wastes a process) |
+| Helper inside THIS session | the Task/subagent tool | this skill |
+
+### BAD
+
+```bash
+# Resuming from the wrong directory — session id is scoped to its own project dir.
+cd /any/where && claude -p "ping" --resume 2222...-...  # → No conversation found with session ID
+```
+
+### GOOD
+
+```bash
+# Resolve the recipient's dir from roster, then resume from there.
+cd "$(<plugin>/bin/relay list | awk '$1=="agent-B"{print $4}')" \
+  && claude -p "ping" --resume 2222...-... --model opus --effort max --output-format json | jq -r .result
+```
 
 ## How it fits together
 
@@ -424,29 +455,6 @@ export route.
    Never let both workers write the plan at the same time.
 5. The orchestrator writes `### Verdict`: agreements are confirmed conclusions;
    disagreements are open questions.
-
-## Pick the transport deliberately
-
-| Need | Use | Not |
-|---|---|---|
-| Ask another project's agent and get its answer | `send` → doorbell `claude -p --resume`, read `.result` | a subagent (can't leave this session) |
-| Fire-and-forget note picked up later | `send` (delivered at recipient's next SessionStart) | the doorbell (wastes a process) |
-| Helper inside THIS session | the Task/subagent tool | this skill |
-
-### BAD
-
-```bash
-# Resuming from the wrong directory — session id is scoped to its own project dir.
-cd /any/where && claude -p "ping" --resume 2222...-...  # → No conversation found with session ID
-```
-
-### GOOD
-
-```bash
-# Resolve the recipient's dir from roster, then resume from there.
-cd "$(<plugin>/bin/relay list | awk '$1=="agent-B"{print $4}')" \
-  && claude -p "ping" --resume 2222...-... --model opus --effort max --output-format json | jq -r .result
-```
 
 ## Gotchas
 
