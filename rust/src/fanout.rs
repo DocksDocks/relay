@@ -86,6 +86,11 @@ impl CollectionPhase {
     }
 }
 
+enum PreparedMergeOutcome {
+    Merged,
+    Aborted { merge_error: String },
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FanoutRecord {
     pub reservation_id: String,
@@ -697,26 +702,9 @@ pub fn collect(
     }
     let worktree = PathBuf::from(&record.worktree);
     if record.collection_phase == Some(CollectionPhase::Prepared) {
-        ensure_clean(&parent_dir, "collect parent")?;
-        ensure_clean(&worktree, "collect child")?;
-        if !repo_identity(&worktree)?.matches_record(&record) {
-            return Err("fanout collect child repository identity changed".to_string());
-        }
-        let head = record
-            .handback_head
-            .clone()
-            .ok_or_else(|| "fanout handback has no head".to_string())?;
-        let current_head = run_git(&worktree, &["rev-parse", "--verify", "HEAD"])?;
-        if current_head != head {
-            return Err(format!(
-                "fanout child HEAD changed after handback; restore {} to {head} before retrying collection",
-                worktree.display()
-            ));
-        }
-        if let Err(merge_error) = run_git(&parent_dir, &["merge", "--no-ff", "--no-edit", &head]) {
-            let abort = run_git(&parent_dir, &["merge", "--abort"]);
-            let clean = ensure_clean(&parent_dir, "collect parent after merge abort");
-            if abort.is_ok() && clean.is_ok() {
+        match merge_prepared_handback(&parent_dir, &worktree, &record)? {
+            PreparedMergeOutcome::Merged => {}
+            PreparedMergeOutcome::Aborted { merge_error } => {
                 fanout.transaction(|records, _, _| {
                     let current = records
                         .get_mut(&record.reservation_id)
@@ -734,45 +722,11 @@ pub fn collect(
                 })?;
                 return Err(format!("merge failed and was aborted: {merge_error}"));
             }
-            return Err(format!(
-                "merge failed and abort could not restore a clean parent at {}; run `git merge --abort`, clean the checkout, then retry: {merge_error}",
-                parent_dir.display()
-            ));
         }
         record = advance_collection(fanout, &record, CollectionPhase::Merged)?;
     }
     if record.collection_phase == Some(CollectionPhase::Merged) {
-        let tracked = git_tracks_worktree(&parent_dir, &worktree)?;
-        match fs::symlink_metadata(&worktree) {
-            Ok(_) => {
-                if !tracked {
-                    return Err(
-                        "fanout collect child exists but is no longer registered".to_string()
-                    );
-                }
-                ensure_clean(&worktree, "collect child")?;
-                if !repo_identity(&worktree)?.matches_record(&record) {
-                    return Err("fanout collect child repository identity changed".to_string());
-                }
-                run_git(
-                    &parent_dir,
-                    &["worktree", "remove", record.worktree.as_str()],
-                )?;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound && !tracked => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Err(format!(
-                    "fanout worktree {} is missing but remains registered; repair the git worktree metadata before retrying",
-                    worktree.display()
-                ));
-            }
-            Err(error) => {
-                return Err(format!(
-                    "inspect fanout worktree {}: {error}",
-                    worktree.display()
-                ));
-            }
-        }
+        remove_merged_worktree(&parent_dir, &worktree, &record)?;
         record = advance_collection(fanout, &record, CollectionPhase::WorktreeRemoved)?;
     }
     if record.collection_phase == Some(CollectionPhase::WorktreeRemoved) {
@@ -846,6 +800,78 @@ pub fn run_collect(raw: Vec<String>) -> ! {
 fn fanout_die(message: &str) -> ! {
     eprintln!("{message}");
     std::process::exit(1);
+}
+
+fn merge_prepared_handback(
+    parent_dir: &Path,
+    worktree: &Path,
+    record: &FanoutRecord,
+) -> Result<PreparedMergeOutcome, String> {
+    ensure_clean(parent_dir, "collect parent")?;
+    ensure_clean(worktree, "collect child")?;
+    if !repo_identity(worktree)?.matches_record(record) {
+        return Err("fanout collect child repository identity changed".to_string());
+    }
+    let head = record
+        .handback_head
+        .as_deref()
+        .ok_or_else(|| "fanout handback has no head".to_string())?;
+    let current_head = run_git(worktree, &["rev-parse", "--verify", "HEAD"])?;
+    if current_head != head {
+        return Err(format!(
+            "fanout child HEAD changed after handback; restore {} to {head} before retrying collection",
+            worktree.display()
+        ));
+    }
+    if let Err(merge_error) = run_git(parent_dir, &["merge", "--no-ff", "--no-edit", head]) {
+        let abort = run_git(parent_dir, &["merge", "--abort"]);
+        let clean = ensure_clean(parent_dir, "collect parent after merge abort");
+        if abort.is_ok() && clean.is_ok() {
+            return Ok(PreparedMergeOutcome::Aborted { merge_error });
+        }
+        return Err(format!(
+            "merge failed and abort could not restore a clean parent at {}; run `git merge --abort`, clean the checkout, then retry: {merge_error}",
+            parent_dir.display()
+        ));
+    }
+    Ok(PreparedMergeOutcome::Merged)
+}
+
+fn remove_merged_worktree(
+    parent_dir: &Path,
+    worktree: &Path,
+    record: &FanoutRecord,
+) -> Result<(), String> {
+    let tracked = git_tracks_worktree(parent_dir, worktree)?;
+    match fs::symlink_metadata(worktree) {
+        Ok(_) => {
+            if !tracked {
+                return Err("fanout collect child exists but is no longer registered".to_string());
+            }
+            ensure_clean(worktree, "collect child")?;
+            if !repo_identity(worktree)?.matches_record(record) {
+                return Err("fanout collect child repository identity changed".to_string());
+            }
+            run_git(
+                parent_dir,
+                &["worktree", "remove", record.worktree.as_str()],
+            )?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && !tracked => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(format!(
+                "fanout worktree {} is missing but remains registered; repair the git worktree metadata before retrying",
+                worktree.display()
+            ));
+        }
+        Err(error) => {
+            return Err(format!(
+                "inspect fanout worktree {}: {error}",
+                worktree.display()
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn advance_collection(

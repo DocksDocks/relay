@@ -851,7 +851,7 @@ fn worktree_dirty_parent_blocks_collection_until_the_same_checkout_is_clean() {
 }
 
 #[test]
-fn worktree_merge_conflict_aborts_cleanly_and_returns_to_handback() {
+fn worktree_merge_conflict_aborts_cleanly_and_retries_after_parent_repair() {
     let (home, _repo, store, root, root_session) = setup_root("conflict");
     let root_dir = PathBuf::from(&root.worktree);
     let child =
@@ -882,5 +882,14 @@ fn worktree_merge_conflict_aborts_cleanly_and_returns_to_handback() {
         store.read(&child.reservation_id).unwrap().unwrap().state,
         FanoutState::HandedBack
     );
+
+    git(&root_dir, &["revert", "--no-edit", "HEAD"]);
+    let collected = fanout::collect(&store, child_session, &root_session).unwrap();
+    assert_eq!(collected.state, FanoutState::Collected);
+    assert_eq!(
+        fs::read_to_string(root_dir.join("shared.txt")).unwrap(),
+        "child\n"
+    );
+    assert!(!Path::new(&child.worktree).exists());
     fs::remove_dir_all(home).ok();
 }
