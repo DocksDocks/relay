@@ -4,6 +4,7 @@
 //   lifecycle-v1.json durable lifecycle authority, isolated from legacy writers
 //   mailbox/<id>.jsonl one append-only inbox per recipient session id
 //   markers/<cwd>      the session id last registered for a project dir
+//   hook-state/        bounded per-session hook emission state
 //
 // Home is a FIXED, TOOL-NEUTRAL path (~/.agent-relay, never under the plugin
 // root — the install dir is replaced on every plugin update). Override with
@@ -33,6 +34,7 @@ const WATCH_LOCK_RETRY: Duration = Duration::from_secs(2);
 const DEFAULT_GC_DAYS: u64 = 14;
 const GC_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
+const SESSION_START_IDENTITY_DEBOUNCE_MS: i64 = 1_000;
 pub const WATCH_PROGRESS_STALE_MS: i64 = 300_000;
 
 fn home_override() -> Option<PathBuf> {
@@ -67,6 +69,11 @@ pub(crate) fn mailbox_path(id: &str) -> PathBuf {
 }
 fn marker_path(dir: &str) -> PathBuf {
     home_dir().join("markers").join(encode_dir(dir))
+}
+fn session_start_identity_path(id: &str) -> PathBuf {
+    home_dir()
+        .join("hook-state")
+        .join(format!("session-start-{}.stamp", sanitize(id)))
 }
 pub fn watcher_lock_path(id: &str) -> PathBuf {
     home_dir()
@@ -110,10 +117,10 @@ pub fn sanitize(s: &str) -> String {
 }
 
 fn ensure_dirs_at(root: &Path) -> Result<(), String> {
-    for d in ["mailbox", "markers", "watchers", "locks"] {
+    for d in ["mailbox", "markers", "watchers", "locks", "hook-state"] {
         let path = root.join(d);
         fs::create_dir_all(&path).map_err(|e| format!("mkdir {d}: {e}"))?;
-        if matches!(d, "watchers" | "locks") {
+        if matches!(d, "watchers" | "locks" | "hook-state") {
             fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
                 .map_err(|e| format!("chmod {}: {e}", path.display()))?;
         }
@@ -831,7 +838,14 @@ fn add_gc_surface(
 
 fn open_gc_surface_dirs(root_fd: &OwnedFd) -> Result<Vec<GcSurfaceDir>, String> {
     let mut dirs = Vec::new();
-    for name in ["mailbox", "markers", "watchers", "locks", "spawn-logs"] {
+    for name in [
+        "mailbox",
+        "markers",
+        "watchers",
+        "locks",
+        "hook-state",
+        "spawn-logs",
+    ] {
         match openat(
             root_fd,
             name,
@@ -861,6 +875,9 @@ fn gc_surface_id(directory: &str, name: &str) -> Option<String> {
             .strip_suffix(".lock")
             .or_else(|| name.strip_suffix(".progress"))?,
         "locks" => name.strip_prefix("resume-")?.strip_suffix(".lock")?,
+        "hook-state" => name
+            .strip_prefix("session-start-")?
+            .strip_suffix(".stamp")?,
         "spawn-logs" => name.strip_suffix(".stderr")?,
         _ => return None,
     };
@@ -1506,6 +1523,35 @@ pub fn resolve(name_or_id: &str) -> Option<Entry> {
 
 pub fn set_marker(dir: &str, id: &str) -> Result<(), String> {
     with_lock(|| atomic_write(&marker_path(dir), &format!("{id}\n")))
+}
+
+/// Record one Codex SessionStart identity emission and return whether its
+/// context should be surfaced. Codex has been observed dispatching the same
+/// start source several times within one turn; the global store lock makes the
+/// cross-process decision atomic. Unknown sources fail open, and callers must
+/// never use this result to suppress real mailbox content.
+pub fn should_emit_session_start_identity(id: &str, source: Option<&str>) -> Result<bool, String> {
+    if !is_uuid(id) {
+        return Ok(true);
+    }
+    let Some(source @ ("startup" | "resume" | "clear" | "compact")) = source else {
+        return Ok(true);
+    };
+    with_lock(|| {
+        let path = session_start_identity_path(id);
+        let now = now_ms();
+        let duplicate = fs::read_to_string(&path).ok().is_some_and(|raw| {
+            let mut rows = raw.lines();
+            let recorded_at = rows.next().and_then(|row| row.parse::<i64>().ok());
+            let recorded_source = rows.next();
+            rows.next().is_none()
+                && recorded_source == Some(source)
+                && recorded_at
+                    .is_some_and(|at| now >= at && now - at <= SESSION_START_IDENTITY_DEBOUNCE_MS)
+        });
+        atomic_write_private(&path, &format!("{now}\n{source}\n"))?;
+        Ok(!duplicate)
+    })
 }
 
 pub fn id_for_dir(dir: &str) -> Option<String> {

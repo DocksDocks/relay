@@ -263,6 +263,17 @@ fn inner(tool: &str, event: HookEvent, input: &str) -> Result<(), String> {
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| "relay".to_string());
     let watch = watcher_command(&relay_exe, &id);
+    if tool == "codex" && event == HookEvent::SessionStart {
+        let source = str_of(&obj, "source");
+        let should_emit = store::should_emit_session_start_identity(&id, source.as_deref())
+            .unwrap_or_else(|error| {
+                eprintln!("[session-relay/hook] SessionStart debounce skipped: {error}");
+                true
+            });
+        if msgs.is_empty() && !should_emit {
+            return Ok(());
+        }
+    }
     let Some(additional_context) = render_context(tool, event, &msgs, no_watch, &watch, &id) else {
         return Ok(());
     };

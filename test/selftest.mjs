@@ -648,6 +648,37 @@ check('codex SessionStart with an empty inbox emits only the identity line (no M
   assert.ok(ctx.includes(`bus id is ${idP}`), 'identity line present');
   assert.ok(!ctx.includes('session-relay-mail') && !/monitor/i.test(ctx), 'nothing but identity');
 });
+const idCodexDebounce = '77777777-7777-4777-8777-777777777777';
+const dirCodexDebounce = path.join(HOME, 'proj-codex-debounce');
+fs.mkdirSync(dirCodexDebounce, { recursive: true });
+check('rapid duplicate Codex SessionStart suppresses only repeated identity context', () => {
+  const event = { session_id: idCodexDebounce, cwd: dirCodexDebounce, source: 'resume' };
+  const first = hookArgs(['codex'], event);
+  const duplicate = hookArgs(['codex'], event);
+  assert.equal(first.status, 0);
+  assert.ok(JSON.parse(first.stdout).hookSpecificOutput.additionalContext.includes(`bus id is ${idCodexDebounce}`));
+  assert.equal(duplicate.status, 0);
+  assert.equal(duplicate.stdout, '');
+});
+check('Codex SessionStart debounce never suppresses mail or a different start source', () => {
+  assert.equal(relay(['send', '--id', idCodexDebounce, '--', 'debounce mail']).status, 0);
+  const withMail = hookArgs(['codex'], {
+    session_id: idCodexDebounce,
+    cwd: dirCodexDebounce,
+    source: 'resume',
+  });
+  const mailContext = JSON.parse(withMail.stdout).hookSpecificOutput.additionalContext;
+  assert.ok(mailContext.includes('debounce mail'));
+  assert.ok(mailContext.includes(`bus id is ${idCodexDebounce}`));
+  assert.equal(peek(idCodexDebounce).count, 0);
+
+  const differentSource = hookArgs(['codex'], {
+    session_id: idCodexDebounce,
+    cwd: dirCodexDebounce,
+    source: 'compact',
+  });
+  assert.ok(JSON.parse(differentSource.stdout).hookSpecificOutput.additionalContext.includes(`bus id is ${idCodexDebounce}`));
+});
 check('RELAY_NO_WATCH=1 suppresses the nudge but keeps the identity line', () => {
   const r = hookArgs([], { session_id: idP, cwd: dirP, source: 'startup' }, { RELAY_NO_WATCH: '1' });
   assert.equal(r.status, 0);
