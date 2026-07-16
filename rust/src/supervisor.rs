@@ -1158,6 +1158,9 @@ fn derive_command(
                     args.extend(["--effort".to_string(), effort.to_string()]);
                 }
             }
+            if resolved.tool == "codex" {
+                args.extend(options.service_tier().codex_config_args());
+            }
             Ok((
                 resolved.tool.clone(),
                 args,
@@ -1171,7 +1174,6 @@ fn derive_command(
                     "exec".to_string(),
                     "resume".to_string(),
                     resolved.operation.runtime_session_id.clone(),
-                    "--json".to_string(),
                 ]
             } else if resolved.tool == "claude" {
                 vec![
@@ -1201,6 +1203,10 @@ fn derive_command(
                 } else {
                     args.extend(["--effort".to_string(), effort.to_string()]);
                 }
+            }
+            if resolved.tool == "codex" {
+                args.extend(message.service_tier().codex_config_args());
+                args.push("--json".to_string());
             }
             args.extend(["--".to_string(), message.as_str().to_string()]);
             Ok((program, args, Some(resolved.canonical_cwd.clone())))

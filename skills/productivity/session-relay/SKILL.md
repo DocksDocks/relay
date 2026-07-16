@@ -5,8 +5,8 @@ user-invocable: true
 allowed-tools: Bash, Read
 metadata:
   pattern: tool-wrapper
-  updated: "2026-07-15"
-  content_hash: "26fc7db7d839f7d781e546711ec6c01da29199945e4dbaa6010f7a1c5f9ff051"
+  updated: "2026-07-16"
+  content_hash: "c61a24d470dfad8c93243ae26eded9a37b09d18ec2d59eaf9de0afe6bbcb62a3"
 ---
 
 # Session relay
@@ -22,7 +22,7 @@ The Claude doorbell (`claude -p --resume <id>`) MUST run from the recipient's ow
 </constraint>
 
 <constraint>
-Relay children and doorbell wakes run unattended and can reprocess full transcripts. ALWAYS pin `--model`/`--effort` on `relay spawn` and `relay wake`; never use Fable or another top interactive default for a relay child or wake. Current examples as of 2026-07: Claude `--model opus --effort max`, Codex `--model gpt-5.6-sol --effort xhigh`; check your own tier list before copying them.
+Relay children and doorbell wakes run unattended and can reprocess full transcripts. ALWAYS pin `--model`/`--effort` on `relay spawn` and `relay wake`; for Codex also pin `--service-tier default|fast`. Omission is explicit Standard, never ambient Fast. Never use Fable or another top interactive default for a relay child or wake. Current examples as of 2026-07: Claude `--model opus --effort max`, Codex `--model gpt-5.6-sol --effort high --service-tier default`; check your own tier list before copying them.
 </constraint>
 
 ## Pick the transport deliberately
@@ -136,7 +136,7 @@ When the user says "talk to / check / message my other session" without giving a
    - **registered** target → `send` then `wake <name>`.
    - **unregistered** target (no bus membership, so no inbox-drain hook) → wake it directly with the message inline — its resume prompt carries your text even without the hook. Put the message after a `--` so any dashes in it aren't parsed as flags:
      ```bash
-     <plugin>/bin/relay wake --id <id> --dir <cwd> --tool <claude|codex> --model <model> --effort <effort> -- "<message>"
+     <plugin>/bin/relay wake --id <id> --dir <cwd> --tool <claude|codex> --model <model> --effort <effort> [--service-tier default|fast for Codex] -- "<message>"
      ```
 
 ## Send a message to another session
@@ -272,7 +272,7 @@ codex app-server --listen unix://$HOME/.codex-app.sock   # socket must live unde
 codex --remote unix://$HOME/.codex-app.sock              # optional: attach the normal TUI to the same server
 <plugin>/bin/relay watch <name>... --server $HOME/.codex-app.sock          # or --all; or RELAY_APP_SERVER env
 <plugin>/bin/relay register <name> --id <uuid> --tool codex --server $HOME/.codex-app.sock
-<plugin>/bin/relay spawn <project> --tool codex --server $HOME/.codex-app.sock --name worker --reply-to <me> -- "<task>"
+<plugin>/bin/relay spawn <project> --tool codex --server $HOME/.codex-app.sock --service-tier default --name worker --reply-to <me> -- "<task>"
 ```
 
 For the full human-visible spawn-and-co-drive flow, keep the server in its own
@@ -284,12 +284,12 @@ codex app-server --listen unix://$HOME/.codex-app.sock
 
 # terminal 2: birth the relay worker on that server, then join its thread
 <plugin>/bin/relay spawn <project> --tool codex --server $HOME/.codex-app.sock \
-  --model gpt-5.6-sol --effort xhigh --name worker --reply-to <me> -- "<task>"
+  --model gpt-5.6-sol --effort high --service-tier default --name worker --reply-to <me> -- "<task>"
 <plugin>/bin/relay attach worker --exec   # choose worker's thread in the remote TUI picker
 
 # terminal 3: after the TUI is attached
 <plugin>/bin/relay send worker --from <me> -- "<follow-up>"
-<plugin>/bin/relay wake worker
+<plugin>/bin/relay wake worker --service-tier default
 ```
 
 The attached TUI shows the neutral acknowledgement user row and the worker's
@@ -365,7 +365,7 @@ ANOTHER project — with that project's CLAUDE.md/AGENTS.md, skills, and plugins
 birth a real, resumable session there instead:
 
 ```bash
-<plugin>/bin/relay spawn <dir> --tool claude|codex --model <model> --effort <effort> --name worker1 [--reply-to <me>] [--watch] -- "<first task>"
+<plugin>/bin/relay spawn <dir> --tool claude|codex --model <model> --effort <effort> [--service-tier default|fast for Codex] --name worker1 [--reply-to <me>] [--watch] -- "<first task>"
 ```
 
 - **Pick the tool from standing preference first.** If `RELAY_SPAWN_TOOL`, user
@@ -373,9 +373,12 @@ birth a real, resumable session there instead:
   Ask via the native question UI only when no preference is discoverable; the bare
   CLI defaults to `codex` when the codex CLI is installed, else `claude` — a
   printed note names the choice either way.
-- **Model discipline:** pass `--model`/`--effort` every time. As of 2026-07, use
-  `--model opus --effort max` for a Claude child or `--model gpt-5.6-sol --effort
-  xhigh` for a Codex child unless the user's current tier list says otherwise.
+- **Model/tier discipline:** pass `--model`/`--effort` every time. For Codex,
+  pass `--service-tier fast` only for an explicitly Fast role; otherwise pass
+  `--service-tier default` (omission has the same Standard meaning). The flag is
+  rejected for Claude. Classic Standard launches append
+  `-c service_tier="default"`; Fast appends both `-c features.fast_mode=true`
+  and `-c service_tier="fast"` without modifying global config.
 - **Managed birth:** before launching a classic Claude/Codex child, relay writes
   a pending worker and passes one exact claim token only to that child. Its
   SessionStart hook must bind the observed session id `Active` before spawn
@@ -402,6 +405,10 @@ birth a real, resumable session there instead:
   five seconds. A failed `turn/start` has no safe turn id, so it fences
   unconfirmed and emits no interrupt. A connection/pump failure after
   `turn/start` also fences unconfirmed because terminal state cannot be proven.
+- **App-server tier boundary:** relay sends explicit `serviceTier:"default"` or
+  `"fast"` on thread start/resume and every turn start. It verifies the effective
+  tier reported by thread start/resume. Missing or mismatched Fast support fails
+  closed; relay never downgrades to Standard or inherits a shared server's state.
 - **Completion signal:** add `--watch` to keep the spawn caller attached to the
   direct child process until its first turn exits. The relay exit mirrors the
   child and stdout reports `first turn complete` or `first turn failed`; without
@@ -470,11 +477,11 @@ export route.
 
 ## Anti-hallucination
 
-- The only Claude CLI flags this skill uses: `-p`/`--print`, `--resume`, `--session-id`, `--fork-session`, `--model`, `--effort`, `--output-format json`. The Codex doorbell is `codex exec resume <id>` with `-m <model>`, `-c model_reasoning_effort=<effort>`, `--json`. Do not invent others.
+- The only Claude CLI flags this skill uses: `-p`/`--print`, `--resume`, `--session-id`, `--fork-session`, `--model`, `--effort`, `--output-format json`. The Codex doorbell is `codex exec resume <id>` with `-m <model>`, `-c model_reasoning_effort=<effort>`, explicit Standard/Fast config overrides, and `--json`. Do not invent others.
 - The only bus tools: `whoami`, `register`, `roster`, `send`, `inbox`, `discover`. If the tools aren't available, the plugin isn't enabled here.
 - `discover` infers liveness from session-file recency (mtime), not a live handshake — a just-idle session can still appear; a long-dead one won't (it falls outside the window).
 - There is no live session-to-session socket. Even `relay watch` is queue + push-into-thread: mail always lands in the shared store first, and only Codex-under-app-server targets take a push — Claude live delivery is the Monitor watch or the next prompt.
-- `relay watch` flags: `--server`, `--tool`, `--auto-turn`, `--once`, `--all`, `--dry`, `--id`, `--follow <id>`. `relay wake` flags: `--id`, `--dir`, `--tool`, `--model`, `--effort`, `--dry`. `relay spawn` also accepts `--fanout|--worktree --from <session>` for CLI-process fan-out; fan-out rejects `--server`, `--read-only`, `--watch`, and `--dry`. `relay handback` takes `--from`, `--status`, and optional `--note`; `relay collect` takes one session plus `--from <parent>`. Ordinary spawn keeps `--tool`, `--model`, `--effort`, `--name`, `--server`, `--reply-to`, `--timeout`, `--read-only`, `--full-access`, `--watch`, `--dry`. Do not invent `--interval`, `--wait`, or daemon-mode config.
+- `relay watch` flags: `--server`, `--tool`, `--auto-turn`, `--once`, `--all`, `--dry`, `--id`, `--follow <id>`. `relay wake` flags: `--id`, `--dir`, `--tool`, `--model`, `--effort`, Codex-only `--service-tier default|fast`, `--dry`. `relay spawn` also accepts `--fanout|--worktree --from <session>` for CLI-process fan-out; fan-out rejects `--server`, `--read-only`, `--watch`, and `--dry`. `relay handback` takes `--from`, `--status`, and optional `--note`; `relay collect` takes one session plus `--from <parent>`. Ordinary spawn keeps `--tool`, `--model`, `--effort`, Codex-only `--service-tier default|fast`, `--name`, `--server`, `--reply-to`, `--timeout`, `--read-only`, `--full-access`, `--watch`, `--dry`. Do not invent `--interval`, `--wait`, or daemon-mode config.
 - `relay attach` takes one name-or-UUID and optional `--exec`; print mode is the default. There is no attach picker or co-driving mode.
 - Identity params: `send` takes optional `from`, `inbox` takes optional `id` — both must name a REGISTERED session (id or name) and both mean "act as / drain this session". There is no `--as`, no `sender:` field, and no way to send as an unregistered identity.
 

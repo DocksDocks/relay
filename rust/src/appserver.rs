@@ -19,7 +19,7 @@
 //     only when the registry proves the relay spawned the thread; joined or
 //     foreign threads decline every elicitation.
 
-use crate::lifecycle::{OperationKind, ReentryGuard};
+use crate::lifecycle::{OperationKind, ReentryGuard, ServiceTier};
 use crate::sha256::hex_digest;
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -85,6 +85,7 @@ impl SpawnedThread {
         prompt: &str,
         model: Option<&str>,
         effort: Option<&str>,
+        service_tier: ServiceTier,
     ) -> Result<(), String> {
         let target = guard.authorize_use(OperationKind::InitialTurn)?;
         if target.thread_id.as_deref() != Some(self.id.as_str())
@@ -97,7 +98,7 @@ impl SpawnedThread {
             .request_with_guard(
                 2,
                 "turn/start",
-                initial_turn_params(&self.id, prompt, model, effort),
+                initial_turn_params(&self.id, prompt, model, effort, service_tier),
                 guard,
                 OperationKind::InitialTurn,
             )
@@ -147,6 +148,7 @@ pub(crate) fn deliver_with_guard(
     auto_turn: bool,
     settle_ms: u64,
     allow_bus: bool,
+    service_tier: ServiceTier,
 ) -> Result<DeliveryOutcome, DeliveryError> {
     let kind = guard.allowed();
     if !matches!(
@@ -178,14 +180,17 @@ pub(crate) fn deliver_with_guard(
         kind,
     )
     .map_err(DeliveryError::BeforeInject)?;
-    ws.request_with_guard(
-        1,
-        "thread/resume",
-        sobj(vec![("threadId", JsonValue::from(thread_id.clone()))]),
-        guard,
-        kind,
-    )
-    .map_err(|error| DeliveryError::BeforeInject(error.into_message()))?;
+    let resumed = ws
+        .request_with_guard(
+            1,
+            "thread/resume",
+            resume_params(&thread_id, service_tier),
+            guard,
+            kind,
+        )
+        .map_err(|error| DeliveryError::BeforeInject(error.into_message()))?;
+    verify_effective_service_tier(&resumed, service_tier, "thread/resume")
+        .map_err(DeliveryError::BeforeInject)?;
     ws.request_with_guard(
         2,
         "thread/inject_items",
@@ -215,8 +220,16 @@ pub(crate) fn deliver_with_guard(
         {
             ThreadState::Active => return Ok(DeliveryOutcome::AckDeferred),
             ThreadState::Idle => {
-                start_ack_turn_with_guard(&mut ws, 4, &thread_id, allow_bus, guard, kind)
-                    .map_err(DeliveryError::AfterInject)?;
+                start_ack_turn_with_guard(
+                    &mut ws,
+                    4,
+                    &thread_id,
+                    allow_bus,
+                    service_tier,
+                    guard,
+                    kind,
+                )
+                .map_err(DeliveryError::AfterInject)?;
             }
         }
     }
@@ -232,9 +245,15 @@ pub(crate) fn start_thread(
     cwd: &str,
     model: Option<&str>,
     sandbox: &str,
+    service_tier: ServiceTier,
 ) -> Result<SpawnedThread, String> {
     let mut ws = connect_initialized(server, "session-relay-spawn", "session-relay spawn")?;
-    let result = ws.request(1, "thread/start", thread_start_params(cwd, model, sandbox))?;
+    let result = ws.request(
+        1,
+        "thread/start",
+        thread_start_params(cwd, model, sandbox, service_tier),
+    )?;
+    verify_effective_service_tier(&result, service_tier, "thread/start")?;
     let id = result
         .get::<HashMap<String, JsonValue>>()
         .and_then(|result| result.get("thread"))
@@ -284,6 +303,7 @@ pub(crate) fn thread_state(server: &str, thread_id: &str) -> Result<ThreadState,
 pub(crate) fn acknowledge_with_guard(
     guard: &mut ReentryGuard,
     allow_bus: bool,
+    service_tier: ServiceTier,
 ) -> Result<DeliveryOutcome, String> {
     let target = guard.authorize_use(OperationKind::WatchAck)?;
     let server = target
@@ -299,14 +319,16 @@ pub(crate) fn acknowledge_with_guard(
         guard,
         OperationKind::WatchAck,
     )?;
-    ws.request_with_guard(
-        1,
-        "thread/resume",
-        sobj(vec![("threadId", JsonValue::from(thread_id.clone()))]),
-        guard,
-        OperationKind::WatchAck,
-    )
-    .map_err(GuardedRequestError::into_message)?;
+    let resumed = ws
+        .request_with_guard(
+            1,
+            "thread/resume",
+            resume_params(&thread_id, service_tier),
+            guard,
+            OperationKind::WatchAck,
+        )
+        .map_err(GuardedRequestError::into_message)?;
+    verify_effective_service_tier(&resumed, service_tier, "thread/resume")?;
     if read_status_with_guard(&mut ws, 2, &thread_id, guard, OperationKind::WatchAck)?
         == ThreadState::Active
     {
@@ -317,6 +339,7 @@ pub(crate) fn acknowledge_with_guard(
         3,
         &thread_id,
         allow_bus,
+        service_tier,
         guard,
         OperationKind::WatchAck,
     )?;
@@ -454,11 +477,18 @@ fn start_ack_turn_with_guard(
     id: u64,
     thread_id: &str,
     allow_bus: bool,
+    service_tier: ServiceTier,
     guard: &mut ReentryGuard,
     kind: OperationKind,
 ) -> Result<(), String> {
     let result = ws
-        .request_with_guard(id, "turn/start", turn_params(thread_id), guard, kind)
+        .request_with_guard(
+            id,
+            "turn/start",
+            turn_params(thread_id, service_tier),
+            guard,
+            kind,
+        )
         .map_err(GuardedRequestError::into_message)?;
     let turn_id = turn_id_from_start_result(&result)?;
     let wait_ms: u64 = std::env::var("RELAY_TURN_WAIT_MS")
@@ -503,9 +533,13 @@ fn inject_params(thread_id: &str, text: &str) -> JsonValue {
     ])
 }
 
-fn turn_params(thread_id: &str) -> JsonValue {
+fn turn_params(thread_id: &str, service_tier: ServiceTier) -> JsonValue {
     sobj(vec![
         ("threadId", JsonValue::from(thread_id.to_string())),
+        (
+            "serviceTier",
+            JsonValue::from(service_tier.as_str().to_string()),
+        ),
         (
             "input",
             JsonValue::from(vec![sobj(vec![
@@ -517,7 +551,12 @@ fn turn_params(thread_id: &str) -> JsonValue {
     ])
 }
 
-fn thread_start_params(cwd: &str, model: Option<&str>, sandbox: &str) -> JsonValue {
+fn thread_start_params(
+    cwd: &str,
+    model: Option<&str>,
+    sandbox: &str,
+    service_tier: ServiceTier,
+) -> JsonValue {
     let mut params: HashMap<String, JsonValue> = HashMap::new();
     params.insert("cwd".into(), JsonValue::from(cwd.to_string()));
     params.insert(
@@ -525,6 +564,10 @@ fn thread_start_params(cwd: &str, model: Option<&str>, sandbox: &str) -> JsonVal
         JsonValue::from("never".to_string()),
     );
     params.insert("sandbox".into(), JsonValue::from(sandbox.to_string()));
+    params.insert(
+        "serviceTier".into(),
+        JsonValue::from(service_tier.as_str().to_string()),
+    );
     if let Some(model) = model {
         params.insert("model".into(), JsonValue::from(model.to_string()));
     }
@@ -536,8 +579,9 @@ fn initial_turn_params(
     prompt: &str,
     model: Option<&str>,
     effort: Option<&str>,
+    service_tier: ServiceTier,
 ) -> JsonValue {
-    let mut params = turn_params(thread_id)
+    let mut params = turn_params(thread_id, service_tier)
         .get::<HashMap<String, JsonValue>>()
         .cloned()
         .unwrap_or_default();
@@ -555,6 +599,37 @@ fn initial_turn_params(
         params.insert("effort".into(), JsonValue::from(effort.to_string()));
     }
     JsonValue::from(params)
+}
+
+fn resume_params(thread_id: &str, service_tier: ServiceTier) -> JsonValue {
+    sobj(vec![
+        ("threadId", JsonValue::from(thread_id.to_string())),
+        (
+            "serviceTier",
+            JsonValue::from(service_tier.as_str().to_string()),
+        ),
+    ])
+}
+
+fn verify_effective_service_tier(
+    result: &JsonValue,
+    requested: ServiceTier,
+    method: &str,
+) -> Result<(), String> {
+    let reported = result
+        .get::<HashMap<String, JsonValue>>()
+        .and_then(|object| object.get("serviceTier"))
+        .and_then(|value| value.get::<String>())
+        .map(String::as_str)
+        .ok_or_else(|| format!("{method} did not report an effective service tier"))?;
+    if reported == requested.as_str() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{method} requested {} but app-server reported {reported}",
+            requested.as_str()
+        ))
+    }
 }
 
 // ---- minimal WebSocket client over a unix socket ----
@@ -1181,7 +1256,7 @@ mod tests {
 
     #[test]
     fn turn_params_use_the_neutral_nudge_and_never_approvals() {
-        let p = turn_params("tid-2");
+        let p = turn_params("tid-2", crate::lifecycle::ServiceTier::Default);
         let o = as_obj(&p);
         assert_eq!(
             o.get("approvalPolicy").unwrap().get::<String>().unwrap(),
@@ -1197,5 +1272,78 @@ mod tests {
         assert_eq!(text, ACK_NUDGE);
         assert!(!text.to_ascii_lowercase().contains("call inbox"));
         assert!(!text.contains("session-relay-mail"));
+        assert_eq!(
+            o.get("serviceTier").unwrap().get::<String>().unwrap(),
+            "default"
+        );
+    }
+
+    #[test]
+    fn start_and_turn_params_always_carry_the_explicit_service_tier() {
+        let standard = thread_start_params(
+            "/tmp/project",
+            Some("gpt-5.6-sol"),
+            "workspace-write",
+            crate::lifecycle::ServiceTier::Default,
+        );
+        assert_eq!(
+            as_obj(&standard)
+                .get("serviceTier")
+                .unwrap()
+                .get::<String>()
+                .unwrap(),
+            "default"
+        );
+
+        let fast = initial_turn_params(
+            "tid-fast",
+            "implement",
+            Some("gpt-5.6-sol"),
+            Some("high"),
+            crate::lifecycle::ServiceTier::Fast,
+        );
+        assert_eq!(
+            as_obj(&fast)
+                .get("serviceTier")
+                .unwrap()
+                .get::<String>()
+                .unwrap(),
+            "fast"
+        );
+    }
+
+    #[test]
+    fn effective_service_tier_verification_fails_closed_on_missing_or_mismatch() {
+        let matching = r#"{"serviceTier":"fast"}"#.parse::<JsonValue>().unwrap();
+        assert!(
+            verify_effective_service_tier(
+                &matching,
+                crate::lifecycle::ServiceTier::Fast,
+                "thread/start"
+            )
+            .is_ok()
+        );
+
+        let missing = r#"{"thread":{"id":"tid"}}"#.parse::<JsonValue>().unwrap();
+        assert!(
+            verify_effective_service_tier(
+                &missing,
+                crate::lifecycle::ServiceTier::Fast,
+                "thread/start"
+            )
+            .unwrap_err()
+            .contains("did not report an effective service tier")
+        );
+
+        let mismatch = r#"{"serviceTier":"default"}"#.parse::<JsonValue>().unwrap();
+        assert!(
+            verify_effective_service_tier(
+                &mismatch,
+                crate::lifecycle::ServiceTier::Fast,
+                "thread/resume"
+            )
+            .unwrap_err()
+            .contains("requested fast but app-server reported default")
+        );
     }
 }

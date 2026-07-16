@@ -185,6 +185,92 @@ fn lifecycle_supervisor_wake_uses_closed_stdin_and_separate_output() {
 }
 
 #[test]
+fn lifecycle_supervisor_preserves_codex_fast_and_default_tiers_in_exact_argv() {
+    let home = fresh_home("service-tier");
+    let cwd = home.join("project");
+    let session = "22111111-1111-4111-8111-111111111111";
+    seed_entry(&home, session, "codex", &cwd);
+    let stub = home.join("wake-stub");
+    let argv = home.join("argv.txt");
+    write_executable(
+        &stub,
+        &format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n", argv.display()),
+    );
+
+    let fast = Command::new(env!("CARGO_BIN_EXE_relay"))
+        .args(["wake", session, "--service-tier", "fast", "doorbell"])
+        .env("AGENT_RELAY_HOME", &home)
+        .env("RELAY_WAKE_CMD_CODEX", &stub)
+        .output()
+        .unwrap();
+    assert!(
+        fast.status.success(),
+        "{}",
+        String::from_utf8_lossy(&fast.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(&argv)
+            .unwrap()
+            .lines()
+            .collect::<Vec<_>>(),
+        [
+            "exec",
+            "resume",
+            session,
+            "-c",
+            "features.fast_mode=true",
+            "-c",
+            "service_tier=\"fast\"",
+            "--json",
+            "--",
+            "doorbell"
+        ]
+    );
+    wait_until(
+        Duration::from_secs(5),
+        "first wake did not terminalize",
+        || {
+            LifecycleStore::new(home.clone())
+                .read_operations_for_session(session)
+                .is_ok_and(|operations| {
+                    operations
+                        .last()
+                        .is_some_and(|operation| operation.terminal)
+                })
+        },
+    );
+
+    let standard = Command::new(env!("CARGO_BIN_EXE_relay"))
+        .args(["wake", session, "standard doorbell"])
+        .env("AGENT_RELAY_HOME", &home)
+        .env("RELAY_WAKE_CMD_CODEX", &stub)
+        .output()
+        .unwrap();
+    assert!(
+        standard.status.success(),
+        "{}",
+        String::from_utf8_lossy(&standard.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(&argv)
+            .unwrap()
+            .lines()
+            .collect::<Vec<_>>(),
+        [
+            "exec",
+            "resume",
+            session,
+            "-c",
+            "service_tier=\"default\"",
+            "--json",
+            "--",
+            "standard doorbell"
+        ]
+    );
+    fs::remove_dir_all(home).ok();
+}
+
+#[test]
 fn watchdog_retires_bootstrap_when_the_caller_disconnects_before_reply() {
     let home = fresh_home("bootstrap-disconnect");
     let cwd = home.join("project");

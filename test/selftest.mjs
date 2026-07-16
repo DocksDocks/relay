@@ -215,6 +215,7 @@ check('wake dispatches the codex doorbell for a codex target', () => {
   assert.equal(d.tool, 'codex');
   assert.equal(d.cmd, 'codex');
   assert.deepEqual(d.args.slice(0, 3), ['exec', 'resume', idC]);
+  assert.deepEqual(d.args.filter((value, index) => d.args[index - 1] === '-c'), ['service_tier="default"']);
   assert.equal(d.cwd, dirC);
 });
 check('wake dispatches the claude doorbell for a claude target', () => {
@@ -226,12 +227,26 @@ check('wake dispatches the claude doorbell for a claude target', () => {
 check('wake --dry maps --model/--effort for codex and claude targets', () => {
   const c = relayJSON(['wake', 'codex-C', '--model', 'gpt-5.6-sol', '--effort', 'xhigh', '--dry']);
   assert.deepEqual(c.args.slice(0, 7), ['exec', 'resume', idC, '-m', 'gpt-5.6-sol', '-c', 'model_reasoning_effort=xhigh']);
+  assert.deepEqual(c.args.filter((value, index) => c.args[index - 1] === '-c'), ['model_reasoning_effort=xhigh', 'service_tier="default"']);
   assert.ok(c.args.indexOf('--') > 6, 'codex model flags stay before the prompt fence');
 
   const a = relayJSON(['wake', 'agent-A', '--model', 'opus', '--effort', 'max', '--dry']);
   const resume = a.args.indexOf('--resume');
   assert.deepEqual(a.args.slice(resume, resume + 7), ['--resume', idA, '--model', 'opus', '--effort', 'max', '--output-format']);
   assert.ok(a.args.indexOf('--') > resume + 6, 'claude model flags stay before the prompt fence');
+});
+check('wake --service-tier is Codex-only and emits exact Fast overrides', () => {
+  const c = relayJSON(['wake', 'codex-C', '--service-tier', 'fast', '--dry']);
+  assert.deepEqual(c.args.filter((value, index) => c.args[index - 1] === '-c'), ['features.fast_mode=true', 'service_tier="fast"']);
+  const duplicate = relay(['wake', 'codex-C', '--service-tier', 'fast', '--service-tier', 'default', '--dry']);
+  assert.notEqual(duplicate.status, 0);
+  assert.match(duplicate.stderr, /duplicate.*service-tier|service-tier.*duplicate/i);
+  const invalid = relay(['wake', 'codex-C', '--service-tier', 'turbo', '--dry']);
+  assert.notEqual(invalid.status, 0);
+  assert.match(invalid.stderr, /service-tier.*default\|fast/i);
+  const claude = relay(['wake', 'agent-A', '--service-tier', 'fast', '--dry']);
+  assert.notEqual(claude.status, 0);
+  assert.match(claude.stderr, /service-tier.*Codex-only/i);
 });
 
 const attachStubDir = path.join(HOME, 'attach-stubs');
@@ -258,7 +273,7 @@ check('attach always runs as a guarded spawn+wait and prints no copyable command
   });
   assert.equal(codex.status, 0, codex.stderr);
   assert.deepEqual(JSON.parse(fs.readFileSync(codexRecord, 'utf8')), {
-    argv: ['resume', idC, '-C', dirC],
+    argv: ['resume', idC, '-C', dirC, '-c', 'service_tier="default"'],
     cwd: process.cwd(),
   });
   assert.match(codex.stderr, /WARNING: split-brain risk/);
@@ -270,7 +285,7 @@ check('attach always runs as a guarded spawn+wait and prints no copyable command
   });
   assert.equal(byId.status, 0, byId.stderr);
   assert.deepEqual(JSON.parse(fs.readFileSync(byIdRecord, 'utf8')).argv, [
-    'resume', idC, '-C', dirC,
+    'resume', idC, '-C', dirC, '-c', 'service_tier="default"',
   ]);
 
   const claudeRecord = path.join(HOME, 'attach-claude.json');
@@ -296,7 +311,7 @@ check('legacy attach --exec is accepted but still uses guarded spawn+wait', () =
     });
     assert.equal(result.status, 0, result.stderr);
     assert.deepEqual(JSON.parse(fs.readFileSync(record, 'utf8')).argv, [
-      'resume', idC, '-C', dirC,
+      'resume', idC, '-C', dirC, '-c', 'service_tier="default"',
     ]);
     assert.match(result.stderr, /--exec is deprecated/);
     assert.doesNotMatch(result.stdout, /command:/);
@@ -957,7 +972,7 @@ check('attach derives registered codex app-server authority into guarded --remot
   });
   assert.equal(r.status, 0, `remote attach exited ${r.status}: ${r.stderr}`);
   assert.deepEqual(JSON.parse(fs.readFileSync(record, 'utf8')).argv, [
-    '--remote', `unix://${sock}`,
+    '--remote', `unix://${sock}`, '-c', 'service_tier="default"',
   ]);
 });
 
@@ -968,6 +983,7 @@ check('watch prefers the registered server over the RELAY_APP_SERVER fallback', 
   const fr = readFrames();
   const resume = fr.find((f) => f.method === 'thread/resume');
   assert.ok(resume && resume.params.threadId === idW, 'thread/resume targets the mailbox id');
+  assert.equal(resume.params.serviceTier, 'default', 'joined app-server paths explicitly request Standard');
   const inject = fr.find((f) => f.method === 'thread/inject_items');
   const text = inject.params.items[0].content[0].text;
   assert.ok(text.includes('<session-relay-mail>') && /untrusted/i.test(text), 'mail rides inside the UNTRUSTED-DATA fence');
@@ -984,6 +1000,7 @@ check('watch --auto-turn checks idle twice, starts with the neutral nudge, and d
   const turn = fr.find((f) => f.method === 'turn/start');
   assert.ok(turn, 'turn/start sent');
   assert.equal(turn.params.approvalPolicy, 'never');
+  assert.equal(turn.params.serviceTier, 'default');
   assert.ok(/session-relay mail/i.test(turn.params.input[0].text), 'turn carries the neutral doorbell nudge');
   assert.ok(!turn.params.input[0].text.includes('second push'), 'mail content never rides in the turn input');
   assert.ok(fr.findIndex((f) => f.method === 'thread/inject_items') < fr.indexOf(turn), 'inject precedes the turn');
@@ -1001,6 +1018,8 @@ check('wake prefers a reachable registered app-server and an empty retry is a cl
   });
   assert.equal(r.status, 0, `wake exited ${r.status}: ${r.stderr}`);
   const first = readFrames();
+  assert.equal(first.find((f) => f.method === 'thread/resume')?.params.serviceTier, 'default');
+  assert.equal(first.find((f) => f.method === 'turn/start')?.params.serviceTier, 'default');
   assert.equal(first.filter((f) => f.method === 'thread/read').length, 2, 'wake checks status before inject and before turn/start');
   assert.equal(first.filter((f) => f.method === 'thread/inject_items').length, 1, 'wake injects the drained mailbox once');
   assert.equal(first.filter((f) => f.method === 'turn/start').length, 1, 'wake fires one visible acknowledgement turn');
@@ -1025,6 +1044,32 @@ check('wake prefers a reachable registered app-server and an empty retry is a cl
   assert.match(customInject.params.items[0].content[0].text, /custom app-server nudge/);
   assert.equal(afterCustom.filter((f) => f.method === 'turn/start').length, 2, 'custom text receives the same visible acknowledgement turn');
   assert.equal(fs.existsSync(wakeRecord), false, 'custom text never downgrades an app-server-owned thread to codex exec resume');
+});
+check('app-server wake carries and verifies an explicit Fast tier independently', () => {
+  fs.writeFileSync(framesFile, '');
+  assert.equal(relay(['send', 'codex-W', '--', 'fast wake']).status, 0);
+  const r = relay(['wake', 'codex-W', '--service-tier', 'fast'], {
+    env: { RELAY_TURN_SETTLE_MS: '20', RELAY_TURN_WAIT_MS: '8000' },
+  });
+  assert.equal(r.status, 0, `Fast wake exited ${r.status}: ${r.stderr}`);
+  const frames = readFrames();
+  assert.equal(frames.find((f) => f.method === 'thread/resume')?.params.serviceTier, 'fast');
+  assert.equal(frames.find((f) => f.method === 'turn/start')?.params.serviceTier, 'fast');
+});
+check('app-server Fast wake fails closed when the server reports Standard', () => {
+  const fake = startFakeAppServer('wake-tier-mismatch', { reportedServiceTier: 'default' });
+  const id = '69696969-6969-4969-8969-696969696969';
+  try {
+    assert.equal(relay(['register', 'codex-tier-mismatch', '--id', id, '--dir', dirW, '--tool', 'codex', '--server', fake.sock]).status, 0);
+    assert.equal(relay(['send', 'codex-tier-mismatch', '--', 'must remain queued']).status, 0);
+    const r = relay(['wake', 'codex-tier-mismatch', '--service-tier', 'fast']);
+    assert.notEqual(r.status, 0);
+    assert.match(r.stderr, /requested fast but app-server reported default/i);
+    assert.equal(peek('codex-tier-mismatch').count, 1);
+    relayJSON(['inbox', 'codex-tier-mismatch']);
+  } finally {
+    fake.child.kill('SIGKILL');
+  }
 });
 check('wake leaves mail untouched and exits 3 when the first status read is active', () => {
   const fake = startFakeAppServer('wake-busy-first', ['active']);
@@ -1526,7 +1571,20 @@ check('spawn --dry maps --model/--effort for claude and codex children', () => {
 
   const codex = relayJSON(['spawn', dirS, '--tool', 'codex', '--model', 'gpt-5.6-sol', '--effort', 'xhigh', '--reply-to', 'agent-A', '--dry', '--', 'do Y']);
   assert.deepEqual(codex.args.slice(0, 7), ['exec', '--sandbox', 'workspace-write', '-m', 'gpt-5.6-sol', '-c', 'model_reasoning_effort=xhigh']);
+  assert.deepEqual(codex.args.filter((value, index) => codex.args[index - 1] === '-c'), ['model_reasoning_effort=xhigh', 'service_tier="default"']);
   assert.ok(codex.args.indexOf('--') > 6, 'codex model flags stay before the prompt fence');
+});
+check('spawn --service-tier is Codex-only and keeps Fast role overrides exact', () => {
+  const dirS = path.join(HOME, 'proj-s0-service-tier');
+  fs.mkdirSync(dirS, { recursive: true });
+  const fast = relayJSON(['spawn', dirS, '--tool', 'codex', '--service-tier', 'fast', '--reply-to', 'agent-A', '--dry', '--', 'fast task']);
+  assert.deepEqual(fast.args.filter((value, index) => fast.args[index - 1] === '-c'), ['features.fast_mode=true', 'service_tier="fast"']);
+  const claude = relay(['spawn', dirS, '--tool', 'claude', '--service-tier', 'fast', '--reply-to', 'agent-A', '--dry', '--', 'invalid']);
+  assert.notEqual(claude.status, 0);
+  assert.match(claude.stderr, /service-tier.*Codex-only/i);
+  const duplicate = relay(['spawn', dirS, '--tool', 'codex', '--service-tier', 'fast', '--service-tier', 'default', '--reply-to', 'agent-A', '--dry', '--', 'invalid']);
+  assert.notEqual(duplicate.status, 0);
+  assert.match(duplicate.stderr, /duplicate.*service-tier|service-tier.*duplicate/i);
 });
 check('spawn --dry defaults to codex when its CLI is available', () => {
   const dirS = path.join(HOME, 'proj-s0-codex-default');
@@ -1598,7 +1656,7 @@ check('app-server spawn returns before turn completion while its detached pump l
   fs.mkdirSync(dirS, { recursive: true });
   try {
     const started = Date.now();
-    const r = relay(['spawn', dirS, '--tool', 'codex', '--model', 'gpt-5.6-sol', '--effort', 'xhigh', '--name', 'w2', '--server', fake.sock, '--reply-to', 'agent-A', '--timeout', '5', '--', 'task two'], {
+    const r = relay(['spawn', dirS, '--tool', 'codex', '--model', 'gpt-5.6-sol', '--effort', 'xhigh', '--service-tier', 'fast', '--name', 'w2', '--server', fake.sock, '--reply-to', 'agent-A', '--timeout', '5', '--', 'task two'], {
       env: { RELAY_SPAWN_CMD_CODEX: stub, STUB_RECORD: childRecord },
     });
     const elapsedMs = Date.now() - started;
@@ -1613,10 +1671,12 @@ check('app-server spawn returns before turn completion while its detached pump l
     assert.equal(threadStart.params.model, 'gpt-5.6-sol');
     assert.equal(threadStart.params.sandbox, 'workspace-write');
     assert.equal(threadStart.params.approvalPolicy, 'never');
+    assert.equal(threadStart.params.serviceTier, 'fast');
     const turnStart = initial.find((frame) => frame.method === 'turn/start');
     assert.equal(turnStart.params.threadId, id);
     assert.equal(turnStart.params.model, 'gpt-5.6-sol');
     assert.equal(turnStart.params.effort, 'xhigh');
+    assert.equal(turnStart.params.serviceTier, 'fast');
     const prompt = turnStart.params.input[0].text;
     assert.match(prompt, /separate git branch/);
     assert.match(prompt, /Never modify live\/production systems/);
@@ -1646,6 +1706,24 @@ check('app-server spawn returns before turn completion while its detached pump l
     assert.equal(registry.agents[id].spawned_via, 'app-server', 'hook refresh preserves relay ownership');
   } finally {
     fake.child.kill('SIGKILL');
+  }
+});
+check('app-server Fast spawn fails closed when the effective tier is missing or mismatched', () => {
+  for (const [stem, control, pattern] of [
+    ['spawn-tier-mismatch', { reportedServiceTier: 'default' }, /requested fast but app-server reported default/i],
+    ['spawn-tier-missing', { omitServiceTier: true }, /did not report an effective service tier/i],
+  ]) {
+    const dirS = path.join(HOME, `proj-${stem}`);
+    const fake = startFakeAppServer(stem, control);
+    fs.mkdirSync(dirS, { recursive: true });
+    try {
+      const r = relay(['spawn', dirS, '--tool', 'codex', '--service-tier', 'fast', '--name', stem, '--server', fake.sock, '--reply-to', 'agent-A', '--timeout', '2', '--', 'must not downgrade']);
+      assert.notEqual(r.status, 0);
+      assert.match(r.stderr, pattern);
+      assert.equal(fake.frames().some((frame) => frame.method === 'turn/start'), false);
+    } finally {
+      fake.child.kill('SIGKILL');
+    }
   }
 });
 check('app-server spawn surfaces thread/start failure synchronously without a detached pump', () => {

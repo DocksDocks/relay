@@ -317,7 +317,11 @@ pub fn run(raw: Vec<String>) -> ! {
                         continue;
                     }
                 };
-                match appserver::acknowledge_with_guard(&mut guard, t.allow_bus) {
+                match appserver::acknowledge_with_guard(
+                    &mut guard,
+                    t.allow_bus,
+                    crate::lifecycle::ServiceTier::Default,
+                ) {
                     Ok(appserver::DeliveryOutcome::Delivered) => {
                         pending_ack.remove(&t.id);
                     }
@@ -639,7 +643,14 @@ fn push_target(
         return Ok(PushOutcome::Delivered);
     }
     let block = hook::mail_block(drained.messages(), &t.id);
-    match appserver::deliver_with_guard(&mut guard, &block, auto_turn, settle_ms, t.allow_bus) {
+    match appserver::deliver_with_guard(
+        &mut guard,
+        &block,
+        auto_turn,
+        settle_ms,
+        t.allow_bus,
+        crate::lifecycle::ServiceTier::Default,
+    ) {
         Ok(outcome) => {
             println!(
                 "{}",

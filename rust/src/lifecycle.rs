@@ -788,11 +788,48 @@ impl ValidatedEffort {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ServiceTier {
+    #[default]
+    Default,
+    Fast,
+}
+
+impl ServiceTier {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "default" => Ok(Self::Default),
+            "fast" => Ok(Self::Fast),
+            _ => Err("service-tier must be default|fast".to_string()),
+        }
+    }
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Fast => "fast",
+        }
+    }
+
+    pub(crate) fn codex_config_args(self) -> Vec<String> {
+        match self {
+            Self::Default => vec!["-c".into(), "service_tier=\"default\"".into()],
+            Self::Fast => vec![
+                "-c".into(),
+                "features.fast_mode=true".into(),
+                "-c".into(),
+                "service_tier=\"fast\"".into(),
+            ],
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DoorbellMessage {
     text: String,
     model: Option<ValidatedModel>,
     effort: Option<ValidatedEffort>,
+    service_tier: ServiceTier,
 }
 
 impl DoorbellMessage {
@@ -804,6 +841,7 @@ impl DoorbellMessage {
                 text: value.to_string(),
                 model: None,
                 effort: None,
+                service_tier: ServiceTier::Default,
             })
         }
     }
@@ -818,6 +856,11 @@ impl DoorbellMessage {
         self
     }
 
+    pub fn with_service_tier(mut self, service_tier: ServiceTier) -> Self {
+        self.service_tier = service_tier;
+        self
+    }
+
     pub(crate) fn as_str(&self) -> &str {
         &self.text
     }
@@ -829,17 +872,31 @@ impl DoorbellMessage {
     pub(crate) fn effort(&self) -> Option<&str> {
         self.effort.as_ref().map(ValidatedEffort::as_str)
     }
+
+    pub(crate) fn service_tier(&self) -> ServiceTier {
+        self.service_tier
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AttachOptions {
     model: Option<ValidatedModel>,
     effort: Option<ValidatedEffort>,
+    service_tier: ServiceTier,
 }
 
 impl AttachOptions {
     pub fn new(model: Option<ValidatedModel>, effort: Option<ValidatedEffort>) -> Self {
-        Self { model, effort }
+        Self {
+            model,
+            effort,
+            service_tier: ServiceTier::Default,
+        }
+    }
+
+    pub fn with_service_tier(mut self, service_tier: ServiceTier) -> Self {
+        self.service_tier = service_tier;
+        self
     }
 
     pub(crate) fn model(&self) -> Option<&str> {
@@ -848,6 +905,10 @@ impl AttachOptions {
 
     pub(crate) fn effort(&self) -> Option<&str> {
         self.effort.as_ref().map(ValidatedEffort::as_str)
+    }
+
+    pub(crate) fn service_tier(&self) -> ServiceTier {
+        self.service_tier
     }
 }
 
@@ -861,8 +922,10 @@ pub enum ChildLaunchSpec {
 impl ChildLaunchSpec {
     fn to_json(&self) -> JsonValue {
         let mut object = HashMap::new();
+        let service_tier;
         match self {
             Self::AttachResume(options) => {
+                service_tier = options.service_tier();
                 object.insert("kind".into(), JsonValue::from("AttachResume".to_string()));
                 object.insert(
                     "model".into(),
@@ -880,6 +943,7 @@ impl ChildLaunchSpec {
                 );
             }
             Self::WakeDoorbell(message) | Self::WatchWakeFallback(message) => {
+                service_tier = message.service_tier();
                 object.insert(
                     "kind".into(),
                     JsonValue::from(
@@ -911,6 +975,10 @@ impl ChildLaunchSpec {
                 );
             }
         }
+        object.insert(
+            "service_tier".into(),
+            JsonValue::from(service_tier.as_str().to_string()),
+        );
         JsonValue::from(object)
     }
 
@@ -924,12 +992,20 @@ impl ChildLaunchSpec {
             .map(|value| ValidatedEffort::parse(&value))
             .transpose()
             .ok()?;
+        let service_tier = optional_string_from(object, "service_tier")
+            .map(|value| ServiceTier::parse(&value))
+            .transpose()
+            .ok()?
+            .unwrap_or_default();
         match string(object, "kind")?.as_str() {
-            "AttachResume" => Some(Self::AttachResume(AttachOptions::new(model, effort))),
+            "AttachResume" => Some(Self::AttachResume(
+                AttachOptions::new(model, effort).with_service_tier(service_tier),
+            )),
             "WakeDoorbell" | "WatchWakeFallback" => {
                 let message = DoorbellMessage::parse(&string(object, "message")?)
                     .ok()?
-                    .with_runtime_options(model, effort);
+                    .with_runtime_options(model, effort)
+                    .with_service_tier(service_tier);
                 if string(object, "kind")? == "WakeDoorbell" {
                     Some(Self::WakeDoorbell(message))
                 } else {
@@ -938,6 +1014,72 @@ impl ChildLaunchSpec {
             }
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod service_tier_tests {
+    use super::*;
+
+    #[test]
+    fn service_tier_parser_is_closed_and_emits_exact_codex_overrides() {
+        assert_eq!(ServiceTier::parse("default").unwrap(), ServiceTier::Default);
+        assert_eq!(ServiceTier::parse("fast").unwrap(), ServiceTier::Fast);
+        assert!(ServiceTier::parse("ambient").is_err());
+        assert_eq!(
+            ServiceTier::Default.codex_config_args(),
+            ["-c", "service_tier=\"default\""]
+        );
+        assert_eq!(
+            ServiceTier::Fast.codex_config_args(),
+            [
+                "-c",
+                "features.fast_mode=true",
+                "-c",
+                "service_tier=\"fast\""
+            ]
+        );
+    }
+
+    #[test]
+    fn child_launch_spec_roundtrips_tier_and_legacy_state_defaults_to_standard() {
+        let fast = ChildLaunchSpec::WakeDoorbell(
+            DoorbellMessage::parse("ping")
+                .unwrap()
+                .with_runtime_options(None, None)
+                .with_service_tier(ServiceTier::Fast),
+        );
+        let encoded = fast.to_json();
+        assert_eq!(ChildLaunchSpec::from_json(&encoded), Some(fast));
+        assert_eq!(
+            encoded
+                .get::<HashMap<String, JsonValue>>()
+                .unwrap()
+                .get("service_tier")
+                .unwrap()
+                .get::<String>()
+                .unwrap(),
+            "fast"
+        );
+
+        let legacy = r#"{"kind":"WakeDoorbell","message":"ping","model":null,"effort":null}"#
+            .parse::<JsonValue>()
+            .unwrap();
+        let decoded = ChildLaunchSpec::from_json(&legacy).unwrap();
+        match decoded {
+            ChildLaunchSpec::WakeDoorbell(message) => {
+                assert_eq!(message.service_tier(), ServiceTier::Default)
+            }
+            _ => panic!("legacy wake decoded to the wrong launch kind"),
+        }
+    }
+
+    #[test]
+    fn attach_options_preserve_the_selected_tier() {
+        let options = AttachOptions::new(None, None).with_service_tier(ServiceTier::Fast);
+        assert_eq!(options.service_tier(), ServiceTier::Fast);
+        let spec = ChildLaunchSpec::AttachResume(options);
+        assert_eq!(ChildLaunchSpec::from_json(&spec.to_json()), Some(spec));
     }
 }
 

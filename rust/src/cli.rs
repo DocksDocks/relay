@@ -8,8 +8,8 @@
 //   relay inbox <nameOrId>
 //   relay peek <nameOrId>                        (read-only: inbox without draining)
 //   relay attach <nameOrId> [--exec]             (interactive human takeover)
-//   relay wake <nameOrId> [--model <m>] [--effort <e>] [--dry] [message...]
-//   relay wake --id <id> --dir <cwd> --tool <claude|codex> [--model <m>] [--effort <e>] [message...]
+//   relay wake <nameOrId> [--model <m>] [--effort <e>] [--service-tier default|fast] [--dry] [message...]
+//   relay wake --id <id> --dir <cwd> --tool <claude|codex> [--model <m>] [--effort <e>] [--service-tier default|fast] [message...]
 //
 // `wake` is TOOL-AWARE: claude → `claude -p --resume <id> [--model m] [--effort e] --output-format json -- <nudge>`,
 // codex → `codex exec resume <id> [-m m] [-c model_reasoning_effort=e] --json -- <nudge>`,
@@ -20,8 +20,8 @@ use crate::appserver;
 use crate::discover;
 use crate::hook;
 use crate::lifecycle::{
-    self, AttachOptions, ChildLaunchSpec, DoorbellMessage, OperationKind, ValidatedEffort,
-    ValidatedModel,
+    self, AttachOptions, ChildLaunchSpec, DoorbellMessage, OperationKind, ServiceTier,
+    ValidatedEffort, ValidatedModel,
 };
 use crate::spawn;
 use crate::store;
@@ -63,6 +63,27 @@ impl Args {
     }
     pub(crate) fn has(&self, name: &str) -> bool {
         self.0.iter().any(|a| a == &format!("--{name}"))
+    }
+    pub(crate) fn unique_flag(&self, name: &str) -> Result<Option<&str>, String> {
+        let key = format!("--{name}");
+        let positions = self
+            .0
+            .iter()
+            .enumerate()
+            .filter_map(|(index, value)| (value == &key).then_some(index))
+            .collect::<Vec<_>>();
+        if positions.len() > 1 {
+            return Err(format!("duplicate --{name}"));
+        }
+        let Some(index) = positions.first().copied() else {
+            return Ok(None);
+        };
+        self.0
+            .get(index + 1)
+            .map(String::as_str)
+            .filter(|value| !value.is_empty() && !value.starts_with("--"))
+            .map(Some)
+            .ok_or_else(|| format!("--{name} requires a value"))
     }
     // positional args excluding flags + their values; a bare `--` ends option parsing.
     pub(crate) fn positionals(&self, from: usize) -> Vec<&str> {
@@ -521,6 +542,7 @@ fn doorbell_args(
     message: &str,
     model: Option<&str>,
     effort: Option<&str>,
+    service_tier: Option<ServiceTier>,
 ) -> (String, Vec<String>) {
     let mut cargs = if tool == "codex" {
         vec!["exec".into(), "resume".into(), id.into()]
@@ -541,6 +563,7 @@ fn doorbell_args(
         }
     }
     if tool == "codex" {
+        cargs.extend(service_tier.unwrap_or_default().codex_config_args());
         cargs.push("--json".into());
     } else {
         cargs.push("--output-format".into());
@@ -878,9 +901,17 @@ pub fn run(cmd: &str, raw: Vec<String>) -> ! {
             });
             let Some(target) = target else {
                 die(
-                    "usage: relay wake <nameOrId> [--model <m>] [--effort <e>] [message...]  |  wake --id <id> --dir <cwd> --tool <claude|codex> [--model <m>] [--effort <e>] [message...]",
+                    "usage: relay wake <nameOrId> [--model <m>] [--effort <e>] [--service-tier default|fast] [message...]  |  wake --id <id> --dir <cwd> --tool <claude|codex> [--model <m>] [--effort <e>] [--service-tier default|fast] [message...]",
                 );
             };
+            let requested_service_tier = args
+                .unique_flag("service-tier")
+                .unwrap_or_else(|error| die(&error));
+            if target.tool != "codex" && requested_service_tier.is_some() {
+                die("--service-tier is Codex-only");
+            }
+            let service_tier = ServiceTier::parse(requested_service_tier.unwrap_or("default"))
+                .unwrap_or_else(|error| die(&error));
             let Some(dir) = target.dir.clone().filter(|d| !d.is_empty()) else {
                 die("target missing id/dir (for an unregistered session pass --dir)");
             };
@@ -965,6 +996,7 @@ pub fn run(cmd: &str, raw: Vec<String>) -> ! {
                     true,
                     settle_ms,
                     target.allow_bus,
+                    service_tier,
                 );
                 drop(guard);
                 match delivery {
@@ -999,7 +1031,14 @@ pub fn run(cmd: &str, raw: Vec<String>) -> ! {
                     "[relay wake] no --model given — pass --model/--effort to pin a deliberate doorbell model"
                 );
             }
-            let (cmd, cargs) = doorbell_args(&target.tool, &target.id, &message, model, effort);
+            let (cmd, cargs) = doorbell_args(
+                &target.tool,
+                &target.id,
+                &message,
+                model,
+                effort,
+                (target.tool == "codex").then_some(service_tier),
+            );
             if args.has("dry") {
                 let mut m: HashMap<String, JsonValue> = HashMap::new();
                 m.insert("tool".into(), JsonValue::from(target.tool.clone()));
@@ -1064,7 +1103,11 @@ pub fn run(cmd: &str, raw: Vec<String>) -> ! {
                 .transpose()
                 .unwrap_or_else(|error| die(&error));
             let message = DoorbellMessage::parse(&message)
-                .map(|message| message.with_runtime_options(model, effort))
+                .map(|message| {
+                    message
+                        .with_runtime_options(model, effort)
+                        .with_service_tier(service_tier)
+                })
                 .unwrap_or_else(|error| die(&error));
             let mut guard = lifecycle::admit_operation(&target.id, OperationKind::WakeCli)
                 .and_then(lifecycle::Admission::into_guard)
@@ -1093,7 +1136,7 @@ pub fn run(cmd: &str, raw: Vec<String>) -> ! {
             std::process::exit(code);
         }
         _ => die(
-            "usage: relay discover [--within min] [--tool t] | list | register <name> --id <uuid> [--dir <path>] [--server <sock>] | send <to> <msg> | inbox <who> | peek <who> | attach <who> [--exec] | wake <who> [--model m] [--effort e] [msg] | doctor [--id <session>]",
+            "usage: relay discover [--within min] [--tool t] | list | register <name> --id <uuid> [--dir <path>] [--server <sock>] | send <to> <msg> | inbox <who> | peek <who> | attach <who> [--exec] | wake <who> [--model m] [--effort e] [--service-tier default|fast] [msg] | doctor [--id <session>]",
         ),
     }
 }
@@ -1107,15 +1150,31 @@ mod tests {
     }
 
     #[test]
-    fn wake_argv_no_flags_match_existing_shapes() {
-        let (cmd, args) = doorbell_args("codex", "u-1", "ping", None, None);
+    fn wake_argv_defaults_codex_to_explicit_standard_and_leaves_claude_unchanged() {
+        let (cmd, args) = doorbell_args(
+            "codex",
+            "u-1",
+            "ping",
+            None,
+            None,
+            Some(crate::lifecycle::ServiceTier::Default),
+        );
         assert_eq!(cmd, "codex");
         assert_eq!(
             args,
-            strings(&["exec", "resume", "u-1", "--json", "--", "ping"])
+            strings(&[
+                "exec",
+                "resume",
+                "u-1",
+                "-c",
+                "service_tier=\"default\"",
+                "--json",
+                "--",
+                "ping"
+            ])
         );
 
-        let (cmd, args) = doorbell_args("claude", "u-1", "ping", None, None);
+        let (cmd, args) = doorbell_args("claude", "u-1", "ping", None, None, None);
         assert_eq!(cmd, "claude");
         assert_eq!(
             args,
@@ -1132,8 +1191,15 @@ mod tests {
     }
 
     #[test]
-    fn wake_argv_maps_model_and_effort_per_tool_after_resume_id() {
-        let (cmd, args) = doorbell_args("codex", "u-1", "ping", Some("gpt-5.5"), Some("xhigh"));
+    fn wake_argv_maps_model_effort_and_fast_tier_per_tool_after_resume_id() {
+        let (cmd, args) = doorbell_args(
+            "codex",
+            "u-1",
+            "ping",
+            Some("gpt-5.5"),
+            Some("xhigh"),
+            Some(crate::lifecycle::ServiceTier::Fast),
+        );
         assert_eq!(cmd, "codex");
         assert_eq!(
             args,
@@ -1145,13 +1211,17 @@ mod tests {
                 "gpt-5.5",
                 "-c",
                 "model_reasoning_effort=xhigh",
+                "-c",
+                "features.fast_mode=true",
+                "-c",
+                "service_tier=\"fast\"",
                 "--json",
                 "--",
                 "ping"
             ])
         );
 
-        let (cmd, args) = doorbell_args("claude", "u-1", "ping", Some("opus"), Some("max"));
+        let (cmd, args) = doorbell_args("claude", "u-1", "ping", Some("opus"), Some("max"), None);
         assert_eq!(cmd, "claude");
         assert_eq!(
             args,

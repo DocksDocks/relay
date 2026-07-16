@@ -66,7 +66,7 @@ fn main() {
             }
         }
         _ => die(
-            "usage: relay bus | channel | hook [codex] [--event prompt] | discover [--within min] [--tool t] | list | register <name> --id <uuid> [--dir <path>] [--server <sock>] | send <to> [--] <msg> | inbox <who> | peek <who> | attach <who> [--exec] | wake <who> [--model m] [--effort e] [msg] | doctor [--id <session>] | watch <who>...|--all [--server <sock>] [--auto-turn] [--once] | spawn <dir> [--fanout|--worktree --from <session>] [options] -- <task> | handback --from <session> --status completed|failed [--note <text>] | collect <session> --from <parent>",
+            "usage: relay bus | channel | hook [codex] [--event prompt] | discover [--within min] [--tool t] | list | register <name> --id <uuid> [--dir <path>] [--server <sock>] | send <to> [--] <msg> | inbox <who> | peek <who> | attach <who> [--exec] | wake <who> [--model m] [--effort e] [--service-tier default|fast] [msg] | doctor [--id <session>] | watch <who>...|--all [--server <sock>] [--auto-turn] [--once] | spawn <dir> [--fanout|--worktree --from <session>] [--service-tier default|fast] [options] -- <task> | handback --from <session> --status completed|failed [--note <text>] | collect <session> --from <parent>",
         ),
     }
 }

@@ -9,11 +9,13 @@ two live depth-1 leaves.
 ```bash
 # The registered invoking session starts the isolated root.
 relay spawn <repo> --fanout --from <invoker-session> \
-  --tool <claude|codex> --model <model> --effort <effort> -- "<root task>"
+  --tool <claude|codex> --model <model> --effort <effort> \
+  [--service-tier default|fast for Codex] -- "<root task>"
 
 # The root may start no more than two isolated leaves.
 relay spawn <root-worktree> --worktree --from <root-session> \
-  --tool <claude|codex> --model <model> --effort <effort> -- "<leaf task>"
+  --tool <claude|codex> --model <model> --effort <effort> \
+  [--service-tier default|fast for Codex] -- "<leaf task>"
 
 # Each worker commits everything, verifies a clean worktree, then hands back.
 relay handback --from <worker-session> --status completed --note "ready"
@@ -25,6 +27,10 @@ relay collect <worker-session> --from <parent-session>
 The spawned worker prompt already identifies the assigned worktree and makes
 `handback` the final action. Do not create another branch inside that worktree,
 and do not write to it after handback.
+
+Codex fan-out always resolves an explicit role tier. Use `--service-tier fast`
+only for a Fast role and `--service-tier default` otherwise; omission is
+Standard, and Claude rejects the flag.
 
 Collect both leaves before the root hands back. Collection uses a no-fast-forward
 merge, removes only the registered worktree, and retains the relay branch for

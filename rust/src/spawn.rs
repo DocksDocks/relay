@@ -25,7 +25,7 @@ use crate::fanout::{self, FanoutMode, FanoutState, FanoutStore};
 use crate::lifecycle::{
     ChildLaunchSpec, ClaimManagedAttach, ClaimOutcome, ExecutionBackend, LifecycleStore,
     MANAGED_CANCEL_GRACE_MS, ManagedState, OperationKind, PendingAttachSpec, ReentryGuard,
-    RequiredScope, TerminalAction,
+    RequiredScope, ServiceTier, TerminalAction,
 };
 use crate::store;
 use rustix::fs::{FlockOperation, flock};
@@ -67,11 +67,19 @@ struct FanoutLaunchOptions<'a> {
     tool: &'a str,
     model: Option<&'a str>,
     effort: Option<&'a str>,
+    service_tier: ServiceTier,
     name: Option<&'a str>,
     reply_to: &'a str,
     timeout_secs: u64,
     permissions: &'a [String; 2],
     task: &'a str,
+}
+
+#[derive(Default)]
+struct ChildRole<'a> {
+    model: Option<&'a str>,
+    effort: Option<&'a str>,
+    service_tier: Option<ServiceTier>,
 }
 
 enum WorkerWorkspace<'a> {
@@ -287,7 +295,7 @@ fn die(msg: &str) -> ! {
     std::process::exit(1);
 }
 
-const USAGE: &str = "usage: relay spawn <dir> [--fanout|--worktree --from <session>] [--tool claude|codex] [--model <m>] [--effort <e>] [--name <busName>] [--server <unix-socket>] [--reply-to <nameOrId>] [--timeout <sec>] [--read-only] [--full-access] [--watch] [--dry] [--] <first task>";
+const USAGE: &str = "usage: relay spawn <dir> [--fanout|--worktree --from <session>] [--tool claude|codex] [--model <m>] [--effort <e>] [--service-tier default|fast] [--name <busName>] [--server <unix-socket>] [--reply-to <nameOrId>] [--timeout <sec>] [--read-only] [--full-access] [--watch] [--dry] [--] <first task>";
 
 fn exit_code(status: &ExitStatus) -> i32 {
     status
@@ -597,6 +605,7 @@ fn appserver_spawn_config(options: &AppServerSpawn<'_>) -> String {
         ("task", Some(options.task)),
         ("model", options.model),
         ("effort", options.effort),
+        ("service_tier", Some(options.service_tier.as_str())),
         ("sandbox", Some(options.sandbox)),
     ] {
         config.insert(
@@ -665,6 +674,11 @@ pub fn run_appserver_pump() -> ! {
     let name = config_string(&config, "name");
     let model = config_string(&config, "model");
     let effort = config_string(&config, "effort");
+    let service_tier = config_string(&config, "service_tier")
+        .map(|value| ServiceTier::parse(&value))
+        .transpose()
+        .unwrap_or_else(|error| pump_fail(&error))
+        .unwrap_or_default();
     let timeout_secs = config
         .get("timeout_secs")
         .and_then(|value| value.get::<f64>())
@@ -682,8 +696,9 @@ pub fn run_appserver_pump() -> ! {
         ExecutionBackend::SharedAppServer,
     )
     .unwrap_or_else(|error| pump_fail(&error));
-    let mut spawned = appserver::start_thread(&server, &dir, model.as_deref(), &sandbox)
-        .unwrap_or_else(|e| pump_fail(&e));
+    let mut spawned =
+        appserver::start_thread(&server, &dir, model.as_deref(), &sandbox, service_tier)
+            .unwrap_or_else(|e| pump_fail(&e));
     let id = spawned.id().to_string();
     claim_managed_appserver_birth(&lifecycle, &birth, &id, &dir, name.as_deref(), &server)
         .unwrap_or_else(|error| pump_fail(&error));
@@ -700,6 +715,7 @@ pub fn run_appserver_pump() -> ! {
         &prompt,
         model.as_deref(),
         effort.as_deref(),
+        service_tier,
     ) {
         let intent = guard
             .into_fence_intent("initial app-server turn/start failed")
@@ -810,6 +826,7 @@ struct AppServerSpawn<'a> {
     task: &'a str,
     model: Option<&'a str>,
     effort: Option<&'a str>,
+    service_tier: ServiceTier,
     sandbox: &'a str,
     timeout_secs: u64,
     watch: bool,
@@ -903,15 +920,15 @@ fn child_args(
     perm: &[String; 2],
     premint: Option<&str>,
     skip_git_check: bool,
-    model: Option<&str>,
-    effort: Option<&str>,
+    role: ChildRole<'_>,
     prompt: &str,
 ) -> Vec<String> {
     let mut a: Vec<String> = Vec::new();
     if tool == "codex" {
         a.push("exec".into());
         a.extend(perm.iter().cloned());
-        append_model_effort_args(&mut a, tool, model, effort);
+        append_model_effort_args(&mut a, tool, role.model, role.effort);
+        a.extend(role.service_tier.unwrap_or_default().codex_config_args());
         if skip_git_check {
             a.push("--skip-git-repo-check".into());
         }
@@ -922,7 +939,7 @@ fn child_args(
             a.push(id.into());
         }
         a.extend(perm.iter().cloned());
-        append_model_effort_args(&mut a, tool, model, effort);
+        append_model_effort_args(&mut a, tool, role.model, role.effort);
     }
     a.push("--".into());
     a.push(prompt.into());
@@ -980,8 +997,11 @@ fn run_fanout_spawn(options: FanoutLaunchOptions<'_>) -> ! {
             options.permissions,
             preminted_session_id.as_deref(),
             false,
-            options.model,
-            options.effort,
+            ChildRole {
+                model: options.model,
+                effort: options.effort,
+                service_tier: Some(options.service_tier),
+            },
             &prompt,
         ),
         preminted_session_id,
@@ -1449,6 +1469,14 @@ pub fn run(raw: Vec<String>) -> ! {
     }
     let model = args.flag("model");
     let effort = args.flag("effort");
+    let requested_service_tier = args
+        .unique_flag("service-tier")
+        .unwrap_or_else(|error| die(&error));
+    if tool != "codex" && requested_service_tier.is_some() {
+        die("--service-tier is Codex-only");
+    }
+    let service_tier = ServiceTier::parse(requested_service_tier.unwrap_or("default"))
+        .unwrap_or_else(|error| die(&error));
     let server = args.flag("server");
     if model.is_none() {
         eprintln!(
@@ -1513,6 +1541,7 @@ pub fn run(raw: Vec<String>) -> ! {
             tool: &tool,
             model,
             effort,
+            service_tier,
             name: args.flag("name"),
             reply_to: &reply_to,
             timeout_secs,
@@ -1540,6 +1569,10 @@ pub fn run(raw: Vec<String>) -> ! {
                 if let Some(effort) = effort {
                     out.insert("effort".into(), JsonValue::from(effort.to_string()));
                 }
+                out.insert(
+                    "service_tier".into(),
+                    JsonValue::from(service_tier.as_str().to_string()),
+                );
                 println!(
                     "{}",
                     JsonValue::from(out)
@@ -1556,6 +1589,7 @@ pub fn run(raw: Vec<String>) -> ! {
                 task: &task,
                 model,
                 effort,
+                service_tier,
                 sandbox: &perm[1],
                 timeout_secs,
                 watch,
@@ -1574,8 +1608,11 @@ pub fn run(raw: Vec<String>) -> ! {
         &perm,
         premint.as_deref(),
         skip_git_check,
-        model,
-        effort,
+        ChildRole {
+            model,
+            effort,
+            service_tier: (tool == "codex").then_some(service_tier),
+        },
         &prompt,
     );
 
@@ -1834,8 +1871,7 @@ mod tests {
             &perm,
             Some("u-1"),
             false,
-            None,
-            None,
+            ChildRole::default(),
             "-rf looks like a flag",
         );
         assert_eq!(
@@ -1860,10 +1896,30 @@ mod tests {
     #[test]
     fn codex_argv_adds_git_bypass_only_when_asked() {
         let perm = perm_args("codex", false, false);
-        let with = child_args("codex", &perm, None, true, None, None, "t");
+        let with = child_args(
+            "codex",
+            &perm,
+            None,
+            true,
+            ChildRole {
+                service_tier: Some(crate::lifecycle::ServiceTier::Default),
+                ..ChildRole::default()
+            },
+            "t",
+        );
         assert_eq!(with[0], "exec");
         assert!(with.contains(&"--skip-git-repo-check".to_string()));
-        let without = child_args("codex", &perm, None, false, None, None, "t");
+        let without = child_args(
+            "codex",
+            &perm,
+            None,
+            false,
+            ChildRole {
+                service_tier: Some(crate::lifecycle::ServiceTier::Default),
+                ..ChildRole::default()
+            },
+            "t",
+        );
         assert!(!without.contains(&"--skip-git-repo-check".to_string()));
         assert!(!without.iter().any(|x| x == "--json"));
     }
@@ -1876,8 +1932,11 @@ mod tests {
             &claude_perm,
             Some("u-1"),
             false,
-            Some("opus"),
-            Some("max"),
+            ChildRole {
+                model: Some("opus"),
+                effort: Some("max"),
+                service_tier: None,
+            },
             "t",
         );
         assert_eq!(
@@ -1903,8 +1962,11 @@ mod tests {
             &codex_perm,
             None,
             true,
-            Some("gpt-5.5"),
-            Some("xhigh"),
+            ChildRole {
+                model: Some("gpt-5.5"),
+                effort: Some("xhigh"),
+                service_tier: Some(crate::lifecycle::ServiceTier::Fast),
+            },
             "t",
         );
         assert_eq!(
@@ -1917,9 +1979,67 @@ mod tests {
                 "gpt-5.5",
                 "-c",
                 "model_reasoning_effort=xhigh",
+                "-c",
+                "features.fast_mode=true",
+                "-c",
+                "service_tier=\"fast\"",
                 "--skip-git-repo-check",
                 "--",
                 "t"
+            ]
+        );
+    }
+
+    #[test]
+    fn codex_standard_and_fast_child_argv_are_role_scoped_and_exact() {
+        let perm = perm_args("codex", false, false);
+        let standard = child_args(
+            "codex",
+            &perm,
+            None,
+            false,
+            ChildRole {
+                service_tier: Some(crate::lifecycle::ServiceTier::Default),
+                ..ChildRole::default()
+            },
+            "standard task",
+        );
+        assert_eq!(
+            standard,
+            [
+                "exec",
+                "--sandbox",
+                "workspace-write",
+                "-c",
+                "service_tier=\"default\"",
+                "--",
+                "standard task"
+            ]
+        );
+
+        let fast = child_args(
+            "codex",
+            &perm,
+            None,
+            false,
+            ChildRole {
+                service_tier: Some(crate::lifecycle::ServiceTier::Fast),
+                ..ChildRole::default()
+            },
+            "fast task",
+        );
+        assert_eq!(
+            fast,
+            [
+                "exec",
+                "--sandbox",
+                "workspace-write",
+                "-c",
+                "features.fast_mode=true",
+                "-c",
+                "service_tier=\"fast\"",
+                "--",
+                "fast task"
             ]
         );
     }

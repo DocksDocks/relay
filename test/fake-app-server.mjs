@@ -15,6 +15,7 @@
 // control.json: { "statuses": ["idle", "active", ...],
 //   "threadId": "uuid", "threadStartError": "message",
 //   "turnStartError": "message", "elicitationServer": "bus",
+//   "reportedServiceTier": "default", "omitServiceTier": false,
 //   "elicitationDelayMs": 0, "completionDelayMs": 0,
 //   "neverComplete": false }
 import crypto from 'node:crypto';
@@ -38,6 +39,9 @@ const elicitationDelayMs = Number(control.elicitationDelayMs ?? 0);
 const completionDelayMs = Number(control.completionDelayMs ?? 0);
 const interruptCompletionDelayMs = Number(control.interruptCompletionDelayMs ?? 0);
 let statusIndex = 0;
+const effectiveServiceTier = (params) => Object.hasOwn(control, 'reportedServiceTier')
+  ? control.reportedServiceTier
+  : params?.serviceTier;
 
 const encodeText = (s) => {
   const p = Buffer.from(s, 'utf8');
@@ -115,19 +119,29 @@ const server = net.createServer((c) => {
       const fail = (message) => c.write(encodeText(JSON.stringify({ id: msg.id, error: { code: -32000, message } })));
       switch (msg.method) {
         case 'initialize': reply({ userAgent: 'fake-app-server/1.0' }); break;
-        case 'thread/start':
+        case 'thread/start': {
           if (control.threadStartError) fail(control.threadStartError);
-          else reply({
-            thread: { id: threadId, status: { type: 'idle' }, turns: [] },
-            model: msg.params?.model ?? 'fake-model',
-            modelProvider: 'fake-provider',
-            cwd: msg.params?.cwd ?? process.cwd(),
-            approvalPolicy: msg.params?.approvalPolicy ?? 'never',
-            approvalsReviewer: 'user',
-            sandbox: { type: 'workspaceWrite', writableRoots: [], networkAccess: false },
-          });
+          else {
+            const result = {
+              thread: { id: threadId, status: { type: 'idle' }, turns: [] },
+              model: msg.params?.model ?? 'fake-model',
+              modelProvider: 'fake-provider',
+              cwd: msg.params?.cwd ?? process.cwd(),
+              approvalPolicy: msg.params?.approvalPolicy ?? 'never',
+              approvalsReviewer: 'user',
+              sandbox: { type: 'workspaceWrite', writableRoots: [], networkAccess: false },
+            };
+            if (!control.omitServiceTier) result.serviceTier = effectiveServiceTier(msg.params);
+            reply(result);
+          }
           break;
-        case 'thread/resume': reply({ thread: { id: msg.params?.threadId ?? null } }); break;
+        }
+        case 'thread/resume': {
+          const result = { thread: { id: msg.params?.threadId ?? null } };
+          if (!control.omitServiceTier) result.serviceTier = effectiveServiceTier(msg.params);
+          reply(result);
+          break;
+        }
         case 'thread/read': {
           const type = interrupted && control.idleAfterInterrupt
             ? 'idle'
