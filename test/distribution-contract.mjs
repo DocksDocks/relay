@@ -161,6 +161,18 @@ function testCaptureHelper() {
       version: '1',
     });
 
+    const verbosePath = path.join(fixture.root, 'verbose-red.json');
+    const verboseSource = 'require("node:fs").writeSync(1,Buffer.alloc(2*1024*1024,0x61));process.exit(23)';
+    const verboseRun = run(process.execPath, [
+      fixture.helper,
+      ...helperArgs(fixture, verbosePath, [process.execPath, '-e', verboseSource]),
+    ]);
+    assert.equal(verboseRun.status, 0, verboseRun.stderr);
+    const verboseReceipt = JSON.parse(fs.readFileSync(verbosePath));
+    assert.equal(verboseReceipt.exit_code, 23);
+    assert.equal(verboseReceipt.stdout_sha256, sha256(Buffer.alloc(2 * 1024 * 1024, 0x61)));
+    assert.equal(verboseRun.stdout.trim(), sha256(fs.readFileSync(verbosePath)));
+
     const failureCases = [
       ['unknown option', ['--wat', 'x']],
       ['duplicate singleton', ['--repo', fixture.root]],
