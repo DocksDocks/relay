@@ -1,10 +1,89 @@
 #!/bin/sh
-# relay — arch-dispatch launcher for the session-relay Rust binary.
-d=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
-case "$(uname -sm)" in
-  'Darwin arm64')  exec "$d/relay-aarch64-apple-darwin" "$@" ;;
-  'Darwin x86_64') exec "$d/relay-x86_64-apple-darwin" "$@" ;;
-  'Linux aarch64') exec "$d/relay-aarch64-unknown-linux-musl" "$@" ;;
-  'Linux x86_64')  exec "$d/relay-x86_64-unknown-linux-musl" "$@" ;;
-  *) echo "session-relay: unsupported platform $(uname -sm)" >&2; exit 1 ;;
-esac
+# relay — compatibility launcher for the externally installed session-relay CLI.
+
+canonical_path() {
+  path=$1
+  case "$path" in
+    /*) ;;
+    *) path=$PWD/$path ;;
+  esac
+
+  hops=0
+  while [ -L "$path" ]; do
+    [ "$hops" -lt 40 ] || return 1
+    hops=$((hops + 1))
+    target=$(PATH=/usr/bin:/bin readlink "$path") || return 1
+    case "$target" in
+      /*) path=$target ;;
+      *)
+        parent=${path%/*}
+        [ -n "$parent" ] || parent=/
+        path=$parent/$target
+        ;;
+    esac
+  done
+
+  directory=${path%/*}
+  [ -n "$directory" ] || directory=/
+  base=${path##*/}
+  directory=$(CDPATH='' cd -P "$directory" 2>/dev/null && pwd) || return 1
+  printf '%s/%s\n' "$directory" "$base"
+}
+
+fail_invalid() {
+  printf 'session-relay launcher: SESSION_RELAY_BIN is not an executable file: %s\n' "$1" >&2
+  exit 1
+}
+
+fail_recursion() {
+  printf 'session-relay launcher: refusing to execute itself recursively: %s\n' "$1" >&2
+  exit 1
+}
+
+launcher=$(canonical_path "$0") || {
+  printf 'session-relay launcher: cannot resolve launcher path: %s\n' "$0" >&2
+  exit 1
+}
+
+candidate=
+if [ -n "${SESSION_RELAY_BIN:-}" ]; then
+  candidate=$SESSION_RELAY_BIN
+  if [ ! -f "$candidate" ] || [ ! -x "$candidate" ]; then
+    fail_invalid "$candidate"
+  fi
+else
+  candidate=$(command -v session-relay 2>/dev/null || :)
+  if [ -n "$candidate" ] && { [ ! -f "$candidate" ] || [ ! -x "$candidate" ]; }; then
+    candidate=
+  fi
+
+  if [ -z "$candidate" ]; then
+    home_candidate=${HOME:-}/.local/bin/session-relay
+    if [ -n "${HOME:-}" ] && [ -f "$home_candidate" ] && [ -x "$home_candidate" ]; then
+      candidate=$home_candidate
+    fi
+  fi
+
+  if [ -z "$candidate" ]; then
+    printf '%s\n' \
+      'session-relay executable not found.' \
+      'Install it with one of:' \
+      '  docks-kit sync' \
+      '  docks-kit toolchain ensure session-relay' >&2
+    exit 1
+  fi
+fi
+
+resolved=$(canonical_path "$candidate") || {
+  if [ -n "${SESSION_RELAY_BIN:-}" ]; then
+    fail_invalid "$candidate"
+  fi
+  printf 'session-relay launcher: cannot resolve executable path: %s\n' "$candidate" >&2
+  exit 1
+}
+
+if [ "$resolved" = "$launcher" ]; then
+  fail_recursion "$candidate"
+fi
+
+exec "$candidate" "$@"
