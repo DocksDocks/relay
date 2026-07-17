@@ -17,29 +17,40 @@ import { fileURLToPath } from 'node:url';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PLUGIN = path.resolve(HERE, '..');
 
-// Host-leg binary (built by the repo gate), falling back to the committed
-// binaries. The fresh target/ build comes FIRST: mid-development the committed
-// binary lags the source, and the self-test must exercise what was just built.
-// Absent on a cargo-less machine before the binaries are committed —
-// skip loudly rather than fail: the build itself is gated separately.
-function resolveBin() {
-  const arch = { x64: 'x86_64', arm64: 'aarch64' }[process.arch];
-  const triple = process.platform === 'darwin' ? `${arch}-apple-darwin` : `${arch}-unknown-linux-musl`;
-  for (const c of [
-    path.join(PLUGIN, 'rust', 'target', 'debug', 'relay'),
-    path.join(PLUGIN, 'rust', 'target', triple, 'release', 'relay'),
-    path.join(PLUGIN, 'bin', `relay-${triple}`),
-    path.join(PLUGIN, 'bin', 'relay'),
-  ]) {
-    if (fs.existsSync(c)) return c;
-  }
-  return null;
+function failTestBin(reason) {
+  console.error(`FAIL: SESSION_RELAY_TEST_BIN ${reason}`);
+  process.exit(1);
 }
-const BIN = resolveBin();
-if (!BIN) {
-  console.log('SKIP: session-relay self-test — no relay binary in bin/ (build the host leg via the repo gate, or commit bin/)');
-  process.exit(0);
+
+const configuredBin = process.env.SESSION_RELAY_TEST_BIN;
+if (configuredBin === undefined) {
+  failTestBin('is required; set it to a freshly built host executable');
 }
+if (configuredBin.trim() === '') {
+  failTestBin('must be nonempty');
+}
+if (!path.isAbsolute(configuredBin)) {
+  failTestBin('must be an absolute path');
+}
+
+let BIN;
+try {
+  BIN = fs.realpathSync(configuredBin);
+  if (!fs.statSync(BIN).isFile()) failTestBin('must resolve to a regular file');
+  fs.accessSync(BIN, fs.constants.X_OK);
+} catch {
+  failTestBin('must resolve to an executable file');
+}
+
+const LAUNCHER = fs.realpathSync(path.join(PLUGIN, 'bin', 'relay'));
+if (BIN === LAUNCHER) {
+  failTestBin('must not resolve to the plugin launcher');
+}
+
+const cargoManifest = fs.readFileSync(path.join(PLUGIN, 'rust', 'Cargo.toml'), 'utf8');
+const packageSection = cargoManifest.split(/^\[package\]\s*$/m)[1]?.split(/^\[/m)[0];
+const CARGO_VERSION = packageSection?.match(/^version\s*=\s*"([^"]+)"\s*$/m)?.[1];
+assert.ok(CARGO_VERSION, 'Cargo package version is present');
 
 const HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'session-relay-test-'));
 const lifecycleState = () => JSON.parse(
@@ -90,6 +101,13 @@ const idB = '22222222-2222-2222-2222-222222222222';
 
 let passed = 0;
 const check = (label, fn) => { fn(); passed += 1; console.log(`  ok: ${label}`); };
+
+check('--version prints the exact Cargo package version', () => {
+  const result = relay(['--version']);
+  assert.equal(result.status, 0, `relay --version exited ${result.status}: ${result.stderr}`);
+  assert.equal(result.stdout, `session-relay ${CARGO_VERSION}\n`);
+  assert.equal(result.stderr, '');
+});
 
 // --- store seed, entirely through the binary: the hook sets the cwd→id
 // marker + registers each session; the register CLI names them ---
