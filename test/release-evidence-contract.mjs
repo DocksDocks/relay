@@ -67,22 +67,32 @@ function zip(entries) {
     const method = entry.deflate ? 8 : 0;
     const declaredSize = entry.declaredSize ?? bytes.length;
     const crc = crc32(bytes);
+    const flags = 0x800 | (entry.dataDescriptor ? 0x0008 : 0);
     const local = Buffer.alloc(30);
     local.writeUInt32LE(0x04034b50, 0);
     local.writeUInt16LE(20, 4);
-    local.writeUInt16LE(0x800, 6);
+    local.writeUInt16LE(flags, 6);
     local.writeUInt16LE(method, 8);
-    local.writeUInt32LE(crc, 14);
-    local.writeUInt32LE(compressed.length, 18);
-    local.writeUInt32LE(declaredSize, 22);
+    if (!entry.dataDescriptor) {
+      local.writeUInt32LE(crc, 14);
+      local.writeUInt32LE(compressed.length, 18);
+      local.writeUInt32LE(declaredSize, 22);
+    }
     local.writeUInt16LE(name.length, 26);
-    locals.push(local, name, compressed);
+    const descriptor = entry.dataDescriptor ? Buffer.alloc(16) : Buffer.alloc(0);
+    if (entry.dataDescriptor) {
+      descriptor.writeUInt32LE(0x08074b50, 0);
+      descriptor.writeUInt32LE(crc, 4);
+      descriptor.writeUInt32LE(compressed.length, 8);
+      descriptor.writeUInt32LE(declaredSize, 12);
+    }
+    locals.push(local, name, compressed, descriptor);
 
     const central = Buffer.alloc(46);
     central.writeUInt32LE(0x02014b50, 0);
     central.writeUInt16LE(0x031e, 4);
     central.writeUInt16LE(20, 6);
-    central.writeUInt16LE(0x800, 8);
+    central.writeUInt16LE(flags, 8);
     central.writeUInt16LE(method, 10);
     central.writeUInt32LE(crc, 16);
     central.writeUInt32LE(compressed.length, 20);
@@ -91,7 +101,7 @@ function zip(entries) {
     central.writeUInt32LE(entry.mode === 'symlink' ? 0xa1ff0000 : 0x81a40000, 38);
     central.writeUInt32LE(offset, 42);
     centrals.push(central, name);
-    offset += local.length + name.length + compressed.length;
+    offset += local.length + name.length + compressed.length + descriptor.length;
   }
   const centralOffset = offset;
   const centralBytes = Buffer.concat(centrals);
@@ -142,8 +152,8 @@ function artifactFixture({ mutateArchive } = {}) {
       workflow_run_id: RUN_ID,
     }));
     const archive = zip([
-      { name: assetName, bytes: binary },
-      { name: `attestation-${target}.json`, bytes: attestation },
+      { name: assetName, bytes: binary, deflate: true, dataDescriptor: true },
+      { name: `attestation-${target}.json`, bytes: attestation, deflate: true, dataDescriptor: true },
     ]);
     archives.set(databaseId, archive);
     artifacts.push(artifactRecord(databaseId, artifactName, archive));
@@ -152,7 +162,7 @@ function artifactFixture({ mutateArchive } = {}) {
   const manifest = Buffer.from([...binaryDigests]
     .sort(([left], [right]) => left.localeCompare(right))
     .map(([name, digest]) => `${digest}  ${name}\n`).join(''));
-  const checksumArchive = zip([{ name: 'SHA256SUMS', bytes: manifest }]);
+  const checksumArchive = zip([{ name: 'SHA256SUMS', bytes: manifest, deflate: true, dataDescriptor: true }]);
   archives.set(databaseId, checksumArchive);
   artifacts.push(artifactRecord(databaseId, 'session-relay-checksums', checksumArchive));
   if (mutateArchive) mutateArchive({ archives, artifacts });
