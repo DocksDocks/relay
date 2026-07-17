@@ -397,12 +397,13 @@ function runReleaseFixture(root, mode, scenario, expectedOutcome, releaseArgs) {
   assert.equal(result.status, unsuccessful ? 1 : 0, `${mode}/${scenario}: ${result.stderr}`);
   assert.equal(fs.existsSync(reportPath), true, `${mode}/${scenario} did not emit a fixture report`);
   const report = JSON.parse(fs.readFileSync(reportPath));
-  exactKeys(report, ['schema', 'type', 'scenario', 'outcome', 'calls', 'mutations', 'journal', 'receipt'], `${mode}/${scenario} report schema`);
+  exactKeys(report, ['schema', 'type', 'scenario', 'outcome', 'calls', 'mutations', 'journal', 'receipt', 'state'], `${mode}/${scenario} report schema`);
   assert.equal(report.schema, 1);
   assert.equal(report.type, 'SessionRelayReleaseFixtureReportV1');
   assert.equal(report.scenario, scenario);
   assert.equal(report.outcome, expectedOutcome);
   assert.ok(Array.isArray(report.calls));
+  assert.ok(report.state && typeof report.state === 'object' && !Array.isArray(report.state));
   assert.ok(Array.isArray(report.mutations));
   if (report.receipt) {
     assert.equal(report.receipt.schema, 1);
@@ -423,7 +424,7 @@ function releaseContracts() {
   const fixtureRoot = releaseFixtureRoot();
   const inPath = (name) => path.join(fixtureRoot.root, `${name}.json`);
   const outPath = (name) => path.join(fixtureRoot.root, `${name}.receipt.json`);
-  const pair = (name, digest) => [inPath(name), `--${name}-sha256`, digest.repeat(64)];
+  const pair = (name, digest, flag = name) => [inPath(name), `--${flag}-sha256`, digest.repeat(64)];
   try {
     for (const [scenario, outcome] of PUBLICATION_CASES) {
       const args = [
@@ -432,13 +433,13 @@ function releaseContracts() {
         '--receipt-out', outPath(`publication-${scenario}`),
       ];
       if (scenario === 'partial-prerelease' || scenario === 'complete-prerelease') {
-        args.push('--resume-publication', ...pair('prior-publication', 'b'));
+        args.push('--resume-publication', ...pair('prior-publication', 'b', 'resume-publication'));
       }
       const report = runReleaseFixture(fixtureRoot.root, 'publish-reviewed', scenario, outcome, args);
       if (outcome === 'prerelease') {
         assert.deepEqual(report.receipt.assets.map(({ name }) => name).sort(), [...ASSETS, 'SHA256SUMS'].sort());
         assert.equal(report.receipt.release_state, 'prerelease');
-        assert.doesNotMatch(report.receipt.body, /docks-kit sync|plugin install/i);
+        assert.doesNotMatch(report.state.release.body, /docks-kit sync|plugin install/i);
       }
     }
 
@@ -454,7 +455,7 @@ function releaseContracts() {
         '--expected-origin-main', '3'.repeat(40),
         '--receipt-out', outPath(`promotion-${scenario}`),
       ];
-      if (scenario.startsWith('retry-')) args.push('--retry-failed', ...pair('failed-promotion', 'c'));
+      if (scenario.startsWith('retry-')) args.push('--retry-failed', ...pair('failed-promotion', 'c', 'retry-failed'));
       const report = runReleaseFixture(fixtureRoot.root, mode, scenario, outcome, args);
       const keys = report.journal.map(({ attempt, sequence }) => `${attempt}:${sequence}`);
       assert.deepEqual(keys, [...keys].sort((a, b) => a.localeCompare(b, undefined, { numeric: true })), `${scenario} journal keys regress`);
@@ -499,12 +500,12 @@ function releaseContracts() {
         '--promotion', ...pair('promotion', 'c'),
         '--receipt-out', outPath(scenario),
       ];
-      if (scenario === 'finalize-resume') args.push('--resume-finalization', ...pair('prior-final-publication', 'd'));
+      if (scenario === 'finalize-resume') args.push('--resume-finalization', ...pair('prior-final-publication', 'd', 'resume-finalization'));
       const report = runReleaseFixture(fixtureRoot.root, 'finalize-reviewed', scenario, outcome, args);
       if (outcome === 'stable') {
         assert.equal(report.receipt.release_state, 'stable');
-        assert.equal(report.receipt.body.match(/```\n([^\n]+)\n```/)?.[1], 'docks-kit sync');
-        assert.doesNotMatch(report.receipt.body, /plugin install session-relay/i);
+        assert.equal(report.state.release.body.match(/```\n([^\n]+)\n```/)?.[1], 'docks-kit sync');
+        assert.doesNotMatch(report.state.release.body, /plugin install session-relay/i);
       }
     }
 
@@ -550,7 +551,7 @@ function releaseContracts() {
           fixtureRoot.root, 'legacy-release', `${plugin}-${bump}`, 'success',
           ['--plugin', plugin, bump],
         );
-        assert.equal(report.receipt.tag, `${plugin}--v${report.receipt.version}`);
+        assert.equal(report.state.tag, `${plugin}--v${report.state.version}`);
         assert.ok(report.calls.some((call) => call.argv?.includes('scripts/ci.mjs')));
       }
     }
@@ -583,6 +584,8 @@ function releaseContracts() {
       ['existing-output', validPublish],
       ['noncanonical-input', validPublish],
       ['wrong-input-digest', validPublish],
+      ['receipt-unknown-field', validPublish],
+      ['receipt-missing-field', validPublish],
     ]);
     for (const [scenario, args] of malformedCases) {
       if (scenario === 'existing-output') {
@@ -609,14 +612,14 @@ check('release prepare, evidence, publication, promotion, recovery, finalization
 function verifyCompanion() {
   if (!cli.publicRemote) return;
   assert.equal(cli.publicRemote, 'https://github.com/DocksDocks/public.git');
-  assert.match(cli.publicRef, /^refs\/heads\/validation\/session-relay-cli-[0-9a-f-]+$/);
+  assert.match(cli.publicRef, /^refs\/heads\/preflight\/session-relay-cli-0\.9\.0-[0-9a-f]{12}$/);
   const directory = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'session-relay-public-contract-')));
   const identity = fs.statSync(directory);
   try {
     git(directory, ['init', '-q']);
     git(directory, ['remote', 'add', 'origin', cli.publicRemote]);
-    git(directory, ['fetch', '--no-tags', '--depth=1', 'origin', `${cli.publicRef}:refs/remotes/origin/validation`]);
-    assert.equal(git(directory, ['rev-parse', 'refs/remotes/origin/validation^{commit}']), cli.publicCommit);
+    git(directory, ['fetch', '--no-tags', 'origin', `${cli.publicRef}:refs/remotes/origin/preflight`]);
+    assert.equal(git(directory, ['rev-parse', 'refs/remotes/origin/preflight^{commit}']), cli.publicCommit);
     git(directory, ['checkout', '--detach', '-q', cli.publicCommit]);
     assert.equal(git(directory, ['rev-parse', 'HEAD']), cli.publicCommit);
     assert.equal(git(directory, ['status', '--porcelain=v1']), '');
@@ -628,10 +631,15 @@ function verifyCompanion() {
     const planPath = planCandidates.find(fs.existsSync);
     assert.ok(planPath, 'companion plan is absent');
     const plan = fs.readFileSync(planPath, 'utf8');
-    assert.match(plan, /^execution_base_commit:\s*[0-9a-f]{40}$/m);
-    assert.match(plan, /^Review-receipt:\s*\{.*"outcome":"passed".*\}$/m);
-    assert.match(plan, /^- Companion status: blocked$/m);
-    assert.match(plan, /^- Companion blocked reason: Awaiting the four independently hashed `session-relay--v0\.12\.0` production asset digests\.$/m);
+    const executionBase = plan.match(/^execution_base_commit:\s*([0-9a-f]{40})$/m)?.[1];
+    assert.ok(executionBase, 'companion execution base is absent');
+    const reviewBytes = plan.match(/^Review-receipt:\s*(\{.*\})$/m)?.[1];
+    assert.ok(reviewBytes, 'companion review receipt is absent');
+    const review = JSON.parse(reviewBytes);
+    assert.equal(review.outcome, 'passed');
+    assert.match(plan, /^status:\s*blocked$/m);
+    const blockedReason = 'Awaiting the four independently hashed `session-relay--v0.12.0` production asset digests.';
+    assert.match(plan, new RegExp(`^- .*blocked reason: ${blockedReason.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'mi'));
     const receiptBytes = plan.match(/^- (?:Public|Companion) TDD-red receipt JCS bytes: (\{.*\})$/m)?.[1];
     const receiptHash = plan.match(/^- (?:Public|Companion) TDD-red receipt SHA-256: ([0-9a-f]{64})$/m)?.[1];
     assert.ok(receiptBytes && receiptHash, 'companion TDD-red receipt is absent');
@@ -643,6 +651,18 @@ function verifyCompanion() {
     assert.ok(receipt.test_paths.length > 0);
     for (const test of receipt.test_paths) assert.equal(git(directory, ['rev-parse', `${receipt.pre_production_commit}:${test.path}`]), test.blob_id);
     assert.equal(git(directory, ['merge-base', '--is-ancestor', receipt.pre_production_commit, cli.publicCommit]), '');
+    const docksPlan = fs.readFileSync(path.join(REPO, 'docs/plans/active/session-relay-prebuilt-cli-distribution.md'), 'utf8');
+    const docksField = (name) => docksPlan.match(new RegExp(`^- ${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}: (.+)$`, 'm'))?.[1];
+    assert.equal(docksField('Companion repository ID'), 'DocksDocks/public');
+    assert.equal(docksField('Companion validation ref'), cli.publicRef);
+    assert.equal(docksField('Companion implementation commit'), cli.publicCommit);
+    assert.equal(docksField('Companion plan input SHA-256'), review.input_sha256);
+    assert.equal(docksField('Companion execution-base commit'), executionBase);
+    assert.equal(docksField('Companion review receipt SHA-256'), sha256(reviewBytes));
+    assert.equal(docksField('Companion TDD-red receipt JCS bytes'), receiptBytes);
+    assert.equal(docksField('Companion TDD-red receipt SHA-256'), receiptHash);
+    assert.equal(docksField('Companion status'), 'blocked');
+    assert.equal(docksField('Companion blocked reason'), blockedReason);
     const toolchain = JSON.parse(fs.readFileSync(path.join(directory, 'SoT/toolchain.json'), 'utf8'));
     const relay = toolchain['session-relay'] ?? toolchain.tools?.['session-relay'];
     assert.equal(relay.repository, 'DocksDocks/docks');
