@@ -580,6 +580,10 @@ function releaseContracts() {
     assert.equal(dry.calls.some((call) => /ci\.mjs/.test(JSON.stringify(call))), false, 'dry-run executed CI');
     assert.deepEqual(dry.mutations, []);
     assert.match(JSON.stringify(dry), /real release|changed tree|gate/i);
+    const realDry = run('node', [
+      'scripts/release.mjs', '--prepare', '--plugin', 'session-relay', '--dry-run', '0.12.0',
+    ]);
+    assert.equal(realDry.status, 0, `real prepare dry-run failed: ${realDry.stderr}`);
     assert.equal(git(REPO, ['status', '--porcelain=v1', '--untracked-files=all']), before.get('status'));
     for (const [relative, bytes] of before) if (relative !== 'status') assert.deepEqual(fs.readFileSync(path.join(REPO, relative)), bytes);
 
