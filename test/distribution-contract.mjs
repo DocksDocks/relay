@@ -15,6 +15,7 @@ const HELPER = path.join(REPO, 'scripts/capture-tdd-red.mjs');
 const LAUNCHER = path.join(REPO, 'plugins/session-relay/bin/relay');
 const RELEASE = path.join(REPO, 'scripts/release.mjs');
 const WORKFLOW = path.join(REPO, '.github/workflows/build-binaries.yml');
+const CI_WORKFLOW = path.join(REPO, '.github/workflows/ci.yml');
 const SHA = /^[0-9a-f]{64}$/;
 const COMMIT = /^[0-9a-f]{40}$/;
 const ASSETS = [
@@ -436,6 +437,11 @@ function releaseContracts() {
   const fixtureRoot = releaseFixtureRoot();
   const inPath = (name) => path.join(fixtureRoot.root, `${name}.json`);
   const outPath = (name) => path.join(fixtureRoot.root, `${name}.receipt.json`);
+  const sourceCi = parseYaml(fs.readFileSync(CI_WORKFLOW, 'utf8'));
+  const sourceCiStepNames = JSON.stringify(sourceCi.jobs.validate.steps.map((step) => step.name ?? step.uses ?? ''));
+  for (const required of ['24', '--frozen-lockfile', '1.85.0', 'musl', 'scripts/ci.mjs']) {
+    assert.ok(sourceCiStepNames.includes(required), `source CI job metadata omits ${required}`);
+  }
   const pair = (name, digest, flag = name) => [inPath(name), `--${flag}-sha256`, digest.repeat(64)];
   try {
     for (const [scenario, outcome] of PUBLICATION_CASES) {
