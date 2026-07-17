@@ -439,7 +439,7 @@ function capturePublicRed(temp) {
   return { value: JSON.parse(fs.readFileSync(receiptOut, 'utf8')), digest: result.stdout.trim(), path: receiptOut };
 }
 
-function preparationAdapter({ plan, sourcePlan, docksRed, publicRed, publicPlan, sourceCi, unrelated = false, unrelatedExecutionBase = false, publicTamper = null }) {
+function preparationAdapter({ plan, sourcePlan, docksRed, publicRed, publicPlan, sourceCi, unrelated = false, unrelatedExecutionBase = false, publicTamper = null, status = '' }) {
   const evidenceCommit = '234567890abcdef1234567890abcdef123456789';
   return {
     repoRoot: process.cwd(),
@@ -448,7 +448,7 @@ function preparationAdapter({ plan, sourcePlan, docksRed, publicRed, publicPlan,
       if (joined === `rev-parse ${COMMIT}^{commit}`) return COMMIT;
       if (joined === 'rev-parse HEAD^{commit}') return evidenceCommit;
       if (args[0] === 'diff' && args[1] === '--name-only') return '';
-      if (args[0] === 'status') return '';
+      if (args[0] === 'status') return status;
       if (args[0] === 'merge-base' && args[1] === '--is-ancestor') {
         if (unrelated && args[2] === COMMIT && args[3] === evidenceCommit) throw new Error('not an ancestor');
         if (unrelatedExecutionBase && args[2] === '4567890abcdef1234567890abcdef12345678901' && args[3] === COMMIT) throw new Error('not an ancestor');
@@ -583,6 +583,29 @@ function testPreparationHandlers(temp, preflight, sourceCi) {
   assert.equal(candidate.receipt.source_commit, COMMIT);
   assert.deepEqual(candidate.receipt.checks.map(({ id }) => id), ['A1', 'A2', 'A3', 'A4', 'A5', 'A6']);
   assert.equal(candidate.receipt.checks[0].steps[0].argv[1], 'plugins/session-relay/test/companion-distribution-contract.mjs');
+  const dirtyPlanOptions = new Map(options);
+  dirtyPlanOptions.set('receipt-out', path.join(temp, 'candidate-dirty-plan.json'));
+  const dirtyPlan = checkPrepared(dirtyPlanOptions, preparationAdapter({
+    plan: sourcePlan,
+    sourcePlan,
+    docksRed,
+    publicRed: publicRed.value,
+    publicPlan,
+    sourceCi: sourceCi.result.receipt,
+    status: '1 .M N... 100644 100644 100644 abcdef1 abcdef1 docs/plans/active/session-relay-prebuilt-cli-distribution.md\0',
+  }));
+  assert.equal(dirtyPlan.receipt.source_commit, COMMIT);
+  const misleadingPlanOptions = new Map(options);
+  misleadingPlanOptions.set('receipt-out', path.join(temp, 'candidate-misleading-plan.json'));
+  expectReject('active-plan suffix substitution', () => checkPrepared(misleadingPlanOptions, preparationAdapter({
+    plan: sourcePlan,
+    sourcePlan,
+    docksRed,
+    publicRed: publicRed.value,
+    publicPlan,
+    sourceCi: sourceCi.result.receipt,
+    status: '1 M. N... 100644 100644 100644 abcdef1 abcdef1 x docs/plans/active/session-relay-prebuilt-cli-distribution.md\0',
+  })), /working tree is not clean/i);
 
   for (const publicTamper of ['ref', 'blob']) {
     const tamperedOptions = new Map(options);
