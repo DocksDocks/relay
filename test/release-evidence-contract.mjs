@@ -583,6 +583,9 @@ function testPreparationHandlers(temp, preflight, sourceCi) {
   assert.equal(candidate.receipt.source_commit, COMMIT);
   assert.deepEqual(candidate.receipt.checks.map(({ id }) => id), ['A1', 'A2', 'A3', 'A4', 'A5', 'A6']);
   assert.equal(candidate.receipt.checks[0].steps[0].argv[1], 'plugins/session-relay/test/companion-distribution-contract.mjs');
+  assert.deepEqual(candidate.receipt.checks[1].steps[0].argv, [
+    'cargo', '+1.85.0', 'build', '--manifest-path', 'plugins/session-relay/rust/Cargo.toml', '--release', '--locked',
+  ]);
   const dirtyPlanOptions = new Map(options);
   dirtyPlanOptions.set('receipt-out', path.join(temp, 'candidate-dirty-plan.json'));
   const dirtyPlan = checkPrepared(dirtyPlanOptions, preparationAdapter({
