@@ -11,6 +11,7 @@ import { parse as parseYaml } from 'yaml';
 
 import {
   bindCompletion,
+  prepareCiCall,
   checkPrepared,
   validateProducerPreflightReceipt,
   validateProof,
@@ -22,6 +23,7 @@ import {
 } from '../../../scripts/lib/session-relay-release-preparation.mjs';
 import { canonicalPlanView } from '../../../plugins/docks/skills/productivity/plan-review/scripts/review-policy.mjs';
 import { verifyPreflight } from '../../../scripts/verify-session-relay-preflight.mjs';
+import { runFixture } from '../../../scripts/lib/session-relay-release-fixture.mjs';
 
 const REPOSITORY_ID = 'DocksDocks/docks';
 const COMMIT = '1234567890abcdef1234567890abcdef12345678';
@@ -816,6 +818,38 @@ function testCompletionBinding(temp, preparation) {
 }
 
 
+function testPrepareFixtureUsesFullCi(temp) {
+  const fixturePath = path.join(temp, 'prepare-fixture.json');
+  const reportPath = path.join(temp, 'prepare-report.json');
+  fs.writeFileSync(fixturePath, JSON.stringify({
+    schema: 1,
+    type: 'SessionRelayReleaseFixtureV1',
+    scenario: 'prepare-full-ci',
+    repository_id: REPOSITORY_ID,
+    source_commit: COMMIT,
+    promoted_commit: '2'.repeat(40),
+    expected_origin_main: '3'.repeat(40),
+    tag: 'session-relay--v0.12.0',
+    assets: [],
+    expected_outcome: 'success',
+  }));
+  const previousFixture = process.env.SESSION_RELAY_RELEASE_FIXTURE;
+  const previousReport = process.env.SESSION_RELAY_RELEASE_REPORT;
+  try {
+    process.env.SESSION_RELAY_RELEASE_FIXTURE = fixturePath;
+    process.env.SESSION_RELAY_RELEASE_REPORT = reportPath;
+    assert.equal(runFixture(['--prepare', '--plugin', 'session-relay', '0.12.0'], { mode: 'prepare', options: new Map() }, null), true);
+  } finally {
+    if (previousFixture === undefined) delete process.env.SESSION_RELAY_RELEASE_FIXTURE;
+    else process.env.SESSION_RELAY_RELEASE_FIXTURE = previousFixture;
+    if (previousReport === undefined) delete process.env.SESSION_RELAY_RELEASE_REPORT;
+    else process.env.SESSION_RELAY_RELEASE_REPORT = previousReport;
+  }
+  const report = JSON.parse(fs.readFileSync(reportPath, 'utf8'));
+  assert.deepEqual(report.calls, [{ argv: ['node', 'scripts/ci.mjs'] }], 'Session Relay prepare must gate the exact changed tree with full CI');
+  assert.deepEqual(prepareCiCall(), { argv: ['node', 'scripts/ci.mjs'] }, 'production prepare journal must match the full CI command');
+}
+
 function testLiveSourceCiAndPrepareDryRun() {
   const repo = process.cwd();
   const sourceCi = parseYaml(fs.readFileSync(path.join(repo, '.github/workflows/ci.yml'), 'utf8'));
@@ -858,6 +892,7 @@ function main() {
     const preparation = testPreparationHandlers(temp, preflight, sourceCi);
     testCompletionBinding(temp, preparation);
     testArtifactAdversaries(temp);
+    testPrepareFixtureUsesFullCi(temp);
     testLiveSourceCiAndPrepareDryRun();
     console.log('release evidence contract: ok');
   } finally {

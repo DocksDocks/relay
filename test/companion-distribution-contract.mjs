@@ -50,6 +50,18 @@ function git(cwd, args, { ancestorMiss = false } = {}) {
   assert.equal(result.status, 0, `git ${args.join(' ')}: ${result.stderr}`);
   return result.stdout.trim();
 }
+function run(cwd, executable, args) {
+  const result = spawnSync(executable, args, {
+    cwd,
+    encoding: 'utf8',
+    shell: false,
+    env: { ...process.env, CI: '1' },
+    maxBuffer: 64 * 1024 * 1024,
+  });
+  assert.equal(result.signal, null, `${executable} ${args.join(' ')} terminated by ${result.signal}`);
+  assert.equal(result.status, 0, `${executable} ${args.join(' ')}: ${result.stderr || result.stdout}`);
+}
+
 
 function canonicalize(value) {
   if (value === null || typeof value !== 'object') return JSON.stringify(value);
@@ -104,6 +116,24 @@ function verify() {
       assert.equal(git(directory, ['rev-parse', `${receipt.pre_production_commit}:${test.path}`]), test.blob_id);
     }
     assert.notEqual(git(directory, ['merge-base', '--is-ancestor', receipt.pre_production_commit, cli.commit], { ancestorMiss: true }), null);
+    assert.deepEqual(receipt.test_paths.map(({ path: testPath }) => testPath).sort(), [
+      'cli/test/unit/pluginRefresh.test.ts',
+      'cli/test/unit/sessionRelayCli.test.ts',
+    ]);
+    assert.deepEqual(receipt.command.argv, [
+      'bun', 'run', 'test:unit', '--',
+      'cli/test/unit/sessionRelayCli.test.ts',
+      'cli/test/unit/pluginRefresh.test.ts',
+    ]);
+    for (const test of receipt.test_paths) {
+      assert.equal(git(directory, ['rev-parse', `${cli.commit}:${test.path}`]), test.blob_id, `${test.path} changed after the frozen TDD-red capture`);
+    }
+    assert.equal(fs.statSync(path.join(directory, 'bun.lock')).isFile(), true, 'companion lockfile is absent');
+    run(directory, 'bun', ['install', '--frozen-lockfile']);
+    run(directory, receipt.command.argv[0], receipt.command.argv.slice(1));
+    assert.equal(git(directory, ['rev-parse', 'HEAD']), cli.commit);
+    assert.equal(git(directory, ['status', '--porcelain=v1']), '', 'companion tests or setup changed the reviewed checkout');
+
 
     const docksPlan = fs.readFileSync(path.join(REPO, 'docs/plans/active/session-relay-prebuilt-cli-distribution.md'), 'utf8');
     const docksField = (name) => docksPlan.match(new RegExp(`^- ${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}: (.+)$`, 'm'))?.[1];
