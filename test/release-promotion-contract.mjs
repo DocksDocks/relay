@@ -5,6 +5,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
+import * as releasePromotion from '../../../scripts/lib/session-relay-release-promotion.mjs';
 import {
   PROMOTION_ADAPTER_KEYS,
   fetchPromotionAuthoritativeRef,
@@ -23,10 +24,11 @@ const PROMOTED_COMMIT = '3'.repeat(40);
 const LOCK_COMMIT = '4'.repeat(40);
 const RESTORE_COMMIT = '5'.repeat(40);
 const REAPPLY_COMMIT = '6'.repeat(40);
-const PUBLIC_COMMIT = '7'.repeat(40);
+const PUBLIC_REVIEWED_COMMIT = 'c3b542220d5a24a98ca05383bbe28afc2319b7e2';
+const PUBLIC_RELEASE_COMMIT = '7'.repeat(40);
 const DIGEST = (letter) => letter.repeat(64);
 const BLOB = (letter) => letter.repeat(40);
-const hash = (value) => createHash('sha256').update(typeof value === 'string' ? value : canonicalize(value)).digest('hex');
+const hash = (value) => createHash('sha256').update(Buffer.isBuffer(value) || typeof value === 'string' ? value : canonicalize(value)).digest('hex');
 const HOST_ASSET_DIGEST = '5'.repeat(64);
 
 const candidate = {
@@ -48,7 +50,7 @@ const candidate = {
   companion: {
     repository_id: 'DocksDocks/public',
     validation_ref: 'refs/heads/preflight/session-relay-0.12.0',
-    commit: PUBLIC_COMMIT,
+    commit: PUBLIC_REVIEWED_COMMIT,
     plan_path: 'docs/plans/active/session-relay-cli-installation.md',
     input_sha256: DIGEST('3'),
     execution_base_commit: BLOB('b'),
@@ -117,7 +119,7 @@ const proofValue = {
     verified: true,
   },
   public_repository_id: 'DocksDocks/public',
-  public_reviewed_commit: PUBLIC_COMMIT,
+  public_reviewed_commit: PUBLIC_REVIEWED_COMMIT,
   review_status: 'passed',
   bound_at: '2026-07-17T19:30:00.000Z',
 };
@@ -161,11 +163,83 @@ const publication = {
     created_at: '2026-07-17T20:00:00.000Z',
   },
 };
+const PUBLIC_ASSET_TARGETS = [
+  'x86_64-unknown-linux-musl',
+  'aarch64-unknown-linux-musl',
+  'x86_64-apple-darwin',
+  'aarch64-apple-darwin',
+];
+const PUBLIC_RELEASE_ASSET_NAMES = [
+  'SHA256SUMS',
+  'docks-kit-darwin-arm64',
+  'docks-kit-darwin-x64',
+  'docks-kit-linux-arm64',
+  'docks-kit-linux-x64',
+  'docks-kit-windows-x64.exe',
+];
+const publicationAssetPins = Object.fromEntries(PUBLIC_ASSET_TARGETS.map((target) => [
+  target,
+  assets.find(({ name }) => name === `session-relay-${target}`).digest,
+]));
+const publicRequestValue = {
+  schema: 1,
+  type: 'PublicReleaseRequestV1',
+  repository_id: 'DocksDocks/public',
+  tag: 'cli-v0.9.0',
+  version: '0.9.0',
+  companion_base_commit: PUBLIC_REVIEWED_COMMIT,
+  session_relay: {
+    repository_id: 'DocksDocks/docks',
+    tag: 'session-relay--v0.12.0',
+    version: '0.12.0',
+    tag_commit: TAG_COMMIT,
+    publication_receipt_sha256: publication.digest,
+  },
+  assets: publicationAssetPins,
+  created_at: '2026-07-17T20:30:00.000Z',
+};
+const publicReleaseValue = {
+  schema: 1,
+  type: 'PublicReleaseReceiptV1',
+  request_sha256: hash(publicRequestValue),
+  repository_id: 'DocksDocks/public',
+  tag: 'cli-v0.9.0',
+  version: '0.9.0',
+  release_commit: PUBLIC_RELEASE_COMMIT,
+  companion_base_commit: PUBLIC_REVIEWED_COMMIT,
+  ancestry_verified: true,
+  workflow: {
+    file: '.github/workflows/release-cli.yml',
+    run_database_id: 801,
+    run_attempt: 1,
+    conclusion: 'success',
+  },
+  release: {
+    database_id: 901,
+    assets: PUBLIC_RELEASE_ASSET_NAMES.map((name, index) => ({
+      name,
+      size: 2000 + index,
+      digest: String(index + 8).slice(-1).repeat(64),
+    })),
+    checksums_sha256: DIGEST('8'),
+  },
+  npm: { state: 'published' },
+  pinned_assets: publicationAssetPins,
+  public_plan: {
+    path: 'docs/plans/finished/2026-07-18-session-relay-cli-production-release.md',
+    completion_receipt_sha256: DIGEST('c'),
+  },
+  created_at: '2026-07-17T21:00:00.000Z',
+};
+const publicRelease = { digest: hash(publicReleaseValue), value: publicReleaseValue };
+
 
 function options(output = '/receipts/promotion.json', extra = {}) {
   return new Map(Object.entries({
     publication: '/receipts/publication.json',
     'publication-sha256': publication.digest,
+    'public-release': '/receipts/public-release.json',
+    'public-release-sha256': publicRelease.digest,
     'source-proof': '/receipts/proof.json',
     'source-proof-sha256': proof.digest,
     'docks-kit-release': 'cli-v0.9.0',
@@ -188,13 +262,13 @@ function smoke(kind) {
     installed_version: 'session-relay 0.12.0',
     launcher_sha256: DIGEST('a'),
     launcher_version: 'session-relay 0.12.0',
-    docks_kit_target_commit: PUBLIC_COMMIT,
+    docks_kit_target_commit: PUBLIC_RELEASE_COMMIT,
     docks_kit_asset: { name: 'docks-kit-linux-x64', database_id: 501, size: 2000, digest: DIGEST('9') },
     docks_kit_release_database_id: 601,
   };
 }
 
-function makeAdapter({ killAfter = null, killMutation = null, rejectMutation = null, outageAfterAppend = null, liveResults = [true], prepushThrows = false, prepushMutator = null, liveThrows = false, liveMutator = null, restoreDrift = false, reapplyDrift = false, ancestry = true, initialMain = OLD_MAIN, adoptionRerunParity = null } = {}) {
+function makeAdapter({ killAfter = null, killMutation = null, rejectMutation = null, outageAfterAppend = null, liveResults = [true], prepushThrows = false, prepushMutator = null, liveThrows = false, liveMutator = null, restoreDrift = false, reapplyDrift = false, ancestry = true, publicAncestry = true, initialMain = OLD_MAIN, adoptionRerunParity = null } = {}) {
   const state = {
     refs: new Map([['refs/heads/main', initialMain]]),
     journal: [],
@@ -244,6 +318,7 @@ function makeAdapter({ killAfter = null, killMutation = null, rejectMutation = n
     nonce: () => '0123456789abcdef0123456789abcdef',
     loadProof: () => proof,
     loadPublication: () => publication,
+    loadPublicRelease: () => publicRelease,
     loadRetryReceipt: (_opts) => {
       const bytes = state.outputs.get('/receipts/failure.json');
       assert.ok(bytes, 'retry input must be a receipt emitted by the state machine');
@@ -261,7 +336,11 @@ function makeAdapter({ killAfter = null, killMutation = null, rejectMutation = n
       assert.equal(tip, state.refs.get(TRANSACTION_REF));
       return state.journal.map((item) => structuredClone(item));
     },
-    isAncestor: () => ancestry,
+    isAncestor: (ancestorCommit, descendantCommit) => (
+      ancestorCommit === PUBLIC_REVIEWED_COMMIT && descendantCommit === PUBLIC_RELEASE_COMMIT
+        ? publicAncestry
+        : ancestry
+    ),
     createLockCommit: ({ nonce }) => {
       assert.equal(nonce, '0123456789abcdef0123456789abcdef');
       return LOCK_COMMIT;
@@ -328,18 +407,20 @@ function makeAdapter({ killAfter = null, killMutation = null, rejectMutation = n
         : null,
       verification_ok: true,
     }),
-    runPrepushSmoke: ({ docksKitRepository, docksKitRelease, sourceCommit }) => {
+    runPrepushSmoke: ({ docksKitRepository, docksKitRelease, sourceCommit, publicReleaseCommit }) => {
       if (prepushThrows) throw new Error('docks-kit identity failed');
-      state.calls.push({ operation: 'prepush', docksKitRepository, docksKitRelease, sourceCommit });
+      state.calls.push({ operation: 'prepush', docksKitRepository, docksKitRelease, sourceCommit, publicReleaseCommit });
       assert.equal(docksKitRepository, 'DocksDocks/public');
       assert.equal(docksKitRelease, 'cli-v0.9.0');
       assert.equal(sourceCommit, TAG_COMMIT);
+      assert.equal(publicReleaseCommit, PUBLIC_RELEASE_COMMIT);
       state.counts.prepush += 1;
       const evidence = smoke('exact_source');
       state.prepushMutator?.(evidence);
       return { ok: true, evidence };
     },
-    runLiveSmoke: () => {
+    runLiveSmoke: ({ publicReleaseCommit }) => {
+      assert.equal(publicReleaseCommit, PUBLIC_RELEASE_COMMIT);
       if (liveThrows) throw new Error('live launcher scan failed');
       state.counts.live += 1;
       const ok = state.liveResults.length > 1 ? state.liveResults.shift() : state.liveResults[0];
@@ -430,6 +511,211 @@ function runGit(cwd, args, expectOk = true) {
   return result;
 }
 
+const boundaryFixtureNames = [
+  'emit-public-request derivation',
+  'verify-public-release success',
+  'verify-public-release tag commit mismatch',
+  'verify-public-release broken companion ancestry',
+  'verify-public-release missing successful workflow run',
+  'verify-public-release duplicate successful workflow run',
+  'verify-public-release wrong six-asset set',
+  'verify-public-release checksum conflict',
+  'verify-public-release digest-pin mismatch',
+  'verify-public-release completion line hash mismatch',
+  'verify-public-release non-passed review_status',
+];
+const missingBoundaryFixtures = boundaryFixtureNames.filter((name) => (
+  name.startsWith('emit-')
+    ? typeof releasePromotion.emitPublicRequest !== 'function'
+    : typeof releasePromotion.verifyPublicRelease !== 'function'
+));
+assert.deepEqual(missingBoundaryFixtures, [], 'public release boundary fixture exports are not implemented');
+
+function writeBoundaryValue(directory, name, value) {
+  const file = path.join(directory, name);
+  const bytes = Buffer.from(canonicalize(value));
+  fs.writeFileSync(file, bytes, { mode: 0o600, flag: 'wx' });
+  return { file, bytes, digest: hash(bytes), value };
+}
+
+function captureDigest(action) {
+  const original = process.stdout.write;
+  let output = '';
+  process.stdout.write = (chunk) => {
+    output += Buffer.isBuffer(chunk) ? chunk.toString('utf8') : String(chunk);
+    return true;
+  };
+  try {
+    const value = action();
+    assert.match(output, /^[0-9a-f]{64}\n$/);
+    return value;
+  } finally {
+    process.stdout.write = original;
+  }
+}
+
+function publicBoundaryFixture(directory) {
+  const publicationFile = writeBoundaryValue(directory, 'publication.json', publication.value);
+  const requestOutput = path.join(directory, 'request.json');
+  const requestResult = captureDigest(() => releasePromotion.emitPublicRequest(new Map([
+    ['publication', publicationFile.file],
+    ['publication-sha256', publicationFile.digest],
+    ['receipt-out', requestOutput],
+  ]), { now: () => '2026-07-17T20:30:00.000Z' }));
+  const requestBytes = fs.readFileSync(requestOutput);
+  const request = { file: requestOutput, bytes: requestBytes, digest: hash(requestBytes), value: JSON.parse(requestBytes) };
+  const expectedRequest = {
+    ...publicRequestValue,
+    session_relay: {
+      ...publicRequestValue.session_relay,
+      publication_receipt_sha256: publicationFile.digest,
+    },
+  };
+  assert.deepEqual(request.value, expectedRequest, 'emit-public-request derivation');
+  assert.deepEqual(Object.keys(request.value).sort(), [
+    'assets', 'companion_base_commit', 'created_at', 'repository_id', 'schema',
+    'session_relay', 'tag', 'type', 'version',
+  ]);
+  assert.deepEqual(Object.keys(request.value.session_relay).sort(), [
+    'publication_receipt_sha256', 'repository_id', 'tag', 'tag_commit', 'version',
+  ]);
+  assert.deepEqual(Object.keys(request.value.assets).sort(), [...PUBLIC_ASSET_TARGETS].sort());
+  assert.equal(requestBytes.toString('utf8'), canonicalize(request.value));
+  assert.throws(
+    () => releasePromotion.emitPublicRequest(new Map([
+      ['publication', publicationFile.file],
+      ['publication-sha256', publicationFile.digest],
+      ['receipt-out', requestOutput],
+    ]), { now: () => '2026-07-17T20:30:00.000Z' }),
+    /output already exists/i,
+    'emit-public-request no-clobber emission',
+  );
+  assert.equal(requestResult.receipt.type, 'PublicReleaseRequestV1');
+  return { publicationFile, request };
+}
+
+function makePublicReleaseAdapter(request, {
+  tagCommit = PUBLIC_RELEASE_COMMIT,
+  ancestry = true,
+  runs,
+  removeAsset = null,
+  checksumConflict = false,
+  pinnedAssets = request.value.assets,
+  reviewStatus = 'passed',
+  completionReceipt = canonicalize({ schema: 5, phase: 'completion', outcome: 'passed' }),
+} = {}) {
+  const binaryNames = PUBLIC_RELEASE_ASSET_NAMES.filter((name) => name !== 'SHA256SUMS');
+  const binaries = new Map(binaryNames.map((name) => [name, Buffer.from(`public-release:${name}`)]));
+  let checksumBytes = Buffer.from(`${binaryNames.map((name) => `${hash(binaries.get(name))}  ${name}`).join('\n')}\n`);
+  if (checksumConflict) checksumBytes = Buffer.from(`${DIGEST('f')}  ${binaryNames[0]}\n`);
+  const bytesByName = new Map([...binaries, ['SHA256SUMS', checksumBytes]]);
+  let releaseAssets = PUBLIC_RELEASE_ASSET_NAMES.map((name, index) => {
+    const bytes = bytesByName.get(name);
+    return { id: 1000 + index, name, size: bytes.length, digest: `sha256:${hash(bytes)}` };
+  });
+  if (removeAsset !== null) releaseAssets = releaseAssets.filter(({ name }) => name !== removeAsset);
+  const release = {
+    id: 901,
+    tag_name: 'cli-v0.9.0',
+    draft: false,
+    prerelease: false,
+    assets: releaseAssets,
+  };
+  const successfulRun = {
+    id: 801,
+    run_attempt: 1,
+    head_sha: PUBLIC_RELEASE_COMMIT,
+    head_branch: 'cli-v0.9.0',
+    path: '.github/workflows/release-cli.yml',
+    event: 'push',
+    status: 'completed',
+    conclusion: 'success',
+  };
+  const selectedRuns = runs ?? [successfulRun];
+  const finishedPlan = Buffer.from([
+    '---',
+    'status: finished',
+    `review_status: ${reviewStatus}`,
+    '---',
+    '',
+    '# Public release',
+    '',
+    `Completion-review-receipt: ${completionReceipt}`,
+    '',
+  ].join('\n'));
+  const adapter = {
+    now: () => '2026-07-17T21:00:00.000Z',
+    getTagCommit: () => tagCommit,
+    isAncestor: () => ancestry,
+    getFinishedPlan: () => finishedPlan,
+    listWorkflowRuns: () => structuredClone(selectedRuns),
+    getRelease: () => structuredClone(release),
+    downloadReleaseAsset: (id) => {
+      const asset = releaseAssets.find((candidate) => candidate.id === id);
+      assert.ok(asset, `unexpected asset download ${id}`);
+      return Buffer.from(bytesByName.get(asset.name));
+    },
+    getPinnedAssets: () => structuredClone(pinnedAssets),
+    getNpmState: () => 'published',
+  };
+  return { adapter, completionDigest: hash(completionReceipt), successfulRun };
+}
+
+function verifyPublicBoundary(directory, boundary, adapter, {
+  output = 'public-release.json',
+  completionDigest = adapter.completionDigest,
+} = {}) {
+  return captureDigest(() => releasePromotion.verifyPublicRelease(new Map([
+    ['request', boundary.request.file],
+    ['request-sha256', boundary.request.digest],
+    ['publication', boundary.publicationFile.file],
+    ['publication-sha256', boundary.publicationFile.digest],
+    ['public-finished-plan', 'docs/plans/finished/2026-07-18-session-relay-cli-production-release.md'],
+    ['public-release-commit', PUBLIC_RELEASE_COMMIT],
+    ['public-completion-sha256', completionDigest],
+    ['receipt-out', path.join(directory, output)],
+  ]), adapter.adapter ?? adapter));
+}
+
+{
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'session-relay-public-boundary-'));
+  try {
+    const boundary = publicBoundaryFixture(directory);
+    const success = makePublicReleaseAdapter(boundary.request);
+    const verified = verifyPublicBoundary(directory, boundary, success);
+    assert.equal(verified.receipt.type, 'PublicReleaseReceiptV1', 'verify-public-release success');
+    assert.equal(verified.receipt.release_commit, PUBLIC_RELEASE_COMMIT);
+    assert.equal(verified.receipt.companion_base_commit, PUBLIC_REVIEWED_COMMIT);
+    assert.deepEqual(verified.receipt.pinned_assets, boundary.request.value.assets);
+    assert.deepEqual(verified.receipt.release.assets.map(({ name }) => name), PUBLIC_RELEASE_ASSET_NAMES);
+    assert.equal(fs.readFileSync(path.join(directory, 'public-release.json'), 'utf8'), canonicalize(verified.receipt));
+
+    const cases = [
+      ['tag commit mismatch', makePublicReleaseAdapter(boundary.request, { tagCommit: 'e'.repeat(40) }), {}, /tag.*commit|release commit/i],
+      ['broken companion ancestry', makePublicReleaseAdapter(boundary.request, { ancestry: false }), {}, /ancestor|ancestry/i],
+      ['missing successful workflow run', makePublicReleaseAdapter(boundary.request, { runs: [] }), {}, /workflow.*run|successful/i],
+      ['duplicate successful workflow run', (() => {
+        const value = makePublicReleaseAdapter(boundary.request);
+        return makePublicReleaseAdapter(boundary.request, { runs: [value.successfulRun, { ...value.successfulRun, id: 802 }] });
+      })(), {}, /workflow.*run|duplicate|exactly one/i],
+      ['wrong six-asset set', makePublicReleaseAdapter(boundary.request, { removeAsset: 'docks-kit-windows-x64.exe' }), {}, /asset set|six|assets/i],
+      ['checksum conflict', makePublicReleaseAdapter(boundary.request, { checksumConflict: true }), {}, /checksum|digest/i],
+      ['digest-pin mismatch', makePublicReleaseAdapter(boundary.request, { pinnedAssets: { ...boundary.request.value.assets, 'x86_64-unknown-linux-musl': DIGEST('f') } }), {}, /pinned|digest/i],
+      ['completion line hash mismatch', makePublicReleaseAdapter(boundary.request), { completionDigest: DIGEST('e') }, /completion.*hash|digest/i],
+      ['non-passed review_status', makePublicReleaseAdapter(boundary.request, { reviewStatus: 'failed' }), {}, /review_status|passed/i],
+    ];
+    for (const [name, adapter, overrides, pattern] of cases) {
+      assert.throws(
+        () => verifyPublicBoundary(directory, boundary, adapter, { output: `${name.replaceAll(' ', '-')}.json`, ...overrides }),
+        pattern,
+        `verify-public-release ${name}`,
+      );
+    }
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+}
+
 {
   const { adapter, state } = makeAdapter();
   const result = run(adapter);
@@ -437,17 +723,30 @@ function runGit(cwd, args, expectOk = true) {
   assert.equal(result.receipt.retryable, false);
   const wrongPublicTag = structuredClone(result.receipt);
   wrongPublicTag.public_tag_commit = 'e'.repeat(40);
-  assert.throws(() => validatePromotionReceipt(wrongPublicTag), /public reviewed|docks-kit/i);
+  assert.throws(() => validatePromotionReceipt(wrongPublicTag), /public release|docks-kit/i);
   const wrongDocksTarget = structuredClone(result.receipt);
   wrongDocksTarget.docks_kit.target_commit = 'e'.repeat(40);
-  assert.throws(() => validatePromotionReceipt(wrongDocksTarget), /public reviewed|docks-kit/i);
+  assert.throws(() => validatePromotionReceipt(wrongDocksTarget), /public release|docks-kit/i);
   const duplicateExcludedPath = structuredClone(result.receipt);
   duplicateExcludedPath.non_plan_tree_equivalence.excluded_paths = ['z', 'z'];
   assert.throws(() => validatePromotionReceipt(duplicateExcludedPath), /tree equivalence/i);
   assert.equal(validatePromotionReceipt(result.receipt), result.receipt);
   assert.throws(() => validatePromotionReceipt({ ...result.receipt, unknown: true }), /schema|keys|unknown|field/i);
   assert.equal(result.receipt.public_repository_id, 'DocksDocks/public');
-  assert.equal(result.receipt.public_reviewed_commit, PUBLIC_COMMIT);
+  assert.equal(result.receipt.public_reviewed_commit, PUBLIC_REVIEWED_COMMIT);
+  assert.equal(result.receipt.public_release_commit, PUBLIC_RELEASE_COMMIT);
+  assert.equal(result.receipt.public_release_receipt_sha256, publicRelease.digest);
+  assert.equal(result.receipt.public_tag_commit, PUBLIC_RELEASE_COMMIT);
+  assert.equal(result.receipt.docks_kit.target_commit, PUBLIC_RELEASE_COMMIT);
+  const oldShape = structuredClone(result.receipt);
+  delete oldShape.public_release_commit;
+  delete oldShape.public_release_receipt_sha256;
+  assert.throws(() => validatePromotionReceipt(oldShape), /unknown|missing|field|keys/i, 'old promotion receipt shape must be rejected');
+  assert.throws(
+    () => validatePromotionReceiptForFinalization(oldShape, { proof, publication }, adapter),
+    /unknown|missing|field|keys/i,
+    'finalization must reject the old promotion receipt shape',
+  );
   assert.deepEqual(result.receipt.docks_kit.asset, smoke('exact_source').docks_kit_asset);
   assert.deepEqual(phases(state), ['0:0:initialized', '0:1:locked', '0:2:prepush_passed', '0:3:main_pushed', '0:4:live_passed', '0:5:terminal_success']);
   assert.deepEqual(state.counts, { lock: 1, prepush: 1, main: 1, live: 1, restore: 0, reapply: 0, append: 6 });
@@ -665,7 +964,7 @@ for (const phase of ['locked', 'reapply_pushed']) {
   const before = { ...state.counts };
   const recovered = run(adapter, '/receipts/retry-terminal.json', {}, true);
   assert.equal(recovered.receipt.outcome, 'success');
-  assert.equal(recovered.receipt.public_reviewed_commit, PUBLIC_COMMIT);
+  assert.equal(recovered.receipt.public_reviewed_commit, PUBLIC_REVIEWED_COMMIT);
   run(adapter, '/receipts/retry-terminal.json', {}, true);
   assert.deepEqual(state.counts, before, 'retry terminal recovery is mutation-free and idempotent');
 }
@@ -841,6 +1140,12 @@ for (const releaseAbsent of [false, true]) {
 }
 
 {
+  const { adapter, state } = makeAdapter({ publicAncestry: false });
+  assert.throws(() => run(adapter, '/receipts/divergent-public-release.json'), /public.*ancestor|companion.*ancestry|lineage/i);
+  assert.deepEqual(state.counts, { lock: 0, prepush: 0, main: 0, live: 0, restore: 0, reapply: 0, append: 0 });
+}
+
+{
   const { adapter, state } = makeAdapter({ prepushThrows: true });
   const result = run(adapter, '/receipts/prepush-exception.json');
   assert.equal(result.receipt.outcome, 'failure');
@@ -970,17 +1275,21 @@ for (const releaseAbsent of [false, true]) {
   try {
     const proofPath = path.join(directory, 'proof.json');
     const publicationPath = path.join(directory, 'publication.json');
+    const publicReleasePath = path.join(directory, 'public-release.json');
     const receiptPath = path.join(directory, 'promotion.json');
     const successful = run(makeAdapter().adapter, path.join(directory, 'fake-output.json')).receipt;
     const proofBytes = Buffer.from(`${canonicalize(proof.value)}\n`);
     const publicationBytes = Buffer.from(`${canonicalize(publication.value)}\n`);
+    const publicReleaseBytes = Buffer.from(canonicalize(publicRelease.value));
     fs.writeFileSync(proofPath, proofBytes, { mode: 0o600 });
     fs.writeFileSync(publicationPath, publicationBytes, { mode: 0o600 });
+    fs.writeFileSync(publicReleasePath, publicReleaseBytes, { mode: 0o600 });
     fs.writeFileSync(receiptPath, `${canonicalize(successful)}\n`, { mode: 0o600 });
     const common = [
       '--plugin', 'session-relay',
       '--source-proof', proofPath, '--source-proof-sha256', hash(proofBytes),
       '--publication', publicationPath, '--publication-sha256', hash(publicationBytes),
+      '--public-release', publicReleasePath, '--public-release-sha256', hash(publicReleaseBytes),
       '--docks-kit-release', 'cli-v0.9.0',
       '--expected-origin-main', OLD_MAIN,
       '--receipt-out', receiptPath,
@@ -1067,5 +1376,16 @@ for (const releaseAbsent of [false, true]) {
     fs.rmSync(root, { recursive: true, force: true });
   }
 }
+
+await assert.rejects(
+  dispatchSessionRelayRelease(['--emit-public-request', '--plugin', 'session-relay', '0.12.0']),
+  /missing required option: --publication/i,
+  'emit-public-request CLI mode must be recognized',
+);
+await assert.rejects(
+  dispatchSessionRelayRelease(['--verify-public-release', '--plugin', 'session-relay', '0.12.0']),
+  /missing required option: --request/i,
+  'verify-public-release CLI mode must be recognized',
+);
 
 process.stdout.write('release promotion contract: OK\n');

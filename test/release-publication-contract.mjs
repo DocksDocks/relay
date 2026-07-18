@@ -1000,6 +1000,37 @@ try {
   }
 
   {
+    const directory = fs.mkdtempSync(path.join(root, 'finalize-crash-after-edit-'));
+    const fake = fakeAdapter();
+    const staged = publish(directory, fake);
+    const promotion = makePromotion(directory, staged.sourceProof, staged.options.get('receipt-out'));
+    const crashedOptions = finalizeOptions(directory, staged.sourceProof, staged.options.get('receipt-out'), promotion, 'crashed-final.json');
+    const mutateStable = fake.adapter.editStable;
+    fake.adapter.editStable = () => {
+      mutateStable();
+      throw new Error('simulated process death after editStable');
+    };
+    assert.throws(
+      () => finalizeReviewed(crashedOptions, fake.adapter, acceptPromotionReceipt),
+      /simulated process death after editStable/,
+      'finalization crash fixture must propagate termination after editStable',
+    );
+    assert.equal(fake.state.edited, 1);
+    assert.equal(fake.state.release.prerelease, false);
+    assert.equal(fs.existsSync(crashedOptions.get('receipt-out')), false, 'finalization crash fixture must not write a receipt');
+
+    fake.adapter.editStable = () => { throw new Error('base recovery attempted a second editStable'); };
+    const recoveryOptions = finalizeOptions(directory, staged.sourceProof, staged.options.get('receipt-out'), promotion, 'fresh-path-recovery.json');
+    finalizeReviewed(recoveryOptions, fake.adapter, acceptPromotionReceipt);
+    assert.equal(fake.state.edited, 1, 'fresh-path base recovery must perform exactly one total editStable');
+    const recovered = receiptAt(recoveryOptions.get('receipt-out'));
+    assert.equal(recovered.release_state, 'stable');
+    assert.equal(recovered.transition, 'already_stable');
+    assert.equal(fs.readFileSync(recoveryOptions.get('receipt-out'), 'utf8'), canonicalize(recovered));
+    checks += 1;
+  }
+
+  {
     const directory = fs.mkdtempSync(path.join(root, 'finalize-expired-artifacts-'));
     const fake = fakeAdapter();
     const staged = publish(directory, fake);
