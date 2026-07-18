@@ -232,10 +232,19 @@ function expectReject(label, fn, pattern) {
 }
 
 function extractDocksRedReceipt() {
-  const plan = fs.readFileSync(path.resolve('docs/plans/active/session-relay-prebuilt-cli-distribution.md'), 'utf8');
-  const match = plan.match(/^- Docks TDD-red receipt JCS bytes: (\{.*\})$/m);
-  assert.ok(match, 'active plan carries the real capture-helper receipt');
-  return JSON.parse(match[1]);
+  const active = path.resolve('docs/plans/active/session-relay-prebuilt-cli-distribution.md');
+  const finished = fs.readdirSync(path.resolve('docs/plans/finished'))
+    .filter((name) => /^\d{4}-\d{2}-\d{2}-session-relay-prebuilt-cli-distribution\.md$/.test(name))
+    .sort()
+    .reverse()
+    .map((name) => path.resolve('docs/plans/finished', name));
+  const candidates = fs.existsSync(active) ? [active, ...finished] : finished;
+  for (const candidate of candidates) {
+    const plan = fs.readFileSync(candidate, 'utf8');
+    const match = plan.match(/^- Docks TDD-red receipt JCS bytes: (\{.*\})$/m);
+    if (match) return JSON.parse(match[1]);
+  }
+  assert.fail('a tracked source-preparation plan carries the real capture-helper receipt');
 }
 
 function testClosedValidators(preflight) {
@@ -727,6 +736,7 @@ function testCompletionBinding(temp, preparation) {
     equivalent = true,
     sourceEvidenceClean = true,
     evidenceShippedClean = true,
+    evidenceBody = evidencePlan,
     shippedBody = finishedBody,
     shippedPlanMatches = true,
     dirty = false,
@@ -736,7 +746,7 @@ function testCompletionBinding(temp, preparation) {
     git(args) {
       const joined = args.join(' ');
       if (joined === 'rev-parse HEAD^{commit}') return shippedCommit;
-      if (joined === `show ${evidenceCommit}:docs/plans/active/session-relay-prebuilt-cli-distribution.md`) return Buffer.from(evidencePlan);
+      if (joined === `show ${evidenceCommit}:docs/plans/active/session-relay-prebuilt-cli-distribution.md`) return Buffer.from(evidenceBody);
       if (joined === `show ${COMMIT}:docs/plans/active/session-relay-prebuilt-cli-distribution.md`) return Buffer.from(preparation.sourcePlan);
       if (joined === `show ${shippedCommit}:docs/plans/finished/${finishedDate}-session-relay-prebuilt-cli-distribution.md`) {
         return Buffer.from(shippedPlanMatches ? shippedBody : `${shippedBody}\nsubstituted\n`);
@@ -774,6 +784,63 @@ function testCompletionBinding(temp, preparation) {
   assert.equal(loaded.value.evidence_commit, evidenceCommit);
   assert.equal(loaded.value.promoted_commit, shippedCommit);
   assert.deepEqual(result.receipt.candidate, preparation.candidate.receipt);
+  const waiver = {
+    phase: 'completion',
+    input_sha256: inputSha256,
+    roles: ['primary'],
+    actor: 'user',
+    reason: 'User explicitly waived the bounded completion review.',
+    at: '2026-07-17T18:29:00.000Z',
+  };
+  const waivedReviewer = {
+    raw: {
+      schema: 5,
+      role: 'primary',
+      request: completion.request,
+      result: 'waived',
+      attempts: [],
+      selected: null,
+      reviewer_output: null,
+      findings_sha256: null,
+      waiver,
+      waiver_sha256: sha256(Buffer.from(jcs(waiver))),
+      reason: null,
+    },
+    accepted_finding_ids: [],
+    rejected: [],
+  };
+  const waivedRun = {
+    ...completion.series.rounds[0],
+    reviewer: waivedReviewer,
+    reproduced: [],
+    outcome: 'waived',
+  };
+  const waivedCompletion = {
+    ...completion,
+    reviewer: waivedReviewer,
+    reproduced: [],
+    outcome: 'waived',
+    series: { ...completion.series, rounds: [waivedRun] },
+  };
+  const waivedEvidencePlan = evidencePlan.replace(
+    'review_status: null',
+    `review_waivers: ${jcs([waiver])}\nreview_status: null`,
+  );
+  const waivedFinishedBody = waivedEvidencePlan
+    .replace('status: in_review', 'status: finished')
+    .replace('review_status: null', 'review_status: passed')
+    + `\n## Review\n\nCompletion-review-receipt: ${jcs(waivedCompletion)}\n`;
+  const waivedFinished = makePlan('2026-07-30', waivedFinishedBody);
+  const waivedResult = bindCompletion(new Map([
+    ['finished-plan', waivedFinished],
+    ['embedded-candidate-sha256', sha256(fs.readFileSync(preparation.candidateOut))],
+    ['receipt-out', path.join(temp, 'waived-source-proof.json')],
+  ]), adapter({
+    evidenceBody: waivedEvidencePlan,
+    finishedDate: '2026-07-30',
+    shippedBody: waivedFinishedBody,
+  }));
+  validateSourcePreparationProof(waivedResult.receipt);
   const tamperedProof = structuredClone(result.receipt);
   tamperedProof.candidate.preflight.run_database_id += 1;
   expectReject('source proof nested candidate substitution', () => validateSourcePreparationProof(tamperedProof), /candidate|preflight|proof|source/i);
