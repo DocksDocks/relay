@@ -12,6 +12,7 @@ import { parse as parseYaml } from 'yaml';
 import {
   bindCompletion,
   prepareCiCall,
+  runPrepareCi,
   checkPrepared,
   validateProducerPreflightReceipt,
   validateProof,
@@ -848,6 +849,9 @@ function testPrepareFixtureUsesFullCi(temp) {
   const report = JSON.parse(fs.readFileSync(reportPath, 'utf8'));
   assert.deepEqual(report.calls, [{ argv: ['node', 'scripts/ci.mjs'] }], 'Session Relay prepare must gate the exact changed tree with full CI');
   assert.deepEqual(prepareCiCall(), { argv: ['node', 'scripts/ci.mjs'] }, 'production prepare journal must match the full CI command');
+  const observed = [];
+  assert.deepEqual(runPrepareCi((commandName, args, options) => observed.push({ commandName, args, options })), { argv: ['node', 'scripts/ci.mjs'] });
+  assert.deepEqual(observed, [{ commandName: 'node', args: ['scripts/ci.mjs'], options: { inherit: true } }], 'production prepare execution must equal its journal argv');
 }
 
 function testLiveSourceCiAndPrepareDryRun() {
