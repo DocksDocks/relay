@@ -761,6 +761,7 @@ function testCompletionBinding(temp, preparation) {
     shippedPlanMatches = true,
     dirty = false,
     finishedDate = '2026-07-17',
+    sourceBody = preparation.sourcePlan,
   } = {}) => ({
     repoRoot: root,
     git(args) {
@@ -768,7 +769,7 @@ function testCompletionBinding(temp, preparation) {
       if (joined === 'rev-parse HEAD^{commit}') return currentHead;
       if (joined === `log -n1 --format=%H -- docs/plans/finished/${finishedDate}-session-relay-prebuilt-cli-distribution.md`) return shippedCommit;
       if (joined === `show ${evidenceCommit}:docs/plans/active/session-relay-prebuilt-cli-distribution.md`) return Buffer.from(evidenceBody);
-      if (joined === `show ${COMMIT}:docs/plans/active/session-relay-prebuilt-cli-distribution.md`) return Buffer.from(preparation.sourcePlan);
+      if (joined === `show ${COMMIT}:docs/plans/active/session-relay-prebuilt-cli-distribution.md`) return Buffer.from(sourceBody);
       if (joined === `show ${shippedCommit}:docs/plans/finished/${finishedDate}-session-relay-prebuilt-cli-distribution.md`) {
         return Buffer.from(shippedPlanMatches ? shippedBody : `${shippedBody}\nsubstituted\n`);
       }
@@ -805,6 +806,59 @@ function testCompletionBinding(temp, preparation) {
   assert.equal(loaded.value.evidence_commit, evidenceCommit);
   assert.equal(loaded.value.promoted_commit, shippedCommit);
   assert.deepEqual(result.receipt.candidate, preparation.candidate.receipt);
+
+  // Model a candidate sealed before the raw-byte binder repair: its recorded
+  // source_blob_sha256 is the hash of the TRIMMED `git show` adapter output,
+  // while the binder now reads the raw blob (with its trailing newline).
+  const legacyCandidate = structuredClone(preparation.candidate.receipt);
+  legacyCandidate.plan.source_blob_sha256 = sha256(Buffer.from(preparation.sourcePlan.trim(), 'utf8'));
+  const legacyCandidateBytes = jcs(legacyCandidate);
+  const originalCandidateBytes = fs.readFileSync(preparation.candidateOut, 'utf8');
+  const legacyPlanText = preparation.plan
+    .replace(`- Source preparation candidate JCS bytes: ${originalCandidateBytes}`, `- Source preparation candidate JCS bytes: ${legacyCandidateBytes}\n`)
+    .replace(`- Source preparation candidate SHA-256: ${sha256(Buffer.from(originalCandidateBytes))}`, `- Source preparation candidate SHA-256: ${sha256(Buffer.from(legacyCandidateBytes))}`);
+  const legacyEvidencePlan = legacyPlanText
+    .replace('status: ongoing', 'status: in_review')
+    .replace('review_status: null', 'review_status: null');
+  const legacyInputSha256 = sha256(canonicalPlanView(Buffer.from(legacyEvidencePlan)));
+  const legacyTemplate = completionTemplate();
+  const legacyCompletion = replaceReceiptIdentity(legacyTemplate, new Map([
+    [legacyTemplate.reviewed_head, evidenceCommit],
+    [legacyTemplate.plan_input_sha256, legacyInputSha256],
+  ]));
+  const legacyFinishedBody = legacyEvidencePlan
+    .replace('status: in_review', 'status: finished')
+    .replace('review_status: null', 'review_status: passed')
+    + `\n## Review\n\nCompletion-review-receipt: ${jcs(legacyCompletion)}\n`;
+  const legacyFinished = makePlan('2026-07-16', legacyFinishedBody);
+  const legacyProofOut = path.join(temp, 'source-proof-legacy.json');
+  const legacyResult = bindCompletion(new Map([
+    ['finished-plan', legacyFinished],
+    ['embedded-candidate-sha256', sha256(Buffer.from(legacyCandidateBytes))],
+    ['receipt-out', legacyProofOut],
+  ]), adapter({
+    finishedDate: '2026-07-16',
+    evidenceBody: legacyEvidencePlan,
+    shippedBody: legacyFinishedBody,
+    sourceBody: preparation.sourcePlan,
+  }));
+  validateSourcePreparationProof(legacyResult.receipt);
+  assert.equal(
+    legacyResult.receipt.plans.source_sha256,
+    sha256(Buffer.from(preparation.sourcePlan)),
+    'legacy trimmed-candidate binding must record the raw source blob hash',
+  );
+  assert.equal(
+    legacyResult.receipt.candidate.plan.source_blob_sha256,
+    sha256(Buffer.from(preparation.sourcePlan.trim(), 'utf8')),
+    'legacy binding preserves the sealed candidate hash form',
+  );
+
+  expectReject('source blob content tamper', () => bindCompletion(new Map([
+    ['finished-plan', finished],
+    ['embedded-candidate-sha256', sha256(fs.readFileSync(preparation.candidateOut))],
+    ['receipt-out', path.join(temp, 'source-proof-tampered.json')],
+  ]), adapter({ sourceBody: `${preparation.sourcePlan}\ntampered` })), /source plan blob/);
   const waiver = {
     phase: 'completion',
     input_sha256: inputSha256,
