@@ -323,12 +323,25 @@ function expectConflict(action, pattern) {
   checks += 1;
 }
 
+function assertNoPublicationMutation(state) {
+  assert.deepEqual(state.pushed, []);
+  assert.deepEqual(state.dispatched, []);
+  assert.equal(state.created, 0);
+  assert.deepEqual(state.uploaded, []);
+}
+
 function publish(directory, adapterState, configureOptions) {
   const sourceProof = proof(directory);
   const options = optionsFor(directory, sourceProof);
   configureOptions?.(options);
   const result = publishReviewed(options, adapterState.adapter);
   return { result, sourceProof, options, receipt: receiptAt(options.get('receipt-out')) };
+}
+
+function rebind(directory, adapterState) {
+  return publish(directory, adapterState, (options) => {
+    options.set('rebind-complete-publication', true);
+  });
 }
 
 function makePromotion(directory, sourceProof, publicationFile, outcome = 'success') {
@@ -537,6 +550,72 @@ function assertWorkflowFailure(run, message) {
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'session-relay-publication-contract-'));
 try {
+  {
+    const cli = spawnSync(process.execPath, [
+      'scripts/release.mjs',
+      '--publish-reviewed',
+      '--plugin', 'session-relay',
+      VERSION,
+      '--source-proof', path.join(root, 'missing-source-proof.json'),
+      '--source-proof-sha256', 'a'.repeat(64),
+      '--rebind-complete-publication',
+      '--receipt-out', path.join(root, 'missing-source-proof-receipt.json'),
+    ], { cwd: process.cwd(), encoding: 'utf8' });
+    assert.notEqual(cli.status, 0, 'rebind grammar probe must stop before publication');
+    assert.doesNotMatch(cli.stderr, /unknown option/i, 'rebind flag must be accepted by the CLI grammar');
+    assert.match(cli.stderr, /--source-proof does not exist/i);
+    checks += 1;
+  }
+
+  {
+    const directory = fs.mkdtempSync(path.join(root, 'complete-without-explicit-rebind-'));
+    const fake = fakeAdapter();
+    const sourceProof = proof(directory);
+    const options = optionsFor(directory, sourceProof);
+    expectConflict(
+      () => publishReviewed(options, fake.adapter),
+      /complete matching prerelease.*rebind-complete-publication/i,
+    );
+    assertNoPublicationMutation(fake.state);
+    assert.equal(fake.state.releaseDownloads, 0);
+    assert.equal(fs.existsSync(options.get('receipt-out')), false);
+  }
+
+  for (const [label, release] of [
+    ['absent', null],
+    ['partial', prerelease(runAssetRecords(), { assets: releaseAssets(runAssetRecords(), { missing: [ASSETS[0]] }) })],
+  ]) {
+    const directory = fs.mkdtempSync(path.join(root, `explicit-rebind-${label}-`));
+    const fake = fakeAdapter({ release });
+    const sourceProof = proof(directory);
+    const options = optionsFor(directory, sourceProof);
+    options.set('rebind-complete-publication', true);
+    expectConflict(
+      () => publishReviewed(options, fake.adapter),
+      /rebind.*complete matching prerelease/i,
+    );
+    assertNoPublicationMutation(fake.state);
+    assert.equal(fake.state.releaseDownloads, 0);
+    assert.equal(fs.existsSync(options.get('receipt-out')), false);
+  }
+
+  {
+    const directory = fs.mkdtempSync(path.join(root, 'explicit-complete-rebind-'));
+    const fake = fakeAdapter();
+    const sourceProof = proof(directory);
+    const options = optionsFor(directory, sourceProof);
+    options.set('rebind-complete-publication', true);
+    publishReviewed(options, fake.adapter);
+    const receipt = receiptAt(options.get('receipt-out'));
+    assert.equal(receipt.transition, 'reconciled');
+    assert.equal(receipt.release_state, 'prerelease');
+    assert.equal(receipt.workflow.event, 'push');
+    assertNoPublicationMutation(fake.state);
+    assert.equal(fake.state.downloaded.length, 0);
+    assert.equal(fake.state.releaseDownloads, 1);
+    checks += 1;
+  }
+
   {
     const absent = runPublicationWorkflow(root);
     assert.equal(absent.result.status, 0, absent.result.stderr);
@@ -794,7 +873,7 @@ try {
       downloadAttempts += 1;
       throw new SessionRelayReleaseError('Actions artifacts unavailable', 'failure');
     };
-    const staged = publish(directory, fake);
+    const staged = rebind(directory, fake);
     assert.equal(staged.receipt.workflow.run_id, 701);
     assert.equal(fake.state.dispatched.length, 0);
 
@@ -836,8 +915,10 @@ try {
       fake.state.checksumEntries[0].digest = 'f'.repeat(64);
     }
     const sourceProof = proof(directory);
+    const options = optionsFor(directory, sourceProof);
+    options.set('rebind-complete-publication', true);
     expectConflict(
-      () => publishReviewed(optionsFor(directory, sourceProof), fake.adapter),
+      () => publishReviewed(options, fake.adapter),
       conflict === 'timestamp' || conflict.includes('publisher')
         ? /timestamp|run window|publisher/i
         : conflict === 'database-id' ? /database identity|duplicate/i : /digest|checksum/i,
@@ -849,9 +930,11 @@ try {
 
   {
     const directory = fs.mkdtempSync(path.join(root, 'live-release-requery-drift-'));
-    const fake = fakeAdapter({ releaseDriftAt: 3 });
+    const fake = fakeAdapter({ releaseDriftAt: 2 });
     const sourceProof = proof(directory);
-    expectConflict(() => publishReviewed(optionsFor(directory, sourceProof), fake.adapter), /drift|changed/i);
+    const options = optionsFor(directory, sourceProof);
+    options.set('rebind-complete-publication', true);
+    expectConflict(() => publishReviewed(options, fake.adapter), /drift|changed/i);
     assert.equal(fake.state.dispatched.length, 0);
     assert.equal(fake.state.created, 0);
     assert.equal(fake.state.uploaded.length, 0);
@@ -889,7 +972,7 @@ try {
   {
     const directory = fs.mkdtempSync(path.join(root, 'resume-'));
     const fake = fakeAdapter();
-    const first = publish(directory, fake);
+    const first = rebind(directory, fake);
     const secondOptions = optionsFor(directory, first.sourceProof, 'resumed.json');
     secondOptions.set('resume-publication', first.options.get('receipt-out'));
     secondOptions.set('resume-publication-sha256', sha256(fs.readFileSync(first.options.get('receipt-out'))));
@@ -905,7 +988,7 @@ try {
   {
     const directory = fs.mkdtempSync(path.join(root, 'resume-partial-release-conflict-'));
     const fake = fakeAdapter();
-    const first = publish(directory, fake);
+    const first = rebind(directory, fake);
     const resumeOptions = optionsFor(directory, first.sourceProof, 'partial-resume.json');
     resumeOptions.set('resume-publication', first.options.get('receipt-out'));
     resumeOptions.set('resume-publication-sha256', sha256(fs.readFileSync(first.options.get('receipt-out'))));
@@ -956,7 +1039,7 @@ try {
   {
     const directory = fs.mkdtempSync(path.join(root, 'complete-resume-expired-artifacts-'));
     const fake = fakeAdapter();
-    const first = publish(directory, fake);
+    const first = rebind(directory, fake);
     const resumeOptions = optionsFor(directory, first.sourceProof, 'expired-resumed.json');
     resumeOptions.set('resume-publication', first.options.get('receipt-out'));
     resumeOptions.set('resume-publication-sha256', sha256(fs.readFileSync(first.options.get('receipt-out'))));
@@ -970,7 +1053,7 @@ try {
   {
     const directory = fs.mkdtempSync(path.join(root, 'finalize-'));
     const fake = fakeAdapter();
-    const staged = publish(directory, fake);
+    const staged = rebind(directory, fake);
     const promotion = makePromotion(directory, staged.sourceProof, staged.options.get('receipt-out'));
     const options = finalizeOptions(directory, staged.sourceProof, staged.options.get('receipt-out'), promotion);
     const injectedPromotionAdapter = Object.freeze({ authority: 'promotion-test-only' });
@@ -1002,7 +1085,7 @@ try {
   {
     const directory = fs.mkdtempSync(path.join(root, 'finalize-crash-after-edit-'));
     const fake = fakeAdapter();
-    const staged = publish(directory, fake);
+    const staged = rebind(directory, fake);
     const promotion = makePromotion(directory, staged.sourceProof, staged.options.get('receipt-out'));
     const crashedOptions = finalizeOptions(directory, staged.sourceProof, staged.options.get('receipt-out'), promotion, 'crashed-final.json');
     const mutateStable = fake.adapter.editStable;
@@ -1033,7 +1116,7 @@ try {
   {
     const directory = fs.mkdtempSync(path.join(root, 'finalize-expired-artifacts-'));
     const fake = fakeAdapter();
-    const staged = publish(directory, fake);
+    const staged = rebind(directory, fake);
     const promotion = makePromotion(directory, staged.sourceProof, staged.options.get('receipt-out'));
     fake.adapter.downloadRunAssets = () => { throw new Error('Actions artifacts expired'); };
     const options = finalizeOptions(directory, staged.sourceProof, staged.options.get('receipt-out'), promotion);
@@ -1045,7 +1128,7 @@ try {
   for (const kind of ['missing', 'rejecting']) {
     const directory = fs.mkdtempSync(path.join(root, `promotion-validator-${kind}-`));
     const fake = fakeAdapter();
-    const staged = publish(directory, fake);
+    const staged = rebind(directory, fake);
     const promotion = makePromotion(directory, staged.sourceProof, staged.options.get('receipt-out'));
     const options = finalizeOptions(directory, staged.sourceProof, staged.options.get('receipt-out'), promotion);
     const releaseQueries = fake.state.releaseQueries;
@@ -1062,7 +1145,7 @@ try {
   {
     const directory = fs.mkdtempSync(path.join(root, 'finalize-body-conflict-'));
     const fake = fakeAdapter();
-    const staged = publish(directory, fake);
+    const staged = rebind(directory, fake);
     const promotion = makePromotion(directory, staged.sourceProof, staged.options.get('receipt-out'));
     fake.state.release.body = 'drifted staging body';
     const options = finalizeOptions(directory, staged.sourceProof, staged.options.get('receipt-out'), promotion);
@@ -1073,7 +1156,7 @@ try {
   {
     const directory = fs.mkdtempSync(path.join(root, 'finalize-release-conflict-'));
     const fake = fakeAdapter();
-    const staged = publish(directory, fake);
+    const staged = rebind(directory, fake);
     const promotion = makePromotion(directory, staged.sourceProof, staged.options.get('receipt-out'));
     fake.state.release.id += 1;
     const options = finalizeOptions(directory, staged.sourceProof, staged.options.get('receipt-out'), promotion);
