@@ -27,6 +27,7 @@ const SOURCE = '1'.repeat(40);
 const WORKFLOW_PATH = '.github/workflows/build-binaries.yml';
 const POLL_LIMIT = 12;
 const acceptPromotionReceipt = (receipt) => receipt;
+const RECONCILER = Object.freeze({ id: 55303379, login: 'DocksDocks', type: 'User' });
 let checks = 0;
 
 function writeCanonical(directory, name, value) {
@@ -152,6 +153,7 @@ function run(id = 701, event = 'push') {
     conclusion: 'success',
     run_started_at: '2026-07-17T11:59:00.000Z',
     updated_at: '2026-07-17T12:01:00.000Z',
+    actor: RECONCILER,
   };
 }
 
@@ -221,6 +223,21 @@ function prerelease(runAssets, overrides = {}) {
     assets: releaseAssets(runAssets),
     ...overrides,
   };
+}
+
+function reconciledPrerelease(runAssets, overrides = {}) {
+  return prerelease(runAssets, {
+    created_at: '2026-07-17T10:00:00.000Z',
+    published_at: '2026-07-17T12:03:00.000Z',
+    author: RECONCILER,
+    assets: releaseAssets(runAssets).map((asset) => ({
+      ...asset,
+      created_at: '2026-07-17T12:02:30.000Z',
+      updated_at: '2026-07-17T12:03:00.000Z',
+      uploader: RECONCILER,
+    })),
+    ...overrides,
+  });
 }
 
 function fakeAdapter({
@@ -611,10 +628,66 @@ try {
     assert.equal(receipt.release_state, 'prerelease');
     assert.equal(receipt.workflow.event, 'push');
     assertNoPublicationMutation(fake.state);
-    assert.equal(fake.state.downloaded.length, 0);
+    assert.deepEqual(fake.state.downloaded, []);
     assert.equal(fake.state.releaseDownloads, 1);
     checks += 1;
   }
+
+  {
+    const directory = fs.mkdtempSync(path.join(root, 'explicit-rebind-reconciled-shell-'));
+    const assets = runAssetRecords();
+    const fake = fakeAdapter({
+      release: reconciledPrerelease(assets),
+      publisher: RECONCILER,
+    });
+    const rebound = rebind(directory, fake);
+    assert.equal(rebound.receipt.transition, 'reconciled');
+    assert.deepEqual(fake.state.downloaded, [701]);
+    assert.equal(fake.state.releaseDownloads, 1);
+    assertNoPublicationMutation(fake.state);
+    checks += 1;
+  }
+
+  {
+    const directory = fs.mkdtempSync(path.join(root, 'explicit-rebind-run-artifact-conflict-'));
+    const releaseAssetsFromRun = runAssetRecords();
+    const conflictingRunAssets = runAssetRecords();
+    conflictingRunAssets[0] = { ...conflictingRunAssets[0], digest: 'f'.repeat(64) };
+    const boundRun = run();
+    const fake = fakeAdapter({
+      release: reconciledPrerelease(releaseAssetsFromRun),
+      runAssets: conflictingRunAssets,
+      attestations: runAttestationRecords(boundRun, conflictingRunAssets),
+      publisher: RECONCILER,
+    });
+    const sourceProof = proof(directory);
+    const options = optionsFor(directory, sourceProof);
+    options.set('rebind-complete-publication', true);
+    expectConflict(
+      () => publishReviewed(options, fake.adapter),
+      /bound run.*release asset|run artifact.*conflict/i,
+    );
+    assertNoPublicationMutation(fake.state);
+    assert.equal(fs.existsSync(options.get('receipt-out')), false);
+  }
+
+  {
+    const directory = fs.mkdtempSync(path.join(root, 'explicit-rebind-reconciler-conflict-'));
+    const assets = runAssetRecords();
+    const fake = fakeAdapter({
+      release: reconciledPrerelease(assets, {
+        author: { id: 1, login: 'replacement-user', type: 'User' },
+      }),
+      publisher: RECONCILER,
+    });
+    const sourceProof = proof(directory);
+    const options = optionsFor(directory, sourceProof);
+    options.set('rebind-complete-publication', true);
+    expectConflict(() => publishReviewed(options, fake.adapter), /publisher identity conflict/i);
+    assertNoPublicationMutation(fake.state);
+    assert.equal(fs.existsSync(options.get('receipt-out')), false);
+  }
+
 
   {
     const absent = runPublicationWorkflow(root);
