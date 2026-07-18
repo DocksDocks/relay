@@ -22,6 +22,7 @@ import {
   verifyEmbedded,
   verifySourceCi,
 } from '../../../scripts/lib/session-relay-release-preparation.mjs';
+import { gitRaw } from '../../../scripts/lib/session-relay-release-core.mjs';
 import { canonicalPlanView } from '../../../plugins/docks/skills/productivity/plan-review/scripts/review-policy.mjs';
 import { verifyPreflight } from '../../../scripts/verify-session-relay-preflight.mjs';
 import { runFixture } from '../../../scripts/lib/session-relay-release-fixture.mjs';
@@ -42,6 +43,25 @@ const TARGETS = [
 
 function sha256(bytes) {
   return createHash('sha256').update(bytes).digest('hex');
+}
+
+function testRawGitBytes(temp) {
+  const repo = path.join(temp, 'raw-git');
+  fs.mkdirSync(repo);
+  for (const args of [
+    ['init', '--quiet'],
+    ['config', 'user.name', 'Session Relay Test'],
+    ['config', 'user.email', 'relay-test@example.invalid'],
+  ]) {
+    const result = spawnSync('git', args, { cwd: repo, encoding: 'utf8', shell: false });
+    assert.equal(result.status, 0, result.stderr);
+  }
+  fs.writeFileSync(path.join(repo, 'payload.txt'), 'terminal newline\n');
+  const commit = spawnSync('git', ['add', 'payload.txt'], { cwd: repo, encoding: 'utf8', shell: false });
+  assert.equal(commit.status, 0, commit.stderr);
+  const committed = spawnSync('git', ['commit', '--quiet', '-m', 'fixture'], { cwd: repo, encoding: 'utf8', shell: false });
+  assert.equal(committed.status, 0, committed.stderr);
+  assert.deepEqual(gitRaw(['-C', repo, 'show', 'HEAD:payload.txt']), Buffer.from('terminal newline\n'));
 }
 
 function jcs(value) {
@@ -709,6 +729,7 @@ function completionTemplate() {
 function testCompletionBinding(temp, preparation) {
   const evidenceCommit = '234567890abcdef1234567890abcdef123456789';
   const shippedCommit = '567890abcdef1234567890abcdef123456789012';
+  const currentHead = '67890abcdef1234567890abcdef1234567890123';
   const evidencePlan = preparation.plan
     .replace('status: ongoing', 'status: in_review')
     .replace('review_status: null', 'review_status: null');
@@ -725,7 +746,6 @@ function testCompletionBinding(temp, preparation) {
   const root = path.join(temp, 'completion-root');
   const finishedDirectory = path.join(root, 'docs/plans/finished');
   fs.mkdirSync(finishedDirectory, { recursive: true, mode: 0o700 });
-
   const makePlan = (date, body = finishedBody) => {
     const file = path.join(finishedDirectory, `${date}-session-relay-prebuilt-cli-distribution.md`);
     fs.writeFileSync(file, body);
@@ -745,7 +765,8 @@ function testCompletionBinding(temp, preparation) {
     repoRoot: root,
     git(args) {
       const joined = args.join(' ');
-      if (joined === 'rev-parse HEAD^{commit}') return shippedCommit;
+      if (joined === 'rev-parse HEAD^{commit}') return currentHead;
+      if (joined === `log -n1 --format=%H -- docs/plans/finished/${finishedDate}-session-relay-prebuilt-cli-distribution.md`) return shippedCommit;
       if (joined === `show ${evidenceCommit}:docs/plans/active/session-relay-prebuilt-cli-distribution.md`) return Buffer.from(evidenceBody);
       if (joined === `show ${COMMIT}:docs/plans/active/session-relay-prebuilt-cli-distribution.md`) return Buffer.from(preparation.sourcePlan);
       if (joined === `show ${shippedCommit}:docs/plans/finished/${finishedDate}-session-relay-prebuilt-cli-distribution.md`) {
@@ -953,6 +974,7 @@ function main() {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'session-relay-release-evidence-'));
   fs.chmodSync(temp, 0o700);
   try {
+    testRawGitBytes(temp);
     const preflight = runPreflight(temp);
     assert.equal(fs.statSync(preflight.receiptOut).mode & 0o777, 0o600);
     assert.equal(preflight.receipt.workflow.file_blob_id, WORKFLOW_BLOB);
