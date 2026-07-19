@@ -26,6 +26,7 @@ const RESTORE_COMMIT = '5'.repeat(40);
 const REAPPLY_COMMIT = '6'.repeat(40);
 const PUBLIC_REVIEWED_COMMIT = 'c3b542220d5a24a98ca05383bbe28afc2319b7e2';
 const PUBLIC_RELEASE_COMMIT = '7'.repeat(40);
+const PUBLIC_PLAN_COMMIT = '8'.repeat(40);
 const DIGEST = (letter) => letter.repeat(64);
 const BLOB = (letter) => letter.repeat(40);
 const hash = (value) => createHash('sha256').update(Buffer.isBuffer(value) || typeof value === 'string' ? value : canonicalize(value)).digest('hex');
@@ -226,6 +227,7 @@ const publicReleaseValue = {
   npm: { state: 'published' },
   pinned_assets: publicationAssetPins,
   public_plan: {
+    commit: PUBLIC_PLAN_COMMIT,
     path: 'docs/plans/finished/2026-07-18-session-relay-cli-production-release.md',
     completion_receipt_sha256: DIGEST('c'),
   },
@@ -516,6 +518,7 @@ const boundaryFixtureNames = [
   'verify-public-release success',
   'verify-public-release tag commit mismatch',
   'verify-public-release broken companion ancestry',
+  'verify-public-release broken plan ancestry',
   'verify-public-release missing successful workflow run',
   'verify-public-release duplicate successful workflow run',
   'verify-public-release wrong six-asset set',
@@ -596,7 +599,8 @@ function publicBoundaryFixture(directory) {
 
 function makePublicReleaseAdapter(request, {
   tagCommit = PUBLIC_RELEASE_COMMIT,
-  ancestry = true,
+  releaseAncestry = true,
+  planAncestry = true,
   runs,
   removeAsset = null,
   checksumConflict = false,
@@ -646,8 +650,15 @@ function makePublicReleaseAdapter(request, {
   const adapter = {
     now: () => '2026-07-17T21:00:00.000Z',
     getTagCommit: () => tagCommit,
-    isAncestor: () => ancestry,
-    getFinishedPlan: () => finishedPlan,
+    isAncestor: (ancestor, descendant) => {
+      if (ancestor === PUBLIC_REVIEWED_COMMIT && descendant === PUBLIC_RELEASE_COMMIT) return releaseAncestry;
+      if (ancestor === PUBLIC_RELEASE_COMMIT && descendant === PUBLIC_PLAN_COMMIT) return planAncestry;
+      assert.fail(`unexpected public ancestry check: ${ancestor}...${descendant}`);
+    },
+    getFinishedPlan: (commit) => {
+      assert.equal(commit, PUBLIC_PLAN_COMMIT, 'finished plan must be read from the public plan commit');
+      return finishedPlan;
+    },
     listWorkflowRuns: () => structuredClone(selectedRuns),
     getRelease: () => structuredClone(release),
     downloadReleaseAsset: (id) => {
@@ -672,6 +683,7 @@ function verifyPublicBoundary(directory, boundary, adapter, {
     ['publication-sha256', boundary.publicationFile.digest],
     ['public-finished-plan', 'docs/plans/finished/2026-07-18-session-relay-cli-production-release.md'],
     ['public-release-commit', PUBLIC_RELEASE_COMMIT],
+    ['public-plan-commit', PUBLIC_PLAN_COMMIT],
     ['public-completion-sha256', completionDigest],
     ['receipt-out', path.join(directory, output)],
   ]), adapter.adapter ?? adapter));
@@ -685,6 +697,7 @@ function verifyPublicBoundary(directory, boundary, adapter, {
     const verified = verifyPublicBoundary(directory, boundary, success);
     assert.equal(verified.receipt.type, 'PublicReleaseReceiptV1', 'verify-public-release success');
     assert.equal(verified.receipt.release_commit, PUBLIC_RELEASE_COMMIT);
+    assert.equal(verified.receipt.public_plan.commit, PUBLIC_PLAN_COMMIT);
     assert.equal(verified.receipt.companion_base_commit, PUBLIC_REVIEWED_COMMIT);
     assert.deepEqual(verified.receipt.pinned_assets, boundary.request.value.assets);
     assert.deepEqual(verified.receipt.release.assets.map(({ name }) => name), PUBLIC_RELEASE_ASSET_NAMES);
@@ -692,7 +705,8 @@ function verifyPublicBoundary(directory, boundary, adapter, {
 
     const cases = [
       ['tag commit mismatch', makePublicReleaseAdapter(boundary.request, { tagCommit: 'e'.repeat(40) }), {}, /tag.*commit|release commit/i],
-      ['broken companion ancestry', makePublicReleaseAdapter(boundary.request, { ancestry: false }), {}, /ancestor|ancestry/i],
+      ['broken plan ancestry', makePublicReleaseAdapter(boundary.request, { planAncestry: false }), {}, /finished-plan.*ancestry|plan.*ancestry/i],
+      ['broken companion ancestry', makePublicReleaseAdapter(boundary.request, { releaseAncestry: false }), {}, /ancestor|ancestry/i],
       ['missing successful workflow run', makePublicReleaseAdapter(boundary.request, { runs: [] }), {}, /workflow.*run|successful/i],
       ['duplicate successful workflow run', (() => {
         const value = makePublicReleaseAdapter(boundary.request);
