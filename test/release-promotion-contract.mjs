@@ -620,6 +620,26 @@ function publicBoundaryFixture(directory) {
   return { publicationFile, request };
 }
 
+function completePublicCompletionReceipt() {
+  const producerPlan = fs.readFileSync('docs/plans/finished/2026-07-17-completion-reuse-terminal-lf.md', 'utf8');
+  const match = producerPlan.match(/^Completion-review-receipt: (\{.*\})$/m);
+  assert.ok(match, 'a complete schema-5 plan-manager completion receipt is available as the producer fixture');
+  const receipt = JSON.parse(match[1]);
+  const reviewedHead = receipt.reviewed_head;
+  return JSON.parse(JSON.stringify(receipt).replaceAll(reviewedHead, PUBLIC_RELEASE_COMMIT));
+}
+
+function completionReceiptForReviewedHead(reviewedHead) {
+  const receipt = completePublicCompletionReceipt();
+  return JSON.parse(JSON.stringify(receipt).replaceAll(PUBLIC_RELEASE_COMMIT, reviewedHead));
+}
+
+function changedCompletionReceipt(change) {
+  const receipt = completePublicCompletionReceipt();
+  change(receipt);
+  return receipt;
+}
+
 function makePublicReleaseAdapter(request, {
   tagCommit = PUBLIC_RELEASE_COMMIT,
   releaseAncestry = true,
@@ -629,8 +649,9 @@ function makePublicReleaseAdapter(request, {
   checksumConflict = false,
   pinnedAssets = request.value.assets,
   reviewStatus = 'passed',
-  completionReceipt = canonicalize({ schema: 5, phase: 'completion', outcome: 'passed' }),
+  completionReceipt = completePublicCompletionReceipt(),
 } = {}) {
+  const completionReceiptText = canonicalize(completionReceipt);
   const binaryNames = PUBLIC_RELEASE_ASSET_NAMES.filter((name) => name !== 'SHA256SUMS');
   const binaries = new Map(binaryNames.map((name) => [name, Buffer.from(`public-release:${name}`)]));
   let checksumBytes = Buffer.from(`${binaryNames.map((name) => `${hash(binaries.get(name))}  ${name}`).join('\n')}\n`);
@@ -667,7 +688,7 @@ function makePublicReleaseAdapter(request, {
     '',
     '# Public release',
     '',
-    `Completion-review-receipt: ${completionReceipt}`,
+    `Completion-review-receipt: ${completionReceiptText}`,
     '',
   ].join('\n'));
   const adapter = {
@@ -692,19 +713,20 @@ function makePublicReleaseAdapter(request, {
     getPinnedAssets: () => structuredClone(pinnedAssets),
     getNpmState: () => 'published',
   };
-  return { adapter, completionDigest: hash(completionReceipt), successfulRun };
+  return { adapter, completionDigest: hash(completionReceiptText), successfulRun };
 }
 
 function verifyPublicBoundary(directory, boundary, adapter, {
   output = 'public-release.json',
   completionDigest = adapter.completionDigest,
+  finishedPlanPath = 'docs/plans/finished/2026-07-18-session-relay-cli-production-release.md',
 } = {}) {
   return captureDigest(() => releasePromotion.verifyPublicRelease(new Map([
     ['request', boundary.request.file],
     ['request-sha256', boundary.request.digest],
     ['publication', boundary.publicationFile.file],
     ['publication-sha256', boundary.publicationFile.digest],
-    ['public-finished-plan', 'docs/plans/finished/2026-07-18-session-relay-cli-production-release.md'],
+    ['public-finished-plan', finishedPlanPath],
     ['public-release-commit', PUBLIC_RELEASE_COMMIT],
     ['public-plan-commit', PUBLIC_PLAN_COMMIT],
     ['public-completion-sha256', completionDigest],
@@ -740,6 +762,12 @@ function verifyPublicBoundary(directory, boundary, adapter, {
       ['digest-pin mismatch', makePublicReleaseAdapter(boundary.request, { pinnedAssets: { ...boundary.request.value.assets, 'x86_64-unknown-linux-musl': DIGEST('f') } }), {}, /pinned|digest/i],
       ['completion line hash mismatch', makePublicReleaseAdapter(boundary.request), { completionDigest: DIGEST('e') }, /completion.*hash|digest/i],
       ['non-passed review_status', makePublicReleaseAdapter(boundary.request, { reviewStatus: 'failed' }), {}, /review_status|passed/i],
+      ['completion receipt missing field', makePublicReleaseAdapter(boundary.request, { completionReceipt: changedCompletionReceipt((receipt) => { delete receipt.reviewed_at; }) }), {}, /completion receipt|missing|keys/i],
+      ['completion receipt unknown field', makePublicReleaseAdapter(boundary.request, { completionReceipt: changedCompletionReceipt((receipt) => { receipt.unknown_field = true; }) }), {}, /completion receipt|unknown|keys/i],
+      ['completion receipt wrong phase', makePublicReleaseAdapter(boundary.request, { completionReceipt: changedCompletionReceipt((receipt) => { receipt.phase = 'draft'; }) }), {}, /completion receipt|phase/i],
+      ['completion receipt wrong outcome', makePublicReleaseAdapter(boundary.request, { completionReceipt: changedCompletionReceipt((receipt) => { receipt.outcome = 'not_ready'; }) }), {}, /completion receipt|outcome|series/i],
+      ['completion receipt wrong reviewed_head', makePublicReleaseAdapter(boundary.request, { completionReceipt: completionReceiptForReviewedHead('d'.repeat(40)) }), {}, /completion receipt|reviewed_head|stale/i],
+      ['wrong finished-plan slug', makePublicReleaseAdapter(boundary.request), { finishedPlanPath: 'docs/plans/finished/2026-07-18-other-release.md' }, /finished-plan|production-release|path/i],
     ];
     for (const [name, adapter, overrides, pattern] of cases) {
       assert.throws(
