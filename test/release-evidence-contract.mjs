@@ -23,7 +23,7 @@ import {
   verifySourceCi,
 } from '../../../scripts/lib/session-relay-release-preparation.mjs';
 import { gitRaw } from '../../../scripts/lib/session-relay-release-core.mjs';
-import { canonicalPlanView } from '../../../plugins/docks/skills/productivity/plan-review/scripts/review-policy.mjs';
+import { canonicalPlanView } from '../../../plugins/docks/skills/productivity/plan-reviewer/scripts/review-policy.mjs';
 import { verifyPreflight } from '../../../scripts/verify-session-relay-preflight.mjs';
 import { runFixture } from '../../../scripts/lib/session-relay-release-fixture.mjs';
 
