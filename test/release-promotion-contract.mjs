@@ -24,6 +24,7 @@ const PROMOTED_COMMIT = '3'.repeat(40);
 const LOCK_COMMIT = '4'.repeat(40);
 const RESTORE_COMMIT = '5'.repeat(40);
 const REAPPLY_COMMIT = '6'.repeat(40);
+const REPAIR_IMPLEMENTATION_COMMIT = 'e'.repeat(40);
 const PUBLIC_REVIEWED_COMMIT = 'c3b542220d5a24a98ca05383bbe28afc2319b7e2';
 const PUBLIC_RELEASE_COMMIT = '7'.repeat(40);
 const PUBLIC_PLAN_COMMIT = '8'.repeat(40);
@@ -254,8 +255,8 @@ function options(output = '/receipts/promotion.json', extra = {}) {
 function smoke(kind) {
   return {
     kind,
-    isolation_root_sha256: hash({ kind, source: kind === 'exact_source' ? TAG_COMMIT : 'origin/main', sync: kind === 'exact_source' ? ['sync', '--release-test-source', TAG_COMMIT] : ['sync'] }),
-    sync_argv: kind === 'exact_source' ? ['sync', '--release-test-source', TAG_COMMIT] : ['sync'],
+    isolation_root_sha256: hash({ kind, source: kind === 'exact_source' ? TAG_COMMIT : 'origin/main', sync: ['sync'] }),
+    sync_argv: ['sync'],
     stdout_sha256: DIGEST('f'),
     stderr_sha256: DIGEST('0'),
     ordering_log_sha256: DIGEST('1'),
@@ -284,6 +285,7 @@ function makeAdapter({ killAfter = null, killMutation = null, rejectMutation = n
     outageAfterAppend,
     probeOutage: false,
     liveResults: [...liveResults],
+    prepushThrows,
     releaseAssets: structuredClone(assets),
     restoreDrift,
     prepushMutator,
@@ -347,6 +349,22 @@ function makeAdapter({ killAfter = null, killMutation = null, rejectMutation = n
       assert.equal(ancestorCommit, PUBLIC_REVIEWED_COMMIT);
       assert.equal(descendantCommit, PUBLIC_RELEASE_COMMIT);
       return publicAncestry;
+    },
+    validatePrepushRepair: ({ baseCommit, repairCommit }) => {
+      assert.equal(baseCommit, OLD_MAIN);
+      assert.equal(repairCommit, REPAIR_IMPLEMENTATION_COMMIT);
+      return {
+        base_commit: OLD_MAIN,
+        commit: REPAIR_IMPLEMENTATION_COMMIT,
+        paths: [
+          'plugins/session-relay/test/release-promotion-contract.mjs',
+          'scripts/lib/session-relay-release-cli.mjs',
+          'scripts/lib/session-relay-release-promotion.mjs',
+        ],
+        full_ci_exit: 0,
+        full_ci_stdout_sha256: DIGEST('d'),
+        full_ci_stderr_sha256: DIGEST('e'),
+      };
     },
     createLockCommit: ({ nonce }) => {
       assert.equal(nonce, '0123456789abcdef0123456789abcdef');
@@ -415,7 +433,7 @@ function makeAdapter({ killAfter = null, killMutation = null, rejectMutation = n
       verification_ok: true,
     }),
     runPrepushSmoke: ({ docksKitRepository, docksKitRelease, sourceCommit, publicReleaseCommit }) => {
-      if (prepushThrows) throw new Error('docks-kit identity failed');
+      if (state.prepushThrows) throw new Error('docks-kit identity failed');
       state.calls.push({ operation: 'prepush', docksKitRepository, docksKitRelease, sourceCommit, publicReleaseCommit });
       assert.equal(docksKitRepository, 'DocksDocks/public');
       assert.equal(docksKitRelease, 'cli-v0.9.0');
@@ -816,10 +834,15 @@ for (const phase of ['initialized', 'locked', 'prepush_passed', 'main_pushed', '
 }
 
 {
-  const { adapter, state } = makeAdapter({ liveResults: [false, true] });
+  const legacyRetryArgv = ['sync', '--release-test-source', TAG_COMMIT];
+  const { adapter, state } = makeAdapter({
+    liveResults: [false, true],
+    prepushMutator: (evidence) => { evidence.sync_argv = legacyRetryArgv; },
+  });
   const failure = run(adapter, '/receipts/failure.json');
   assert.equal(failure.receipt.outcome, 'restored_failure');
   assert.equal(failure.receipt.retryable, true);
+  assert.deepEqual(failure.receipt.exact_source_smoke.sync_argv, legacyRetryArgv);
   assert.equal(state.refs.get('refs/heads/main'), RESTORE_COMMIT);
   assert.deepEqual(phases(state).slice(-2), ['0:4:restore_pushed', '0:5:terminal_failure']);
   const retried = run(adapter, '/receipts/retry.json', {
@@ -828,8 +851,23 @@ for (const phase of ['initialized', 'locked', 'prepush_passed', 'main_pushed', '
   });
   assert.equal(retried.receipt.outcome, 'success');
   assert.equal(retried.receipt.attempt, 1);
+  assert.deepEqual(retried.receipt.exact_source_smoke.sync_argv, legacyRetryArgv, 'restored retry preserves historical exact-source evidence');
   assert.deepEqual(phases(state).slice(-4), ['1:0:initialized', '1:1:locked', '1:2:reapply_pushed', '1:3:terminal_success']);
   assert.deepEqual({ prepush: state.counts.prepush, main: state.counts.main, restore: state.counts.restore, reapply: state.counts.reapply }, { prepush: 1, main: 1, restore: 1, reapply: 1 });
+  const legacyChain = adapter.readJournal(TRANSACTION_REF, state.refs.get(TRANSACTION_REF));
+  for (const item of legacyChain) delete item.entry.immutable.prepush_repair;
+  const attemptOneIndex = legacyChain.findIndex(({ entry }) => entry.attempt === 1);
+  const legacyPrefix = legacyChain.slice(0, attemptOneIndex);
+  const legacyPriorReceipt = structuredClone(failure.receipt);
+  legacyPriorReceipt.journal_chain_sha256 = hash(canonicalize(legacyPrefix));
+  const legacyPriorDigest = hash(canonicalize(legacyPriorReceipt));
+  for (const item of legacyChain.slice(attemptOneIndex)) item.entry.immutable.prior_attempt_receipt_sha256 = legacyPriorDigest;
+  legacyChain.at(-1).entry.receipt_projection.prior_attempt_receipt_sha256 = legacyPriorDigest;
+  assert.equal(
+    validatePromotionJournal(legacyChain, legacyChain.at(-1).commit).tip.entry.phase,
+    'terminal_success',
+    'old-format restored retry journals must keep the reapply transition map',
+  );
   assert.throws(() => run(adapter, '/receipts/retry-again.json', {
     'retry-failed': '/receipts/failure.json',
     'retry-failed-sha256': failure.state.receipt_sha256,
@@ -1165,12 +1203,150 @@ for (const releaseAbsent of [false, true]) {
 }
 
 {
-  const { adapter, state } = makeAdapter({ prepushThrows: true });
-  const result = run(adapter, '/receipts/prepush-exception.json');
+  const legacyArgv = ['sync', '--release-test-source', TAG_COMMIT];
+  const { adapter, state } = makeAdapter({
+    prepushMutator: (evidence) => {
+      evidence.sync_argv = legacyArgv;
+      evidence.installed_binary_sha256 = hash(Buffer.alloc(0));
+      evidence.launcher_sha256 = hash(Buffer.alloc(0));
+      evidence.installed_version = '';
+      evidence.launcher_version = '';
+    },
+  });
+  const successfulPrepush = adapter.runPrepushSmoke;
+  adapter.runPrepushSmoke = (args) => ({
+    ...successfulPrepush(args),
+    ok: false,
+    error: 'Unknown sync target(s): --release-test-source, /tmp/reviewed-docks',
+  });
+  const result = run(adapter, '/receipts/failure.json');
+  const priorBytes = state.outputs.get('/receipts/failure.json');
   assert.equal(result.receipt.outcome, 'failure');
+  assert.equal(result.receipt.retryable, false);
+  assert.deepEqual(result.receipt.exact_source_smoke.sync_argv, legacyArgv, 'historical failed evidence retains the rejected sync argv');
   assert.equal(state.counts.main, 0);
   assert.equal(state.journal.at(-1).entry.phase, 'terminal_failure');
   assert.equal(run(adapter, '/receipts/prepush-exception-resume.json', {}, true).receipt.outcome, 'failure');
+  assert.throws(() => run(adapter, '/receipts/generic-retry.json', {
+    'retry-failed': '/receipts/failure.json',
+    'retry-failed-sha256': result.state.receipt_sha256,
+  }), /restored.failure|repair.prepush/i);
+
+  const appendCountBeforeAuthorityFailure = state.counts.append;
+  state.releaseStable = true;
+  assert.throws(() => run(adapter, '/receipts/stable-release-repair.json', {
+    'repair-prepush': true,
+    'repair-implementation-commit': REPAIR_IMPLEMENTATION_COMMIT,
+    'retry-failed': '/receipts/failure.json',
+    'retry-failed-sha256': result.state.receipt_sha256,
+  }), /release|prerelease/i);
+  assert.equal(state.counts.append, appendCountBeforeAuthorityFailure, 'changed prerelease authority must be rejected before attempt 1');
+  state.releaseStable = false;
+  const validateRepair = adapter.validatePrepushRepair;
+  adapter.validatePrepushRepair = (input) => {
+    const evidence = validateRepair(input);
+    state.releaseStable = true;
+    return evidence;
+  };
+  assert.throws(() => run(adapter, '/receipts/raced-release-repair.json', {
+    'repair-prepush': true,
+    'repair-implementation-commit': REPAIR_IMPLEMENTATION_COMMIT,
+    'retry-failed': '/receipts/failure.json',
+    'retry-failed-sha256': result.state.receipt_sha256,
+  }), /release|prerelease/i);
+  assert.equal(state.counts.append, appendCountBeforeAuthorityFailure, 'authority drift during repair CI must be rejected before attempt 1');
+  state.releaseStable = false;
+  adapter.validatePrepushRepair = validateRepair;
+  adapter.runPrepushSmoke = successfulPrepush;
+  state.prepushMutator = null;
+  const repaired = run(adapter, '/receipts/repaired.json', {
+    'repair-prepush': true,
+    'repair-implementation-commit': REPAIR_IMPLEMENTATION_COMMIT,
+    'retry-failed': '/receipts/failure.json',
+    'retry-failed-sha256': result.state.receipt_sha256,
+  });
+  assert.equal(repaired.receipt.outcome, 'success');
+  assert.equal(repaired.receipt.attempt, 1);
+  assert.equal(repaired.receipt.retryable, false);
+  assert.deepEqual(repaired.receipt.exact_source_smoke.sync_argv, ['sync'], 'successful repair evidence uses the URL-rewrite sync binding');
+  assert.equal(state.refs.get('refs/heads/main'), PROMOTED_COMMIT);
+  assert.equal(state.outputs.get('/receipts/failure.json'), priorBytes, 'repair continuation must not rewrite failed evidence');
+  assert.deepEqual(phases(state).slice(-6), [
+    '1:0:initialized',
+    '1:1:locked',
+    '1:2:prepush_passed',
+    '1:3:main_pushed',
+    '1:4:live_passed',
+    '1:5:terminal_success',
+  ]);
+  const repair = state.journal.find(({ entry }) => entry.attempt === 1).entry.immutable.prepush_repair;
+  assert.equal(repair.commit, REPAIR_IMPLEMENTATION_COMMIT);
+  const forgedRepairSuccess = adapter.readJournal(TRANSACTION_REF, state.refs.get(TRANSACTION_REF));
+  forgedRepairSuccess.at(-1).entry.receipt_projection.exact_source_smoke.sync_argv = legacyArgv;
+  forgedRepairSuccess.at(-1).entry.state.prepush_smoke.sync_argv = legacyArgv;
+  assert.throws(
+    () => validatePromotionJournal(forgedRepairSuccess, forgedRepairSuccess.at(-1).commit),
+    /terminal repair success.*URL-rewrite/i,
+  );
+  const invalidBase = adapter.readJournal(TRANSACTION_REF, state.refs.get(TRANSACTION_REF));
+  for (const item of invalidBase.filter(({ entry }) => entry.attempt === 1)) item.entry.immutable.prepush_repair.base_commit = 'f'.repeat(40);
+  assert.throws(
+    () => validatePromotionJournal(invalidBase, invalidBase.at(-1).commit),
+    /repair base.*expected origin\/main/i,
+  );
+  const invalidProjection = adapter.readJournal(TRANSACTION_REF, state.refs.get(TRANSACTION_REF));
+  invalidProjection.at(-1).entry.receipt_projection.prior_attempt_receipt_sha256 = null;
+  assert.throws(
+    () => validatePromotionJournal(invalidProjection, invalidProjection.at(-1).commit),
+    /projection is not derived/i,
+  );
+  const invalidEligibility = adapter.readJournal(TRANSACTION_REF, state.refs.get(TRANSACTION_REF));
+  invalidEligibility.find(({ entry }) => entry.attempt === 0 && entry.phase === 'terminal_failure').entry.state.failure = 'unrelated pre-push failure';
+  assert.throws(
+    () => validatePromotionJournal(invalidEligibility, invalidEligibility.at(-1).commit),
+    /repair authorization/i,
+  );
+  const invalidAttemptZero = adapter.readJournal(TRANSACTION_REF, state.refs.get(TRANSACTION_REF));
+  invalidAttemptZero[0].entry.immutable.prepush_repair = structuredClone(repair);
+  assert.throws(
+    () => validatePromotionJournal(invalidAttemptZero, invalidAttemptZero.at(-1).commit),
+    /attempt 0 cannot bind pre-push repair/i,
+  );
+}
+
+{
+  const legacyArgv = ['sync', '--release-test-source', TAG_COMMIT];
+  const failedPrepush = makeAdapter({
+    prepushMutator: (evidence) => {
+      evidence.sync_argv = legacyArgv;
+      evidence.installed_binary_sha256 = hash(Buffer.alloc(0));
+      evidence.launcher_sha256 = hash(Buffer.alloc(0));
+      evidence.installed_version = '';
+      evidence.launcher_version = '';
+    },
+  });
+  const successfulPrepush = failedPrepush.adapter.runPrepushSmoke;
+  failedPrepush.adapter.runPrepushSmoke = (args) => ({
+    ...successfulPrepush(args),
+    ok: false,
+    error: 'Unknown sync target(s): --release-test-source, /tmp/reviewed-docks',
+  });
+  const failed = run(failedPrepush.adapter, '/receipts/failure.json');
+  failedPrepush.adapter.validatePrepushRepair = ({ baseCommit, repairCommit }) => ({
+    base_commit: baseCommit,
+    commit: repairCommit,
+    paths: ['scripts/lib/session-relay-release-promotion.mjs'],
+    full_ci_exit: 0,
+    full_ci_stdout_sha256: DIGEST('d'),
+    full_ci_stderr_sha256: DIGEST('e'),
+  });
+  assert.throws(() => run(failedPrepush.adapter, '/receipts/invalid-repair.json', {
+    'repair-prepush': true,
+    'repair-implementation-commit': REPAIR_IMPLEMENTATION_COMMIT,
+    'retry-failed': '/receipts/failure.json',
+    'retry-failed-sha256': failed.state.receipt_sha256,
+  }), /repair.*paths/i);
+  assert.equal(failedPrepush.state.journal.at(-1).entry.attempt, 0, 'invalid repair must not append attempt 1');
 }
 
 {
@@ -1405,6 +1581,21 @@ await assert.rejects(
   dispatchSessionRelayRelease(['--verify-public-release', '--plugin', 'session-relay', '0.12.0']),
   /missing required option: --request/i,
   'verify-public-release CLI mode must be recognized',
+);
+await assert.rejects(
+  dispatchSessionRelayRelease([
+    '--promote-reviewed',
+    '--plugin', 'session-relay', '0.12.0',
+    '--source-proof', '/proof.json', '--source-proof-sha256', DIGEST('1'),
+    '--publication', '/publication.json', '--publication-sha256', DIGEST('2'),
+    '--public-release', '/public-release.json', '--public-release-sha256', DIGEST('3'),
+    '--docks-kit-release', 'cli-v0.9.0',
+    '--expected-origin-main', OLD_MAIN,
+    '--receipt-out', '/promotion.json',
+    '--repair-prepush',
+  ]),
+  /repair-prepush.*repair-implementation-commit.*together/i,
+  'repair-prepush CLI mode must require its committed repair identity',
 );
 
 process.stdout.write('release promotion contract: OK\n');
