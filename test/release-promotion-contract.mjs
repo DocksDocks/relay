@@ -768,6 +768,7 @@ function verifyPublicBoundary(directory, boundary, adapter, {
       ['completion receipt wrong outcome', makePublicReleaseAdapter(boundary.request, { completionReceipt: changedCompletionReceipt((receipt) => { receipt.outcome = 'not_ready'; }) }), {}, /completion receipt|outcome|series/i],
       ['completion receipt wrong reviewed_head', makePublicReleaseAdapter(boundary.request, { completionReceipt: completionReceiptForReviewedHead('d'.repeat(40)) }), {}, /completion receipt|reviewed_head|stale/i],
       ['wrong finished-plan slug', makePublicReleaseAdapter(boundary.request), { finishedPlanPath: 'docs/plans/finished/2026-07-18-other-release.md' }, /finished-plan|production-release|path/i],
+      ['wrong finished-plan date', makePublicReleaseAdapter(boundary.request), { finishedPlanPath: 'docs/plans/finished/2026-07-17-session-relay-cli-production-release.md' }, /finished-plan|production-release|path/i],
     ];
     for (const [name, adapter, overrides, pattern] of cases) {
       assert.throws(
