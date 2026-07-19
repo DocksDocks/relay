@@ -338,11 +338,12 @@ function makeAdapter({ killAfter = null, killMutation = null, rejectMutation = n
       assert.equal(tip, state.refs.get(TRANSACTION_REF));
       return state.journal.map((item) => structuredClone(item));
     },
-    isAncestor: (ancestorCommit, descendantCommit) => (
-      ancestorCommit === PUBLIC_REVIEWED_COMMIT && descendantCommit === PUBLIC_RELEASE_COMMIT
-        ? publicAncestry
-        : ancestry
-    ),
+    isAncestor: () => ancestry,
+    isPublicAncestor: (ancestorCommit, descendantCommit) => {
+      assert.equal(ancestorCommit, PUBLIC_REVIEWED_COMMIT);
+      assert.equal(descendantCommit, PUBLIC_RELEASE_COMMIT);
+      return publicAncestry;
+    },
     createLockCommit: ({ nonce }) => {
       assert.equal(nonce, '0123456789abcdef0123456789abcdef');
       return LOCK_COMMIT;
