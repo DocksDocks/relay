@@ -338,7 +338,11 @@ function makeAdapter({ killAfter = null, killMutation = null, rejectMutation = n
       assert.equal(tip, state.refs.get(TRANSACTION_REF));
       return state.journal.map((item) => structuredClone(item));
     },
-    isAncestor: () => ancestry,
+    isAncestor: (ancestorCommit, descendantCommit) => {
+      assert.ok([TAG_COMMIT, PROMOTED_COMMIT].includes(ancestorCommit), 'reviewed promotion commit must be the ancestor');
+      assert.equal(descendantCommit, OLD_MAIN, 'expected origin/main must be the descendant');
+      return ancestry;
+    },
     isPublicAncestor: (ancestorCommit, descendantCommit) => {
       assert.equal(ancestorCommit, PUBLIC_REVIEWED_COMMIT);
       assert.equal(descendantCommit, PUBLIC_RELEASE_COMMIT);
