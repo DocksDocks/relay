@@ -5,8 +5,8 @@ user-invocable: true
 allowed-tools: Bash, Read
 metadata:
   pattern: tool-wrapper
-  updated: "2026-07-17"
-  content_hash: "1c134be6ab05b1f6f3217f266b7733200301865a8be59ffc7e20d7abdcc8b8fd"
+  updated: "2026-07-18"
+  content_hash: "fa6618e9303c85974e614282509f87d58f76e8bf739fc5bc85535de5d7d24868"
 ---
 
 # Session relay
@@ -49,7 +49,7 @@ quality, authentication, usage discount, or host-policy bypass.
 
 | Need | Use | Not |
 |---|---|---|
-| Canonical Docks plan review with sealed input and closed structured evidence | plan-manager/plan-review's direct explicit-model CLI | `session-relay spawn` (resumable bus output is not the canonical receipt boundary) |
+| Canonical Docks plan review with sealed input and closed structured evidence | `plan-manager` dispatch to internal `plan-reviewer` through the direct explicit-model path | `session-relay spawn` (resumable bus output is not the canonical receipt boundary) |
 | Small one-shot task in the current project | the current agent or a direct CLI | relay (persistent-session overhead adds no value) |
 | Cross-provider implementation needing an isolated committed handback | `session-relay spawn --fanout` → `session-relay handback` → parent `session-relay collect` | a bare writable CLI against the shared worktree |
 | Long-running/resumable worker or later human takeover | `session-relay spawn`, then `session-relay send`/`session-relay wake`/`session-relay attach` | a one-shot command whose process exit loses addressability |
@@ -457,17 +457,20 @@ Use this when a plan needs a two-model adversarial review. The orchestrator owns
 the plan and the final verdict; workers edit only their assigned sections.
 
 This is an ordinary collaborative debate, **not** Docks' canonical strong-default
-plan-policy review. Schema-v1 policy review requires a sealed non-git read-only
-bundle, one byte-identical request, structured findings, and no worker edits.
-Current `session-relay spawn` injects separate-branch/write guardrails and returns at
-birth registration, so it is deliberately rejected as a schema-v1 policy
-transport. Use the portable explicit-model CLI legs documented by plan-manager/
-plan-review instead. Skill prose cannot bypass the binary guardrail. A future
+plan-policy review. Current schema-6 policy review requires a sealed non-git
+read-only bundle, one closed typed request, structured evidence, persisted
+orchestration, and no reviewer writes. Historical schemas 1–5 are
+validation-only; they are not live dispatch routes. Current `session-relay
+spawn` injects separate-branch/write guardrails and returns at birth
+registration, so it is deliberately rejected as canonical review transport.
+Use `plan-manager` with internal `plan-reviewer` through the portable
+explicit-model path instead. Skill prose cannot bypass the binary guardrail. A future
 dedicated non-writing relay reviewer mode requires binary implementation, tests,
 and its own approved release; do not simulate it with flags or an alternate
 export route.
 
-1. Create or open the plan via plan-manager. Add `## Debate` with `### [a-team]`
+1. For a missing plan, route creation to `plan-creator`; for an existing plan,
+   route public management to `plan-manager`. Add `## Debate` with `### [a-team]`
    and `### [b-team]`, then state the exact question.
 2. Spawn `a-team` first, usually Codex:
    `session-relay spawn <dir> --tool codex --model gpt-5.6-sol --effort xhigh --name a-team --reply-to <me> -- "<question + absolute plan path + edit ONLY ### [a-team]>"`
