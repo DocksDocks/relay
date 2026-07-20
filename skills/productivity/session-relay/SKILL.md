@@ -5,8 +5,8 @@ user-invocable: true
 allowed-tools: Bash, Read
 metadata:
   pattern: tool-wrapper
-  updated: "2026-07-18"
-  content_hash: "fa6618e9303c85974e614282509f87d58f76e8bf739fc5bc85535de5d7d24868"
+  updated: "2026-07-20"
+  content_hash: "5ab246b23bb2fdc5bf8e2a8ac0e366b7b76f1f7206400148e767d824fe05cd12"
 ---
 
 # Session relay
@@ -39,7 +39,7 @@ The installed plugin's compatibility launcher resolves a non-empty `SESSION_RELA
 
 The launcher has no embedded relay binary and never compiles, builds, or downloads one at startup. For a missing CLI, run `docks-kit sync` and then `docks-kit toolchain ensure session-relay`; do not install a compiler. For a broken override, correct it or `unset SESSION_RELAY_BIN`.
 
-Official prebuilts support Linux and macOS on x86-64 or arm64. On another OS/architecture, provide a compatible separately installed executable through `SESSION_RELAY_BIN` or use a supported host; retrying the launcher cannot add platform support.
+Official prebuilts support Linux and macOS on x86-64 or arm64. Other operating systems and architectures are unsupported; use a supported host because retrying the launcher cannot add platform support.
 
 ## Pick the transport deliberately
 
@@ -257,10 +257,9 @@ policy. Check that policy before diagnosing a silent channel:
 - Anthropic Console API authentication permits channels by default unless the
   organization deploys managed settings; then that managed key is required.
 - `channelsEnabled` is managed-only, not a user/project setting. File delivery
-  uses `/etc/claude-code/managed-settings.json` on Linux/WSL,
-  `/Library/Application Support/ClaudeCode/managed-settings.json` on macOS, or
-  `C:\Program Files\ClaudeCode\managed-settings.json` on Windows. The admin
-  console is the preferred organization-wide path.
+  uses `/etc/claude-code/managed-settings.json` on Linux or
+  `/Library/Application Support/ClaudeCode/managed-settings.json` on macOS. The
+  admin console is the preferred organization-wide path.
 
 The channel binds only to Claude's exact `CLAUDE_CODE_SESSION_ID`, waits at most
 five seconds for that UUID's hook registration, and fails closed on a missing,
