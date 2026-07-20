@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict';
+import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { spawn, spawnSync } from 'node:child_process';
 
 if (process.argv[2] !== '--matrix') {
   console.error('usage: node supervisor-custody.mjs --matrix');
@@ -26,29 +26,32 @@ function fresh(tag) {
 
 function seed(home, session, cwd) {
   fs.mkdirSync(cwd, { recursive: true });
-  fs.writeFileSync(path.join(home, 'registry.json'), JSON.stringify({
-    agents: {
-      [session]: {
-        id: session,
-        dir: cwd,
-        name: null,
-        tool: 'claude',
-        lastSeen: new Date().toISOString(),
-        server: null,
-        spawned_via: null,
+  fs.writeFileSync(
+    path.join(home, 'registry.json'),
+    JSON.stringify(
+      {
+        agents: {
+          [session]: {
+            id: session,
+            dir: cwd,
+            name: null,
+            tool: 'claude',
+            lastSeen: new Date().toISOString(),
+            server: null,
+            spawned_via: null,
+          },
+        },
+        names: {},
       },
-    },
-    names: {},
-  }, null, 2));
+      null,
+      2,
+    ),
+  );
 }
 
 function writeExecutable(file, body) {
   fs.writeFileSync(file, body, { mode: 0o755 });
   fs.chmodSync(file, 0o755);
-}
-
-function registry(home) {
-  return JSON.parse(fs.readFileSync(path.join(home, 'registry.json'), 'utf8'));
 }
 
 function lifecycle(home) {
@@ -59,10 +62,7 @@ function lifecycle(home) {
 
 function operationRows(home) {
   const state = lifecycle(home);
-  return [
-    ...Object.values(state.active_operations ?? {}),
-    ...Object.values(state.operation_tombstones ?? {}),
-  ];
+  return [...Object.values(state.active_operations ?? {}), ...Object.values(state.operation_tombstones ?? {})];
 }
 
 async function waitFor(label, predicate, timeoutMs = 5000) {
@@ -96,7 +96,9 @@ function ptyMatrix() {
   seed(home, session, cwd);
   const binDir = path.join(home, 'bin');
   fs.mkdirSync(binDir);
-  writeExecutable(path.join(binDir, 'claude'), `#!/bin/sh
+  writeExecutable(
+    path.join(binDir, 'claude'),
+    `#!/bin/sh
 if test -t 0; then in_tty=yes; else in_tty=no; fi
 if test -t 1; then out_tty=yes; else out_tty=no; fi
 if test -t 2; then err_tty=yes; else err_tty=no; fi
@@ -107,7 +109,8 @@ tpgid=$(ps -o tpgid= -p $$ | tr -d ' ')
 printf 'foreground:%s\n' "$([ "$pgid" = "$tpgid" ] && printf yes || printf no)"
 trap 'printf got-int\\n; exit 0' INT
 while IFS= read -r line; do printf 'input:%s\n' "$line"; done
-`);
+`,
+  );
   const result = spawnSync(
     'sh',
     [
@@ -141,10 +144,13 @@ async function floodDisconnectMatrix() {
   seed(home, session, cwd);
   const binDir = path.join(home, 'bin');
   fs.mkdirSync(binDir);
-  writeExecutable(path.join(binDir, 'claude'), `#!/bin/sh
+  writeExecutable(
+    path.join(binDir, 'claude'),
+    `#!/bin/sh
 trap '' TERM HUP INT
 while :; do printf '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'; done
-`);
+`,
+  );
   const attach = spawn(BIN, ['attach', session], {
     env: {
       ...process.env,
@@ -184,10 +190,10 @@ while :; do printf '0123456789abcdef0123456789abcdef0123456789abcdef0123456789ab
   await new Promise((resolve) => attach.once('exit', resolve));
   const terminal = await waitFor('cancelled flood reap', () => {
     const operations = operationRows(home);
-    return operations.find((operation) =>
-      operation.cancelled === true
-      && operation.terminal === true
-      && operation.custody?.kind === 'ChildReaped');
+    return operations.find(
+      (operation) =>
+        operation.cancelled === true && operation.terminal === true && operation.custody?.kind === 'ChildReaped',
+    );
   });
   assert.equal(terminal.custody.process.pid, String(childPid));
   assert.equal(processExists(childPid), false, 'supervisor must reap the flooded child');
@@ -196,15 +202,11 @@ while :; do printf '0123456789abcdef0123456789abcdef0123456789abcdef0123456789ab
     ...Object.values(finalRegistry.lifecycle_supervisors ?? {}).map((row) => Number(row.process.pid)),
     ...Object.values(finalRegistry.lifecycle_watchdogs ?? {}).map((row) => Number(row.process.pid)),
   ];
-  await waitFor('detached custody services to exit', () =>
-    servicePids.every((pid) => !processExists(pid)));
+  await waitFor('detached custody services to exit', () => servicePids.every((pid) => !processExists(pid)));
   fs.rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
 }
 
-const spawnSource = fs.readFileSync(
-  path.join(ROOT, 'plugins/session-relay/rust/src/spawn.rs'),
-  'utf8',
-);
+const spawnSource = fs.readFileSync(path.join(ROOT, 'plugins/session-relay/rust/src/spawn.rs'), 'utf8');
 assert.doesNotMatch(spawnSource, /run_child_with_guard_legacy/);
 assert.match(spawnSource, /crate::supervisor::run_child_with_guard\(guard, spec\)/);
 

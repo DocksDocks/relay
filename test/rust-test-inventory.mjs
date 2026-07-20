@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
-import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -24,7 +24,8 @@ const run = spawnSync('cargo', ['test', '--locked', '--test', name, '--', '--lis
   encoding: 'utf8',
 });
 assert.equal(run.status, 0, run.stderr);
-const actual = run.stdout.split('\n')
+const actual = run.stdout
+  .split('\n')
   .filter((line) => line.endsWith(': test'))
   .map((line) => line.slice(0, -6))
   .sort();

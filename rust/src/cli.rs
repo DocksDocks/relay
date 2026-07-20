@@ -1257,7 +1257,7 @@ mod tests {
     fn parses_codex_fixture_usage_line() {
         let line = wake_usage_line(
             "codex",
-            include_str!("../../test/fixtures/wake-usage-codex.json").as_bytes(),
+            include_str!("../../test/fixtures/wake-usage-codex.jsonl").as_bytes(),
         );
         assert_eq!(
             line,

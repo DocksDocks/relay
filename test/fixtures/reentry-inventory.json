@@ -21,12 +21,7 @@
     "appserver::acknowledge_with_guard",
     "spawn::run_child_with_guard"
   ],
-  "read_only_apis": [
-    "store::peek",
-    "store::mailbox_has_content",
-    "appserver::probe",
-    "appserver::thread_state"
-  ],
+  "read_only_apis": ["store::peek", "store::mailbox_has_content", "appserver::probe", "appserver::thread_state"],
   "process_function_classes": {
     "guarded_reentry": ["run_child_with_guard", "spawn_watchdog", "spawn_owned_child", "supervise_connected"],
     "non_reentry_creation": ["run"],

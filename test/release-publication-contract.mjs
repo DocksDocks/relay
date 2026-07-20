@@ -1,27 +1,24 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { spawnSync } from 'node:child_process';
 
 import { parse as parseYaml } from 'yaml';
 
 import {
   ASSETS,
+  canonicalize,
   PRERELEASE_BODY,
   REPOSITORY_ID,
+  SessionRelayReleaseError,
   STABLE_BODY,
+  sha256,
   TAG,
   VERSION,
-  canonicalize,
-  SessionRelayReleaseError,
-  sha256,
 } from '../../../scripts/lib/session-relay-release-core.mjs';
-import {
-  finalizeReviewed,
-  publishReviewed,
-} from '../../../scripts/lib/session-relay-release-publication.mjs';
+import { finalizeReviewed, publishReviewed } from '../../../scripts/lib/session-relay-release-publication.mjs';
 
 const SOURCE = '1'.repeat(40);
 const WORKFLOW_PATH = '.github/workflows/build-binaries.yml';
@@ -170,28 +167,29 @@ function runAttestationRecords(workflowRun, assets, mode = workflowRun.event ===
     'x86_64-apple-darwin': ['X64', 'macOS'],
     'x86_64-unknown-linux-musl': ['X64', 'Linux'],
   };
-  return assets.filter(({ name }) => name !== 'SHA256SUMS').map((asset) => {
-    const target = asset.name.replace(/^session-relay-/, '');
-    return {
-      asset_name: asset.name,
-      inputs: {
-        expected_commit: workflowRun.event === 'push' ? '' : SOURCE,
-        expected_tag: workflowRun.event === 'push' ? '' : TAG,
-        mode,
-      },
-      runner_arch: runners[target][0],
-      runner_os: runners[target][1],
-      schema: 'SessionRelayBinaryAttestationV1',
-      sha256: asset.digest,
-      source_commit: SOURCE,
-      target,
-      version_stdout: `session-relay ${VERSION}`,
-      workflow_run_attempt: workflowRun.run_attempt,
-      workflow_run_id: workflowRun.id,
-    };
-  });
+  return assets
+    .filter(({ name }) => name !== 'SHA256SUMS')
+    .map((asset) => {
+      const target = asset.name.replace(/^session-relay-/, '');
+      return {
+        asset_name: asset.name,
+        inputs: {
+          expected_commit: workflowRun.event === 'push' ? '' : SOURCE,
+          expected_tag: workflowRun.event === 'push' ? '' : TAG,
+          mode,
+        },
+        runner_arch: runners[target][0],
+        runner_os: runners[target][1],
+        schema: 'SessionRelayBinaryAttestationV1',
+        sha256: asset.digest,
+        source_commit: SOURCE,
+        target,
+        version_stdout: `session-relay ${VERSION}`,
+        workflow_run_attempt: workflowRun.run_attempt,
+        workflow_run_id: workflowRun.id,
+      };
+    });
 }
-
 
 function releaseAssets(runAssets, { missing = [], digestConflict = null, duplicate = null } = {}) {
   const assets = runAssets
@@ -247,9 +245,7 @@ function fakeAdapter({
   runAssets = runAssetRecords(),
   attestations = runAttestationRecords(runs[0] ?? run(), runAssets),
   liveReleaseAssets = runAssets,
-  checksumEntries = runAssets
-    .filter(({ name }) => name !== 'SHA256SUMS')
-    .map(({ name, digest }) => ({ name, digest })),
+  checksumEntries = runAssets.filter(({ name }) => name !== 'SHA256SUMS').map(({ name, digest }) => ({ name, digest })),
   publisher = { id: 41898282, login: 'github-actions[bot]', type: 'Bot' },
   releaseDriftAt = null,
 } = {}) {
@@ -277,8 +273,13 @@ function fakeAdapter({
     cleaned: 0,
   };
   const adapter = {
-    getTagCommit() { return state.tagCommit; },
-    pushTag(commit) { state.pushed.push(commit); state.tagCommit = commit; },
+    getTagCommit() {
+      return state.tagCommit;
+    },
+    pushTag(commit) {
+      state.pushed.push(commit);
+      state.tagCommit = commit;
+    },
     getRelease() {
       state.releaseQueries += 1;
       if (!state.release) return null;
@@ -286,14 +287,28 @@ function fakeAdapter({
       if (state.releaseDriftAt === state.releaseQueries) value.assets[0].id += 10_000;
       return value;
     },
-    getPublisherIdentity() { return structuredClone(state.publisher); },
-    listRuns() { return structuredClone(state.runs); },
-    dispatchRecovery(commit) { state.dispatched.push(commit); },
-    watchRun(id) { state.watched.push(id); },
-    getRun(id) { return structuredClone(state.runs.find((candidate) => candidate.id === id)); },
+    getPublisherIdentity() {
+      return structuredClone(state.publisher);
+    },
+    listRuns() {
+      return structuredClone(state.runs);
+    },
+    dispatchRecovery(commit) {
+      state.dispatched.push(commit);
+    },
+    watchRun(id) {
+      state.watched.push(id);
+    },
+    getRun(id) {
+      return structuredClone(state.runs.find((candidate) => candidate.id === id));
+    },
     downloadRunAssets(id) {
       state.downloaded.push(id);
-      return { directory: `/bound-run/${id}`, assets: structuredClone(state.runAssets), attestations: structuredClone(state.attestations) };
+      return {
+        directory: `/bound-run/${id}`,
+        assets: structuredClone(state.runAssets),
+        attestations: structuredClone(state.attestations),
+      };
     },
     downloadReleaseAssets(releaseId, assets) {
       state.releaseDownloads += 1;
@@ -321,10 +336,20 @@ function fakeAdapter({
         uploader: { id: 41898282, login: 'github-actions[bot]', type: 'Bot' },
       });
     },
-    editStable() { state.edited += 1; state.release.prerelease = false; state.release.body = STABLE_BODY; },
-    sleep() { state.sleeps += 1; },
-    now() { return '2026-07-17T12:00:00.000Z'; },
-    cleanupRunAssets() { state.cleaned += 1; },
+    editStable() {
+      state.edited += 1;
+      state.release.prerelease = false;
+      state.release.body = STABLE_BODY;
+    },
+    sleep() {
+      state.sleeps += 1;
+    },
+    now() {
+      return '2026-07-17T12:00:00.000Z';
+    },
+    cleanupRunAssets() {
+      state.cleaned += 1;
+    },
   };
   return { adapter, state };
 }
@@ -489,13 +514,16 @@ if (operation === 'upload') {
 fail('unexpected release operation: ' + operation);
 `;
 
-function runPublicationWorkflow(root, {
-  existing = null,
-  releaseOverrides = {},
-  assetOverrides = (assets) => assets,
-  queryFailure = null,
-  raceOnUpload = false,
-} = {}) {
+function runPublicationWorkflow(
+  root,
+  {
+    existing = null,
+    releaseOverrides = {},
+    assetOverrides = (assets) => assets,
+    queryFailure = null,
+    raceOnUpload = false,
+  } = {},
+) {
   const directory = fs.mkdtempSync(path.join(root, 'workflow-'));
   const releaseDirectory = path.join(directory, 'session-relay-release');
   const binDirectory = path.join(directory, 'bin');
@@ -506,35 +534,34 @@ function runPublicationWorkflow(root, {
     fs.writeFileSync(file, Buffer.from(`${name}:${index}\n`));
     return file;
   });
-  fs.writeFileSync(
-    path.join(directory, 'session-relay-prerelease.md'),
-    PRERELEASE_BODY,
-  );
+  fs.writeFileSync(path.join(directory, 'session-relay-prerelease.md'), PRERELEASE_BODY);
   const localAssets = files.map((file, index) => githubAsset(file, 100 + index));
-  const present = existing === null
-    ? null
-    : localAssets.filter(({ name }) => existing.includes(name));
-  const release = present === null
-    ? null
-    : {
-        id: 88,
-        tag_name: TAG,
-        draft: false,
-        prerelease: true,
-        name: `Session Relay ${VERSION}`,
-        body: PRERELEASE_BODY,
-        assets: assetOverrides(structuredClone(present)),
-        ...releaseOverrides,
-      };
+  const present = existing === null ? null : localAssets.filter(({ name }) => existing.includes(name));
+  const release =
+    present === null
+      ? null
+      : {
+          id: 88,
+          tag_name: TAG,
+          draft: false,
+          prerelease: true,
+          name: `Session Relay ${VERSION}`,
+          body: PRERELEASE_BODY,
+          assets: assetOverrides(structuredClone(present)),
+          ...releaseOverrides,
+        };
   const stateFile = path.join(directory, 'state.json');
-  fs.writeFileSync(stateFile, JSON.stringify({
-    release,
-    mutations: [],
-    queries: 0,
-    nextAssetId: 1000,
-    queryFailure,
-    raceOnUpload,
-  }));
+  fs.writeFileSync(
+    stateFile,
+    JSON.stringify({
+      release,
+      mutations: [],
+      queries: 0,
+      nextAssetId: 1000,
+      queryFailure,
+      raceOnUpload,
+    }),
+  );
   const gh = path.join(binDirectory, 'gh');
   fs.writeFileSync(gh, FAKE_GH, { mode: 0o755 });
   const script = publicationWorkflowScript();
@@ -568,16 +595,24 @@ function assertWorkflowFailure(run, message) {
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'session-relay-publication-contract-'));
 try {
   {
-    const cli = spawnSync(process.execPath, [
-      'scripts/release.mjs',
-      '--publish-reviewed',
-      '--plugin', 'session-relay',
-      VERSION,
-      '--source-proof', path.join(root, 'missing-source-proof.json'),
-      '--source-proof-sha256', 'a'.repeat(64),
-      '--rebind-complete-publication',
-      '--receipt-out', path.join(root, 'missing-source-proof-receipt.json'),
-    ], { cwd: process.cwd(), encoding: 'utf8' });
+    const cli = spawnSync(
+      process.execPath,
+      [
+        'scripts/release.mjs',
+        '--publish-reviewed',
+        '--plugin',
+        'session-relay',
+        VERSION,
+        '--source-proof',
+        path.join(root, 'missing-source-proof.json'),
+        '--source-proof-sha256',
+        'a'.repeat(64),
+        '--rebind-complete-publication',
+        '--receipt-out',
+        path.join(root, 'missing-source-proof-receipt.json'),
+      ],
+      { cwd: process.cwd(), encoding: 'utf8' },
+    );
     assert.notEqual(cli.status, 0, 'rebind grammar probe must stop before publication');
     assert.doesNotMatch(cli.stderr, /unknown option/i, 'rebind flag must be accepted by the CLI grammar');
     assert.match(cli.stderr, /--source-proof does not exist/i);
@@ -607,10 +642,7 @@ try {
     const sourceProof = proof(directory);
     const options = optionsFor(directory, sourceProof);
     options.set('rebind-complete-publication', true);
-    expectConflict(
-      () => publishReviewed(options, fake.adapter),
-      /rebind.*complete matching prerelease/i,
-    );
+    expectConflict(() => publishReviewed(options, fake.adapter), /rebind.*complete matching prerelease/i);
     assertNoPublicationMutation(fake.state);
     assert.equal(fake.state.releaseDownloads, 0);
     assert.equal(fs.existsSync(options.get('receipt-out')), false);
@@ -663,10 +695,7 @@ try {
     const sourceProof = proof(directory);
     const options = optionsFor(directory, sourceProof);
     options.set('rebind-complete-publication', true);
-    expectConflict(
-      () => publishReviewed(options, fake.adapter),
-      /bound run.*release asset|run artifact.*conflict/i,
-    );
+    expectConflict(() => publishReviewed(options, fake.adapter), /bound run.*release asset|run artifact.*conflict/i);
     assertNoPublicationMutation(fake.state);
     assert.equal(fs.existsSync(options.get('receipt-out')), false);
   }
@@ -688,22 +717,23 @@ try {
     assert.equal(fs.existsSync(options.get('receipt-out')), false);
   }
 
-
   {
     const absent = runPublicationWorkflow(root);
     assert.equal(absent.result.status, 0, absent.result.stderr);
-    assert.deepEqual(absent.state.mutations, [
-      { operation: 'create', names: ASSETS },
-    ]);
+    assert.deepEqual(absent.state.mutations, [{ operation: 'create', names: ASSETS }]);
     assert.ok(absent.state.queries >= 2, 'created release must be authoritatively re-queried');
-    assert.deepEqual(absent.state.release.assets.map(({ name }) => name), ASSETS);
+    assert.deepEqual(
+      absent.state.release.assets.map(({ name }) => name),
+      ASSETS,
+    );
 
     const partial = runPublicationWorkflow(root, { existing: ASSETS.slice(0, 2) });
     assert.equal(partial.result.status, 0, partial.result.stderr);
-    assert.deepEqual(partial.state.mutations, [
-      { operation: 'upload', names: ASSETS.slice(2) },
-    ]);
-    assert.deepEqual(partial.state.release.assets.map(({ name }) => name), ASSETS);
+    assert.deepEqual(partial.state.mutations, [{ operation: 'upload', names: ASSETS.slice(2) }]);
+    assert.deepEqual(
+      partial.state.release.assets.map(({ name }) => name),
+      ASSETS,
+    );
 
     const complete = runPublicationWorkflow(root, { existing: ASSETS });
     assert.equal(complete.result.status, 0, complete.result.stderr);
@@ -712,33 +742,48 @@ try {
 
     assert.doesNotMatch(complete.script, /--clobber|release\s+delete|api\s+.*\s-X\s+DELETE/i);
 
-    assertWorkflowFailure(runPublicationWorkflow(root, {
-      existing: ASSETS,
-      assetOverrides: (assets) => {
-        assets[0].size += 1;
-        return assets;
-      },
-    }), 'existing asset size conflict');
-    assertWorkflowFailure(runPublicationWorkflow(root, {
-      existing: ASSETS,
-      assetOverrides: (assets) => {
-        assets[0].digest = `sha256:${'f'.repeat(64)}`;
-        return assets;
-      },
-    }), 'existing asset digest conflict');
-    assertWorkflowFailure(runPublicationWorkflow(root, {
-      existing: ASSETS,
-      assetOverrides: (assets) => [...assets, {
-        id: 999,
-        name: 'unknown-asset',
-        size: 1,
-        digest: `sha256:${'0'.repeat(64)}`,
-      }],
-    }), 'unknown release asset');
-    assertWorkflowFailure(runPublicationWorkflow(root, {
-      existing: ASSETS,
-      assetOverrides: (assets) => [...assets, structuredClone(assets[0])],
-    }), 'duplicate release asset');
+    assertWorkflowFailure(
+      runPublicationWorkflow(root, {
+        existing: ASSETS,
+        assetOverrides: (assets) => {
+          assets[0].size += 1;
+          return assets;
+        },
+      }),
+      'existing asset size conflict',
+    );
+    assertWorkflowFailure(
+      runPublicationWorkflow(root, {
+        existing: ASSETS,
+        assetOverrides: (assets) => {
+          assets[0].digest = `sha256:${'f'.repeat(64)}`;
+          return assets;
+        },
+      }),
+      'existing asset digest conflict',
+    );
+    assertWorkflowFailure(
+      runPublicationWorkflow(root, {
+        existing: ASSETS,
+        assetOverrides: (assets) => [
+          ...assets,
+          {
+            id: 999,
+            name: 'unknown-asset',
+            size: 1,
+            digest: `sha256:${'0'.repeat(64)}`,
+          },
+        ],
+      }),
+      'unknown release asset',
+    );
+    assertWorkflowFailure(
+      runPublicationWorkflow(root, {
+        existing: ASSETS,
+        assetOverrides: (assets) => [...assets, structuredClone(assets[0])],
+      }),
+      'duplicate release asset',
+    );
 
     for (const [field, value] of [
       ['tag_name', 'session-relay--v9.9.9'],
@@ -747,22 +792,34 @@ try {
       ['name', 'drifted title'],
       ['body', 'drifted body'],
     ]) {
-      assertWorkflowFailure(runPublicationWorkflow(root, {
-        existing: ASSETS,
-        releaseOverrides: { [field]: value },
-      }), `release ${field} conflict`);
+      assertWorkflowFailure(
+        runPublicationWorkflow(root, {
+          existing: ASSETS,
+          releaseOverrides: { [field]: value },
+        }),
+        `release ${field} conflict`,
+      );
     }
 
-    assertWorkflowFailure(runPublicationWorkflow(root, {
-      queryFailure: { withResponse: true, status: 500, message: 'gh: server failure (HTTP 500)' },
-    }), 'non-404 query failure');
-    assertWorkflowFailure(runPublicationWorkflow(root, {
-      queryFailure: { withResponse: false, status: 0, message: 'gh: authentication failed' },
-    }), 'authentication failure without an HTTP response');
-    assertWorkflowFailure(runPublicationWorkflow(root, {
-      existing: ASSETS.slice(0, 2),
-      raceOnUpload: true,
-    }), 'upload race');
+    assertWorkflowFailure(
+      runPublicationWorkflow(root, {
+        queryFailure: { withResponse: true, status: 500, message: 'gh: server failure (HTTP 500)' },
+      }),
+      'non-404 query failure',
+    );
+    assertWorkflowFailure(
+      runPublicationWorkflow(root, {
+        queryFailure: { withResponse: false, status: 0, message: 'gh: authentication failed' },
+      }),
+      'authentication failure without an HTTP response',
+    );
+    assertWorkflowFailure(
+      runPublicationWorkflow(root, {
+        existing: ASSETS.slice(0, 2),
+        raceOnUpload: true,
+      }),
+      'upload race',
+    );
     checks += 1;
   }
 
@@ -795,7 +852,10 @@ try {
       run_id: 701,
       workflow_sha: SOURCE,
     });
-    assert.deepEqual(receipt.assets.map(({ digest }) => digest), runAssetRecords().map(({ digest }) => digest));
+    assert.deepEqual(
+      receipt.assets.map(({ digest }) => digest),
+      runAssetRecords().map(({ digest }) => digest),
+    );
     checks += 1;
   }
 
@@ -813,7 +873,11 @@ try {
   {
     const directory = fs.mkdtempSync(path.join(root, 'partial-conflict-'));
     const assets = runAssetRecords();
-    const fake = fakeAdapter({ release: prerelease(assets, { assets: releaseAssets(assets, { missing: [assets[1].name], digestConflict: assets[0].name }) }) });
+    const fake = fakeAdapter({
+      release: prerelease(assets, {
+        assets: releaseAssets(assets, { missing: [assets[1].name], digestConflict: assets[0].name }),
+      }),
+    });
     const sourceProof = proof(directory);
     expectConflict(() => publishReviewed(optionsFor(directory, sourceProof), fake.adapter), /asset.*digest.*conflict/i);
     assert.equal(fake.state.uploaded.length, 0);
@@ -845,7 +909,10 @@ try {
 
   for (const history of [
     [{ ...run(702, 'workflow_dispatch'), conclusion: 'failure' }],
-    [{ ...run(701, 'push'), conclusion: 'failure' }, { ...run(702, 'workflow_dispatch'), conclusion: 'failure' }],
+    [
+      { ...run(701, 'push'), conclusion: 'failure' },
+      { ...run(702, 'workflow_dispatch'), conclusion: 'failure' },
+    ],
   ]) {
     const directory = fs.mkdtempSync(path.join(root, `failed-history-${history.length}-`));
     const assets = runAssetRecords();
@@ -881,7 +948,10 @@ try {
       attestations: runAttestationRecords(dispatchedRun, assets, 'validate-only'),
     });
     const sourceProof = proof(directory);
-    expectConflict(() => publishReviewed(optionsFor(directory, sourceProof), fake.adapter), /attestation.*input|publish-existing-tag/i);
+    expectConflict(
+      () => publishReviewed(optionsFor(directory, sourceProof), fake.adapter),
+      /attestation.*input|publish-existing-tag/i,
+    );
     assert.equal(fake.state.created, 0);
   }
   {
@@ -895,7 +965,10 @@ try {
       attestations: runAttestationRecords(dispatchedRun, assets, 'validate-only'),
     });
     const sourceProof = proof(directory);
-    expectConflict(() => publishReviewed(optionsFor(directory, sourceProof), fake.adapter), /attestation.*input|publish-existing-tag/i);
+    expectConflict(
+      () => publishReviewed(optionsFor(directory, sourceProof), fake.adapter),
+      /attestation.*input|publish-existing-tag/i,
+    );
     assert.equal(fake.state.created, 0);
     assert.equal(fake.state.uploaded.length, 0);
   }
@@ -934,7 +1007,10 @@ try {
     const directory = fs.mkdtempSync(path.join(root, 'duplicate-runs-'));
     const fake = fakeAdapter({ runs: [run(701), run(702)], release: null });
     const sourceProof = proof(directory);
-    expectConflict(() => publishReviewed(optionsFor(directory, sourceProof), fake.adapter), /multiple.*workflow runs|duplicate.*workflow runs/i);
+    expectConflict(
+      () => publishReviewed(optionsFor(directory, sourceProof), fake.adapter),
+      /multiple.*workflow runs|duplicate.*workflow runs/i,
+    );
     assert.equal(fake.state.created, 0);
   }
 
@@ -956,16 +1032,24 @@ try {
     publishReviewed(resumeOptions, fake.adapter);
 
     const promotion = makePromotion(directory, staged.sourceProof, staged.options.get('receipt-out'));
-    const finalOptions = finalizeOptions(directory, staged.sourceProof, staged.options.get('receipt-out'), promotion, 'successful-expired-final.json');
+    const finalOptions = finalizeOptions(
+      directory,
+      staged.sourceProof,
+      staged.options.get('receipt-out'),
+      promotion,
+      'successful-expired-final.json',
+    );
     finalizeReviewed(finalOptions, fake.adapter, acceptPromotionReceipt);
     assert.equal(fake.state.edited, 1);
     assert.equal(fake.state.downloaded.length, 0);
     assert.equal(downloadAttempts, 0);
     assert.equal(fake.state.releaseDownloads, 1);
-    assert.deepEqual(fake.state.releaseDownloadRequests, [{
-      releaseId: 501,
-      assetIds: fake.state.release.assets.map(({ id }) => id),
-    }]);
+    assert.deepEqual(fake.state.releaseDownloadRequests, [
+      {
+        releaseId: 501,
+        assetIds: fake.state.release.assets.map(({ id }) => id),
+      },
+    ]);
     checks += 1;
   }
 
@@ -994,7 +1078,9 @@ try {
       () => publishReviewed(options, fake.adapter),
       conflict === 'timestamp' || conflict.includes('publisher')
         ? /timestamp|run window|publisher/i
-        : conflict === 'database-id' ? /database identity|duplicate/i : /digest|checksum/i,
+        : conflict === 'database-id'
+          ? /database identity|duplicate/i
+          : /digest|checksum/i,
     );
     assert.equal(fake.state.dispatched.length, 0);
     assert.equal(fake.state.created, 0);
@@ -1032,13 +1118,15 @@ try {
     assert.equal(downloadAttempts, 1);
   }
 
-
   {
     const directory = fs.mkdtempSync(path.join(root, 'mismatched-run-'));
     const bad = { ...run(), head_sha: '9'.repeat(40) };
     const fake = fakeAdapter({ runs: [bad], release: null });
     const sourceProof = proof(directory);
-    expectConflict(() => publishReviewed(optionsFor(directory, sourceProof), fake.adapter), /workflow run.*identity.*conflict/i);
+    expectConflict(
+      () => publishReviewed(optionsFor(directory, sourceProof), fake.adapter),
+      /workflow run.*identity.*conflict/i,
+    );
     assert.equal(fake.state.dispatched.length, 0);
   }
 
@@ -1067,7 +1155,10 @@ try {
     resumeOptions.set('resume-publication-sha256', sha256(fs.readFileSync(first.options.get('receipt-out'))));
     fake.state.release.assets.pop();
     const before = { created: fake.state.created, uploaded: fake.state.uploaded.length };
-    expectConflict(() => publishReviewed(resumeOptions, fake.adapter), /resume publication release asset|resume publication release identity/i);
+    expectConflict(
+      () => publishReviewed(resumeOptions, fake.adapter),
+      /resume publication release asset|resume publication release identity/i,
+    );
     assert.deepEqual({ created: fake.state.created, uploaded: fake.state.uploaded.length }, before);
   }
 
@@ -1078,7 +1169,10 @@ try {
       throw new SessionRelayReleaseError('same-run checksum digest conflict');
     };
     const sourceProof = proof(directory);
-    expectConflict(() => publishReviewed(optionsFor(directory, sourceProof), fake.adapter), /checksum digest conflict/i);
+    expectConflict(
+      () => publishReviewed(optionsFor(directory, sourceProof), fake.adapter),
+      /checksum digest conflict/i,
+    );
     assert.equal(fake.state.dispatched.length, 0);
   }
 
@@ -1103,7 +1197,9 @@ try {
     resumeOptions.set('resume-publication', first.options.get('receipt-out'));
     resumeOptions.set('resume-publication-sha256', sha256(fs.readFileSync(first.options.get('receipt-out'))));
     const downloads = fake.state.downloaded.length;
-    fake.adapter.downloadRunAssets = () => { throw new Error('Actions artifacts expired'); };
+    fake.adapter.downloadRunAssets = () => {
+      throw new Error('Actions artifacts expired');
+    };
     publishReviewed(resumeOptions, fake.adapter);
     assert.equal(fake.state.downloaded.length, downloads);
     checks += 1;
@@ -1117,7 +1213,9 @@ try {
     resumeOptions.set('resume-publication', first.options.get('receipt-out'));
     resumeOptions.set('resume-publication-sha256', sha256(fs.readFileSync(first.options.get('receipt-out'))));
     const downloads = fake.state.downloaded.length;
-    fake.adapter.downloadRunAssets = () => { throw new Error('Actions artifacts expired'); };
+    fake.adapter.downloadRunAssets = () => {
+      throw new Error('Actions artifacts expired');
+    };
     publishReviewed(resumeOptions, fake.adapter);
     assert.equal(fake.state.downloaded.length, downloads);
     checks += 1;
@@ -1148,7 +1246,13 @@ try {
     assert.deepEqual(finalReceipt.workflow, staged.receipt.workflow);
     checks += 1;
 
-    const stableOptions = finalizeOptions(directory, staged.sourceProof, staged.options.get('receipt-out'), promotion, 'already-stable.json');
+    const stableOptions = finalizeOptions(
+      directory,
+      staged.sourceProof,
+      staged.options.get('receipt-out'),
+      promotion,
+      'already-stable.json',
+    );
     finalizeReviewed(stableOptions, fake.adapter, acceptPromotionReceipt);
     assert.equal(fake.state.edited, 1);
     assert.equal(receiptAt(stableOptions.get('receipt-out')).transition, 'already_stable');
@@ -1160,7 +1264,13 @@ try {
     const fake = fakeAdapter();
     const staged = rebind(directory, fake);
     const promotion = makePromotion(directory, staged.sourceProof, staged.options.get('receipt-out'));
-    const crashedOptions = finalizeOptions(directory, staged.sourceProof, staged.options.get('receipt-out'), promotion, 'crashed-final.json');
+    const crashedOptions = finalizeOptions(
+      directory,
+      staged.sourceProof,
+      staged.options.get('receipt-out'),
+      promotion,
+      'crashed-final.json',
+    );
     const mutateStable = fake.adapter.editStable;
     fake.adapter.editStable = () => {
       mutateStable();
@@ -1173,10 +1283,22 @@ try {
     );
     assert.equal(fake.state.edited, 1);
     assert.equal(fake.state.release.prerelease, false);
-    assert.equal(fs.existsSync(crashedOptions.get('receipt-out')), false, 'finalization crash fixture must not write a receipt');
+    assert.equal(
+      fs.existsSync(crashedOptions.get('receipt-out')),
+      false,
+      'finalization crash fixture must not write a receipt',
+    );
 
-    fake.adapter.editStable = () => { throw new Error('base recovery attempted a second editStable'); };
-    const recoveryOptions = finalizeOptions(directory, staged.sourceProof, staged.options.get('receipt-out'), promotion, 'fresh-path-recovery.json');
+    fake.adapter.editStable = () => {
+      throw new Error('base recovery attempted a second editStable');
+    };
+    const recoveryOptions = finalizeOptions(
+      directory,
+      staged.sourceProof,
+      staged.options.get('receipt-out'),
+      promotion,
+      'fresh-path-recovery.json',
+    );
     finalizeReviewed(recoveryOptions, fake.adapter, acceptPromotionReceipt);
     assert.equal(fake.state.edited, 1, 'fresh-path base recovery must perform exactly one total editStable');
     const recovered = receiptAt(recoveryOptions.get('receipt-out'));
@@ -1191,7 +1313,9 @@ try {
     const fake = fakeAdapter();
     const staged = rebind(directory, fake);
     const promotion = makePromotion(directory, staged.sourceProof, staged.options.get('receipt-out'));
-    fake.adapter.downloadRunAssets = () => { throw new Error('Actions artifacts expired'); };
+    fake.adapter.downloadRunAssets = () => {
+      throw new Error('Actions artifacts expired');
+    };
     const options = finalizeOptions(directory, staged.sourceProof, staged.options.get('receipt-out'), promotion);
     finalizeReviewed(options, fake.adapter, acceptPromotionReceipt);
     assert.equal(fake.state.edited, 1);
@@ -1205,7 +1329,12 @@ try {
     const promotion = makePromotion(directory, staged.sourceProof, staged.options.get('receipt-out'));
     const options = finalizeOptions(directory, staged.sourceProof, staged.options.get('receipt-out'), promotion);
     const releaseQueries = fake.state.releaseQueries;
-    const validator = kind === 'missing' ? undefined : () => { throw new SessionRelayReleaseError('promotion receipt rejected'); };
+    const validator =
+      kind === 'missing'
+        ? undefined
+        : () => {
+            throw new SessionRelayReleaseError('promotion receipt rejected');
+          };
     expectConflict(
       () => finalizeReviewed(options, fake.adapter, validator),
       kind === 'missing' ? /promotion validator.*function/i : /promotion receipt rejected/i,
@@ -1233,7 +1362,10 @@ try {
     const promotion = makePromotion(directory, staged.sourceProof, staged.options.get('receipt-out'));
     fake.state.release.id += 1;
     const options = finalizeOptions(directory, staged.sourceProof, staged.options.get('receipt-out'), promotion);
-    expectConflict(() => finalizeReviewed(options, fake.adapter, acceptPromotionReceipt), /release database identity conflict/i);
+    expectConflict(
+      () => finalizeReviewed(options, fake.adapter, acceptPromotionReceipt),
+      /release database identity conflict/i,
+    );
     assert.equal(fake.state.edited, 0);
   }
 

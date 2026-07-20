@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -12,7 +12,8 @@ const repo = path.resolve(plugin, '..', '..');
 const fixture = JSON.parse(fs.readFileSync(path.join(here, 'fixtures', 'reentry-inventory.json'), 'utf8'));
 assert.equal(fixture.schema_version, 3);
 
-const rustFiles = fs.readdirSync(path.join(plugin, 'rust', 'src'))
+const rustFiles = fs
+  .readdirSync(path.join(plugin, 'rust', 'src'))
   .filter((name) => name.endsWith('.rs'))
   .map((name) => path.join(plugin, 'rust', 'src', name));
 const sources = rustFiles.map((file) => ({
@@ -50,7 +51,8 @@ function functionByName(source, name) {
 function compileFail() {
   const manifest = path.join(here, 'fixtures', 'lifecycle-capability-bypass', 'Cargo.toml');
   const binDir = path.join(here, 'fixtures', 'lifecycle-capability-bypass', 'src', 'bin');
-  const actualBins = fs.readdirSync(binDir)
+  const actualBins = fs
+    .readdirSync(binDir)
     .filter((name) => name.endsWith('.rs'))
     .map((name) => name.slice(0, -3))
     .sort();
@@ -109,11 +111,23 @@ assert.match(
 const drain = functionByName(sourceByName('plugins/session-relay/rust/src/store.rs'), 'drain_with_guard');
 assert.match(drain.text, /guard\.with_authorized/, 'mailbox validation and removal must share one store lock');
 const rollback = functionByName(sourceByName('plugins/session-relay/rust/src/store.rs'), 'rollback');
-assert.doesNotMatch(rollback.text, /recipient|session_id|target/, 'receipt rollback may not accept an independent target');
-assert.match(rollback.text, /self\.raw[\s\S]*push_str\(&current\)/, 'receipt rollback must restore exact original lines before newer mail');
+assert.doesNotMatch(
+  rollback.text,
+  /recipient|session_id|target/,
+  'receipt rollback may not accept an independent target',
+);
+assert.match(
+  rollback.text,
+  /self\.raw[\s\S]*push_str\(&current\)/,
+  'receipt rollback must restore exact original lines before newer mail',
+);
 const appserverSource = sourceByName('plugins/session-relay/rust/src/appserver.rs');
 const guardedRequest = functionByName(appserverSource, 'request_with_guard');
-assert.match(guardedRequest.text, /Duration::from_secs\(RPC_TIMEOUT_SECS\)/, 'guarded RPC must preserve the normal timeout');
+assert.match(
+  guardedRequest.text,
+  /Duration::from_secs\(RPC_TIMEOUT_SECS\)/,
+  'guarded RPC must preserve the normal timeout',
+);
 assert.match(guardedRequest.text, /recv_text_with_guard/, 'guarded RPC responses must poll lifecycle cancellation');
 assert.match(guardedRequest.text, /BeforeSend[\s\S]*AfterSend/, 'guarded RPC must retain its sent boundary');
 const guardedReceive = functionByName(appserverSource, 'recv_text_with_guard');
@@ -121,10 +135,7 @@ assert.match(guardedReceive.text, /authorize_use[\s\S]*parse_frame/, 'buffered f
 const guardedConnect = functionByName(appserverSource, 'connect_with_guard');
 assert.match(guardedConnect.text, /connect_checked/, 'connect and HTTP upgrade must use the guard-aware poller');
 
-const threadState = functionByName(
-  sourceByName('plugins/session-relay/rust/src/appserver.rs'),
-  'thread_state',
-);
+const threadState = functionByName(sourceByName('plugins/session-relay/rust/src/appserver.rs'), 'thread_state');
 assert.doesNotMatch(
   threadState.text,
   /"thread\/resume"/,
@@ -139,9 +150,7 @@ const processPatterns = [
 ];
 const processRows = [];
 const processClasses = new Map(
-  Object.entries(fixture.process_function_classes).flatMap(([kind, names]) =>
-    names.map((name) => [name, kind]),
-  ),
+  Object.entries(fixture.process_function_classes).flatMap(([kind, names]) => names.map((name) => [name, kind])),
 );
 for (const source of sources) {
   for (const pattern of processPatterns) {
@@ -185,9 +194,7 @@ const appserverPatterns = [
 ];
 const appserverRows = [];
 const appserverClasses = new Map(
-  Object.entries(fixture.appserver_function_classes).flatMap(([kind, names]) =>
-    names.map((name) => [name, kind]),
-  ),
+  Object.entries(fixture.appserver_function_classes).flatMap(([kind, names]) => names.map((name) => [name, kind])),
 );
 for (const source of sources) {
   for (const pattern of appserverPatterns) {
@@ -213,9 +220,10 @@ for (const birth of fixture.births) {
     assert.ok(source.text.includes(evidence), `${birth.id}: creates-new evidence is missing: ${evidence}`);
   }
   const classified = [...processRows, ...appserverRows].filter(
-    (row) => row.source.file === birth.file
-      && row.owner.name === birth.function
-      && row.classification === 'non_reentry_creation',
+    (row) =>
+      row.source.file === birth.file &&
+      row.owner.name === birth.function &&
+      row.classification === 'non_reentry_creation',
   );
   assert.ok(classified.length > 0, `${birth.id}: no source-derived NON-REENTRY CREATION row`);
   console.log(`PASS birth_inventory id=${birth.id} creates_new=1 rows=${classified.length}`);

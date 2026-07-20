@@ -32,7 +32,8 @@ function parseCli(argv) {
     const name = names.get(option);
     assert.ok(name, `unknown option ${option}`);
     assert.equal(result[name], undefined, `duplicate ${option}`);
-    const value = argv[index += 1];
+    index += 1;
+    const value = argv[index];
     assert.ok(value && !value.startsWith('--'), `${option} requires a value`);
     result[name] = value;
   }
@@ -62,15 +63,18 @@ function run(cwd, executable, args) {
   assert.equal(result.status, 0, `${executable} ${args.join(' ')}: ${result.stderr || result.stdout}`);
 }
 
-
 function canonicalize(value) {
   if (value === null || typeof value !== 'object') return JSON.stringify(value);
   if (Array.isArray(value)) return `[${value.map(canonicalize).join(',')}]`;
-  return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalize(value[key])}`).join(',')}}`;
+  return `{${Object.keys(value)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${canonicalize(value[key])}`)
+    .join(',')}}`;
 }
 
 const sha256 = (value) => createHash('sha256').update(value).digest('hex');
-const exactKeys = (object, expected, label) => assert.deepEqual(Object.keys(object).sort(), [...expected].sort(), label);
+const exactKeys = (object, expected, label) =>
+  assert.deepEqual(Object.keys(object).sort(), [...expected].sort(), label);
 
 function verify() {
   const cli = parseCli(process.argv.slice(2));
@@ -87,7 +91,9 @@ function verify() {
     const planPath = [
       'docs/plans/active/session-relay-cli-installation.md',
       'docs/plans/finished/session-relay-cli-installation.md',
-    ].map((relative) => path.join(directory, relative)).find(fs.existsSync);
+    ]
+      .map((relative) => path.join(directory, relative))
+      .find(fs.existsSync);
     assert.ok(planPath, 'companion plan is absent');
     const plan = fs.readFileSync(planPath, 'utf8');
     const executionBase = plan.match(/^execution_base_commit:\s*([0-9a-f]{40})$/m)?.[1];
@@ -101,7 +107,10 @@ function verify() {
     assert.equal(review.reviewer?.verdict, 'ready');
     assert.match(plan, /^review_status:\s*ready$/m);
     assert.match(plan, /^status:\s*blocked$/m);
-    assert.match(plan, new RegExp(`^- .*blocked reason: ${BLOCKED_REASON.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'mi'));
+    assert.match(
+      plan,
+      new RegExp(`^- .*blocked reason: ${BLOCKED_REASON.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'mi'),
+    );
 
     const receiptBytes = plan.match(/^- (?:Public|Companion) TDD-red receipt JCS bytes: (\{.*\})$/m)?.[1];
     const receiptHash = plan.match(/^- (?:Public|Companion) TDD-red receipt SHA-256: ([0-9a-f]{64})$/m)?.[1];
@@ -115,28 +124,47 @@ function verify() {
     for (const test of receipt.test_paths) {
       assert.equal(git(directory, ['rev-parse', `${receipt.pre_production_commit}:${test.path}`]), test.blob_id);
     }
-    assert.notEqual(git(directory, ['merge-base', '--is-ancestor', receipt.pre_production_commit, cli.commit], { ancestorMiss: true }), null);
+    assert.notEqual(
+      git(directory, ['merge-base', '--is-ancestor', receipt.pre_production_commit, cli.commit], {
+        ancestorMiss: true,
+      }),
+      null,
+    );
     assert.deepEqual(receipt.test_paths.map(({ path: testPath }) => testPath).sort(), [
       'cli/test/unit/pluginRefresh.test.ts',
       'cli/test/unit/sessionRelayCli.test.ts',
     ]);
     assert.deepEqual(receipt.command.argv, [
-      'bun', 'run', 'test:unit', '--',
+      'bun',
+      'run',
+      'test:unit',
+      '--',
       'cli/test/unit/sessionRelayCli.test.ts',
       'cli/test/unit/pluginRefresh.test.ts',
     ]);
     for (const test of receipt.test_paths) {
-      assert.equal(git(directory, ['rev-parse', `${cli.commit}:${test.path}`]), test.blob_id, `${test.path} changed after the frozen TDD-red capture`);
+      assert.equal(
+        git(directory, ['rev-parse', `${cli.commit}:${test.path}`]),
+        test.blob_id,
+        `${test.path} changed after the frozen TDD-red capture`,
+      );
     }
     assert.equal(fs.statSync(path.join(directory, 'bun.lock')).isFile(), true, 'companion lockfile is absent');
     run(directory, 'bun', ['install', '--frozen-lockfile']);
     run(directory, receipt.command.argv[0], receipt.command.argv.slice(1));
     assert.equal(git(directory, ['rev-parse', 'HEAD']), cli.commit);
-    assert.equal(git(directory, ['status', '--porcelain=v1']), '', 'companion tests or setup changed the reviewed checkout');
+    assert.equal(
+      git(directory, ['status', '--porcelain=v1']),
+      '',
+      'companion tests or setup changed the reviewed checkout',
+    );
 
-
-    const docksPlan = fs.readFileSync(path.join(REPO, 'docs/plans/active/session-relay-prebuilt-cli-distribution.md'), 'utf8');
-    const docksField = (name) => docksPlan.match(new RegExp(`^- ${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}: (.+)$`, 'm'))?.[1];
+    const docksPlan = fs.readFileSync(
+      path.join(REPO, 'docs/plans/active/session-relay-prebuilt-cli-distribution.md'),
+      'utf8',
+    );
+    const docksField = (name) =>
+      docksPlan.match(new RegExp(`^- ${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}: (.+)$`, 'm'))?.[1];
     assert.equal(docksField('Companion repository ID'), 'DocksDocks/public');
     assert.equal(docksField('Companion validation ref'), cli.ref);
     assert.equal(docksField('Companion implementation commit'), cli.commit);
@@ -150,7 +178,11 @@ function verify() {
 
     const toolchain = JSON.parse(fs.readFileSync(path.join(directory, 'SoT/toolchain.json'), 'utf8'));
     const relay = toolchain['session-relay'] ?? toolchain.tools?.['session-relay'];
-    exactKeys(relay, ['kind', 'policy', 'verified', 'repository', 'tag', 'plugin_id', 'plugin_version', 'install_path', 'assets'], 'companion Session Relay manifest is closed');
+    exactKeys(
+      relay,
+      ['kind', 'policy', 'verified', 'repository', 'tag', 'plugin_id', 'plugin_version', 'install_path', 'assets'],
+      'companion Session Relay manifest is closed',
+    );
     assert.equal(relay.kind, 'managed-release');
     assert.equal(relay.policy, 'exact');
     assert.equal(relay.repository, 'DocksDocks/docks');
@@ -159,11 +191,19 @@ function verify() {
     assert.equal(relay.plugin_id, 'session-relay@docks');
     assert.equal(relay.plugin_version, '0.12.0');
     assert.equal(relay.install_path, '~/.local/bin/session-relay');
-    exactKeys(relay.assets, ['x86_64-unknown-linux-musl', 'aarch64-unknown-linux-musl', 'x86_64-apple-darwin', 'aarch64-apple-darwin'], 'companion asset pins are closed');
+    exactKeys(
+      relay.assets,
+      ['x86_64-unknown-linux-musl', 'aarch64-unknown-linux-musl', 'x86_64-apple-darwin', 'aarch64-apple-darwin'],
+      'companion asset pins are closed',
+    );
     for (const digest of Object.values(relay.assets)) assert.match(digest, SHA);
   } finally {
     const current = fs.statSync(directory);
-    assert.equal(`${current.dev}:${current.ino}`, `${identity.dev}:${identity.ino}`, 'companion clone identity changed before cleanup');
+    assert.equal(
+      `${current.dev}:${current.ino}`,
+      `${identity.dev}:${identity.ino}`,
+      'companion clone identity changed before cleanup',
+    );
     fs.rmSync(directory, { recursive: true, force: true });
     assert.equal(fs.existsSync(directory), false);
   }

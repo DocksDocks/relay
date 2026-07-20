@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -47,14 +47,12 @@ const waitFor = (description, predicate, timeoutMs = 10_000) => {
   }
   assert.fail(`timed out waiting for ${description}`);
 };
-const lifecycleState = () => JSON.parse(
-  fs.readFileSync(path.join(home, 'lifecycle-v1.json'), 'utf8'),
-).state;
-const workerState = (sessionId) => Object.values(lifecycleState().managed_workers ?? {})
-  .find((worker) => worker.runtime_session_id === sessionId)?.state;
-const fanoutRecords = () => Object.values(JSON.parse(
-  fs.readFileSync(path.join(home, 'fanout-v1.json'), 'utf8'),
-).records);
+const lifecycleState = () => JSON.parse(fs.readFileSync(path.join(home, 'lifecycle-v1.json'), 'utf8')).state;
+const workerState = (sessionId) =>
+  Object.values(lifecycleState().managed_workers ?? {}).find((worker) => worker.runtime_session_id === sessionId)
+    ?.state;
+const fanoutRecords = () =>
+  Object.values(JSON.parse(fs.readFileSync(path.join(home, 'fanout-v1.json'), 'utf8')).records);
 const spawnId = (result) => {
   assert.equal(result.status, 0, `fanout spawn failed:\n${result.stdout}\n${result.stderr}`);
   const id = /spawned (?:[^\s]+ \()?([0-9a-f-]{36})\)? in /.exec(result.stdout)?.[1];
@@ -86,7 +84,9 @@ const hook = relay(['hook'], {
 assert.equal(hook.status, 0, `register invoker hook failed: ${hook.stderr}`);
 
 const stub = path.join(home, 'fanout-child.mjs');
-fs.writeFileSync(stub, `#!/usr/bin/env node
+fs.writeFileSync(
+  stub,
+  `#!/usr/bin/env node
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -106,31 +106,80 @@ for (const args of [['add', process.env.STUB_OUTPUT_FILE], ['commit', '-qm', 'fa
 const handback = spawnSync(process.env.STUB_RELAY_BIN, ['handback', '--from', sessionId, '--status', 'completed', '--note', 'ready'], { encoding: 'utf8', env: process.env });
 if (handback.status !== 0) process.exit(22);
 while (true) sleep(1000);
-`, { mode: 0o755 });
+`,
+  { mode: 0o755 },
+);
 
 try {
   const rootTrigger = triggerPath('root');
-  const rootId = spawnId(relay([
-    'spawn', repo, '--fanout', '--from', invoker, '--tool', 'claude', '--timeout', '5', '--', 'root task',
-  ], { env: { STUB_HANDBACK_TRIGGER: rootTrigger, STUB_OUTPUT_FILE: 'root.txt' } }));
+  const rootId = spawnId(
+    relay(['spawn', repo, '--fanout', '--from', invoker, '--tool', 'claude', '--timeout', '5', '--', 'root task'], {
+      env: { STUB_HANDBACK_TRIGGER: rootTrigger, STUB_OUTPUT_FILE: 'root.txt' },
+    }),
+  );
   const rootRecord = fanoutRecords().find((record) => record.runtime_session_id === rootId);
   assert.equal(rootRecord?.depth, '0');
   assert.equal(rootRecord?.state, 'Running');
 
   const leaf1Trigger = triggerPath('leaf1');
-  const leaf1Id = spawnId(relay([
-    'spawn', rootRecord.worktree, '--worktree', '--from', rootId, '--tool', 'claude', '--timeout', '5', '--', 'leaf one',
-  ], { env: { STUB_HANDBACK_TRIGGER: leaf1Trigger, STUB_OUTPUT_FILE: 'leaf-one.txt' } }));
+  const leaf1Id = spawnId(
+    relay(
+      [
+        'spawn',
+        rootRecord.worktree,
+        '--worktree',
+        '--from',
+        rootId,
+        '--tool',
+        'claude',
+        '--timeout',
+        '5',
+        '--',
+        'leaf one',
+      ],
+      { env: { STUB_HANDBACK_TRIGGER: leaf1Trigger, STUB_OUTPUT_FILE: 'leaf-one.txt' } },
+    ),
+  );
   const leaf2Trigger = triggerPath('leaf2');
-  const leaf2Id = spawnId(relay([
-    'spawn', rootRecord.worktree, '--worktree', '--from', rootId, '--tool', 'claude', '--timeout', '5', '--', 'leaf two',
-  ], { env: { STUB_HANDBACK_TRIGGER: leaf2Trigger, STUB_OUTPUT_FILE: 'leaf-two.txt' } }));
+  const leaf2Id = spawnId(
+    relay(
+      [
+        'spawn',
+        rootRecord.worktree,
+        '--worktree',
+        '--from',
+        rootId,
+        '--tool',
+        'claude',
+        '--timeout',
+        '5',
+        '--',
+        'leaf two',
+      ],
+      { env: { STUB_HANDBACK_TRIGGER: leaf2Trigger, STUB_OUTPUT_FILE: 'leaf-two.txt' } },
+    ),
+  );
 
   const worktreesBeforeThird = fs.readdirSync(path.join(home, 'worktrees')).sort();
-  const branchesBeforeThird = git(['branch', '--list', 'relay/fanout-*'], rootRecord.worktree).split('\n').filter(Boolean);
-  const third = relay([
-    'spawn', rootRecord.worktree, '--worktree', '--from', rootId, '--tool', 'claude', '--timeout', '5', '--', 'third leaf',
-  ], { env: { STUB_HANDBACK_TRIGGER: triggerPath('leaf3'), STUB_OUTPUT_FILE: 'leaf-three.txt' } });
+  const branchesBeforeThird = git(['branch', '--list', 'relay/fanout-*'], rootRecord.worktree)
+    .split('\n')
+    .filter(Boolean);
+  const third = relay(
+    [
+      'spawn',
+      rootRecord.worktree,
+      '--worktree',
+      '--from',
+      rootId,
+      '--tool',
+      'claude',
+      '--timeout',
+      '5',
+      '--',
+      'third leaf',
+    ],
+    { env: { STUB_HANDBACK_TRIGGER: triggerPath('leaf3'), STUB_OUTPUT_FILE: 'leaf-three.txt' } },
+  );
   assert.notEqual(third.status, 0, 'third live leaf must be refused');
   assert.match(third.stderr, /fanout cap reached \(2 active descendants\)/);
   assert.deepEqual(fs.readdirSync(path.join(home, 'worktrees')).sort(), worktreesBeforeThird);

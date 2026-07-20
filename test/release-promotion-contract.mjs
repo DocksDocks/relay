@@ -1,23 +1,29 @@
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-
+import { dispatchSessionRelayRelease } from '../../../scripts/lib/session-relay-release-cli.mjs';
+import {
+  canonicalize,
+  LOCK_REF,
+  PRERELEASE_BODY,
+  SessionRelayReleaseError,
+  TRANSACTION_REF,
+} from '../../../scripts/lib/session-relay-release-core.mjs';
+import { validateSourcePreparationProof } from '../../../scripts/lib/session-relay-release-preparation.mjs';
 import * as releasePromotion from '../../../scripts/lib/session-relay-release-promotion.mjs';
 import {
-  PROMOTION_ADAPTER_KEYS,
   fetchPromotionAuthoritativeRef,
+  PROMOTION_ADAPTER_KEYS,
   promoteReviewed,
   readPromotionJournalFromRepository,
   validatePromotionJournal,
   validatePromotionReceipt,
   validatePromotionReceiptForFinalization,
 } from '../../../scripts/lib/session-relay-release-promotion.mjs';
-import { canonicalize, LOCK_REF, PRERELEASE_BODY, SessionRelayReleaseError, TRANSACTION_REF } from '../../../scripts/lib/session-relay-release-core.mjs';
-import { validateSourcePreparationProof } from '../../../scripts/lib/session-relay-release-preparation.mjs';
-import { dispatchSessionRelayRelease } from '../../../scripts/lib/session-relay-release-cli.mjs';
+
 const OLD_MAIN = '1'.repeat(40);
 const TAG_COMMIT = '2'.repeat(40);
 const PROMOTED_COMMIT = '3'.repeat(40);
@@ -30,7 +36,10 @@ const PUBLIC_RELEASE_COMMIT = '7'.repeat(40);
 const PUBLIC_PLAN_COMMIT = '8'.repeat(40);
 const DIGEST = (letter) => letter.repeat(64);
 const BLOB = (letter) => letter.repeat(40);
-const hash = (value) => createHash('sha256').update(Buffer.isBuffer(value) || typeof value === 'string' ? value : canonicalize(value)).digest('hex');
+const hash = (value) =>
+  createHash('sha256')
+    .update(Buffer.isBuffer(value) || typeof value === 'string' ? value : canonicalize(value))
+    .digest('hex');
 const HOST_ASSET_DIGEST = '5'.repeat(64);
 
 const candidate = {
@@ -77,12 +86,14 @@ const candidate = {
   },
   checks: Array.from({ length: 6 }, (_, index) => ({
     id: `A${index + 1}`,
-    steps: [{
-      argv: ['node', `check-${index + 1}.mjs`],
-      exit_code: 0,
-      stdout_sha256: DIGEST('8'),
-      stderr_sha256: DIGEST('9'),
-    }],
+    steps: [
+      {
+        argv: ['node', `check-${index + 1}.mjs`],
+        exit_code: 0,
+        stdout_sha256: DIGEST('8'),
+        stderr_sha256: DIGEST('9'),
+      },
+    ],
     exit_code: 0,
     stdout_sha256: DIGEST('a'),
     stderr_sha256: DIGEST('b'),
@@ -110,7 +121,12 @@ const proofValue = {
     finished_sha256: DIGEST('e'),
   },
   completion_review_sha256: DIGEST('f'),
-  source_ancestry: { source_commit: TAG_COMMIT, evidence_commit: '8'.repeat(40), shipped_commit: PROMOTED_COMMIT, verified: true },
+  source_ancestry: {
+    source_commit: TAG_COMMIT,
+    evidence_commit: '8'.repeat(40),
+    shipped_commit: PROMOTED_COMMIT,
+    verified: true,
+  },
   non_plan_tree_equivalence: {
     source_commit: TAG_COMMIT,
     shipped_commit: PROMOTED_COMMIT,
@@ -179,10 +195,9 @@ const PUBLIC_RELEASE_ASSET_NAMES = [
   'docks-kit-linux-x64',
   'docks-kit-windows-x64.exe',
 ];
-const publicationAssetPins = Object.fromEntries(PUBLIC_ASSET_TARGETS.map((target) => [
-  target,
-  assets.find(({ name }) => name === `session-relay-${target}`).digest,
-]));
+const publicationAssetPins = Object.fromEntries(
+  PUBLIC_ASSET_TARGETS.map((target) => [target, assets.find(({ name }) => name === `session-relay-${target}`).digest]),
+);
 const publicRequestValue = {
   schema: 1,
   type: 'PublicReleaseRequestV1',
@@ -221,7 +236,9 @@ const publicReleaseValue = {
     assets: PUBLIC_RELEASE_ASSET_NAMES.map((name, index) => ({
       name,
       size: 2000 + index,
-      digest: String(index + 8).slice(-1).repeat(64),
+      digest: String(index + 8)
+        .slice(-1)
+        .repeat(64),
     })),
     checksums_sha256: DIGEST('8'),
   },
@@ -236,20 +253,21 @@ const publicReleaseValue = {
 };
 const publicRelease = { digest: hash(publicReleaseValue), value: publicReleaseValue };
 
-
 function options(output = '/receipts/promotion.json', extra = {}) {
-  return new Map(Object.entries({
-    publication: '/receipts/publication.json',
-    'publication-sha256': publication.digest,
-    'public-release': '/receipts/public-release.json',
-    'public-release-sha256': publicRelease.digest,
-    'source-proof': '/receipts/proof.json',
-    'source-proof-sha256': proof.digest,
-    'docks-kit-release': 'cli-v0.9.0',
-    'expected-origin-main': OLD_MAIN,
-    'receipt-out': output,
-    ...extra,
-  }));
+  return new Map(
+    Object.entries({
+      publication: '/receipts/publication.json',
+      'publication-sha256': publication.digest,
+      'public-release': '/receipts/public-release.json',
+      'public-release-sha256': publicRelease.digest,
+      'source-proof': '/receipts/proof.json',
+      'source-proof-sha256': proof.digest,
+      'docks-kit-release': 'cli-v0.9.0',
+      'expected-origin-main': OLD_MAIN,
+      'receipt-out': output,
+      ...extra,
+    }),
+  );
 }
 
 function smoke(kind) {
@@ -271,7 +289,23 @@ function smoke(kind) {
   };
 }
 
-function makeAdapter({ killAfter = null, killMutation = null, rejectMutation = null, outageAfterAppend = null, liveResults = [true], prepushThrows = false, prepushMutator = null, liveThrows = false, liveMutator = null, restoreDrift = false, reapplyDrift = false, ancestry = true, publicAncestry = true, initialMain = OLD_MAIN, adoptionRerunParity = null } = {}) {
+function makeAdapter({
+  killAfter = null,
+  killMutation = null,
+  rejectMutation = null,
+  outageAfterAppend = null,
+  liveResults = [true],
+  prepushThrows = false,
+  prepushMutator = null,
+  liveThrows = false,
+  liveMutator = null,
+  restoreDrift = false,
+  reapplyDrift = false,
+  ancestry = true,
+  publicAncestry = true,
+  initialMain = OLD_MAIN,
+  adoptionRerunParity = null,
+} = {}) {
   const state = {
     refs: new Map([['refs/heads/main', initialMain]]),
     journal: [],
@@ -341,7 +375,10 @@ function makeAdapter({ killAfter = null, killMutation = null, rejectMutation = n
       return state.journal.map((item) => structuredClone(item));
     },
     isAncestor: (ancestorCommit, descendantCommit) => {
-      assert.ok([TAG_COMMIT, PROMOTED_COMMIT].includes(ancestorCommit), 'reviewed promotion commit must be the ancestor');
+      assert.ok(
+        [TAG_COMMIT, PROMOTED_COMMIT].includes(ancestorCommit),
+        'reviewed promotion commit must be the ancestor',
+      );
       assert.equal(descendantCommit, OLD_MAIN, 'expected origin/main must be the descendant');
       return ancestry;
     },
@@ -374,7 +411,11 @@ function makeAdapter({ killAfter = null, killMutation = null, rejectMutation = n
       state.calls.push({ operation: 'append', ref, prior, phase: entry.phase });
       if (state.rejectMutation === 'append') throw new Error('journal CAS rejected');
       assert.equal(ref, TRANSACTION_REF);
-      assert.equal(state.refs.get(ref) ?? null, prior, 'journal append must use the authoritative prior tip as its CAS lease');
+      assert.equal(
+        state.refs.get(ref) ?? null,
+        prior,
+        'journal append must use the authoritative prior tip as its CAS lease',
+      );
       const commit = hash({ parent: prior, entry }).slice(0, 40);
       state.journal.push({ commit, parent: prior, entry: structuredClone(entry) });
       state.refs.set(ref, commit);
@@ -416,25 +457,46 @@ function makeAdapter({ killAfter = null, killMutation = null, rejectMutation = n
         before: structuredClone(beforeBlobs),
         promoted: structuredClone(promotedFilled),
         current: fill(state.currentBlobs),
-        unexpected_paths: Object.keys(state.currentBlobs).filter((item) => !paths.includes(item)).sort(),
+        unexpected_paths: Object.keys(state.currentBlobs)
+          .filter((item) => !paths.includes(item))
+          .sort(),
       };
     },
     validateCommitTransition: ({ kind, commit, parent }) => ({
-      valid: kind === 'restore'
-        ? commit === RESTORE_COMMIT && [PROMOTED_COMMIT, REAPPLY_COMMIT].includes(parent)
-        : commit === REAPPLY_COMMIT && parent === RESTORE_COMMIT,
+      valid:
+        kind === 'restore'
+          ? commit === RESTORE_COMMIT && [PROMOTED_COMMIT, REAPPLY_COMMIT].includes(parent)
+          : commit === REAPPLY_COMMIT && parent === RESTORE_COMMIT,
       live_smoke: kind === 'restore' ? smoke('live') : null,
-      recorded_parity: kind === 'restore'
-        ? { manifest_catalog: true, full_ci_exit: 0, full_ci_stdout_sha256: DIGEST('7'), full_ci_stderr_sha256: DIGEST('8') }
-        : null,
-      parity: kind === 'restore'
-        ? adoptionRerunParity ?? { manifest_catalog: true, full_ci_exit: 0, full_ci_stdout_sha256: DIGEST('7'), full_ci_stderr_sha256: DIGEST('8') }
-        : null,
+      recorded_parity:
+        kind === 'restore'
+          ? {
+              manifest_catalog: true,
+              full_ci_exit: 0,
+              full_ci_stdout_sha256: DIGEST('7'),
+              full_ci_stderr_sha256: DIGEST('8'),
+            }
+          : null,
+      parity:
+        kind === 'restore'
+          ? (adoptionRerunParity ?? {
+              manifest_catalog: true,
+              full_ci_exit: 0,
+              full_ci_stdout_sha256: DIGEST('7'),
+              full_ci_stderr_sha256: DIGEST('8'),
+            })
+          : null,
       verification_ok: true,
     }),
     runPrepushSmoke: ({ docksKitRepository, docksKitRelease, sourceCommit, publicReleaseCommit }) => {
       if (state.prepushThrows) throw new Error('docks-kit identity failed');
-      state.calls.push({ operation: 'prepush', docksKitRepository, docksKitRelease, sourceCommit, publicReleaseCommit });
+      state.calls.push({
+        operation: 'prepush',
+        docksKitRepository,
+        docksKitRelease,
+        sourceCommit,
+        publicReleaseCommit,
+      });
       assert.equal(docksKitRepository, 'DocksDocks/public');
       assert.equal(docksKitRelease, 'cli-v0.9.0');
       assert.equal(sourceCommit, TAG_COMMIT);
@@ -470,7 +532,12 @@ function makeAdapter({ killAfter = null, killMutation = null, rejectMutation = n
           definitive: true,
           commit: 'a'.repeat(40),
           error: 'restore CI failed',
-          parity: { manifest_catalog: false, full_ci_exit: 1, full_ci_stdout_sha256: DIGEST('c'), full_ci_stderr_sha256: DIGEST('d') },
+          parity: {
+            manifest_catalog: false,
+            full_ci_exit: 1,
+            full_ci_stdout_sha256: DIGEST('c'),
+            full_ci_stderr_sha256: DIGEST('d'),
+          },
         };
       }
       assert.equal(state.refs.get('refs/heads/main'), promoted);
@@ -482,7 +549,12 @@ function makeAdapter({ killAfter = null, killMutation = null, rejectMutation = n
         ok: true,
         commit: RESTORE_COMMIT,
         blobs: { restored: structuredClone(beforeRaw) },
-        parity: { manifest_catalog: true, full_ci_exit: 0, full_ci_stdout_sha256: DIGEST('7'), full_ci_stderr_sha256: DIGEST('8') },
+        parity: {
+          manifest_catalog: true,
+          full_ci_exit: 0,
+          full_ci_stdout_sha256: DIGEST('7'),
+          full_ci_stderr_sha256: DIGEST('8'),
+        },
       };
     },
     reapplyCompatibility: ({ expected }) => {
@@ -519,7 +591,11 @@ function makeAdapter({ killAfter = null, killMutation = null, rejectMutation = n
 }
 
 function run(adapter, output = '/receipts/promotion.json', extra = {}, resume = false) {
-  return promoteReviewed(options(output, resume ? { 'transaction-ref': TRANSACTION_REF, ...extra } : extra), resume, adapter);
+  return promoteReviewed(
+    options(output, resume ? { 'transaction-ref': TRANSACTION_REF, ...extra } : extra),
+    resume,
+    adapter,
+  );
 }
 
 function phases(state) {
@@ -550,11 +626,11 @@ const boundaryFixtureNames = [
   'verify-public-release completion line hash mismatch',
   'verify-public-release non-passed review_status',
 ];
-const missingBoundaryFixtures = boundaryFixtureNames.filter((name) => (
+const missingBoundaryFixtures = boundaryFixtureNames.filter((name) =>
   name.startsWith('emit-')
     ? typeof releasePromotion.emitPublicRequest !== 'function'
-    : typeof releasePromotion.verifyPublicRelease !== 'function'
-));
+    : typeof releasePromotion.verifyPublicRelease !== 'function',
+);
 assert.deepEqual(missingBoundaryFixtures, [], 'public release boundary fixture exports are not implemented');
 
 function writeBoundaryValue(directory, name, value) {
@@ -583,13 +659,23 @@ function captureDigest(action) {
 function publicBoundaryFixture(directory) {
   const publicationFile = writeBoundaryValue(directory, 'publication.json', publication.value);
   const requestOutput = path.join(directory, 'request.json');
-  const requestResult = captureDigest(() => releasePromotion.emitPublicRequest(new Map([
-    ['publication', publicationFile.file],
-    ['publication-sha256', publicationFile.digest],
-    ['receipt-out', requestOutput],
-  ]), { now: () => '2026-07-17T20:30:00.000Z' }));
+  const requestResult = captureDigest(() =>
+    releasePromotion.emitPublicRequest(
+      new Map([
+        ['publication', publicationFile.file],
+        ['publication-sha256', publicationFile.digest],
+        ['receipt-out', requestOutput],
+      ]),
+      { now: () => '2026-07-17T20:30:00.000Z' },
+    ),
+  );
   const requestBytes = fs.readFileSync(requestOutput);
-  const request = { file: requestOutput, bytes: requestBytes, digest: hash(requestBytes), value: JSON.parse(requestBytes) };
+  const request = {
+    file: requestOutput,
+    bytes: requestBytes,
+    digest: hash(requestBytes),
+    value: JSON.parse(requestBytes),
+  };
   const expectedRequest = {
     ...publicRequestValue,
     session_relay: {
@@ -599,20 +685,35 @@ function publicBoundaryFixture(directory) {
   };
   assert.deepEqual(request.value, expectedRequest, 'emit-public-request derivation');
   assert.deepEqual(Object.keys(request.value).sort(), [
-    'assets', 'companion_base_commit', 'created_at', 'repository_id', 'schema',
-    'session_relay', 'tag', 'type', 'version',
+    'assets',
+    'companion_base_commit',
+    'created_at',
+    'repository_id',
+    'schema',
+    'session_relay',
+    'tag',
+    'type',
+    'version',
   ]);
   assert.deepEqual(Object.keys(request.value.session_relay).sort(), [
-    'publication_receipt_sha256', 'repository_id', 'tag', 'tag_commit', 'version',
+    'publication_receipt_sha256',
+    'repository_id',
+    'tag',
+    'tag_commit',
+    'version',
   ]);
   assert.deepEqual(Object.keys(request.value.assets).sort(), [...PUBLIC_ASSET_TARGETS].sort());
   assert.equal(requestBytes.toString('utf8'), canonicalize(request.value));
   assert.throws(
-    () => releasePromotion.emitPublicRequest(new Map([
-      ['publication', publicationFile.file],
-      ['publication-sha256', publicationFile.digest],
-      ['receipt-out', requestOutput],
-    ]), { now: () => '2026-07-17T20:30:00.000Z' }),
+    () =>
+      releasePromotion.emitPublicRequest(
+        new Map([
+          ['publication', publicationFile.file],
+          ['publication-sha256', publicationFile.digest],
+          ['receipt-out', requestOutput],
+        ]),
+        { now: () => '2026-07-17T20:30:00.000Z' },
+      ),
     /output already exists/i,
     'emit-public-request no-clobber emission',
   );
@@ -640,17 +741,20 @@ function changedCompletionReceipt(change) {
   return receipt;
 }
 
-function makePublicReleaseAdapter(request, {
-  tagCommit = PUBLIC_RELEASE_COMMIT,
-  releaseAncestry = true,
-  planAncestry = true,
-  runs,
-  removeAsset = null,
-  checksumConflict = false,
-  pinnedAssets = request.value.assets,
-  reviewStatus = 'passed',
-  completionReceipt = completePublicCompletionReceipt(),
-} = {}) {
+function makePublicReleaseAdapter(
+  request,
+  {
+    tagCommit = PUBLIC_RELEASE_COMMIT,
+    releaseAncestry = true,
+    planAncestry = true,
+    runs,
+    removeAsset = null,
+    checksumConflict = false,
+    pinnedAssets = request.value.assets,
+    reviewStatus = 'passed',
+    completionReceipt = completePublicCompletionReceipt(),
+  } = {},
+) {
   const completionReceiptText = canonicalize(completionReceipt);
   const binaryNames = PUBLIC_RELEASE_ASSET_NAMES.filter((name) => name !== 'SHA256SUMS');
   const binaries = new Map(binaryNames.map((name) => [name, Buffer.from(`public-release:${name}`)]));
@@ -680,17 +784,19 @@ function makePublicReleaseAdapter(request, {
     conclusion: 'success',
   };
   const selectedRuns = runs ?? [successfulRun];
-  const finishedPlan = Buffer.from([
-    '---',
-    'status: finished',
-    `review_status: ${reviewStatus}`,
-    '---',
-    '',
-    '# Public release',
-    '',
-    `Completion-review-receipt: ${completionReceiptText}`,
-    '',
-  ].join('\n'));
+  const finishedPlan = Buffer.from(
+    [
+      '---',
+      'status: finished',
+      `review_status: ${reviewStatus}`,
+      '---',
+      '',
+      '# Public release',
+      '',
+      `Completion-review-receipt: ${completionReceiptText}`,
+      '',
+    ].join('\n'),
+  );
   const adapter = {
     now: () => '2026-07-17T21:00:00.000Z',
     getTagCommit: () => tagCommit,
@@ -716,22 +822,32 @@ function makePublicReleaseAdapter(request, {
   return { adapter, completionDigest: hash(completionReceiptText), successfulRun };
 }
 
-function verifyPublicBoundary(directory, boundary, adapter, {
-  output = 'public-release.json',
-  completionDigest = adapter.completionDigest,
-  finishedPlanPath = 'docs/plans/finished/2026-07-18-session-relay-cli-production-release.md',
-} = {}) {
-  return captureDigest(() => releasePromotion.verifyPublicRelease(new Map([
-    ['request', boundary.request.file],
-    ['request-sha256', boundary.request.digest],
-    ['publication', boundary.publicationFile.file],
-    ['publication-sha256', boundary.publicationFile.digest],
-    ['public-finished-plan', finishedPlanPath],
-    ['public-release-commit', PUBLIC_RELEASE_COMMIT],
-    ['public-plan-commit', PUBLIC_PLAN_COMMIT],
-    ['public-completion-sha256', completionDigest],
-    ['receipt-out', path.join(directory, output)],
-  ]), adapter.adapter ?? adapter));
+function verifyPublicBoundary(
+  directory,
+  boundary,
+  adapter,
+  {
+    output = 'public-release.json',
+    completionDigest = adapter.completionDigest,
+    finishedPlanPath = 'docs/plans/finished/2026-07-18-session-relay-cli-production-release.md',
+  } = {},
+) {
+  return captureDigest(() =>
+    releasePromotion.verifyPublicRelease(
+      new Map([
+        ['request', boundary.request.file],
+        ['request-sha256', boundary.request.digest],
+        ['publication', boundary.publicationFile.file],
+        ['publication-sha256', boundary.publicationFile.digest],
+        ['public-finished-plan', finishedPlanPath],
+        ['public-release-commit', PUBLIC_RELEASE_COMMIT],
+        ['public-plan-commit', PUBLIC_PLAN_COMMIT],
+        ['public-completion-sha256', completionDigest],
+        ['receipt-out', path.join(directory, output)],
+      ]),
+      adapter.adapter ?? adapter,
+    ),
+  );
 }
 
 {
@@ -745,34 +861,148 @@ function verifyPublicBoundary(directory, boundary, adapter, {
     assert.equal(verified.receipt.public_plan.commit, PUBLIC_PLAN_COMMIT);
     assert.equal(verified.receipt.companion_base_commit, PUBLIC_REVIEWED_COMMIT);
     assert.deepEqual(verified.receipt.pinned_assets, boundary.request.value.assets);
-    assert.deepEqual(verified.receipt.release.assets.map(({ name }) => name), PUBLIC_RELEASE_ASSET_NAMES);
+    assert.deepEqual(
+      verified.receipt.release.assets.map(({ name }) => name),
+      PUBLIC_RELEASE_ASSET_NAMES,
+    );
     assert.equal(fs.readFileSync(path.join(directory, 'public-release.json'), 'utf8'), canonicalize(verified.receipt));
 
     const cases = [
-      ['tag commit mismatch', makePublicReleaseAdapter(boundary.request, { tagCommit: 'e'.repeat(40) }), {}, /tag.*commit|release commit/i],
-      ['broken plan ancestry', makePublicReleaseAdapter(boundary.request, { planAncestry: false }), {}, /finished-plan.*ancestry|plan.*ancestry/i],
-      ['broken companion ancestry', makePublicReleaseAdapter(boundary.request, { releaseAncestry: false }), {}, /ancestor|ancestry/i],
-      ['missing successful workflow run', makePublicReleaseAdapter(boundary.request, { runs: [] }), {}, /workflow.*run|successful/i],
-      ['duplicate successful workflow run', (() => {
-        const value = makePublicReleaseAdapter(boundary.request);
-        return makePublicReleaseAdapter(boundary.request, { runs: [value.successfulRun, { ...value.successfulRun, id: 802 }] });
-      })(), {}, /workflow.*run|duplicate|exactly one/i],
-      ['wrong six-asset set', makePublicReleaseAdapter(boundary.request, { removeAsset: 'docks-kit-windows-x64.exe' }), {}, /asset set|six|assets/i],
-      ['checksum conflict', makePublicReleaseAdapter(boundary.request, { checksumConflict: true }), {}, /checksum|digest/i],
-      ['digest-pin mismatch', makePublicReleaseAdapter(boundary.request, { pinnedAssets: { ...boundary.request.value.assets, 'x86_64-unknown-linux-musl': DIGEST('f') } }), {}, /pinned|digest/i],
-      ['completion line hash mismatch', makePublicReleaseAdapter(boundary.request), { completionDigest: DIGEST('e') }, /completion.*hash|digest/i],
-      ['non-passed review_status', makePublicReleaseAdapter(boundary.request, { reviewStatus: 'failed' }), {}, /review_status|passed/i],
-      ['completion receipt missing field', makePublicReleaseAdapter(boundary.request, { completionReceipt: changedCompletionReceipt((receipt) => { delete receipt.reviewed_at; }) }), {}, /completion receipt|missing|keys/i],
-      ['completion receipt unknown field', makePublicReleaseAdapter(boundary.request, { completionReceipt: changedCompletionReceipt((receipt) => { receipt.unknown_field = true; }) }), {}, /completion receipt|unknown|keys/i],
-      ['completion receipt wrong phase', makePublicReleaseAdapter(boundary.request, { completionReceipt: changedCompletionReceipt((receipt) => { receipt.phase = 'draft'; }) }), {}, /completion receipt|phase/i],
-      ['completion receipt wrong outcome', makePublicReleaseAdapter(boundary.request, { completionReceipt: changedCompletionReceipt((receipt) => { receipt.outcome = 'not_ready'; }) }), {}, /completion receipt|outcome|series/i],
-      ['completion receipt wrong reviewed_head', makePublicReleaseAdapter(boundary.request, { completionReceipt: completionReceiptForReviewedHead('d'.repeat(40)) }), {}, /completion receipt|reviewed_head|stale/i],
-      ['wrong finished-plan slug', makePublicReleaseAdapter(boundary.request), { finishedPlanPath: 'docs/plans/finished/2026-07-18-other-release.md' }, /finished-plan|production-release|path/i],
-      ['wrong finished-plan date', makePublicReleaseAdapter(boundary.request), { finishedPlanPath: 'docs/plans/finished/2026-07-17-session-relay-cli-production-release.md' }, /finished-plan|production-release|path/i],
+      [
+        'tag commit mismatch',
+        makePublicReleaseAdapter(boundary.request, { tagCommit: 'e'.repeat(40) }),
+        {},
+        /tag.*commit|release commit/i,
+      ],
+      [
+        'broken plan ancestry',
+        makePublicReleaseAdapter(boundary.request, { planAncestry: false }),
+        {},
+        /finished-plan.*ancestry|plan.*ancestry/i,
+      ],
+      [
+        'broken companion ancestry',
+        makePublicReleaseAdapter(boundary.request, { releaseAncestry: false }),
+        {},
+        /ancestor|ancestry/i,
+      ],
+      [
+        'missing successful workflow run',
+        makePublicReleaseAdapter(boundary.request, { runs: [] }),
+        {},
+        /workflow.*run|successful/i,
+      ],
+      [
+        'duplicate successful workflow run',
+        (() => {
+          const value = makePublicReleaseAdapter(boundary.request);
+          return makePublicReleaseAdapter(boundary.request, {
+            runs: [value.successfulRun, { ...value.successfulRun, id: 802 }],
+          });
+        })(),
+        {},
+        /workflow.*run|duplicate|exactly one/i,
+      ],
+      [
+        'wrong six-asset set',
+        makePublicReleaseAdapter(boundary.request, { removeAsset: 'docks-kit-windows-x64.exe' }),
+        {},
+        /asset set|six|assets/i,
+      ],
+      [
+        'checksum conflict',
+        makePublicReleaseAdapter(boundary.request, { checksumConflict: true }),
+        {},
+        /checksum|digest/i,
+      ],
+      [
+        'digest-pin mismatch',
+        makePublicReleaseAdapter(boundary.request, {
+          pinnedAssets: { ...boundary.request.value.assets, 'x86_64-unknown-linux-musl': DIGEST('f') },
+        }),
+        {},
+        /pinned|digest/i,
+      ],
+      [
+        'completion line hash mismatch',
+        makePublicReleaseAdapter(boundary.request),
+        { completionDigest: DIGEST('e') },
+        /completion.*hash|digest/i,
+      ],
+      [
+        'non-passed review_status',
+        makePublicReleaseAdapter(boundary.request, { reviewStatus: 'failed' }),
+        {},
+        /review_status|passed/i,
+      ],
+      [
+        'completion receipt missing field',
+        makePublicReleaseAdapter(boundary.request, {
+          completionReceipt: changedCompletionReceipt((receipt) => {
+            delete receipt.reviewed_at;
+          }),
+        }),
+        {},
+        /completion receipt|missing|keys/i,
+      ],
+      [
+        'completion receipt unknown field',
+        makePublicReleaseAdapter(boundary.request, {
+          completionReceipt: changedCompletionReceipt((receipt) => {
+            receipt.unknown_field = true;
+          }),
+        }),
+        {},
+        /completion receipt|unknown|keys/i,
+      ],
+      [
+        'completion receipt wrong phase',
+        makePublicReleaseAdapter(boundary.request, {
+          completionReceipt: changedCompletionReceipt((receipt) => {
+            receipt.phase = 'draft';
+          }),
+        }),
+        {},
+        /completion receipt|phase/i,
+      ],
+      [
+        'completion receipt wrong outcome',
+        makePublicReleaseAdapter(boundary.request, {
+          completionReceipt: changedCompletionReceipt((receipt) => {
+            receipt.outcome = 'not_ready';
+          }),
+        }),
+        {},
+        /completion receipt|outcome|series/i,
+      ],
+      [
+        'completion receipt wrong reviewed_head',
+        makePublicReleaseAdapter(boundary.request, {
+          completionReceipt: completionReceiptForReviewedHead('d'.repeat(40)),
+        }),
+        {},
+        /completion receipt|reviewed_head|stale/i,
+      ],
+      [
+        'wrong finished-plan slug',
+        makePublicReleaseAdapter(boundary.request),
+        { finishedPlanPath: 'docs/plans/finished/2026-07-18-other-release.md' },
+        /finished-plan|production-release|path/i,
+      ],
+      [
+        'wrong finished-plan date',
+        makePublicReleaseAdapter(boundary.request),
+        { finishedPlanPath: 'docs/plans/finished/2026-07-17-session-relay-cli-production-release.md' },
+        /finished-plan|production-release|path/i,
+      ],
     ];
     for (const [name, adapter, overrides, pattern] of cases) {
       assert.throws(
-        () => verifyPublicBoundary(directory, boundary, adapter, { output: `${name.replaceAll(' ', '-')}.json`, ...overrides }),
+        () =>
+          verifyPublicBoundary(directory, boundary, adapter, {
+            output: `${name.replaceAll(' ', '-')}.json`,
+            ...overrides,
+          }),
         pattern,
         `verify-public-release ${name}`,
       );
@@ -807,30 +1037,62 @@ function verifyPublicBoundary(directory, boundary, adapter, {
   const oldShape = structuredClone(result.receipt);
   delete oldShape.public_release_commit;
   delete oldShape.public_release_receipt_sha256;
-  assert.throws(() => validatePromotionReceipt(oldShape), /unknown|missing|field|keys/i, 'old promotion receipt shape must be rejected');
+  assert.throws(
+    () => validatePromotionReceipt(oldShape),
+    /unknown|missing|field|keys/i,
+    'old promotion receipt shape must be rejected',
+  );
   assert.throws(
     () => validatePromotionReceiptForFinalization(oldShape, { proof, publication }, adapter),
     /unknown|missing|field|keys/i,
     'finalization must reject the old promotion receipt shape',
   );
   assert.deepEqual(result.receipt.docks_kit.asset, smoke('exact_source').docks_kit_asset);
-  assert.deepEqual(phases(state), ['0:0:initialized', '0:1:locked', '0:2:prepush_passed', '0:3:main_pushed', '0:4:live_passed', '0:5:terminal_success']);
+  assert.deepEqual(phases(state), [
+    '0:0:initialized',
+    '0:1:locked',
+    '0:2:prepush_passed',
+    '0:3:main_pushed',
+    '0:4:live_passed',
+    '0:5:terminal_success',
+  ]);
   assert.deepEqual(state.counts, { lock: 1, prepush: 1, main: 1, live: 1, restore: 0, reapply: 0, append: 6 });
   assert.equal(state.calls.find(({ operation }) => operation === 'main').expected, OLD_MAIN);
   assert.equal(state.calls.find(({ operation }) => operation === 'lock').prior, null);
-  assert.equal(validatePromotionReceiptForFinalization(result.receipt, { proof, publication }, adapter), result.receipt);
+  assert.equal(
+    validatePromotionReceiptForFinalization(result.receipt, { proof, publication }, adapter),
+    result.receipt,
+  );
   assert.throws(
-    () => validatePromotionReceiptForFinalization(result.receipt, { proof, publication }, { ...adapter, isAncestor: () => false }),
+    () =>
+      validatePromotionReceiptForFinalization(
+        result.receipt,
+        { proof, publication },
+        { ...adapter, isAncestor: () => false },
+      ),
     /lineage|ancestor/i,
   );
   assert.throws(
-    () => validatePromotionReceiptForFinalization({ ...result.receipt, created_at: '2026-07-17T21:00:00.001Z' }, { proof, publication }, adapter),
+    () =>
+      validatePromotionReceiptForFinalization(
+        { ...result.receipt, created_at: '2026-07-17T21:00:00.001Z' },
+        { proof, publication },
+        adapter,
+      ),
     /reconstruct|journal/i,
   );
   state.releaseStable = true;
-  assert.equal(validatePromotionReceiptForFinalization(result.receipt, { proof, publication }, adapter), result.receipt, 'stable finalization resume must retain authoritative receipt validation');
+  assert.equal(
+    validatePromotionReceiptForFinalization(result.receipt, { proof, publication }, adapter),
+    result.receipt,
+    'stable finalization resume must retain authoritative receipt validation',
+  );
   state.releaseStable = false;
-  assert.ok(state.calls.filter(({ operation }) => operation === 'append').every((call, index, calls) => index === 0 ? call.prior === null : call.prior !== calls[index - 1].prior));
+  assert.ok(
+    state.calls
+      .filter(({ operation }) => operation === 'append')
+      .every((call, index, calls) => (index === 0 ? call.prior === null : call.prior !== calls[index - 1].prior)),
+  );
 }
 
 for (const phase of ['initialized', 'locked', 'prepush_passed', 'main_pushed', 'live_passed', 'terminal_success']) {
@@ -843,12 +1105,16 @@ for (const phase of ['initialized', 'locked', 'prepush_passed', 'main_pushed', '
   assert.equal(state.counts.prepush, 1, `prepush not replayed from ${phase}`);
   assert.equal(state.counts.main, 1, `main not replayed from ${phase}`);
   assert.equal(state.counts.live, 1, `live not replayed from ${phase}`);
-  if (phase === 'terminal_success') assert.equal(state.counts.append, before.append, 'terminal recovery must not append');
+  if (phase === 'terminal_success')
+    assert.equal(state.counts.append, before.append, 'terminal recovery must not append');
 }
 
 {
   const { adapter, state } = makeAdapter({ outageAfterAppend: 'initialized' });
-  assert.throws(() => run(adapter, '/receipts/probe-outage.json'), (error) => error.outcome === 'failure' && /probe outage/.test(error.message));
+  assert.throws(
+    () => run(adapter, '/receipts/probe-outage.json'),
+    (error) => error.outcome === 'failure' && /probe outage/.test(error.message),
+  );
   assert.equal(state.counts.append, 1, 'accepted journal mutation must remain durable across the next-probe outage');
   assert.equal(run(adapter, '/receipts/probe-outage-resume.json', {}, true).receipt.outcome, 'success');
   assert.equal(state.counts.append, 6, 'resume must not duplicate the accepted initialized mutation');
@@ -866,7 +1132,9 @@ for (const phase of ['initialized', 'locked', 'prepush_passed', 'main_pushed', '
   const legacyRetryArgv = ['sync', '--release-test-source', TAG_COMMIT];
   const { adapter, state } = makeAdapter({
     liveResults: [false, true],
-    prepushMutator: (evidence) => { evidence.sync_argv = legacyRetryArgv; },
+    prepushMutator: (evidence) => {
+      evidence.sync_argv = legacyRetryArgv;
+    },
   });
   const failure = run(adapter, '/receipts/failure.json');
   assert.equal(failure.receipt.outcome, 'restored_failure');
@@ -880,9 +1148,26 @@ for (const phase of ['initialized', 'locked', 'prepush_passed', 'main_pushed', '
   });
   assert.equal(retried.receipt.outcome, 'success');
   assert.equal(retried.receipt.attempt, 1);
-  assert.deepEqual(retried.receipt.exact_source_smoke.sync_argv, legacyRetryArgv, 'restored retry preserves historical exact-source evidence');
-  assert.deepEqual(phases(state).slice(-4), ['1:0:initialized', '1:1:locked', '1:2:reapply_pushed', '1:3:terminal_success']);
-  assert.deepEqual({ prepush: state.counts.prepush, main: state.counts.main, restore: state.counts.restore, reapply: state.counts.reapply }, { prepush: 1, main: 1, restore: 1, reapply: 1 });
+  assert.deepEqual(
+    retried.receipt.exact_source_smoke.sync_argv,
+    legacyRetryArgv,
+    'restored retry preserves historical exact-source evidence',
+  );
+  assert.deepEqual(phases(state).slice(-4), [
+    '1:0:initialized',
+    '1:1:locked',
+    '1:2:reapply_pushed',
+    '1:3:terminal_success',
+  ]);
+  assert.deepEqual(
+    {
+      prepush: state.counts.prepush,
+      main: state.counts.main,
+      restore: state.counts.restore,
+      reapply: state.counts.reapply,
+    },
+    { prepush: 1, main: 1, restore: 1, reapply: 1 },
+  );
   const legacyChain = adapter.readJournal(TRANSACTION_REF, state.refs.get(TRANSACTION_REF));
   for (const item of legacyChain) delete item.entry.immutable.prepush_repair;
   const attemptOneIndex = legacyChain.findIndex(({ entry }) => entry.attempt === 1);
@@ -890,17 +1175,22 @@ for (const phase of ['initialized', 'locked', 'prepush_passed', 'main_pushed', '
   const legacyPriorReceipt = structuredClone(failure.receipt);
   legacyPriorReceipt.journal_chain_sha256 = hash(canonicalize(legacyPrefix));
   const legacyPriorDigest = hash(canonicalize(legacyPriorReceipt));
-  for (const item of legacyChain.slice(attemptOneIndex)) item.entry.immutable.prior_attempt_receipt_sha256 = legacyPriorDigest;
+  for (const item of legacyChain.slice(attemptOneIndex))
+    item.entry.immutable.prior_attempt_receipt_sha256 = legacyPriorDigest;
   legacyChain.at(-1).entry.receipt_projection.prior_attempt_receipt_sha256 = legacyPriorDigest;
   assert.equal(
     validatePromotionJournal(legacyChain, legacyChain.at(-1).commit).tip.entry.phase,
     'terminal_success',
     'old-format restored retry journals must keep the reapply transition map',
   );
-  assert.throws(() => run(adapter, '/receipts/retry-again.json', {
-    'retry-failed': '/receipts/failure.json',
-    'retry-failed-sha256': failure.state.receipt_sha256,
-  }), /retry|terminal|attempt/i);
+  assert.throws(
+    () =>
+      run(adapter, '/receipts/retry-again.json', {
+        'retry-failed': '/receipts/failure.json',
+        'retry-failed-sha256': failure.state.receipt_sha256,
+      }),
+    /retry|terminal|attempt/i,
+  );
 }
 
 {
@@ -917,10 +1207,12 @@ for (const phase of ['locked', 'reapply_pushed']) {
   const failure = run(adapter, '/receipts/failure.json');
   state.killAfter = phase;
   state.killed = false;
-  expectInterrupted(() => run(adapter, `/receipts/retry-delete-${phase}.json`, {
-    'retry-failed': '/receipts/failure.json',
-    'retry-failed-sha256': failure.state.receipt_sha256,
-  }));
+  expectInterrupted(() =>
+    run(adapter, `/receipts/retry-delete-${phase}.json`, {
+      'retry-failed': '/receipts/failure.json',
+      'retry-failed-sha256': failure.state.receipt_sha256,
+    }),
+  );
   state.refs.delete('refs/heads/main');
   const incident = run(adapter, `/receipts/retry-delete-${phase}-resume.json`, {}, true);
   assert.equal(incident.receipt.outcome, 'manual_incident', `deleted main recovery from retry ${phase}`);
@@ -942,15 +1234,23 @@ for (const phase of ['locked', 'reapply_pushed']) {
     full_ci_stdout_sha256: DIGEST('c'),
     full_ci_stderr_sha256: DIGEST('d'),
   };
-  const { adapter } = makeAdapter({ liveResults: [false], killMutation: 'restore_mutation', adoptionRerunParity: rerunParity });
+  const { adapter } = makeAdapter({
+    liveResults: [false],
+    killMutation: 'restore_mutation',
+    adoptionRerunParity: rerunParity,
+  });
   expectInterrupted(() => run(adapter, '/receipts/nondeterministic-ci.json'));
   const recovered = run(adapter, '/receipts/nondeterministic-ci-recovered.json', {}, true);
-  assert.deepEqual(recovered.receipt.post_restore, {
-    manifest_catalog: true,
-    full_ci_exit: 0,
-    full_ci_stdout_sha256: DIGEST('7'),
-    full_ci_stderr_sha256: DIGEST('8'),
-  }, 'receipt must preserve commit-bound restore evidence rather than nondeterministic adoption-run hashes');
+  assert.deepEqual(
+    recovered.receipt.post_restore,
+    {
+      manifest_catalog: true,
+      full_ci_exit: 0,
+      full_ci_stdout_sha256: DIGEST('7'),
+      full_ci_stderr_sha256: DIGEST('8'),
+    },
+    'receipt must preserve commit-bound restore evidence rather than nondeterministic adoption-run hashes',
+  );
 }
 
 {
@@ -973,7 +1273,11 @@ for (const phase of ['locked', 'reapply_pushed']) {
   const two = makeAdapter();
   run(one.adapter, '/receipts/one.json');
   run(two.adapter, '/receipts/two.json');
-  assert.equal(one.state.outputs.get('/receipts/one.json'), two.state.outputs.get('/receipts/two.json'), 'terminal receipt bytes must be deterministic');
+  assert.equal(
+    one.state.outputs.get('/receipts/one.json'),
+    two.state.outputs.get('/receipts/two.json'),
+    'terminal receipt bytes must be deterministic',
+  );
 }
 
 {
@@ -999,7 +1303,11 @@ for (const phase of ['locked', 'reapply_pushed']) {
   state.refs.set('refs/heads/main', PROMOTED_COMMIT);
   state.currentBlobs = structuredClone(state.journal[0].entry.state.compatibility.promoted);
   const result = run(adapter, '/receipts/locked-promoted.json', {}, true);
-  assert.equal(result.receipt.outcome, 'success', 'resume may rerun and journal prepush evidence before deriving main_pushed');
+  assert.equal(
+    result.receipt.outcome,
+    'success',
+    'resume may rerun and journal prepush evidence before deriving main_pushed',
+  );
   assert.equal(state.counts.prepush, 1);
   assert.equal(state.counts.main, 0, 'already completed main push is not repeated');
 }
@@ -1016,10 +1324,12 @@ for (const phase of ['locked', 'reapply_pushed']) {
   const { adapter, state } = makeAdapter({ liveResults: [false, true] });
   const failure = run(adapter, '/receipts/failure.json');
   state.killMutation = 'reapply_mutation';
-  expectInterrupted(() => run(adapter, '/receipts/retry-killed.json', {
-    'retry-failed': '/receipts/failure.json',
-    'retry-failed-sha256': failure.state.receipt_sha256,
-  }));
+  expectInterrupted(() =>
+    run(adapter, '/receipts/retry-killed.json', {
+      'retry-failed': '/receipts/failure.json',
+      'retry-failed-sha256': failure.state.receipt_sha256,
+    }),
+  );
   const result = run(adapter, '/receipts/retry-recovered.json', {}, true);
   assert.equal(result.receipt.outcome, 'success');
   assert.equal(state.counts.reapply, 1, 'resume must not repeat a completed reapply');
@@ -1029,10 +1339,12 @@ for (const phase of ['locked', 'reapply_pushed']) {
   const { adapter, state } = makeAdapter({ liveResults: [false, true] });
   const failure = run(adapter, '/receipts/failure.json');
   state.killAfter = 'locked';
-  expectInterrupted(() => run(adapter, '/receipts/retry-killed.json', {
-    'retry-failed': '/receipts/failure.json',
-    'retry-failed-sha256': failure.state.receipt_sha256,
-  }));
+  expectInterrupted(() =>
+    run(adapter, '/receipts/retry-killed.json', {
+      'retry-failed': '/receipts/failure.json',
+      'retry-failed-sha256': failure.state.receipt_sha256,
+    }),
+  );
   state.refs.set('refs/heads/main', '9'.repeat(40));
   state.currentBlobs = structuredClone(state.journal[0].entry.state.compatibility.promoted);
   const result = run(adapter, '/receipts/arbitrary-reapply-head.json', {}, true);
@@ -1043,10 +1355,12 @@ for (const phase of ['locked', 'reapply_pushed']) {
   const { adapter, state } = makeAdapter({ liveResults: [false, true] });
   const failure = run(adapter, '/receipts/failure.json');
   state.killAfter = 'terminal_success';
-  expectInterrupted(() => run(adapter, '/receipts/retry-killed.json', {
-    'retry-failed': '/receipts/failure.json',
-    'retry-failed-sha256': failure.state.receipt_sha256,
-  }));
+  expectInterrupted(() =>
+    run(adapter, '/receipts/retry-killed.json', {
+      'retry-failed': '/receipts/failure.json',
+      'retry-failed-sha256': failure.state.receipt_sha256,
+    }),
+  );
   const before = { ...state.counts };
   const recovered = run(adapter, '/receipts/retry-terminal.json', {}, true);
   assert.equal(recovered.receipt.outcome, 'success');
@@ -1059,10 +1373,12 @@ for (const phase of ['locked', 'reapply_pushed']) {
   const { adapter, state } = makeAdapter({ liveResults: [false, false] });
   const failure = run(adapter, '/receipts/failure.json');
   state.killAfter = 'terminal_failure';
-  expectInterrupted(() => run(adapter, '/receipts/retry-killed.json', {
-    'retry-failed': '/receipts/failure.json',
-    'retry-failed-sha256': failure.state.receipt_sha256,
-  }));
+  expectInterrupted(() =>
+    run(adapter, '/receipts/retry-killed.json', {
+      'retry-failed': '/receipts/failure.json',
+      'retry-failed-sha256': failure.state.receipt_sha256,
+    }),
+  );
   const recovered = run(adapter, '/receipts/retry-restored-terminal.json', {}, true);
   assert.equal(recovered.receipt.outcome, 'restored_failure');
   assert.equal(recovered.receipt.retryable, false);
@@ -1088,7 +1404,10 @@ for (const releaseAbsent of [false, true]) {
   assert.equal(state.journal.at(-1).entry.state.observed_release.commit, null);
   assert.equal(run(adapter, output, {}, true).receipt.outcome, 'manual_incident');
   state.tagAbsent = false;
-  assert.throws(() => run(adapter, `/receipts/tag-recreated-${releaseAbsent}.json`, {}, true), /snapshot.*changed|authority/i);
+  assert.throws(
+    () => run(adapter, `/receipts/tag-recreated-${releaseAbsent}.json`, {}, true),
+    /snapshot.*changed|authority/i,
+  );
 }
 
 {
@@ -1100,13 +1419,15 @@ for (const releaseAbsent of [false, true]) {
   assert.equal(run(adapter, '/receipts/contended.json', {}, true).receipt.outcome, 'manual_incident');
   const corruptObservedRelease = structuredClone(state.journal);
   corruptObservedRelease.at(-1).entry.state.observed_release.release_database_id = 0;
-  assert.throws(() => validatePromotionJournal(corruptObservedRelease, state.refs.get(TRANSACTION_REF)), /observed Release state/i);
+  assert.throws(
+    () => validatePromotionJournal(corruptObservedRelease, state.refs.get(TRANSACTION_REF)),
+    /observed Release state/i,
+  );
   state.refs.set(LOCK_REF, '8'.repeat(40));
   assert.throws(() => run(adapter, '/receipts/contended-drift.json', {}, true), /snapshot.*changed|authority/i);
   assert.equal(phases(state).at(-1), '0:1:manual_incident', 'lock contention must be journaled');
   assert.equal(state.counts.prepush, 0);
   assert.equal(state.counts.main, 0);
-
 }
 
 {
@@ -1140,11 +1461,9 @@ for (const releaseAbsent of [false, true]) {
   assert.equal(run(adapter, '/receipts/release-conflict.json', {}, true).receipt.outcome, 'manual_incident');
   state.releaseAssets[0].digest = DIGEST('f');
   assert.throws(() => run(adapter, '/receipts/release-conflict-drift.json', {}, true), /snapshot.*changed|authority/i);
-
 }
 
 {
-
   const { adapter, state } = makeAdapter({ killAfter: 'prepush_passed' });
   expectInterrupted(() => run(adapter));
   state.refs.set('refs/heads/main', '9'.repeat(40));
@@ -1166,10 +1485,16 @@ for (const releaseAbsent of [false, true]) {
 {
   const { adapter, state } = makeAdapter({ killAfter: 'locked' });
   expectInterrupted(() => run(adapter));
-  state.prepushMutator = (evidence) => { evidence.unknown = true; };
+  state.prepushMutator = (evidence) => {
+    evidence.unknown = true;
+  };
   const before = { append: state.counts.append, tip: state.refs.get(TRANSACTION_REF) };
   assert.throws(() => run(adapter, '/receipts/invalid-generated-state.json', {}, true), /smoke|unknown|schema/i);
-  assert.deepEqual({ append: state.counts.append, tip: state.refs.get(TRANSACTION_REF) }, before, 'invalid generated journal entry must be rejected before remote append');
+  assert.deepEqual(
+    { append: state.counts.append, tip: state.refs.get(TRANSACTION_REF) },
+    before,
+    'invalid generated journal entry must be rejected before remote append',
+  );
 }
 
 {
@@ -1178,16 +1503,29 @@ for (const releaseAbsent of [false, true]) {
   const valid = adapter.readJournal(TRANSACTION_REF, state.refs.get(TRANSACTION_REF));
   assert.equal(validatePromotionJournal(valid, state.refs.get(TRANSACTION_REF)).tip.entry.phase, 'locked');
   const corruptions = [
-    (chain) => { chain[0].entry.unknown = true; },
-    (chain) => { chain[1].entry.sequence = 8; },
-    (chain) => { chain[1].entry.immutable.tag_commit = '8'.repeat(40); },
-    (chain) => { chain[1].entry.phase = 'main_pushed'; },
-    (chain) => { chain[1].parent = '8'.repeat(40); },
+    (chain) => {
+      chain[0].entry.unknown = true;
+    },
+    (chain) => {
+      chain[1].entry.sequence = 8;
+    },
+    (chain) => {
+      chain[1].entry.immutable.tag_commit = '8'.repeat(40);
+    },
+    (chain) => {
+      chain[1].entry.phase = 'main_pushed';
+    },
+    (chain) => {
+      chain[1].parent = '8'.repeat(40);
+    },
   ];
   for (const corrupt of corruptions) {
     const chain = structuredClone(valid);
     corrupt(chain);
-    assert.throws(() => validatePromotionJournal(chain, state.refs.get(TRANSACTION_REF)), /journal|schema|sequence|immutable|transition|parent/i);
+    assert.throws(
+      () => validatePromotionJournal(chain, state.refs.get(TRANSACTION_REF)),
+      /journal|schema|sequence|immutable|transition|parent/i,
+    );
   }
   assert.throws(() => validatePromotionJournal(valid, '8'.repeat(40)), /authoritative.*tip/i);
 }
@@ -1197,21 +1535,41 @@ for (const releaseAbsent of [false, true]) {
   run(adapter, '/receipts/schema.json');
   const valid = adapter.readJournal(TRANSACTION_REF, state.refs.get(TRANSACTION_REF));
   const corruptions = [
-    (projection) => { projection.source_ancestry.extra = true; },
-    (projection) => { projection.non_plan_tree_equivalence = {}; },
-    (projection) => { projection.compatibility_blobs.before['plugins/session-relay/bin/relay'] = DIGEST('9'); },
-    (projection) => { projection.docks_kit.extra = true; },
-    (projection) => { projection.session_relay_assets[0].extra = true; },
-    (projection) => { projection.exact_source_smoke = {}; },
-    (projection) => { projection.live_smoke = {}; },
-    (projection) => { projection.created_at = '1'; },
-    (projection) => { projection.outcome = 'restored_failure'; projection.retryable = true; },
-    (projection) => { projection.public_reviewed_commit = null; },
+    (projection) => {
+      projection.source_ancestry.extra = true;
+    },
+    (projection) => {
+      projection.non_plan_tree_equivalence = {};
+    },
+    (projection) => {
+      projection.compatibility_blobs.before['plugins/session-relay/bin/relay'] = DIGEST('9');
+    },
+    (projection) => {
+      projection.docks_kit.extra = true;
+    },
+    (projection) => {
+      projection.session_relay_assets[0].extra = true;
+    },
+    (projection) => {
+      projection.exact_source_smoke = {};
+    },
+    (projection) => {
+      projection.live_smoke = {};
+    },
+    (projection) => {
+      projection.created_at = '1';
+    },
+    (projection) => {
+      projection.outcome = 'restored_failure';
+      projection.retryable = true;
+    },
+    (projection) => {
+      projection.public_reviewed_commit = null;
+    },
   ];
   for (const corrupt of corruptions) {
     const chain = structuredClone(valid);
     corrupt(chain.at(-1).entry.receipt_projection);
-
 
     assert.throws(
       () => validatePromotionJournal(chain, state.refs.get(TRANSACTION_REF)),
@@ -1227,7 +1585,10 @@ for (const releaseAbsent of [false, true]) {
 
 {
   const { adapter, state } = makeAdapter({ publicAncestry: false });
-  assert.throws(() => run(adapter, '/receipts/divergent-public-release.json'), /public.*ancestor|companion.*ancestry|lineage/i);
+  assert.throws(
+    () => run(adapter, '/receipts/divergent-public-release.json'),
+    /public.*ancestor|companion.*ancestry|lineage/i,
+  );
   assert.deepEqual(state.counts, { lock: 0, prepush: 0, main: 0, live: 0, restore: 0, reapply: 0, append: 0 });
 }
 
@@ -1252,24 +1613,40 @@ for (const releaseAbsent of [false, true]) {
   const priorBytes = state.outputs.get('/receipts/failure.json');
   assert.equal(result.receipt.outcome, 'failure');
   assert.equal(result.receipt.retryable, false);
-  assert.deepEqual(result.receipt.exact_source_smoke.sync_argv, legacyArgv, 'historical failed evidence retains the rejected sync argv');
+  assert.deepEqual(
+    result.receipt.exact_source_smoke.sync_argv,
+    legacyArgv,
+    'historical failed evidence retains the rejected sync argv',
+  );
   assert.equal(state.counts.main, 0);
   assert.equal(state.journal.at(-1).entry.phase, 'terminal_failure');
   assert.equal(run(adapter, '/receipts/prepush-exception-resume.json', {}, true).receipt.outcome, 'failure');
-  assert.throws(() => run(adapter, '/receipts/generic-retry.json', {
-    'retry-failed': '/receipts/failure.json',
-    'retry-failed-sha256': result.state.receipt_sha256,
-  }), /restored.failure|repair.prepush/i);
+  assert.throws(
+    () =>
+      run(adapter, '/receipts/generic-retry.json', {
+        'retry-failed': '/receipts/failure.json',
+        'retry-failed-sha256': result.state.receipt_sha256,
+      }),
+    /restored.failure|repair.prepush/i,
+  );
 
   const appendCountBeforeAuthorityFailure = state.counts.append;
   state.releaseStable = true;
-  assert.throws(() => run(adapter, '/receipts/stable-release-repair.json', {
-    'repair-prepush': true,
-    'repair-implementation-commit': REPAIR_IMPLEMENTATION_COMMIT,
-    'retry-failed': '/receipts/failure.json',
-    'retry-failed-sha256': result.state.receipt_sha256,
-  }), /release|prerelease/i);
-  assert.equal(state.counts.append, appendCountBeforeAuthorityFailure, 'changed prerelease authority must be rejected before attempt 1');
+  assert.throws(
+    () =>
+      run(adapter, '/receipts/stable-release-repair.json', {
+        'repair-prepush': true,
+        'repair-implementation-commit': REPAIR_IMPLEMENTATION_COMMIT,
+        'retry-failed': '/receipts/failure.json',
+        'retry-failed-sha256': result.state.receipt_sha256,
+      }),
+    /release|prerelease/i,
+  );
+  assert.equal(
+    state.counts.append,
+    appendCountBeforeAuthorityFailure,
+    'changed prerelease authority must be rejected before attempt 1',
+  );
   state.releaseStable = false;
   const validateRepair = adapter.validatePrepushRepair;
   adapter.validatePrepushRepair = (input) => {
@@ -1277,13 +1654,21 @@ for (const releaseAbsent of [false, true]) {
     state.releaseStable = true;
     return evidence;
   };
-  assert.throws(() => run(adapter, '/receipts/raced-release-repair.json', {
-    'repair-prepush': true,
-    'repair-implementation-commit': REPAIR_IMPLEMENTATION_COMMIT,
-    'retry-failed': '/receipts/failure.json',
-    'retry-failed-sha256': result.state.receipt_sha256,
-  }), /release|prerelease/i);
-  assert.equal(state.counts.append, appendCountBeforeAuthorityFailure, 'authority drift during repair CI must be rejected before attempt 1');
+  assert.throws(
+    () =>
+      run(adapter, '/receipts/raced-release-repair.json', {
+        'repair-prepush': true,
+        'repair-implementation-commit': REPAIR_IMPLEMENTATION_COMMIT,
+        'retry-failed': '/receipts/failure.json',
+        'retry-failed-sha256': result.state.receipt_sha256,
+      }),
+    /release|prerelease/i,
+  );
+  assert.equal(
+    state.counts.append,
+    appendCountBeforeAuthorityFailure,
+    'authority drift during repair CI must be rejected before attempt 1',
+  );
   state.releaseStable = false;
   adapter.validatePrepushRepair = validateRepair;
   adapter.runPrepushSmoke = successfulPrepush;
@@ -1297,9 +1682,17 @@ for (const releaseAbsent of [false, true]) {
   assert.equal(repaired.receipt.outcome, 'success');
   assert.equal(repaired.receipt.attempt, 1);
   assert.equal(repaired.receipt.retryable, false);
-  assert.deepEqual(repaired.receipt.exact_source_smoke.sync_argv, ['sync'], 'successful repair evidence uses the URL-rewrite sync binding');
+  assert.deepEqual(
+    repaired.receipt.exact_source_smoke.sync_argv,
+    ['sync'],
+    'successful repair evidence uses the URL-rewrite sync binding',
+  );
   assert.equal(state.refs.get('refs/heads/main'), PROMOTED_COMMIT);
-  assert.equal(state.outputs.get('/receipts/failure.json'), priorBytes, 'repair continuation must not rewrite failed evidence');
+  assert.equal(
+    state.outputs.get('/receipts/failure.json'),
+    priorBytes,
+    'repair continuation must not rewrite failed evidence',
+  );
   assert.deepEqual(phases(state).slice(-6), [
     '1:0:initialized',
     '1:1:locked',
@@ -1318,7 +1711,8 @@ for (const releaseAbsent of [false, true]) {
     /terminal repair success.*URL-rewrite/i,
   );
   const invalidBase = adapter.readJournal(TRANSACTION_REF, state.refs.get(TRANSACTION_REF));
-  for (const item of invalidBase.filter(({ entry }) => entry.attempt === 1)) item.entry.immutable.prepush_repair.base_commit = 'f'.repeat(40);
+  for (const item of invalidBase.filter(({ entry }) => entry.attempt === 1))
+    item.entry.immutable.prepush_repair.base_commit = 'f'.repeat(40);
   assert.throws(
     () => validatePromotionJournal(invalidBase, invalidBase.at(-1).commit),
     /repair base.*expected origin\/main/i,
@@ -1330,7 +1724,9 @@ for (const releaseAbsent of [false, true]) {
     /projection is not derived/i,
   );
   const invalidEligibility = adapter.readJournal(TRANSACTION_REF, state.refs.get(TRANSACTION_REF));
-  invalidEligibility.find(({ entry }) => entry.attempt === 0 && entry.phase === 'terminal_failure').entry.state.failure = 'unrelated pre-push failure';
+  invalidEligibility.find(
+    ({ entry }) => entry.attempt === 0 && entry.phase === 'terminal_failure',
+  ).entry.state.failure = 'unrelated pre-push failure';
   assert.throws(
     () => validatePromotionJournal(invalidEligibility, invalidEligibility.at(-1).commit),
     /repair authorization/i,
@@ -1369,12 +1765,16 @@ for (const releaseAbsent of [false, true]) {
     full_ci_stdout_sha256: DIGEST('d'),
     full_ci_stderr_sha256: DIGEST('e'),
   });
-  assert.throws(() => run(failedPrepush.adapter, '/receipts/invalid-repair.json', {
-    'repair-prepush': true,
-    'repair-implementation-commit': REPAIR_IMPLEMENTATION_COMMIT,
-    'retry-failed': '/receipts/failure.json',
-    'retry-failed-sha256': failed.state.receipt_sha256,
-  }), /repair.*paths/i);
+  assert.throws(
+    () =>
+      run(failedPrepush.adapter, '/receipts/invalid-repair.json', {
+        'repair-prepush': true,
+        'repair-implementation-commit': REPAIR_IMPLEMENTATION_COMMIT,
+        'retry-failed': '/receipts/failure.json',
+        'retry-failed-sha256': failed.state.receipt_sha256,
+      }),
+    /repair.*paths/i,
+  );
   assert.equal(failedPrepush.state.journal.at(-1).entry.attempt, 0, 'invalid repair must not append attempt 1');
 }
 
@@ -1453,7 +1853,10 @@ for (const releaseAbsent of [false, true]) {
   prior.entry.receipt_projection.post_restore = null;
   prior.entry.receipt_projection.outcome = 'failure';
   prior.entry.receipt_projection.retryable = false;
-  assert.throws(() => validatePromotionJournal(chain, state.refs.get(TRANSACTION_REF)), /retry.*restored|retryable|authorization/i);
+  assert.throws(
+    () => validatePromotionJournal(chain, state.refs.get(TRANSACTION_REF)),
+    /retry.*restored|retryable|authorization/i,
+  );
 }
 
 {
@@ -1488,7 +1891,6 @@ for (const releaseAbsent of [false, true]) {
   assert.equal(terminal.receipt.observed_origin_main, REAPPLY_COMMIT);
 }
 
-
 {
   const { adapter } = makeAdapter();
   assert.throws(() => promoteReviewed(options(), false, { ...adapter, extra: () => {} }), /adapter.*unknown/i);
@@ -1510,13 +1912,26 @@ for (const releaseAbsent of [false, true]) {
     fs.writeFileSync(publicReleasePath, publicReleaseBytes, { mode: 0o600 });
     fs.writeFileSync(receiptPath, `${canonicalize(successful)}\n`, { mode: 0o600 });
     const common = [
-      '--plugin', 'session-relay',
-      '--source-proof', proofPath, '--source-proof-sha256', hash(proofBytes),
-      '--publication', publicationPath, '--publication-sha256', hash(publicationBytes),
-      '--public-release', publicReleasePath, '--public-release-sha256', hash(publicReleaseBytes),
-      '--docks-kit-release', 'cli-v0.9.0',
-      '--expected-origin-main', OLD_MAIN,
-      '--receipt-out', receiptPath,
+      '--plugin',
+      'session-relay',
+      '--source-proof',
+      proofPath,
+      '--source-proof-sha256',
+      hash(proofBytes),
+      '--publication',
+      publicationPath,
+      '--publication-sha256',
+      hash(publicationBytes),
+      '--public-release',
+      publicReleasePath,
+      '--public-release-sha256',
+      hash(publicReleaseBytes),
+      '--docks-kit-release',
+      'cli-v0.9.0',
+      '--expected-origin-main',
+      OLD_MAIN,
+      '--receipt-out',
+      receiptPath,
       '0.12.0',
     ];
     await assert.rejects(
@@ -1525,7 +1940,14 @@ for (const releaseAbsent of [false, true]) {
       'non-resume modes must reject an existing receipt output before their handler',
     );
     await assert.rejects(
-      dispatchSessionRelayRelease(['--resume-promotion', '--plugin', 'session-relay', '--transaction-ref', TRANSACTION_REF, ...common.slice(2)]),
+      dispatchSessionRelayRelease([
+        '--resume-promotion',
+        '--plugin',
+        'session-relay',
+        '--transaction-ref',
+        TRANSACTION_REF,
+        ...common.slice(2),
+      ]),
       (error) => {
         assert.doesNotMatch(error.message, /output already exists/i);
         return true;
@@ -1539,9 +1961,15 @@ for (const releaseAbsent of [false, true]) {
 
 {
   for (const liveMutator of [
-    (evidence) => { evidence.launcher_sha256 = DIGEST('e'); },
-    (evidence) => { evidence.docks_kit_asset.digest = DIGEST('e'); },
-    (evidence) => { evidence.launcher_version = ''; },
+    (evidence) => {
+      evidence.launcher_sha256 = DIGEST('e');
+    },
+    (evidence) => {
+      evidence.docks_kit_asset.digest = DIGEST('e');
+    },
+    (evidence) => {
+      evidence.launcher_version = '';
+    },
   ]) {
     const { adapter } = makeAdapter({ liveMutator });
     assert.equal(run(adapter, '/receipts/live-binding-failure.json').receipt.outcome, 'restored_failure');
@@ -1579,7 +2007,11 @@ for (const releaseAbsent of [false, true]) {
     runGit(seed, ['push', 'origin', `HEAD:${TRANSACTION_REF}`, 'HEAD:refs/heads/main']);
     runGit(cold, ['init']);
     runGit(cold, ['remote', 'add', 'origin', origin]);
-    assert.notEqual(runGit(cold, ['cat-file', '-e', tip], false).status, 0, 'cold fixture must start without authoritative objects');
+    assert.notEqual(
+      runGit(cold, ['cat-file', '-e', tip], false).status,
+      0,
+      'cold fixture must start without authoritative objects',
+    );
     const journal = readPromotionJournalFromRepository(TRANSACTION_REF, tip, cold);
     assert.equal(journal.at(-1).commit, tip);
     assert.deepEqual(journal.at(-1).entry, { kind: 'cold-journal' });
@@ -1589,12 +2021,17 @@ for (const releaseAbsent of [false, true]) {
     const movedTip = runGit(seed, ['rev-parse', 'HEAD']).stdout.trim();
     runGit(seed, ['push', 'origin', `HEAD:${TRANSACTION_REF}`]);
     const movedJournal = readPromotionJournalFromRepository(TRANSACTION_REF, tip, cold);
-    assert.equal(movedJournal.at(-1).commit, movedTip, 'a single ref movement must requery, refetch, and read the new exact tip');
+    assert.equal(
+      movedJournal.at(-1).commit,
+      movedTip,
+      'a single ref movement must requery, refetch, and read the new exact tip',
+    );
     assert.deepEqual(movedJournal.at(-1).entry, { kind: 'cold-journal-2' });
     runGit(seed, ['push', 'origin', `:${TRANSACTION_REF}`]);
     assert.throws(
       () => readPromotionJournalFromRepository(TRANSACTION_REF, tip, cold),
-      (error) => /deleted|fetch authoritative/.test(error.message) && ['failure', 'manual_incident'].includes(error.outcome),
+      (error) =>
+        /deleted|fetch authoritative/.test(error.message) && ['failure', 'manual_incident'].includes(error.outcome),
     );
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
@@ -1614,13 +2051,27 @@ await assert.rejects(
 await assert.rejects(
   dispatchSessionRelayRelease([
     '--promote-reviewed',
-    '--plugin', 'session-relay', '0.12.0',
-    '--source-proof', '/proof.json', '--source-proof-sha256', DIGEST('1'),
-    '--publication', '/publication.json', '--publication-sha256', DIGEST('2'),
-    '--public-release', '/public-release.json', '--public-release-sha256', DIGEST('3'),
-    '--docks-kit-release', 'cli-v0.9.0',
-    '--expected-origin-main', OLD_MAIN,
-    '--receipt-out', '/promotion.json',
+    '--plugin',
+    'session-relay',
+    '0.12.0',
+    '--source-proof',
+    '/proof.json',
+    '--source-proof-sha256',
+    DIGEST('1'),
+    '--publication',
+    '/publication.json',
+    '--publication-sha256',
+    DIGEST('2'),
+    '--public-release',
+    '/public-release.json',
+    '--public-release-sha256',
+    DIGEST('3'),
+    '--docks-kit-release',
+    'cli-v0.9.0',
+    '--expected-origin-main',
+    OLD_MAIN,
+    '--receipt-out',
+    '/promotion.json',
     '--repair-prepush',
   ]),
   /repair-prepush.*repair-implementation-commit.*together/i,

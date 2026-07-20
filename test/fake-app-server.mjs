@@ -29,9 +29,7 @@ if (!sock || !framesFile) {
 }
 fs.rmSync(sock, { force: true });
 const control = controlFile ? JSON.parse(fs.readFileSync(controlFile, 'utf8')) : {};
-const statuses = Array.isArray(control.statuses) && control.statuses.length > 0
-  ? control.statuses
-  : ['idle'];
+const statuses = Array.isArray(control.statuses) && control.statuses.length > 0 ? control.statuses : ['idle'];
 const elicitationServer = control.elicitationServer ?? 'bus';
 const threadId = control.threadId ?? '77777777-7777-4777-8777-777777777777';
 const turnId = control.turnId ?? 'turn-1';
@@ -39,16 +37,24 @@ const elicitationDelayMs = Number(control.elicitationDelayMs ?? 0);
 const completionDelayMs = Number(control.completionDelayMs ?? 0);
 const interruptCompletionDelayMs = Number(control.interruptCompletionDelayMs ?? 0);
 let statusIndex = 0;
-const effectiveServiceTier = (params) => Object.hasOwn(control, 'reportedServiceTier')
-  ? control.reportedServiceTier
-  : params?.serviceTier;
+const effectiveServiceTier = (params) =>
+  Object.hasOwn(control, 'reportedServiceTier') ? control.reportedServiceTier : params?.serviceTier;
 
 const encodeText = (s) => {
   const p = Buffer.from(s, 'utf8');
   let head;
   if (p.length < 126) head = Buffer.from([0x81, p.length]);
-  else if (p.length <= 0xffff) { head = Buffer.alloc(4); head[0] = 0x81; head[1] = 126; head.writeUInt16BE(p.length, 2); }
-  else { head = Buffer.alloc(10); head[0] = 0x81; head[1] = 127; head.writeBigUInt64BE(BigInt(p.length), 2); }
+  else if (p.length <= 0xffff) {
+    head = Buffer.alloc(4);
+    head[0] = 0x81;
+    head[1] = 126;
+    head.writeUInt16BE(p.length, 2);
+  } else {
+    head = Buffer.alloc(10);
+    head[0] = 0x81;
+    head[1] = 127;
+    head.writeBigUInt64BE(BigInt(p.length), 2);
+  }
   return Buffer.concat([head, p]);
 };
 
@@ -59,10 +65,21 @@ function parseFrame(buf) {
   const masked = (buf[1] & 0x80) !== 0;
   let len = buf[1] & 0x7f;
   let i = 2;
-  if (len === 126) { if (buf.length < 4) return null; len = buf.readUInt16BE(2); i = 4; }
-  else if (len === 127) { if (buf.length < 10) return null; len = Number(buf.readBigUInt64BE(2)); i = 10; }
+  if (len === 126) {
+    if (buf.length < 4) return null;
+    len = buf.readUInt16BE(2);
+    i = 4;
+  } else if (len === 127) {
+    if (buf.length < 10) return null;
+    len = Number(buf.readBigUInt64BE(2));
+    i = 10;
+  }
   let mask = null;
-  if (masked) { if (buf.length < i + 4) return null; mask = buf.subarray(i, i + 4); i += 4; }
+  if (masked) {
+    if (buf.length < i + 4) return null;
+    mask = buf.subarray(i, i + 4);
+    i += 4;
+  }
   if (buf.length < i + len) return null;
   const payload = Buffer.from(buf.subarray(i, i + len));
   if (mask) for (let k = 0; k < payload.length; k += 1) payload[k] ^= mask[k % 4];
@@ -75,13 +92,18 @@ const server = net.createServer((c) => {
   let interrupted = false;
   let activeThreadId = threadId;
   const sendTurnCompleted = (completedThreadId = activeThreadId, completedTurnId = turnId) => {
-    if (!c.destroyed) c.write(encodeText(JSON.stringify({
-      method: 'turn/completed',
-      params: {
-        threadId: completedThreadId,
-        turn: { id: completedTurnId, status: 'completed' },
-      },
-    })));
+    if (!c.destroyed)
+      c.write(
+        encodeText(
+          JSON.stringify({
+            method: 'turn/completed',
+            params: {
+              threadId: completedThreadId,
+              turn: { id: completedTurnId, status: 'completed' },
+            },
+          }),
+        ),
+      );
   };
   c.on('error', () => {});
   c.on('close', () => fs.appendFileSync(framesFile, `${JSON.stringify({ event: 'connection/closed' })}\n`));
@@ -93,17 +115,27 @@ const server = net.createServer((c) => {
       const head = buf.subarray(0, end).toString('utf8');
       const key = /^sec-websocket-key:\s*(.+)$/im.exec(head)?.[1].trim() ?? '';
       const accept = crypto.createHash('sha1').update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`).digest('base64');
-      c.write(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`);
+      c.write(
+        `HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`,
+      );
       buf = Buffer.from(buf.subarray(end + 4));
       upgraded = true;
     }
-    let f;
-    while ((f = parseFrame(buf))) {
+    while (true) {
+      const f = parseFrame(buf);
+      if (!f) break;
       buf = Buffer.from(buf.subarray(f.used));
-      if (f.opcode === 0x8) { c.end(); return; }
+      if (f.opcode === 0x8) {
+        c.end();
+        return;
+      }
       if (f.opcode !== 0x1) continue; // ping/pong/binary: ignore
       let msg;
-      try { msg = JSON.parse(f.payload.toString('utf8')); } catch { continue; }
+      try {
+        msg = JSON.parse(f.payload.toString('utf8'));
+      } catch {
+        continue;
+      }
       fs.appendFileSync(framesFile, `${JSON.stringify(msg)}\n`);
       if (msg.id === undefined) continue; // notification (e.g. initialized)
       if (msg.method === undefined) {
@@ -118,7 +150,9 @@ const server = net.createServer((c) => {
       const reply = (result) => c.write(encodeText(JSON.stringify({ id: msg.id, result })));
       const fail = (message) => c.write(encodeText(JSON.stringify({ id: msg.id, error: { code: -32000, message } })));
       switch (msg.method) {
-        case 'initialize': reply({ userAgent: 'fake-app-server/1.0' }); break;
+        case 'initialize':
+          reply({ userAgent: 'fake-app-server/1.0' });
+          break;
         case 'thread/start': {
           if (control.threadStartError) fail(control.threadStartError);
           else {
@@ -143,15 +177,16 @@ const server = net.createServer((c) => {
           break;
         }
         case 'thread/read': {
-          const type = interrupted && control.idleAfterInterrupt
-            ? 'idle'
-            : statuses[Math.min(statusIndex, statuses.length - 1)];
+          const type =
+            interrupted && control.idleAfterInterrupt ? 'idle' : statuses[Math.min(statusIndex, statuses.length - 1)];
           statusIndex += 1;
           const status = type === 'active' ? { type, activeFlags: [] } : { type };
           reply({ thread: { id: msg.params?.threadId ?? null, status, turns: [] } });
           break;
         }
-        case 'thread/inject_items': reply({}); break;
+        case 'thread/inject_items':
+          reply({});
+          break;
         case 'turn/start':
           if (control.turnStartError) {
             fail(control.turnStartError);
@@ -159,19 +194,38 @@ const server = net.createServer((c) => {
           }
           activeThreadId = msg.params?.threadId ?? threadId;
           reply({ turn: { id: turnId, status: 'inProgress' } });
-          c.write(encodeText(JSON.stringify({
-            method: 'turn/started',
-            params: {
-              threadId: msg.params?.threadId ?? null,
-              turn: { id: turnId, status: 'inProgress' },
-            },
-          })));
+          c.write(
+            encodeText(
+              JSON.stringify({
+                method: 'turn/started',
+                params: {
+                  threadId: msg.params?.threadId ?? null,
+                  turn: { id: turnId, status: 'inProgress' },
+                },
+              }),
+            ),
+          );
           if (control.disconnectAfterTurnStart) {
             setTimeout(() => c.destroy(), 10);
             break;
           }
           setTimeout(() => {
-            if (!c.destroyed) c.write(encodeText(JSON.stringify({ id: 990, method: 'mcpServer/elicitation/request', params: { threadId: msg.params?.threadId ?? null, turnId, serverName: elicitationServer, mode: 'form', _meta: { codex_approval_kind: 'mcp_tool_call' } } })));
+            if (!c.destroyed)
+              c.write(
+                encodeText(
+                  JSON.stringify({
+                    id: 990,
+                    method: 'mcpServer/elicitation/request',
+                    params: {
+                      threadId: msg.params?.threadId ?? null,
+                      turnId,
+                      serverName: elicitationServer,
+                      mode: 'form',
+                      _meta: { codex_approval_kind: 'mcp_tool_call' },
+                    },
+                  }),
+                ),
+              );
           }, elicitationDelayMs);
           break;
         case 'turn/interrupt':
@@ -188,7 +242,8 @@ const server = net.createServer((c) => {
             setTimeout(() => sendTurnCompleted(), interruptCompletionDelayMs);
           }
           break;
-        default: reply({});
+        default:
+          reply({});
       }
     }
   });

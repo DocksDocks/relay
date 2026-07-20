@@ -1,19 +1,19 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
-import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const plugin = path.resolve(here, '..');
 const requested = process.argv[process.argv.indexOf('--case') + 1];
 assert.equal(requested, 'reentry-matrix', 'usage: lifecycle-smoke.mjs --case reentry-matrix');
-const run = spawnSync(
-  'cargo',
-  ['test', '--locked', 'lifecycle_admission_', '--', '--nocapture'],
-  { cwd: path.join(plugin, 'rust'), encoding: 'utf8', env: process.env },
-);
+const run = spawnSync('cargo', ['test', '--locked', 'lifecycle_admission_', '--', '--nocapture'], {
+  cwd: path.join(plugin, 'rust'),
+  encoding: 'utf8',
+  env: process.env,
+});
 assert.equal(run.status, 0, `reentry cargo matrix failed:\n${run.stdout}\n${run.stderr}`);
 for (const behavior of [
   'lifecycle_admission_drain_receipt_rolls_back_exact_lines_before_new_mail',
@@ -24,17 +24,28 @@ for (const behavior of [
 ]) {
   assert.match(run.stdout, new RegExp(`test ${behavior} \\.\\.\\. ok`), `${behavior} behavior row did not pass`);
 }
-const rows = [...run.stdout.matchAll(/PASS reentry kind=(\S+) lower=(\S+)/g)]
-  .map((match) => ({ kind: match[1], lower: match[2] }));
+const rows = [...run.stdout.matchAll(/PASS reentry kind=(\S+) lower=(\S+)/g)].map((match) => ({
+  kind: match[1],
+  lower: match[2],
+}));
 const lifecycle = fs.readFileSync(path.join(plugin, 'rust', 'src', 'lifecycle.rs'), 'utf8');
 const enumBody = /pub enum OperationKind \{([\s\S]*?)\n\}/.exec(lifecycle)?.[1];
 assert.ok(enumBody, 'OperationKind enum source is missing');
-const expected = enumBody.split('\n')
+const expected = enumBody
+  .split('\n')
   .map((line) => /^\s*([A-Z][A-Za-z0-9]+),\s*$/.exec(line)?.[1])
   .filter(Boolean);
-assert.deepEqual(rows.map((row) => row.kind).sort(), expected.sort(), 'matrix rows must match every source-derived OperationKind');
+assert.deepEqual(
+  rows.map((row) => row.kind).sort(),
+  expected.sort(),
+  'matrix rows must match every source-derived OperationKind',
+);
 assert.equal(new Set(rows.map((row) => row.kind)).size, rows.length, 'OperationKind rows must be unique');
-assert.equal(rows.filter((row) => row.lower === 'drain_with_guard').length, 8, 'all eight drain kinds must execute the lower mutator');
+assert.equal(
+  rows.filter((row) => row.lower === 'drain_with_guard').length,
+  8,
+  'all eight drain kinds must execute the lower mutator',
+);
 const selftest = spawnSync(process.execPath, [path.join(plugin, 'test', 'selftest.mjs')], {
   cwd: path.resolve(plugin, '..', '..'),
   encoding: 'utf8',
