@@ -10,8 +10,18 @@ Cross-session / cross-project / cross-tool agent message bus — the repo's seco
 | `bin/` | the tracked POSIX launcher `relay` only; it resolves `SESSION_RELAY_BIN`, then `session-relay` on `PATH`, then `~/.local/bin/session-relay`, rejecting recursion and otherwise directing the user to `docks-kit` |
 | `hooks/` | `hooks.json` (Claude: SessionStart + UserPromptSubmit → `${CLAUDE_PLUGIN_ROOT}/bin/relay hook`) + `codex-hooks.json` (Codex parallel) |
 | `skills/` | the cross-tool `session-relay` skill (productivity) |
-| `test/` | `selftest.mjs` (the plugin's runnable self-test), `fanout-smoke.mjs` (two-leaf lifecycle smoke), and `fake-app-server.mjs` (Codex app-server stub) |
+| `test/` | `selftest.mjs` (deterministic scenario scheduler/aggregator), `selftest-fixture.mjs` (owned-home fixture/cleanup), seven independently owned `scenario-*.mjs` modules (the 133 ordered checks), `fanout-smoke.mjs` (two-leaf lifecycle smoke), and `fake-app-server.mjs` (Codex app-server stub) |
 | `.claude-plugin/` + `.codex-plugin/` | manifests — versions kept in lockstep with the marketplace entry by `ci.mjs`'s per-plugin gate and `release.mjs` |
+
+## Scenario self-test topology
+
+The seven scenario modules are declared in scheduler order as `core`, `discovery-hardening`, `hooks-identity`, `appserver`, `gc`, `spawn-wake-supervisor`, and `follow-doctor-mailbox`. Each scenario independently creates and cleans up its fixture and receives a distinct private home and result path. Never share a fixture, writable home, mutable registry, mailbox, lock, stub, watcher, or child process across scenario modules. The retired monolithic `spawn-custody` layout serialized unrelated ownership and is not a compatibility surface; do not restore it or recreate shared writable state between its replacements.
+
+`spawn-wake-supervisor` owns exactly 24 labels; `follow-doctor-mailbox` owns exactly six. Scheduler declaration order controls launch, result records, and failure reporting, but it does not define production stdout order. The explicit, non-contiguous production order emits the first 23 spawn/wake labels, then all six follow/doctor/mailbox labels, then the detached-supervisor label from `spawn-wake-supervisor` last. The complete union is exactly 133 unique labels. Rendering each as `  ok: <label>\n` must retain the immutable pre-split SHA-256 `8eaa9ecfdc3e5a9ceb72d65cbf2062c0495746a4a31ae7a0ce14c73b9cb5c44f`, and jobs 1 and jobs 4 must produce byte-identical output.
+
+Ordinary scenario failure stops later launches but lets already-active peer scenarios finish and be awaited. Infrastructure failure stops later launches, terminates and awaits every active peer, and is reported as infrastructure failure. In either case, collected failures remain in scenario declaration order and cleanup removes only the scheduler-owned root.
+
+For every future check, choose exactly one owning scenario, update that scenario's local label list, and update the explicit production output order. Do not move a check between modules merely to share setup. An intentional catalog or output change requires a reviewed canonical-output migration; never recompute the pinned pre-split hash from changed arrays to conceal drift. Preserve distinct homes/results, scenario-local stdout and artifacts, the explicit supervisor-last order unless the migration changes it, and jobs-1/jobs-4 byte parity.
 
 ## Store hygiene
 

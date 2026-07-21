@@ -354,6 +354,18 @@ function sourceCiFixture(
   ];
   const jobs = [
     {
+      id: 9000,
+      run_id: 991,
+      run_attempt: 1,
+      head_sha: COMMIT,
+      name: 'validation-shards',
+      status: 'completed',
+      conclusion: 'skipped',
+      started_at: '2026-07-17T18:00:00Z',
+      completed_at: '2026-07-17T18:00:00Z',
+      steps: [],
+    },
+    {
       id: 9001,
       run_id: 991,
       run_attempt: 1,
@@ -371,6 +383,7 @@ function sourceCiFixture(
       })),
     },
   ];
+  const logEndpoints = [];
   const adapter = {
     apiJson(endpoint) {
       if (endpoint.endsWith('/actions/runs/991'))
@@ -396,10 +409,11 @@ function sourceCiFixture(
           encoding: 'base64',
           content: workflowBytes.toString('base64'),
         };
-      if (endpoint.endsWith('/actions/runs/991/jobs?per_page=100')) return { total_count: 1, jobs };
+      if (endpoint.endsWith('/actions/runs/991/jobs?per_page=100')) return { total_count: jobs.length, jobs };
       assert.fail(`unexpected source-CI endpoint ${endpoint}`);
     },
     apiBytes(endpoint) {
+      logEndpoints.push(endpoint);
       assert.equal(endpoint, `repos/${REPOSITORY_ID}/actions/jobs/9001/logs`);
       return Buffer.from('authoritative job log\n');
     },
@@ -415,7 +429,7 @@ function sourceCiFixture(
     ]),
     adapter,
   );
-  return { result, adapter, receiptOut, jobs };
+  return { result, adapter, receiptOut, jobs, logEndpoints };
 }
 
 function sha256GitBlob(bytes) {
@@ -428,6 +442,73 @@ function sha256GitBlob(bytes) {
 function testSourceCi(temp) {
   const fixture = sourceCiFixture(temp);
   validateSourceCiReceipt(fixture.result.receipt, { sourceCommit: COMMIT });
+  assert.equal(fixture.result.receipt.jobs_sha256, sha256(Buffer.from(jcs(fixture.jobs))));
+  assert.equal(
+    fixture.result.receipt.logs_sha256,
+    sha256(
+      Buffer.from(
+        jcs([
+          {
+            job_database_id: 9001,
+            sha256: sha256(Buffer.from('authoritative job log\n')),
+          },
+        ]),
+      ),
+    ),
+  );
+  assert.deepEqual(fixture.logEndpoints, [`repos/${REPOSITORY_ID}/actions/jobs/9001/logs`]);
+  const multipleSkippedShardJobs = structuredClone(fixture.jobs);
+  const additionalSkippedShardJob = { ...structuredClone(multipleSkippedShardJobs[0]), id: 9002 };
+  additionalSkippedShardJob.steps = [{ name: 'not started', number: 1, status: 'queued', conclusion: null }];
+  multipleSkippedShardJobs.splice(1, 0, additionalSkippedShardJob);
+  const multipleSkippedShardAdapter = {
+    ...fixture.adapter,
+    apiJson(endpoint) {
+      const value = fixture.adapter.apiJson(endpoint);
+      return endpoint.endsWith('/jobs?per_page=100')
+        ? { total_count: multipleSkippedShardJobs.length, jobs: multipleSkippedShardJobs }
+        : value;
+    },
+  };
+  const multipleSkippedShardResult = verifySourceCi(
+    new Map([
+      ['run-id', '991'],
+      ['expected-commit', COMMIT],
+      ['receipt-out', path.join(temp, 'source-ci-multiple-skipped-shards.json')],
+    ]),
+    multipleSkippedShardAdapter,
+  );
+  assert.equal(multipleSkippedShardResult.receipt.jobs_sha256, sha256(Buffer.from(jcs(multipleSkippedShardJobs))));
+  assert.equal(multipleSkippedShardResult.receipt.logs_sha256, fixture.result.receipt.logs_sha256);
+  assert.deepEqual(fixture.logEndpoints, [
+    `repos/${REPOSITORY_ID}/actions/jobs/9001/logs`,
+    `repos/${REPOSITORY_ID}/actions/jobs/9001/logs`,
+  ]);
+  let jobsAdversary = 0;
+  const expectJobsReject = (label, mutate, pattern) => {
+    const jobs = structuredClone(fixture.jobs);
+    mutate(jobs);
+    const adapter = {
+      ...fixture.adapter,
+      apiJson(endpoint) {
+        const value = fixture.adapter.apiJson(endpoint);
+        return endpoint.endsWith('/jobs?per_page=100') ? { total_count: jobs.length, jobs } : value;
+      },
+    };
+    expectReject(
+      label,
+      () =>
+        verifySourceCi(
+          new Map([
+            ['run-id', '991'],
+            ['expected-commit', COMMIT],
+            ['receipt-out', path.join(temp, `source-ci-jobs-adversary-${++jobsAdversary}.json`)],
+          ]),
+          adapter,
+        ),
+      pattern,
+    );
+  };
   const changedCommit = { ...fixture.result.receipt, source_commit: 'f'.repeat(40) };
   expectReject(
     'source-CI commit substitution',
@@ -442,27 +523,71 @@ function testSourceCi(temp) {
     /workflow|blob/i,
   );
 
-  const badJobs = structuredClone(fixture.jobs);
-  badJobs[0].steps.find(({ name }) => name.startsWith('run the authoritative')).conclusion = 'failure';
-  const badAdapter = {
-    ...fixture.adapter,
-    apiJson(endpoint) {
-      const value = fixture.adapter.apiJson(endpoint);
-      return endpoint.endsWith('/jobs?per_page=100') ? { total_count: 1, jobs: badJobs } : value;
-    },
-  };
-  expectReject(
+  expectJobsReject(
     'failed required CI step',
-    () =>
-      verifySourceCi(
-        new Map([
-          ['run-id', '991'],
-          ['expected-commit', COMMIT],
-          ['receipt-out', path.join(temp, 'bad-source-ci.json')],
-        ]),
-        badAdapter,
-      ),
+    (jobs) => {
+      jobs
+        .find(({ name }) => name === 'validate (scripts/ci.mjs)')
+        .steps.find(({ name }) => name.startsWith('run the authoritative')).conclusion = 'failure';
+    },
     /step|conclusion|success/i,
+  );
+  expectJobsReject(
+    'successful validation shard row',
+    (jobs) => {
+      jobs[0].conclusion = 'success';
+    },
+    /validation-shards|skipped|non-authoritative/i,
+  );
+  expectJobsReject(
+    'failed validation shard row',
+    (jobs) => {
+      jobs[0].conclusion = 'failure';
+    },
+    /validation-shards|skipped|non-authoritative/i,
+  );
+  expectJobsReject(
+    'in-progress validation shard row',
+    (jobs) => {
+      jobs[0].status = 'in_progress';
+      jobs[0].conclusion = null;
+    },
+    /validation-shards|skipped|non-authoritative/i,
+  );
+  expectJobsReject(
+    'renamed skipped validation shard row',
+    (jobs) => {
+      jobs[0].name = 'validation shard (core)';
+    },
+    /validation-shards|skipped|non-authoritative/i,
+  );
+  expectJobsReject(
+    'skipped validation shard with completed step evidence',
+    (jobs) => {
+      jobs[0].steps.push({ name: 'unexpected evidence', number: 1, status: 'completed', conclusion: 'success' });
+    },
+    /validation-shards|steps|evidence|non-authoritative/i,
+  );
+  expectJobsReject(
+    'missing skipped validation shard row',
+    (jobs) => {
+      jobs.splice(0, 1);
+    },
+    /validation-shards|authoritative job/i,
+  );
+  expectJobsReject(
+    'extra authoritative CI job row',
+    (jobs) => {
+      jobs.push({ ...structuredClone(jobs[1]), id: 9002 });
+    },
+    /exactly one authoritative job/i,
+  );
+  expectJobsReject(
+    'unrecognized extra CI job row',
+    (jobs) => {
+      jobs.push({ ...structuredClone(jobs[0]), id: 9002, name: 'unrecognized-job' });
+    },
+    /validation-shards|skipped|non-authoritative/i,
   );
   const noOpWorkflow = authoritativeCiWorkflow().replace(
     '            node scripts/ci.mjs\n',
@@ -500,6 +625,69 @@ function testSourceCi(temp) {
       }),
     /checkout|workflow|definition|credential/i,
   );
+  const unguardedValidateCheckout = authoritativeCiWorkflow().replace(
+    `      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        if: github.event_name != 'pull_request'
+        with:`,
+    `      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:`,
+  );
+  expectReject(
+    'source-CI validate checkout without pull-request guard',
+    () =>
+      sourceCiFixture(temp, {
+        receiptName: 'unguarded-checkout-source-ci.json',
+        workflowBytes: Buffer.from(unguardedValidateCheckout),
+      }),
+    /workflow|validate|definition|pull.request|condition/i,
+  );
+  const unguardedInstall = authoritativeCiWorkflow().replace(
+    `      - name: "install pnpm dependencies (--frozen-lockfile; yaml + lockfile-pinned claude-code)"
+        if: github.event_name != 'pull_request'
+        run: pnpm install --frozen-lockfile`,
+    `      - name: "install pnpm dependencies (--frozen-lockfile; yaml + lockfile-pinned claude-code)"
+        run: pnpm install --frozen-lockfile`,
+  );
+  expectReject(
+    'source-CI validate install without pull-request guard',
+    () =>
+      sourceCiFixture(temp, {
+        receiptName: 'unguarded-install-source-ci.json',
+        workflowBytes: Buffer.from(unguardedInstall),
+      }),
+    /workflow|validate|definition|pull.request|condition/i,
+  );
+  const relaxedCargoCondition = authoritativeCiWorkflow().replace(
+    `      - name: "cache Cargo dependencies and target outputs"
+        if: github.event_name != 'pull_request' && (github.event_name != 'push' || steps.target.outputs.needs_rust == 'true')`,
+    `      - name: "cache Cargo dependencies and target outputs"
+        if: github.event_name != 'push' || steps.target.outputs.needs_rust == 'true'`,
+  );
+  expectReject(
+    'source-CI validate Cargo cache with relaxed pull-request guard',
+    () =>
+      sourceCiFixture(temp, {
+        receiptName: 'relaxed-cargo-condition-source-ci.json',
+        workflowBytes: Buffer.from(relaxedCargoCondition),
+      }),
+    /workflow|validate|definition|pull.request|condition/i,
+  );
+  const pullRequestAuthoritativeGate = authoritativeCiWorkflow().replace(
+    `      - name: "run the authoritative gate (scripts/ci.mjs)"
+        if: github.event_name != 'pull_request'`,
+    `      - name: "run the authoritative gate (scripts/ci.mjs)"
+        if: always()`,
+  );
+  expectReject(
+    'source-CI authoritative gate allowed on pull request',
+    () =>
+      sourceCiFixture(temp, {
+        receiptName: 'pull-request-authoritative-gate-source-ci.json',
+        workflowBytes: Buffer.from(pullRequestAuthoritativeGate),
+      }),
+    /workflow|validate|authoritative|definition|pull.request|condition/i,
+  );
+
   const cacheOverride = authoritativeCiWorkflow().replace(
     'run: pnpm config set store-dir "$HOME/.pnpm-store"',
     'run: printf "skip deterministic store\\n"',
@@ -512,6 +700,102 @@ function testSourceCi(temp) {
         workflowBytes: Buffer.from(cacheOverride),
       }),
     /workflow|job|definition|store/i,
+  );
+  const mutationLaneOverride = authoritativeCiWorkflow().replace(
+    'lane: [core, relay]',
+    'lane: [core, relay, mutations]',
+  );
+  expectReject(
+    'source-CI mutations validation lane restored',
+    () =>
+      sourceCiFixture(temp, {
+        receiptName: 'mutations-lane-source-ci.json',
+        workflowBytes: Buffer.from(mutationLaneOverride),
+      }),
+    /workflow|validation-shards|definition|matrix/i,
+  );
+  const conditionalShardInstall = authoritativeCiWorkflow().replace(
+    `      - name: "install pnpm dependencies (--frozen-lockfile; yaml + lockfile-pinned claude-code)"
+        run: pnpm install --frozen-lockfile`,
+    `      - name: "install pnpm dependencies (--frozen-lockfile; yaml + lockfile-pinned claude-code)"
+        if: matrix.lane != 'mutations'
+        run: pnpm install --frozen-lockfile`,
+  );
+  expectReject(
+    'source-CI validation dependency install made lane-conditional',
+    () =>
+      sourceCiFixture(temp, {
+        receiptName: 'conditional-shard-install-source-ci.json',
+        workflowBytes: Buffer.from(conditionalShardInstall),
+      }),
+    /workflow|validation-shards|definition|dependenc|condition|install/i,
+  );
+  const coreRustCacheOverride = authoritativeCiWorkflow().replace(
+    `      - name: "cache Cargo dependencies and target outputs"
+        if: matrix.lane == 'relay'`,
+    `      - name: "cache Cargo dependencies and target outputs"
+        if: matrix.lane == 'core'`,
+  );
+  expectReject(
+    'source-CI validation Cargo cache moved from Relay',
+    () =>
+      sourceCiFixture(temp, {
+        receiptName: 'core-rust-cache-source-ci.json',
+        workflowBytes: Buffer.from(coreRustCacheOverride),
+      }),
+    /workflow|validation-shards|definition|Cargo|Rust|relay|condition/i,
+  );
+  const shardConditionOverride = authoritativeCiWorkflow().replace(
+    "if: github.event_name == 'pull_request'",
+    "if: github.event_name != 'push'",
+  );
+  expectReject(
+    'source-CI validation shard event override',
+    () =>
+      sourceCiFixture(temp, {
+        receiptName: 'shard-event-source-ci.json',
+        workflowBytes: Buffer.from(shardConditionOverride),
+      }),
+    /workflow|validation-shards|definition|event/i,
+  );
+  const shardCommandOverride = authoritativeCiWorkflow().replace(
+    `run: node scripts/ci.mjs --lane "\${{ matrix.lane }}"`,
+    'run: node scripts/ci.mjs',
+  );
+  expectReject(
+    'source-CI validation shard command override',
+    () =>
+      sourceCiFixture(temp, {
+        receiptName: 'shard-command-source-ci.json',
+        workflowBytes: Buffer.from(shardCommandOverride),
+      }),
+    /workflow|validation-shards|definition|command/i,
+  );
+  const joinDependencyOverride = authoritativeCiWorkflow().replace(
+    'needs: validation-shards',
+    'needs: substituted-job',
+  );
+  expectReject(
+    'source-CI validate join dependency override',
+    () =>
+      sourceCiFixture(temp, {
+        receiptName: 'join-dependency-source-ci.json',
+        workflowBytes: Buffer.from(joinDependencyOverride),
+      }),
+    /workflow|validate|definition|needs/i,
+  );
+  const joinAssertionOverride = authoritativeCiWorkflow().replace(
+    'echo "validation shards result: $VALIDATION_SHARDS_RESULT" >&2',
+    'echo "validation shards ignored" >&2',
+  );
+  expectReject(
+    'source-CI validation shard assertion override',
+    () =>
+      sourceCiFixture(temp, {
+        receiptName: 'join-assertion-source-ci.json',
+        workflowBytes: Buffer.from(joinAssertionOverride),
+      }),
+    /workflow|validate|definition|assert/i,
   );
 
   let runReads = 0;

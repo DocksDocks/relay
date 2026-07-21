@@ -559,9 +559,6 @@ fn follow_mailbox(id: &str) -> ! {
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
     loop {
-        if let Err(e) = store::update_watcher_progress(id) {
-            eprintln!("[relay watch] progress update for {id} failed: {e}");
-        }
         match std::fs::metadata(&path) {
             Ok(metadata) => {
                 let replaced = state
@@ -604,6 +601,9 @@ fn follow_mailbox(id: &str) -> ! {
                 state = None;
             }
             Err(e) => eprintln!("[relay watch] stat {}: {e}", path.display()),
+        }
+        if let Err(e) = store::update_watcher_progress(id) {
+            eprintln!("[relay watch] progress update for {id} failed: {e}");
         }
         std::thread::sleep(Duration::from_millis(POLL_MS));
     }
