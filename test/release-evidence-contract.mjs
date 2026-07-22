@@ -1006,7 +1006,7 @@ function testNativeProducerWorkflow() {
   assert.equal(byName.get('prove Linux managed-workspace custody').if, "runner.os == 'Linux'");
   assert.match(
     byName.get('prove Linux managed-workspace custody').run,
-    /\/proc\/self\/cgroup[\s\S]*\/sys\/fs\/cgroup\$\{CURRENT_CGROUP%\/\}[\s\S]*cgroup\.procs[\s\S]*cgroup\.threads[\s\S]*cgroup\.subtree_control[\s\S]*SESSION_RELAY_TEST_BIN="\$RUNNER_TEMP\/session-relay\/\$TARGET\/\$ASSET_NAME"[\s\S]*SESSION_RELAY_TEST_CGROUP_ROOT=[\s\S]*workspace_lease_process[\s\S]*linux_cgroup_pidfd_guardian_kills_hostile_descendants[\s\S]*--exact --nocapture/,
+    /\/proc\/self\/cgroup[\s\S]*\/sys\/fs\/cgroup\$\{CURRENT_CGROUP%\/\}[\s\S]*cgroup\.procs[\s\S]*cgroup\.threads[\s\S]*cgroup\.subtree_control[\s\S]*test_pid=\$BASHPID[\s\S]*sudo -n tee "\$CGROUP\/cgroup\.procs" >\/dev\/null <<<"\$test_pid"[\s\S]*SESSION_RELAY_TEST_BIN="\$RUNNER_TEMP\/session-relay\/\$TARGET\/\$ASSET_NAME"[\s\S]*SESSION_RELAY_TEST_CGROUP_ROOT=[\s\S]*workspace_lease_process[\s\S]*linux_cgroup_pidfd_guardian_kills_hostile_descendants[\s\S]*--exact --nocapture/,
   );
   assert.equal(byName.get('prove macOS managed-workspace admission STOP').if, "runner.os == 'macOS'");
   assert.match(
