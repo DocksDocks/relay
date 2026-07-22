@@ -4,12 +4,14 @@ use crate::workspace::custody::{
     PayloadValue, ReceivedPacket,
 };
 use std::collections::BTreeMap;
-use std::ffi::{CString, OsStr};
-use std::fs;
+use std::ffi::{CString, OsStr, OsString};
+use std::fs::{self, File};
+use std::io::{Read, Seek, SeekFrom};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 const CGROUP2_SUPER_MAGIC: libc::c_long = 0x6367_7270;
@@ -38,6 +40,12 @@ const LANDLOCK_WRITE: u64 = LANDLOCK_ACCESS_FS_WRITE_FILE
     | LANDLOCK_ACCESS_FS_MAKE_FIFO | LANDLOCK_ACCESS_FS_MAKE_BLOCK
     | LANDLOCK_ACCESS_FS_MAKE_SYM | LANDLOCK_ACCESS_FS_REFER | LANDLOCK_ACCESS_FS_TRUNCATE;
 const LANDLOCK_HANDLED: u64 = LANDLOCK_READ_EXEC | LANDLOCK_WRITE;
+const LANDLOCK_READ: u64 = LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR;
+const LANDLOCK_WORKSPACE: u64 = LANDLOCK_HANDLED & !LANDLOCK_ACCESS_FS_EXECUTE;
+const LANDLOCK_FILE_ACCESS: u64 = LANDLOCK_ACCESS_FS_EXECUTE
+    | LANDLOCK_ACCESS_FS_WRITE_FILE
+    | LANDLOCK_ACCESS_FS_READ_FILE
+    | LANDLOCK_ACCESS_FS_TRUNCATE;
 const CLONE_PIDFD: u64 = 0x0000_1000;
 const CLONE_INTO_CGROUP: u64 = 0x2000_0000_0;
 const P_PIDFD: libc::idtype_t = 3;
@@ -68,6 +76,19 @@ kill: OwnedFd, }
 pub struct LandlockPolicy { pub workspace: PathBuf,
 pub readable: Vec<PathBuf>,
 pub writable_resources: Vec<PathBuf>, }
+
+#[derive(Debug)]
+struct RuntimePath {
+    path: PathBuf,
+    access: u64,
+    dev: u64,
+    ino: u64,
+}
+
+#[derive(Debug)]
+struct RuntimeClosure {
+    paths: Vec<RuntimePath>,
+}
 
 #[derive(Clone, Debug)]
 pub struct WorkerLaunch { pub executable: PathBuf,
@@ -338,6 +359,11 @@ impl DelegatedCgroup {
     }
     pub fn launch_worker(&self, launch: &WorkerLaunch) -> Result<PreparedWorker, String> { validate_launch(launch)?;
     let executable = fs::metadata(&launch.executable).map_err(|e| format!("stat worker executable {}: {e}", launch.executable.display()))?;
+    let runtime = prove_runtime_closure(
+        &launch.executable,
+        &launch.cwd,
+        &launch.environment,
+    )?;
     let (activation_read, activation_write) = pipe_cloexec()?;
     let (prepared_read, prepared_write) = pipe_cloexec()?;
     let (exec_read, exec_write) = pipe_cloexec()?;
@@ -351,7 +377,7 @@ impl DelegatedCgroup {
     if child.pid == 0 {
         drop(activation_write); drop(prepared_read); drop(exec_read);
         let result = child_prepare_and_exec(
-            &argv, &env, &cwd, &launch.sandbox, &launch.resource_fds,
+            &argv, &env, &cwd, &launch.sandbox, &runtime, &launch.resource_fds,
             activation_read.as_raw_fd(), prepared_write.as_raw_fd(), exec_write.as_raw_fd(),
         );
         let errno = result.err().and_then(|e| e.raw_os_error()).unwrap_or(libc::EPERM);
@@ -915,6 +941,19 @@ fn validate_launch(launch: &WorkerLaunch) -> Result<(), String> {
     if !launch.executable.is_absolute() || !launch.cwd.is_absolute() || !launch.sandbox.workspace.is_absolute() {
         return Err("worker executable, cwd, and workspace must be absolute".to_string());
     }
+    if launch.sandbox.workspace == Path::new("/")
+        || launch
+            .sandbox
+            .readable
+            .iter()
+            .chain(&launch.sandbox.writable_resources)
+            .any(|path| !path.is_absolute() || path == Path::new("/"))
+    {
+        return Err(
+            "sandbox paths must be absolute and may not authorize the filesystem root"
+                .to_string(),
+        );
+    }
     if launch.resource_fds.iter().any(|fd| *fd < 3) {
         return Err("resource FDs may not alias stdio".to_string());
     }
@@ -933,6 +972,12 @@ fn validate_launch(launch: &WorkerLaunch) -> Result<(), String> {
         {
             return Err(
                 "worker environment contains an invalid name or NUL".to_string(),
+            );
+        }
+        if name.starts_with("LD_") || name == "GLIBC_TUNABLES" {
+            return Err(
+                "worker environment may not alter the dynamic-loader closure"
+                    .to_string(),
             );
         }
         if let Some(resource) = name
@@ -1026,12 +1071,295 @@ fn wait_for_traced_exec_stop(pid: libc::pid_t) -> Result<(), String> {
     Ok(())
 }
 
+fn elf_u16(bytes: &[u8], offset: usize) -> Result<u16, String> {
+    let value = bytes
+        .get(offset..offset + 2)
+        .ok_or_else(|| "ELF field is truncated".to_string())?;
+    Ok(u16::from_le_bytes([value[0], value[1]]))
+}
+
+fn elf_u32(bytes: &[u8], offset: usize) -> Result<u32, String> {
+    let value = bytes
+        .get(offset..offset + 4)
+        .ok_or_else(|| "ELF field is truncated".to_string())?;
+    Ok(u32::from_le_bytes([value[0], value[1], value[2], value[3]]))
+}
+
+fn elf_u64(bytes: &[u8], offset: usize) -> Result<u64, String> {
+    let value = bytes
+        .get(offset..offset + 8)
+        .ok_or_else(|| "ELF field is truncated".to_string())?;
+    Ok(u64::from_le_bytes([
+        value[0], value[1], value[2], value[3],
+        value[4], value[5], value[6], value[7],
+    ]))
+}
+
+fn elf_interpreter(executable: &Path) -> Result<Option<PathBuf>, String> {
+    let mut file = File::open(executable)
+        .map_err(|error| format!("open worker executable {}: {error}", executable.display()))?;
+    let length = file
+        .metadata()
+        .map_err(|error| format!("stat worker executable {}: {error}", executable.display()))?
+        .len();
+    let mut header = [0_u8; 64];
+    file.read_exact(&mut header)
+        .map_err(|error| format!("read worker ELF header: {error}"))?;
+    if &header[..4] != b"\x7fELF" || header[4] != 2 || header[5] != 1 {
+        return Err("worker executable is not a supported 64-bit little-endian ELF".to_string());
+    }
+    if !matches!(elf_u16(&header, 16)?, 2 | 3) {
+        return Err("worker ELF is neither executable nor position-independent executable".to_string());
+    }
+    let expected_machine: u16 = if cfg!(target_arch = "x86_64") {
+        62
+    } else if cfg!(target_arch = "aarch64") {
+        183
+    } else {
+        return Err("worker ELF architecture is unsupported".to_string());
+    };
+    if elf_u16(&header, 18)? != expected_machine {
+        return Err("worker ELF architecture differs from the custody host".to_string());
+    }
+    let program_offset = elf_u64(&header, 32)?;
+    let entry_size = u64::from(elf_u16(&header, 54)?);
+    let entry_count = u64::from(elf_u16(&header, 56)?);
+    if entry_size != 56 || entry_count == 0 || entry_count > 1024 {
+        return Err("worker ELF program-header table is unsupported".to_string());
+    }
+    let table_size = entry_size
+        .checked_mul(entry_count)
+        .ok_or_else(|| "worker ELF program-header table overflows".to_string())?;
+    if program_offset
+        .checked_add(table_size)
+        .is_none_or(|end| end > length)
+    {
+        return Err("worker ELF program-header table is outside the file".to_string());
+    }
+
+    let mut interpreter = None;
+    let mut dynamic_segments = Vec::new();
+    for index in 0..entry_count {
+        let offset = program_offset + index * entry_size;
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|error| format!("seek worker ELF program header: {error}"))?;
+        let mut program = [0_u8; 56];
+        file.read_exact(&mut program)
+            .map_err(|error| format!("read worker ELF program header: {error}"))?;
+        let segment_type = elf_u32(&program, 0)?;
+        let segment_offset = elf_u64(&program, 8)?;
+        let segment_size = elf_u64(&program, 32)?;
+        if segment_offset
+            .checked_add(segment_size)
+            .is_none_or(|end| end > length)
+        {
+            return Err("worker ELF segment is outside the file".to_string());
+        }
+        if segment_type == 2 {
+            dynamic_segments.push((segment_offset, segment_size));
+        } else if segment_type == 3 {
+            if interpreter.is_some() || !(2..=4096).contains(&segment_size) {
+                return Err("worker ELF interpreter declaration is ambiguous".to_string());
+            }
+            let mut bytes = vec![0_u8; segment_size as usize];
+            file.seek(SeekFrom::Start(segment_offset))
+                .and_then(|_| file.read_exact(&mut bytes))
+                .map_err(|error| format!("read worker ELF interpreter: {error}"))?;
+            if bytes.pop() != Some(0) || bytes.contains(&0) {
+                return Err("worker ELF interpreter path is not canonical".to_string());
+            }
+            let path = PathBuf::from(OsString::from_vec(bytes));
+            if !path.is_absolute() {
+                return Err("worker ELF interpreter path is not absolute".to_string());
+            }
+            interpreter = Some(path);
+        }
+    }
+
+    if interpreter.is_none() {
+        for (offset, size) in dynamic_segments {
+            if size > 1024 * 1024 || size % 16 != 0 {
+                return Err("static worker ELF has an unsupported dynamic table".to_string());
+            }
+            file.seek(SeekFrom::Start(offset))
+                .map_err(|error| format!("seek worker ELF dynamic table: {error}"))?;
+            let mut entry = [0_u8; 16];
+            for _ in 0..(size / 16) {
+                file.read_exact(&mut entry)
+                    .map_err(|error| format!("read worker ELF dynamic table: {error}"))?;
+                let tag = elf_u64(&entry, 0)?;
+                if tag == 0 {
+                    break;
+                }
+                if tag == 1 {
+                    return Err(
+                        "worker ELF declares a runtime dependency without an interpreter"
+                            .to_string(),
+                    );
+                }
+            }
+        }
+    }
+    Ok(interpreter)
+}
+
+fn add_runtime_path(
+    paths: &mut Vec<RuntimePath>,
+    path: &Path,
+    access: u64,
+) -> Result<(), String> {
+    let canonical = fs::canonicalize(path)
+        .map_err(|error| format!("canonicalize runtime path {}: {error}", path.display()))?;
+    let metadata = fs::metadata(&canonical)
+        .map_err(|error| format!("stat runtime path {}: {error}", canonical.display()))?;
+    if !metadata.is_file() {
+        return Err(format!("runtime path is not a regular file: {}", canonical.display()));
+    }
+    if let Some(existing) = paths.iter_mut().find(|entry| entry.path == canonical) {
+        if existing.dev != metadata.dev() || existing.ino != metadata.ino() {
+            return Err(format!("runtime path identity changed: {}", canonical.display()));
+        }
+        existing.access |= access;
+        return Ok(());
+    }
+    paths.push(RuntimePath {
+        path: canonical,
+        access,
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+    });
+    Ok(())
+}
+
+fn require_trusted_loader(path: &Path) -> Result<(), String> {
+    let metadata = fs::metadata(path)
+        .map_err(|error| format!("stat ELF interpreter {}: {error}", path.display()))?;
+    let name = path.file_name().and_then(OsStr::to_str).unwrap_or("");
+    if (!path.starts_with("/lib") && !path.starts_with("/usr/lib"))
+        || (!name.starts_with("ld-linux-") && !name.starts_with("ld-musl-"))
+        || !metadata.is_file()
+        || metadata.uid() != 0
+        || metadata.mode() & 0o022 != 0
+    {
+        return Err(format!(
+            "worker ELF interpreter is not an immutable system loader: {}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn add_system_loader_file(
+    paths: &mut Vec<RuntimePath>,
+    path: &Path,
+) -> Result<(), String> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let canonical = fs::canonicalize(path)
+        .map_err(|error| format!("canonicalize loader metadata {}: {error}", path.display()))?;
+    let metadata = fs::metadata(&canonical)
+        .map_err(|error| format!("stat loader metadata {}: {error}", canonical.display()))?;
+    if !metadata.is_file() || metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
+        return Err(format!(
+            "dynamic-loader metadata is not an immutable system file: {}",
+            canonical.display()
+        ));
+    }
+    add_runtime_path(paths, &canonical, LANDLOCK_ACCESS_FS_READ_FILE)
+}
+
+fn prove_runtime_closure(
+    executable: &Path,
+    cwd: &Path,
+    environment: &BTreeMap<String, String>,
+) -> Result<RuntimeClosure, String> {
+    let canonical_executable = fs::canonicalize(executable)
+        .map_err(|error| format!("canonicalize worker executable {}: {error}", executable.display()))?;
+    let mut paths = Vec::new();
+    add_runtime_path(
+        &mut paths,
+        &canonical_executable,
+        LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_EXECUTE,
+    )?;
+    let Some(interpreter) = elf_interpreter(&canonical_executable)? else {
+        return Ok(RuntimeClosure { paths });
+    };
+    let interpreter = fs::canonicalize(&interpreter)
+        .map_err(|error| format!("canonicalize worker ELF interpreter: {error}"))?;
+    require_trusted_loader(&interpreter)?;
+    add_runtime_path(
+        &mut paths,
+        &interpreter,
+        LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_EXECUTE,
+    )?;
+
+    let output = Command::new(&interpreter)
+        .arg("--list")
+        .arg(&canonical_executable)
+        .current_dir(cwd)
+        .env_clear()
+        .envs(environment)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|error| format!("run dynamic loader dependency proof: {error}"))?;
+    if !output.status.success() || !output.stderr.is_empty() {
+        return Err(format!(
+            "dynamic loader could not prove the worker dependency closure: status {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let listing = std::str::from_utf8(&output.stdout)
+        .map_err(|_| "dynamic loader dependency proof is not UTF-8".to_string())?;
+    if listing.trim().is_empty() {
+        return Err("dynamic loader returned an empty dependency proof".to_string());
+    }
+    for line in listing.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with("linux-vdso.so.") {
+            continue;
+        }
+        let path = if let Some((_, resolved)) = line.split_once("=>") {
+            let resolved = resolved.trim();
+            if resolved.starts_with("not found") {
+                return Err(format!("dynamic loader dependency is unresolved: {line}"));
+            }
+            resolved.split_ascii_whitespace().next().unwrap_or("")
+        } else {
+            line.split_ascii_whitespace().next().unwrap_or("")
+        };
+        if !path.starts_with('/') {
+            return Err(format!("dynamic loader dependency proof is ambiguous: {line}"));
+        }
+        add_runtime_path(
+            &mut paths,
+            Path::new(path),
+            LANDLOCK_ACCESS_FS_READ_FILE,
+        )?;
+    }
+    add_system_loader_file(&mut paths, Path::new("/etc/ld.so.cache"))?;
+    add_system_loader_file(&mut paths, Path::new("/etc/ld.so.preload"))?;
+    if let Some(name) = interpreter.file_name().and_then(OsStr::to_str) {
+        if let Some(stem) = name.strip_suffix(".so.1") {
+            if stem.starts_with("ld-musl-") {
+                add_system_loader_file(
+                    &mut paths,
+                    &Path::new("/etc").join(format!("{stem}.path")),
+                )?;
+            }
+        }
+    }
+    Ok(RuntimeClosure { paths })
+}
+
 fn child_prepare_and_exec(
-    argv: &[CString], env: &[CString], cwd: &CString, policy: &LandlockPolicy, resource_fds: &[RawFd],
+    argv: &[CString], env: &[CString], cwd: &CString, policy: &LandlockPolicy,
+    runtime: &RuntimeClosure, resource_fds: &[RawFd],
     activation_fd: RawFd, prepared_fd: RawFd, exec_fd: RawFd,
 ) -> Result<(), std::io::Error> {
     if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 { return Err(std::io::Error::last_os_error()); }
-    apply_landlock(policy).map_err(std::io::Error::other)?;
+    apply_landlock(policy, runtime).map_err(std::io::Error::other)?;
     for fd in resource_fds {
         let flags = unsafe { libc::fcntl(*fd, libc::F_GETFD) };
         if flags < 0
@@ -1076,26 +1404,144 @@ fn landlock_abi() -> Result<i32, String> {
     Ok(abi)
 }
 
-fn apply_landlock(policy: &LandlockPolicy) -> Result<(), String> {
-    if landlock_abi()? < 3 { return Err("Linux custody requires Landlock ABI >= 3".to_string()); }
-    let attr = LandlockRulesetAttr { handled_access_fs: LANDLOCK_HANDLED };
-    let fd = unsafe { libc::syscall(libc::SYS_landlock_create_ruleset, &attr, std::mem::size_of::<LandlockRulesetAttr>(), 0) } as RawFd;
-    if fd < 0 { return Err(format!("create Landlock ruleset: {}", std::io::Error::last_os_error())); }
+fn apply_landlock(
+    policy: &LandlockPolicy,
+    runtime: &RuntimeClosure,
+) -> Result<(), String> {
+    if landlock_abi()? < 3 {
+        return Err("Linux custody requires Landlock ABI >= 3".to_string());
+    }
+    let attr = LandlockRulesetAttr {
+        handled_access_fs: LANDLOCK_HANDLED,
+    };
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_landlock_create_ruleset,
+            &attr,
+            std::mem::size_of::<LandlockRulesetAttr>(),
+            0,
+        )
+    } as RawFd;
+    if fd < 0 {
+        return Err(format!(
+            "create Landlock ruleset: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
     let ruleset = unsafe { OwnedFd::from_raw_fd(fd) };
-    let mut readable = vec![PathBuf::from("/")]; readable.extend(policy.readable.iter().cloned());
-    for path in readable { add_landlock_path(&ruleset, &path, LANDLOCK_READ_EXEC)?; }
-    add_landlock_path(&ruleset, &policy.workspace, LANDLOCK_HANDLED)?;
-    for path in &policy.writable_resources { add_landlock_path(&ruleset, path, LANDLOCK_HANDLED)?; }
-    if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 { return Err(format!("set no-new-privs before Landlock: {}", std::io::Error::last_os_error())); }
-    if unsafe { libc::syscall(libc::SYS_landlock_restrict_self, ruleset.as_raw_fd(), 0) } != 0 { return Err(format!("enforce Landlock ruleset: {}", std::io::Error::last_os_error())); }
+    for entry in &runtime.paths {
+        add_landlock_runtime_path(&ruleset, entry)?;
+    }
+    for path in &policy.readable {
+        add_landlock_path(&ruleset, path, LANDLOCK_READ)?;
+    }
+    add_landlock_path(&ruleset, &policy.workspace, LANDLOCK_WORKSPACE)?;
+    for path in &policy.writable_resources {
+        add_landlock_path(&ruleset, path, LANDLOCK_WORKSPACE)?;
+    }
+    if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+        return Err(format!(
+            "set no-new-privs before Landlock: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    if unsafe {
+        libc::syscall(
+            libc::SYS_landlock_restrict_self,
+            ruleset.as_raw_fd(),
+            0,
+        )
+    } != 0
+    {
+        return Err(format!(
+            "enforce Landlock ruleset: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
     Ok(())
 }
 
-fn add_landlock_path(ruleset: &OwnedFd, path: &Path, access: u64) -> Result<(), String> {
-    let parent = open_fd(path, libc::O_PATH)?;
-    let attr = LandlockPathBeneathAttr { allowed_access: access, parent_fd: parent.as_raw_fd() as u64 };
-    if unsafe { libc::syscall(libc::SYS_landlock_add_rule, ruleset.as_raw_fd(), LANDLOCK_RULE_PATH_BENEATH, &attr, 0) } != 0 {
-        return Err(format!("add Landlock rule for {}: {}", path.display(), std::io::Error::last_os_error()));
+fn add_landlock_path(
+    ruleset: &OwnedFd,
+    path: &Path,
+    access: u64,
+) -> Result<(), String> {
+    let canonical = fs::canonicalize(path)
+        .map_err(|error| format!("canonicalize Landlock path {}: {error}", path.display()))?;
+    if canonical == Path::new("/") {
+        return Err(
+            "canonical Landlock path may not authorize the filesystem root"
+                .to_string(),
+        );
+    }
+    let parent = open_fd(&canonical, libc::O_PATH)?;
+    let mode = fstat_mode(parent.as_raw_fd())?;
+    let allowed_access = if mode & libc::S_IFMT == libc::S_IFDIR {
+        access
+    } else if mode & libc::S_IFMT == libc::S_IFREG {
+        access & LANDLOCK_FILE_ACCESS
+    } else {
+        return Err(format!(
+            "Landlock path is neither a regular file nor directory: {}",
+            canonical.display()
+        ));
+    };
+    add_landlock_rule_fd(
+        ruleset,
+        parent.as_raw_fd(),
+        &canonical,
+        allowed_access,
+    )
+}
+
+fn add_landlock_runtime_path(
+    ruleset: &OwnedFd,
+    runtime: &RuntimePath,
+) -> Result<(), String> {
+    let parent = open_fd(&runtime.path, libc::O_PATH)?;
+    let metadata = fstat_metadata(parent.as_raw_fd())?;
+    if metadata != (runtime.dev, runtime.ino) {
+        return Err(format!(
+            "runtime path identity changed before Landlock enforcement: {}",
+            runtime.path.display()
+        ));
+    }
+    add_landlock_rule_fd(
+        ruleset,
+        parent.as_raw_fd(),
+        &runtime.path,
+        runtime.access,
+    )
+}
+
+fn add_landlock_rule_fd(
+    ruleset: &OwnedFd,
+    parent_fd: RawFd,
+    path: &Path,
+    allowed_access: u64,
+) -> Result<(), String> {
+    if allowed_access == 0 {
+        return Err(format!("Landlock path has no applicable rights: {}", path.display()));
+    }
+    let attr = LandlockPathBeneathAttr {
+        allowed_access,
+        parent_fd: parent_fd as u64,
+    };
+    if unsafe {
+        libc::syscall(
+            libc::SYS_landlock_add_rule,
+            ruleset.as_raw_fd(),
+            LANDLOCK_RULE_PATH_BENEATH,
+            &attr,
+            0,
+        )
+    } != 0
+    {
+        return Err(format!(
+            "add Landlock rule for {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        ));
     }
     Ok(())
 }
@@ -1326,6 +1772,7 @@ fn fstat_metadata(fd: RawFd) -> Result<(u64, u64), String> { let mut stat: libc:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -1353,6 +1800,12 @@ mod tests {
             readable: Vec::new(),
             writable_resources: Vec::new(),
         };
+        let runtime = prove_runtime_closure(
+            Path::new("/bin/sh"),
+            &workspace,
+            &BTreeMap::new(),
+        )
+        .unwrap();
         let (activation_read, activation_write) = pipe_cloexec().unwrap();
         let (prepared_read, prepared_write) = pipe_cloexec().unwrap();
         let (exec_read, exec_write) = pipe_cloexec().unwrap();
@@ -1368,6 +1821,7 @@ mod tests {
                 &env,
                 &cwd,
                 &policy,
+                &runtime,
                 &[],
                 activation_read.as_raw_fd(),
                 prepared_write.as_raw_fd(),
@@ -1433,6 +1887,269 @@ mod tests {
         assert!(stopped_before_ack, "worker was not stopped at traced exec");
         assert!(!ran_before_ack, "tool code ran before ACTIVATED acknowledgment");
         assert!(ran_after_ack, "tool code did not run after activation acknowledgment");
+    }
+
+    #[test]
+    fn runtime_closure_fails_closed_for_an_unprovable_tool() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "session-relay-runtime-proof-{}-{suffix}",
+            unsafe { libc::getpid() }
+        ));
+        fs::create_dir(&root).unwrap();
+        let executable = root.join("tool");
+        fs::write(&executable, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut permissions = fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&executable, permissions).unwrap();
+
+        let error = prove_runtime_closure(&executable, &root, &BTreeMap::new())
+            .unwrap_err();
+
+        fs::remove_dir_all(&root).unwrap();
+        assert!(
+            error.contains("ELF"),
+            "unexpected closure-proof error: {error}"
+        );
+    }
+
+    #[test]
+    fn sandbox_policy_rejects_root_and_dynamic_loader_overrides() {
+        let mut launch = WorkerLaunch {
+            executable: PathBuf::from("/bin/true"),
+            arguments: Vec::new(),
+            environment: BTreeMap::new(),
+            cwd: PathBuf::from("/tmp"),
+            resource_fds: Vec::new(),
+            sandbox: LandlockPolicy {
+                workspace: PathBuf::from("/tmp"),
+                readable: vec![PathBuf::from("/")],
+                writable_resources: Vec::new(),
+            },
+        };
+        assert!(
+            validate_launch(&launch)
+                .unwrap_err()
+                .contains("may not authorize the filesystem root")
+        );
+
+        launch.sandbox.readable.clear();
+        launch.environment.insert(
+            "LD_PRELOAD".to_string(),
+            "/tmp/unverified.so".to_string(),
+        );
+        assert!(
+            validate_launch(&launch)
+                .unwrap_err()
+                .contains("may not alter the dynamic-loader closure")
+        );
+    }
+
+    #[test]
+    fn landlock_accepts_the_proven_dynamic_test_runtime() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let workspace = std::env::temp_dir().join(format!(
+            "session-relay-dynamic-runtime-{}-{suffix}",
+            unsafe { libc::getpid() }
+        ));
+        fs::create_dir(&workspace).unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let runtime = prove_runtime_closure(
+            &executable,
+            &workspace,
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let mut readable = vec![executable];
+        for path in ["/usr/lib", "/lib", "/lib64", "/etc/ld.so.cache"] {
+            let path = PathBuf::from(path);
+            if path.exists() {
+                readable.push(path);
+            }
+        }
+        let policy = LandlockPolicy {
+            workspace: workspace.clone(),
+            readable,
+            writable_resources: Vec::new(),
+        };
+        let (result_read, result_write) = pipe_cloexec().unwrap();
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            drop(result_read);
+            let result = apply_landlock(&policy, &runtime);
+            let bytes = match &result {
+                Ok(()) => b"ok".as_slice(),
+                Err(error) => error.as_bytes(),
+            };
+            let _ = write_all_fd(result_write.as_raw_fd(), bytes);
+            unsafe { libc::_exit(i32::from(result.is_err())) };
+        }
+        drop(result_write);
+        let mut bytes = [0_u8; 1024];
+        let count = read_with_deadline(
+            result_read.as_raw_fd(),
+            &mut bytes,
+            PREPARED_DEADLINE,
+        )
+        .unwrap();
+        let result = String::from_utf8_lossy(&bytes[..count]);
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        fs::remove_dir(&workspace).unwrap();
+        assert_eq!(result, "ok", "dynamic runtime Landlock failed: {result}");
+        assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
+    }
+
+    #[test]
+    fn landlock_worker_reads_only_declared_runtime_and_input_paths() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "session-relay-landlock-{}-{suffix}",
+            unsafe { libc::getpid() }
+        ));
+        let workspace = root.join("workspace");
+        let authority = root.join("authority");
+        let sibling = root.join("sibling-workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir(&authority).unwrap();
+        fs::create_dir(&sibling).unwrap();
+        let allowed_dir = root.join("allowed-input");
+        let allowed = allowed_dir.join("input");
+        let authority_secret = authority.join("secret");
+        let sibling_secret = sibling.join("secret");
+        let marker = workspace.join("result");
+        let unverified_tool = workspace.join("unverified-tool");
+        fs::create_dir(&allowed_dir).unwrap();
+        fs::write(&allowed, "allowed\n").unwrap();
+        fs::write(&authority_secret, "authority\n").unwrap();
+        fs::write(&sibling_secret, "sibling\n").unwrap();
+        fs::write(&unverified_tool, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut permissions = fs::metadata(&unverified_tool).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&unverified_tool, permissions).unwrap();
+
+        let command = concat!(
+            "IFS= read -r value < \"$1\" || exit 10; ",
+            "[ \"$value\" = allowed ] || exit 11; ",
+            "if IFS= read -r value < \"$2\"; then exit 12; fi; ",
+            "if IFS= read -r value < \"$3\"; then exit 13; fi; ",
+            "if \"$5\"; then exit 14; fi; ",
+            "printf contained > \"$4\""
+        );
+        let argv = c_argv(
+            Path::new("/bin/sh"),
+            &[
+                "-c".to_string(),
+                command.to_string(),
+                "landlock-test".to_string(),
+                allowed.display().to_string(),
+                authority_secret.display().to_string(),
+                sibling_secret.display().to_string(),
+                marker.display().to_string(),
+                unverified_tool.display().to_string(),
+            ],
+        )
+        .unwrap();
+        let env = c_env(&BTreeMap::new()).unwrap();
+        let cwd = c_path(&workspace).unwrap();
+        let policy = LandlockPolicy {
+            workspace: workspace.clone(),
+            readable: vec![allowed_dir],
+            writable_resources: Vec::new(),
+        };
+        let runtime = prove_runtime_closure(
+            Path::new("/bin/sh"),
+            &workspace,
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let (activation_read, activation_write) = pipe_cloexec().unwrap();
+        let (prepared_read, prepared_write) = pipe_cloexec().unwrap();
+        let (exec_read, exec_write) = pipe_cloexec().unwrap();
+
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            drop(activation_write);
+            drop(prepared_read);
+            drop(exec_read);
+            let result = child_prepare_and_exec(
+                &argv,
+                &env,
+                &cwd,
+                &policy,
+                &runtime,
+                &[],
+                activation_read.as_raw_fd(),
+                prepared_write.as_raw_fd(),
+                exec_write.as_raw_fd(),
+            );
+            let errno = result
+                .err()
+                .and_then(|error| error.raw_os_error())
+                .unwrap_or(libc::EPERM);
+            unsafe {
+                libc::write(
+                    exec_write.as_raw_fd(),
+                    errno.to_ne_bytes().as_ptr().cast(),
+                    std::mem::size_of::<i32>(),
+                );
+                libc::_exit(127);
+            }
+        }
+
+        drop(activation_read);
+        drop(prepared_write);
+        drop(exec_write);
+        assert_eq!(
+            read_one_with_deadline(prepared_read.as_raw_fd(), PREPARED_DEADLINE)
+                .unwrap(),
+            0x01
+        );
+        write_all_fd(activation_write.as_raw_fd(), &[0x01]).unwrap();
+        drop(activation_write);
+        let mut exec_status = [0_u8; 4];
+        assert_eq!(
+            read_with_deadline(
+                exec_read.as_raw_fd(),
+                &mut exec_status,
+                PREPARED_DEADLINE,
+            )
+            .unwrap(),
+            0
+        );
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED) }, pid);
+        assert!(libc::WIFSTOPPED(status));
+        assert_eq!(
+            unsafe {
+                libc::ptrace(
+                    libc::PTRACE_DETACH,
+                    pid,
+                    std::ptr::null_mut::<libc::c_void>(),
+                    std::ptr::null_mut::<libc::c_void>(),
+                )
+            },
+            0
+        );
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "contained worker exited with status {status}"
+        );
+        assert_eq!(fs::read_to_string(&marker).unwrap(), "contained");
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
