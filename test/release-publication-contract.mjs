@@ -62,7 +62,7 @@ function proof(directory) {
       review_receipt_sha256: hash,
       red_receipt_sha256: hash,
       status: 'blocked',
-      blocked_reason: 'Awaiting the four independently hashed `session-relay--v0.12.0` production asset digests.',
+      blocked_reason: 'Awaiting the four independently hashed `session-relay--v0.13.0` production asset digests.',
     },
     preflight: {
       sha256: hash,

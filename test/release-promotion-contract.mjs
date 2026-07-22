@@ -46,7 +46,7 @@ const candidate = {
   schema: 1,
   type: 'SourcePreparationCandidateV1',
   repository_id: 'DocksDocks/docks',
-  version: '0.12.0',
+  version: '0.13.0',
   source_commit: TAG_COMMIT,
   execution_base_commit: OLD_MAIN,
   plan: {
@@ -60,7 +60,7 @@ const candidate = {
   },
   companion: {
     repository_id: 'DocksDocks/public',
-    validation_ref: 'refs/heads/preflight/session-relay-0.12.0',
+    validation_ref: 'refs/heads/preflight/session-relay-0.13.0',
     commit: PUBLIC_REVIEWED_COMMIT,
     plan_path: 'docs/plans/active/session-relay-cli-installation.md',
     input_sha256: DIGEST('3'),
@@ -68,7 +68,7 @@ const candidate = {
     review_receipt_sha256: DIGEST('4'),
     red_receipt_sha256: DIGEST('5'),
     status: 'blocked',
-    blocked_reason: 'Awaiting the four independently hashed `session-relay--v0.12.0` production asset digests.',
+    blocked_reason: 'Awaiting the four independently hashed `session-relay--v0.13.0` production asset digests.',
   },
   preflight: {
     sha256: DIGEST('6'),
@@ -104,7 +104,7 @@ const proofValue = {
   schema: 1,
   type: 'SourcePreparationProofV1',
   repository_id: 'DocksDocks/docks',
-  version: '0.12.0',
+  version: '0.13.0',
   source_commit: TAG_COMMIT,
   tag_commit: TAG_COMMIT,
   evidence_commit: '8'.repeat(40),
@@ -158,9 +158,9 @@ const publication = {
     schema: 1,
     type: 'SessionRelayPublicationReceiptV1',
     repository_id: 'DocksDocks/docks',
-    version: '0.12.0',
+    version: '0.13.0',
     source_proof_sha256: proof.digest,
-    tag: 'session-relay--v0.12.0',
+    tag: 'session-relay--v0.13.0',
     tag_commit: TAG_COMMIT,
     workflow: {
       file: '.github/workflows/build-binaries.yml',
@@ -207,8 +207,8 @@ const publicRequestValue = {
   companion_base_commit: PUBLIC_REVIEWED_COMMIT,
   session_relay: {
     repository_id: 'DocksDocks/docks',
-    tag: 'session-relay--v0.12.0',
-    version: '0.12.0',
+    tag: 'session-relay--v0.13.0',
+    version: '0.13.0',
     tag_commit: TAG_COMMIT,
     publication_receipt_sha256: publication.digest,
   },
@@ -280,9 +280,9 @@ function smoke(kind) {
     ordering_log_sha256: DIGEST('1'),
     installed_binary_sha256: HOST_ASSET_DIGEST,
     session_relay_asset_name: 'session-relay-x86_64-unknown-linux-musl',
-    installed_version: 'session-relay 0.12.0',
+    installed_version: 'session-relay 0.13.0',
     launcher_sha256: DIGEST('a'),
-    launcher_version: 'session-relay 0.12.0',
+    launcher_version: 'session-relay 0.13.0',
     docks_kit_target_commit: PUBLIC_RELEASE_COMMIT,
     docks_kit_asset: { name: 'docks-kit-linux-x64', database_id: 501, size: 2000, digest: DIGEST('9') },
     docks_kit_release_database_id: 601,
@@ -445,7 +445,7 @@ function makeAdapter({
     },
     releaseState: () => ({
       repository_id: 'DocksDocks/docks',
-      tag: 'session-relay--v0.12.0',
+      tag: 'session-relay--v0.13.0',
       commit: state.tagAbsent ? null : TAG_COMMIT,
       release_database_id: state.releaseAbsent ? null : 91,
       prerelease: state.releaseAbsent ? null : !state.releaseStable,
@@ -1932,7 +1932,7 @@ for (const releaseAbsent of [false, true]) {
       OLD_MAIN,
       '--receipt-out',
       receiptPath,
-      '0.12.0',
+      '0.13.0',
     ];
     await assert.rejects(
       dispatchSessionRelayRelease(['--promote-reviewed', ...common]),
@@ -2039,12 +2039,12 @@ for (const releaseAbsent of [false, true]) {
 }
 
 await assert.rejects(
-  dispatchSessionRelayRelease(['--emit-public-request', '--plugin', 'session-relay', '0.12.0']),
+  dispatchSessionRelayRelease(['--emit-public-request', '--plugin', 'session-relay', '0.13.0']),
   /missing required option: --publication/i,
   'emit-public-request CLI mode must be recognized',
 );
 await assert.rejects(
-  dispatchSessionRelayRelease(['--verify-public-release', '--plugin', 'session-relay', '0.12.0']),
+  dispatchSessionRelayRelease(['--verify-public-release', '--plugin', 'session-relay', '0.13.0']),
   /missing required option: --request/i,
   'verify-public-release CLI mode must be recognized',
 );
@@ -2053,7 +2053,7 @@ await assert.rejects(
     '--promote-reviewed',
     '--plugin',
     'session-relay',
-    '0.12.0',
+    '0.13.0',
     '--source-proof',
     '/proof.json',
     '--source-proof-sha256',

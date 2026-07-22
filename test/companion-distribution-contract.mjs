@@ -13,7 +13,7 @@ const REPO = path.resolve(HERE, '../../..');
 const SHA = /^[0-9a-f]{64}$/;
 const COMMIT = /^[0-9a-f]{40}$/;
 const PUBLIC_REMOTE = 'https://github.com/DocksDocks/public.git';
-const BLOCKED_REASON = 'Awaiting the four independently hashed `session-relay--v0.12.0` production asset digests.';
+const BLOCKED_REASON = 'Awaiting the four independently hashed `session-relay--v0.13.0` production asset digests.';
 
 function parseCli(argv) {
   const result = {};
@@ -186,10 +186,10 @@ function verify() {
     assert.equal(relay.kind, 'managed-release');
     assert.equal(relay.policy, 'exact');
     assert.equal(relay.repository, 'DocksDocks/docks');
-    assert.equal(relay.tag, 'session-relay--v0.12.0');
-    assert.equal(relay.verified, '0.12.0');
+    assert.equal(relay.tag, 'session-relay--v0.13.0');
+    assert.equal(relay.verified, '0.13.0');
     assert.equal(relay.plugin_id, 'session-relay@docks');
-    assert.equal(relay.plugin_version, '0.12.0');
+    assert.equal(relay.plugin_version, '0.13.0');
     assert.equal(relay.install_path, '~/.local/bin/session-relay');
     exactKeys(
       relay.assets,
