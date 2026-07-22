@@ -228,7 +228,7 @@ function artifactFixture({ mutateArchive } = {}) {
         sha256: digest,
         source_commit: COMMIT,
         target,
-        version_stdout: 'session-relay 0.13.0',
+        version_stdout: 'session-relay 0.12.0',
         workflow_run_attempt: RUN_ATTEMPT,
         workflow_run_id: RUN_ID,
       }),
@@ -265,7 +265,7 @@ function artifactRecord(id, name, archive) {
       id: RUN_ID,
       repository_id: REPOSITORY_DATABASE_ID,
       head_repository_id: REPOSITORY_DATABASE_ID,
-      head_branch: `preflight/session-relay-0.13.0-${COMMIT.slice(0, 12)}`,
+      head_branch: `preflight/session-relay-0.12.0-${COMMIT.slice(0, 12)}`,
       head_sha: COMMIT,
     },
   };
@@ -281,7 +281,7 @@ function preflightAdapter(fixture) {
           status: 'completed',
           conclusion: 'success',
           head_sha: COMMIT,
-          head_branch: `preflight/session-relay-0.13.0-${COMMIT.slice(0, 12)}`,
+          head_branch: `preflight/session-relay-0.12.0-${COMMIT.slice(0, 12)}`,
           path: '.github/workflows/build-binaries.yml',
           run_attempt: RUN_ATTEMPT,
           workflow_id: WORKFLOW_ID,
@@ -446,7 +446,7 @@ function sourceCiFixture(
           status: 'completed',
           conclusion: 'success',
           head_sha: COMMIT,
-          head_branch: `preflight/session-relay-0.13.0-${COMMIT.slice(0, 12)}`,
+          head_branch: `preflight/session-relay-0.12.0-${COMMIT.slice(0, 12)}`,
           path: '.github/workflows/ci.yml',
           run_started_at: '2026-07-17T18:00:00Z',
           updated_at: '2026-07-17T18:10:00Z',
@@ -1256,7 +1256,7 @@ function testPreparationHandlers(temp, preflight, sourceCi) {
     'status: blocked',
     'review_status: ready',
     `execution_base_commit: ${'5'.repeat(40)}`,
-    'blocked_reason: "Awaiting the four independently hashed `session-relay--v0.13.0` production asset digests."',
+    'blocked_reason: "Awaiting the four independently hashed `session-relay--v0.12.0` production asset digests."',
     '---',
     '',
     `Review-receipt: ${jcs(companionReview)}`,
@@ -1266,7 +1266,7 @@ function testPreparationHandlers(temp, preflight, sourceCi) {
     `- Companion TDD-red receipt JCS bytes: ${jcs(publicRed.value)}`,
     `- Companion TDD-red receipt SHA-256: ${publicRed.digest}`,
     '- Status: blocked',
-    '- Blocked reason: Awaiting the four independently hashed `session-relay--v0.13.0` production asset digests.',
+    '- Blocked reason: Awaiting the four independently hashed `session-relay--v0.12.0` production asset digests.',
     '',
   ].join('\n');
   const base = '4567890abcdef1234567890abcdef12345678901';
@@ -1289,7 +1289,7 @@ function testPreparationHandlers(temp, preflight, sourceCi) {
     `- Companion TDD-red receipt JCS bytes: ${jcs(publicRed.value)}`,
     `- Companion TDD-red receipt SHA-256: ${publicRed.digest}`,
     '- Companion status: blocked',
-    '- Companion blocked reason: Awaiting the four independently hashed `session-relay--v0.13.0` production asset digests.',
+    '- Companion blocked reason: Awaiting the four independently hashed `session-relay--v0.12.0` production asset digests.',
     `- Docks TDD-red receipt JCS bytes: ${jcs(docksRed)}`,
     `- Docks TDD-red receipt SHA-256: ${docksRedDigest}`,
     `- TAG_COMMIT / SOURCE_COMMIT: ${COMMIT}`,
@@ -1864,7 +1864,7 @@ function testPrepareFixtureUsesFullCi(temp) {
       source_commit: COMMIT,
       promoted_commit: '2'.repeat(40),
       expected_origin_main: '3'.repeat(40),
-      tag: 'session-relay--v0.13.0',
+      tag: 'session-relay--v0.12.0',
       assets: [],
       expected_outcome: 'success',
     }),
@@ -1875,7 +1875,7 @@ function testPrepareFixtureUsesFullCi(temp) {
     process.env.SESSION_RELAY_RELEASE_FIXTURE = fixturePath;
     process.env.SESSION_RELAY_RELEASE_REPORT = reportPath;
     assert.equal(
-      runFixture(['--prepare', '--plugin', 'session-relay', '0.13.0'], { mode: 'prepare', options: new Map() }, null),
+      runFixture(['--prepare', '--plugin', 'session-relay', '0.12.0'], { mode: 'prepare', options: new Map() }, null),
       true,
     );
   } finally {
@@ -1931,7 +1931,7 @@ function testLiveSourceCiAndPrepareDryRun() {
   const before = new Map(tracked.map((relative) => [relative, fs.readFileSync(path.join(repo, relative))]));
   const realDry = spawnSync(
     process.execPath,
-    ['scripts/release.mjs', '--prepare', '--plugin', 'session-relay', '--dry-run', '0.13.0'],
+    ['scripts/release.mjs', '--prepare', '--plugin', 'session-relay', '--dry-run', '0.12.0'],
     { cwd: repo, encoding: 'utf8', shell: false },
   );
   assert.equal(realDry.status, 0, `real prepare dry-run failed: ${realDry.stderr}`);

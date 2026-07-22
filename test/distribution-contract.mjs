@@ -333,7 +333,7 @@ function testLauncher() {
     fs.mkdirSync(path.join(home, '.local/bin'), { recursive: true });
     const record = path.join(root, 'record.json');
     const stubBody = (name) =>
-      `require('node:fs').writeFileSync(process.env.RELAY_RECORD, JSON.stringify({name:${JSON.stringify(name)},argv:process.argv.slice(2)}));process.stdout.write(${JSON.stringify(`${name} 0.13.0\n`)});`;
+      `require('node:fs').writeFileSync(process.env.RELAY_RECORD, JSON.stringify({name:${JSON.stringify(name)},argv:process.argv.slice(2)}));process.stdout.write(${JSON.stringify(`${name} 0.12.0\n`)});`;
     const explicit = path.join(envDir, 'explicit');
     makeExecutable(explicit, stubBody('explicit'));
     makeExecutable(path.join(pathDir, 'session-relay'), stubBody('path'));
@@ -346,7 +346,7 @@ function testLauncher() {
 
     let result = launcherRun({ ...common, SESSION_RELAY_BIN: explicit }, ['send', 'agent', '--', 'a b', '--flag']);
     assert.equal(result.status, 0, result.stderr);
-    assert.equal(result.stdout, 'explicit 0.13.0\n');
+    assert.equal(result.stdout, 'explicit 0.12.0\n');
     assert.deepEqual(JSON.parse(fs.readFileSync(record, 'utf8')), {
       name: 'explicit',
       argv: ['send', 'agent', '--', 'a b', '--flag'],
@@ -515,7 +515,7 @@ function runReleaseFixture(root, mode, scenario, expectedOutcome, releaseArgs) {
     source_commit: '1'.repeat(40),
     promoted_commit: '2'.repeat(40),
     expected_origin_main: '3'.repeat(40),
-    tag: 'session-relay--v0.13.0',
+    tag: 'session-relay--v0.12.0',
     assets: [...ASSETS, 'SHA256SUMS'].map((name, index) => ({
       name,
       digest: String(index + 4)
@@ -581,7 +581,7 @@ function releaseContracts() {
         '--publish-reviewed',
         '--plugin',
         'session-relay',
-        '0.13.0',
+        '0.12.0',
         '--source-proof',
         ...pair('source-proof', 'a'),
         '--receipt-out',
@@ -605,8 +605,8 @@ function releaseContracts() {
         `--${mode}`,
         '--plugin',
         'session-relay',
-        '0.13.0',
-        ...(resume ? ['--transaction-ref', 'refs/heads/transactions/session-relay-0.13.0'] : []),
+        '0.12.0',
+        ...(resume ? ['--transaction-ref', 'refs/heads/transactions/session-relay-0.12.0'] : []),
         '--source-proof',
         ...pair('source-proof', 'a'),
         '--publication',
@@ -636,9 +636,9 @@ function releaseContracts() {
         '--resume-promotion',
         '--plugin',
         'session-relay',
-        '0.13.0',
+        '0.12.0',
         '--transaction-ref',
-        'refs/heads/transactions/session-relay-0.13.0',
+        'refs/heads/transactions/session-relay-0.12.0',
         '--source-proof',
         ...pair('source-proof', 'a'),
         '--publication',
@@ -683,7 +683,7 @@ function releaseContracts() {
         '--finalize-reviewed',
         '--plugin',
         'session-relay',
-        '0.13.0',
+        '0.12.0',
         '--source-proof',
         ...pair('source-proof', 'a'),
         '--publication',
@@ -704,14 +704,14 @@ function releaseContracts() {
     }
 
     const preparation = [
-      ['prepare', ['--prepare', '--plugin', 'session-relay', '0.13.0']],
+      ['prepare', ['--prepare', '--plugin', 'session-relay', '0.12.0']],
       [
         'materialize-tdd-red',
         [
           '--materialize-tdd-red',
           '--plugin',
           'session-relay',
-          '0.13.0',
+          '0.12.0',
           '--plan',
           'docs/plans/active/session-relay-prebuilt-cli-distribution.md',
           '--docks-red-out',
@@ -726,7 +726,7 @@ function releaseContracts() {
           '--verify-embedded-preparation',
           '--plugin',
           'session-relay',
-          '0.13.0',
+          '0.12.0',
           '--plan',
           'docs/plans/active/session-relay-prebuilt-cli-distribution.md',
         ],
@@ -737,7 +737,7 @@ function releaseContracts() {
           '--verify-source-ci',
           '--plugin',
           'session-relay',
-          '0.13.0',
+          '0.12.0',
           '--run-id',
           '12345',
           '--expected-commit',
@@ -752,7 +752,7 @@ function releaseContracts() {
           '--check-prepared',
           '--plugin',
           'session-relay',
-          '0.13.0',
+          '0.12.0',
           '--source-commit',
           '1'.repeat(40),
           '--docks-red',
@@ -773,7 +773,7 @@ function releaseContracts() {
           '--bind-completion',
           '--plugin',
           'session-relay',
-          '0.13.0',
+          '0.12.0',
           '--finished-plan',
           inPath('finished-plan'),
           '--embedded-candidate-sha256',
@@ -813,7 +813,7 @@ function releaseContracts() {
       '--prepare',
       '--plugin',
       'session-relay',
-      '0.13.0',
+      '0.12.0',
       '--dry-run',
     ]);
     assert.equal(
@@ -831,7 +831,7 @@ function releaseContracts() {
       '--publish-reviewed',
       '--plugin',
       'session-relay',
-      '0.13.0',
+      '0.12.0',
       '--source-proof',
       ...pair('source-proof', 'a'),
       '--receipt-out',
@@ -847,7 +847,7 @@ function releaseContracts() {
           '--publish-reviewed',
           '--plugin',
           'session-relay',
-          '0.13.0',
+          '0.12.0',
           '--source-proof-sha256',
           'a'.repeat(64),
           '--receipt-out',
@@ -874,7 +874,7 @@ function releaseContracts() {
     const positionalRelay = runReleaseFixture(fixtureRoot.root, 'grammar', 'session-relay-positional', 'conflict', [
       '--plugin',
       'session-relay',
-      '0.13.0',
+      '0.12.0',
     ]);
     assert.deepEqual(positionalRelay.mutations, []);
   } finally {
@@ -915,7 +915,7 @@ function verifyCompanion() {
     const review = JSON.parse(reviewBytes);
     assert.equal(review.outcome, 'passed');
     assert.match(plan, /^status:\s*blocked$/m);
-    const blockedReason = 'Awaiting the four independently hashed `session-relay--v0.13.0` production asset digests.';
+    const blockedReason = 'Awaiting the four independently hashed `session-relay--v0.12.0` production asset digests.';
     assert.match(
       plan,
       new RegExp(`^- .*blocked reason: ${blockedReason.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'mi'),
@@ -951,8 +951,8 @@ function verifyCompanion() {
     const toolchain = JSON.parse(fs.readFileSync(path.join(directory, 'SoT/toolchain.json'), 'utf8'));
     const relay = toolchain['session-relay'] ?? toolchain.tools?.['session-relay'];
     assert.equal(relay.repository, 'DocksDocks/docks');
-    assert.equal(relay.tag, 'session-relay--v0.13.0');
-    assert.equal(relay.version, '0.13.0');
+    assert.equal(relay.tag, 'session-relay--v0.12.0');
+    assert.equal(relay.version, '0.12.0');
     assert.equal(relay.install_path, '~/.local/bin/session-relay');
     exactKeys(
       relay.assets,
