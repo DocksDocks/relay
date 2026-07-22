@@ -8,28 +8,212 @@ use std::fs::{self,File,OpenOptions};
 use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt,OpenOptionsExt,PermissionsExt};
+use std::os::unix::process::CommandExt;
 use std::path::{Path,PathBuf};
 use std::process::{Command,Output,Stdio};
 
 #[derive(Debug)]
-pub struct OpenedRepository{pub root:PathBuf,pub identity:RepositoryIdentityV1,common_dir:File}
-impl OpenedRepository{
- pub fn open(path:&Path)->Result<Self,String>{
-  let root_text=run_git_text(path,&["rev-parse","--path-format=absolute","--show-toplevel"])?;let root=fs::canonicalize(&root_text).map_err(|e|format!("canonicalize repository root {root_text}: {e}"))?;
-  if root.to_str()!=Some(root_text.as_str()){return Err("repository root is not canonical UTF-8 absolute form".into())}
-  let common_text=run_git_text(&root,&["rev-parse","--path-format=absolute","--git-common-dir"])?;let common=fs::canonicalize(&common_text).map_err(|e|format!("canonicalize Git common dir {common_text}: {e}"))?;
-  if common.to_str()!=Some(common_text.as_str()){return Err("Git common dir is not canonical UTF-8 absolute form".into())}
-  let common_dir=OpenOptions::new().read(true).custom_flags(libc::O_CLOEXEC|libc::O_NOFOLLOW|libc::O_DIRECTORY).open(&common).map_err(|e|format!("securely open Git common dir {}: {e}",common.display()))?;
-  let metadata=common_dir.metadata().map_err(|e|format!("fstat Git common dir: {e}"))?;let euid=unsafe{libc::geteuid()};if !metadata.is_dir()||metadata.uid()!=euid{return Err("Git common dir is not an EUID-owned real directory".into())}
-  let object_format=ObjectFormat::parse(&run_git_text(&root,&["rev-parse","--show-object-format"])?)?;
-  let repository_id=authority::repository_id(euid,metadata.dev(),metadata.ino());
-  let identity=RepositoryIdentityV1{repository_id,common_dir_realpath:common.to_string_lossy().into_owned(),common_dir_dev:metadata.dev().to_string(),common_dir_ino:metadata.ino().to_string(),common_dir_owner_euid:metadata.uid().to_string(),euid:euid.to_string(),object_format};
-  Ok(Self{root,identity,common_dir})
- }
- pub fn validate_unchanged(&self)->Result<(),String>{let reopened=Self::open(&self.root)?;if reopened.identity!=self.identity{return Err("repository identity or object format changed".into())}Ok(())}
- pub fn common_dir_fd(&self)->i32{self.common_dir.as_raw_fd()}
- pub fn head(&self)->Result<GitOid,String>{GitOid::parse(&run_git_text(&self.root,&["rev-parse","--verify","HEAD"])?,self.identity.object_format)}
- pub fn validate_oid(&self,value:&str)->Result<GitOid,String>{GitOid::parse(value,self.identity.object_format)}
+pub struct OpenedRepository {
+    pub root: PathBuf,
+    pub identity: RepositoryIdentityV1,
+    common_dir: File,
+    private_dir: File,
+    private_path: PathBuf,
+    root_dir: File,
+}
+
+impl OpenedRepository {
+    pub fn open(path: &Path) -> Result<Self, String> {
+        let root_text = run_git_text(path, &["rev-parse", "--path-format=absolute", "--show-toplevel"])?;
+        let root = fs::canonicalize(&root_text)
+            .map_err(|e| format!("canonicalize repository root {root_text}: {e}"))?;
+        if root.to_str() != Some(root_text.as_str()) {
+            return Err("repository root is not canonical UTF-8 absolute form".into());
+        }
+        let common_text = run_git_text(&root, &["rev-parse", "--path-format=absolute", "--git-common-dir"])?;
+        let common = fs::canonicalize(&common_text)
+            .map_err(|e| format!("canonicalize Git common dir {common_text}: {e}"))?;
+        if common.to_str() != Some(common_text.as_str()) {
+            return Err("Git common dir is not canonical UTF-8 absolute form".into());
+        }
+        let private_text = run_git_text(&root, &["rev-parse", "--path-format=absolute", "--git-dir"])?;
+        let private_path = fs::canonicalize(&private_text)
+            .map_err(|e| format!("canonicalize private Git dir {private_text}: {e}"))?;
+        if private_path.to_str() != Some(private_text.as_str()) {
+            return Err("private Git dir is not canonical UTF-8 absolute form".into());
+        }
+        let open_directory = |directory: &Path, label: &str| {
+            let file = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_DIRECTORY)
+                .open(directory)
+                .map_err(|e| format!("securely open {label} {}: {e}", directory.display()))?;
+            let metadata = file.metadata().map_err(|e| format!("fstat {label}: {e}"))?;
+            if !metadata.is_dir() || metadata.uid() != unsafe { libc::geteuid() } {
+                return Err(format!("{label} is not an EUID-owned real directory"));
+            }
+            Ok((file, metadata))
+        };
+        let (root_dir, _) = open_directory(&root, "repository root")?;
+        let (common_dir, metadata) = open_directory(&common, "Git common dir")?;
+        let (private_dir, _) = open_directory(&private_path, "private Git dir")?;
+        let euid = unsafe { libc::geteuid() };
+        let object_format = ObjectFormat::parse(&run_git_text(&root, &["rev-parse", "--show-object-format"])?)?;
+        let repository_id = authority::repository_id(euid, metadata.dev(), metadata.ino());
+        let identity = RepositoryIdentityV1 {
+            repository_id,
+            common_dir_realpath: common.to_string_lossy().into_owned(),
+            common_dir_dev: metadata.dev().to_string(),
+            common_dir_ino: metadata.ino().to_string(),
+            common_dir_owner_euid: metadata.uid().to_string(),
+            euid: euid.to_string(),
+            object_format,
+        };
+        Ok(Self { root, identity, common_dir, private_dir, private_path, root_dir })
+    }
+
+    fn command(&self, args: &[&str]) -> Command {
+        let root_fd = self.root_dir.as_raw_fd();
+        let private_fd = self.private_dir.as_raw_fd();
+        let common_fd = self.common_dir.as_raw_fd();
+        let mut command = Command::new("git");
+        for name in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_COMMON_DIR",
+            "GIT_NAMESPACE",
+            "GIT_CEILING_DIRECTORIES",
+            "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+            "GIT_PREFIX",
+        ] {
+            command.env_remove(name);
+        }
+        command
+            .args(args)
+            .current_dir(format!("/proc/self/fd/{root_fd}"))
+            .stdin(Stdio::null())
+            .env("GIT_WORK_TREE", format!("/proc/self/fd/{root_fd}"))
+            .env("GIT_DIR", format!("/proc/self/fd/{private_fd}"))
+            .env("GIT_COMMON_DIR", format!("/proc/self/fd/{common_fd}"));
+        unsafe {
+            command.pre_exec(move || {
+                for fd in [root_fd, private_fd, common_fd] {
+                    let flags = libc::fcntl(fd, libc::F_GETFD);
+                    if flags < 0 || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                Ok(())
+            });
+        }
+        command
+    }
+
+    pub fn run_git_output(&self, args: &[&str]) -> Result<Output, String> {
+        self.command(args)
+            .output()
+            .map_err(|e| format!("run bound git {} in {}: {e}", args.join(" "), self.root.display()))
+    }
+
+    pub fn run_git_output_with_env(
+        &self,
+        args: &[&str],
+        environment: &[(&str, &str)],
+    ) -> Result<Output, String> {
+        self.command(args)
+            .envs(environment.iter().copied())
+            .output()
+            .map_err(|e| format!("run bound git {} in {}: {e}", args.join(" "), self.root.display()))
+    }
+
+    pub fn run_git_text(&self, args: &[&str]) -> Result<String, String> {
+        let output = self.run_git_output(args)?;
+        if !output.status.success() {
+            return Err(format!(
+                "bound git {} failed in {}: {}",
+                args.join(" "),
+                self.root.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        String::from_utf8(output.stdout)
+            .map(|text| text.trim_end_matches(['\r', '\n']).to_string())
+            .map_err(|_| "bound Git output was not UTF-8".into())
+    }
+
+    pub fn run_git_bytes(&self, args: &[&str]) -> Result<Vec<u8>, String> {
+        let output = self.run_git_output(args)?;
+        if !output.status.success() {
+            return Err(format!(
+                "bound git {} failed in {}: {}",
+                args.join(" "),
+                self.root.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        Ok(output.stdout)
+    }
+
+    pub fn run_git_output_with_index(
+        &self,
+        args: &[&str],
+        index: &Path,
+    ) -> Result<Output, String> {
+        self.command(args)
+            .env("GIT_INDEX_FILE", index)
+            .output()
+            .map_err(|e| format!("run bound Git index command {}: {e}", args.join(" ")))
+    }
+
+    pub fn worktree_identity(&self, branch_ref: &str) -> Result<WorktreeIdentityV1, String> {
+        let root_meta = self.root_dir.metadata().map_err(|e| format!("fstat workspace root: {e}"))?;
+        let private_meta = self.private_dir.metadata().map_err(|e| format!("fstat private Git dir: {e}"))?;
+        let identity_sha256 = sha256::hex_digest(
+            format!(
+                "session-relay/worktree/v1\\0{}\\0{}\\0{}\\0{}\\0{}\\0{}",
+                self.root.display(),
+                root_meta.dev(),
+                root_meta.ino(),
+                self.private_path.display(),
+                private_meta.dev(),
+                private_meta.ino()
+            )
+            .as_bytes(),
+        );
+        Ok(WorktreeIdentityV1 {
+            identity_sha256,
+            root_realpath: self.root.to_string_lossy().into_owned(),
+            root_dev: root_meta.dev().to_string(),
+            root_ino: root_meta.ino().to_string(),
+            root_owner_euid: root_meta.uid().to_string(),
+            private_git_dir_realpath: self.private_path.to_string_lossy().into_owned(),
+            private_git_dir_dev: private_meta.dev().to_string(),
+            private_git_dir_ino: private_meta.ino().to_string(),
+            branch_ref: branch_ref.into(),
+        })
+    }
+
+    pub fn private_git_path(&self, name: &str) -> PathBuf {
+        PathBuf::from(format!("/proc/self/fd/{}", self.private_dir.as_raw_fd())).join(name)
+    }
+
+    pub fn validate_unchanged(&self) -> Result<(), String> {
+        let reopened = Self::open(&self.root)?;
+        if reopened.identity != self.identity {
+            return Err("repository identity or object format changed".into());
+        }
+        Ok(())
+    }
+    pub fn common_dir_fd(&self) -> i32 { self.common_dir.as_raw_fd() }
+    pub fn head(&self) -> Result<GitOid, String> {
+        GitOid::parse(&self.run_git_text(&["rev-parse", "--verify", "HEAD"])?, self.identity.object_format)
+    }
+    pub fn validate_oid(&self, value: &str) -> Result<GitOid, String> {
+        GitOid::parse(value, self.identity.object_format)
+    }
 }
 
 pub fn run_git(cwd:&Path,args:&[&str])->Result<Output,String>{Command::new("git").args(args).current_dir(cwd).stdin(Stdio::null()).output().map_err(|e|format!("run git {} in {}: {e}",args.join(" "),cwd.display()))}
@@ -144,9 +328,47 @@ fn read_content_addressed(path:&Path,label:&str)->Result<Vec<u8>,String>{
  if sha256::hex_digest(&bytes)!=digest{return Err(format!("{label} content digest differs from its receipt-bound name"))}
  Ok(bytes)
 }
+#[cfg(test)]
+thread_local! {
+    static AFTER_ARTIFACT_VERIFY: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
 
+#[cfg(test)]
+fn set_after_artifact_verify(hook: impl FnOnce() + 'static) {
+    AFTER_ARTIFACT_VERIFY.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(test)]
+fn run_after_artifact_verify() {
+    AFTER_ARTIFACT_VERIFY.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
+}
+
+
+fn command_with_input(
+    mut command: Command,
+    input: &[u8],
+    label: &str,
+) -> Result<Output, String> {
+    command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn().map_err(|e| format!("spawn {label}: {e}"))?;
+    let mut stdin = child.stdin.take().ok_or_else(|| format!("{label} stdin was not piped"))?;
+    let (write_result, output) = std::thread::scope(|scope| {
+        let writer = scope.spawn(move || stdin.write_all(input));
+        let output = child.wait_with_output();
+        (writer.join(), output)
+    });
+    write_result
+        .map_err(|_| format!("{label} input writer panicked"))?
+        .map_err(|e| format!("write {label} input: {e}"))?;
+    output.map_err(|e| format!("wait for {label}: {e}"))
+}
 fn git_env(cwd:&Path,args:&[&str],environment:&[(&str,&str)])->Result<String,String>{let output=Command::new("git").args(args).envs(environment.iter().copied()).current_dir(cwd).stdin(Stdio::null()).output().map_err(|e|format!("run git {}: {e}",args.join(" ")))?;if !output.status.success(){return Err(format!("git {} failed: {}",args.join(" "),String::from_utf8_lossy(&output.stderr).trim()))}String::from_utf8(output.stdout).map(|v|v.trim().to_string()).map_err(|_|"Git output was not UTF-8".into())}
-fn fixed_commit_tree(repository:&OpenedRepository,tree:&str,parent:&str,timestamp:&str,message:&str)->Result<String,String>{let environment=[("GIT_AUTHOR_NAME","Session Relay"),("GIT_AUTHOR_EMAIL","session-relay@localhost"),("GIT_AUTHOR_DATE",timestamp),("GIT_COMMITTER_NAME","Session Relay"),("GIT_COMMITTER_EMAIL","session-relay@localhost"),("GIT_COMMITTER_DATE",timestamp)];git_env(&repository.root,&["commit-tree",tree,"-p",parent,"-m",message],&environment)}
+fn fixed_commit_tree(repository:&OpenedRepository,tree:&str,parent:&str,timestamp:&str,message:&str)->Result<String,String>{let environment=[("GIT_AUTHOR_NAME","Session Relay"),("GIT_AUTHOR_EMAIL","session-relay@localhost"),("GIT_AUTHOR_DATE",timestamp),("GIT_COMMITTER_NAME","Session Relay"),("GIT_COMMITTER_EMAIL","session-relay@localhost"),("GIT_COMMITTER_DATE",timestamp)];let output=repository.run_git_output_with_env(&["commit-tree",tree,"-p",parent,"-m",message],&environment)?;if !output.status.success(){return Err(format!("bound git commit-tree failed: {}",String::from_utf8_lossy(&output.stderr).trim()))}String::from_utf8(output.stdout).map(|value|value.trim().to_string()).map_err(|_|"Git output was not UTF-8".into())}
 
 pub fn provision_worktree(repository:&OpenedRepository,root:&Path,branch_ref:&str,session_id:&str,task_slug:&str,base_commit:&str)->Result<WorktreeIdentityV1,String>{
  if root.exists(){return Err(format!("deterministic workspace root {} already exists; suffixing is forbidden",root.display()))}
@@ -182,11 +404,13 @@ pub fn apply_wip(repository:&OpenedRepository,worktree:&Path,branch_ref:&str,bas
   WipPayloadV1::Artifact{binary_diff,untracked_inventory,untracked_archive,entries,..}=>{
    let diff=read_content_addressed(Path::new(binary_diff),"tracked-full-index.binary")?;
    let inventory=read_content_addressed(Path::new(untracked_inventory),"untracked.inventory")?;
-   let _archive=read_content_addressed(Path::new(untracked_archive),"untracked.pax")?;
+   let archive=read_content_addressed(Path::new(untracked_archive),"untracked.pax")?;
+   #[cfg(test)]
+   run_after_artifact_verify();
    let parsed=inventory.split(|byte|*byte==0).filter(|value|!value.is_empty()).map(|value|std::str::from_utf8(value).map(str::to_string).map_err(|_|"artifact inventory is not UTF-8".to_string())).collect::<Result<Vec<_>,_>>()?;if &parsed!=entries{return Err("artifact inventory differs from receipt entries".into())}
-   let listed=Command::new("tar").args(["-tf",untracked_archive]).stdin(Stdio::null()).output().map_err(|e|format!("list artifact archive: {e}"))?;if !listed.status.success(){return Err("artifact archive cannot be listed".into())}let archive_entries=String::from_utf8(listed.stdout).map_err(|_|"artifact archive member is not UTF-8".to_string())?.lines().map(|line|line.trim_end_matches('/').to_string()).filter(|line|!line.is_empty()).collect::<Vec<_>>();if archive_entries!=*entries{return Err("artifact archive membership differs from receipt".into())}
-   if !diff.is_empty(){let output=Command::new("git").args(["apply","--index","--binary"]).arg(binary_diff).current_dir(worktree).stdin(Stdio::null()).output().map_err(|e|format!("apply tracked artifact: {e}"))?;if !output.status.success(){return Err(format!("apply tracked artifact failed: {}",String::from_utf8_lossy(&output.stderr).trim()))}}
-   let output=Command::new("tar").args(["--extract","--no-same-owner","--no-same-permissions","--keep-old-files","-f",untracked_archive]).current_dir(worktree).stdin(Stdio::null()).output().map_err(|e|format!("extract artifact: {e}"))?;if !output.status.success(){return Err(format!("artifact extraction failed: {}",String::from_utf8_lossy(&output.stderr).trim()))}
+   let mut list=Command::new("tar");list.args(["-tf","-"]);let listed=command_with_input(list,&archive,"artifact archive listing")?;if !listed.status.success(){return Err(format!("artifact archive cannot be listed: {}",String::from_utf8_lossy(&listed.stderr).trim()))}let archive_entries=String::from_utf8(listed.stdout).map_err(|_|"artifact archive member is not UTF-8".to_string())?.lines().map(|line|line.trim_end_matches('/').to_string()).filter(|line|!line.is_empty()).collect::<Vec<_>>();if archive_entries!=*entries{return Err("artifact archive membership differs from receipt".into())}
+   if !diff.is_empty(){let mut apply=Command::new("git");apply.args(["apply","--index","--binary","-"]).current_dir(worktree);let output=command_with_input(apply,&diff,"tracked artifact application")?;if !output.status.success(){return Err(format!("apply tracked artifact failed: {}",String::from_utf8_lossy(&output.stderr).trim()))}}
+   let mut extract=Command::new("tar");extract.args(["--extract","--no-same-owner","--no-same-permissions","--keep-old-files","-f","-"]).current_dir(worktree);let output=command_with_input(extract,&archive,"artifact extraction")?;if !output.status.success(){return Err(format!("artifact extraction failed: {}",String::from_utf8_lossy(&output.stderr).trim()))}
    if !entries.is_empty(){let mut args=vec!["add","--"];args.extend(entries.iter().map(String::as_str));run_git_text(worktree,&args)?;}
   }
  }
@@ -210,13 +434,13 @@ pub fn validate_changed_paths(changes:&[NameStatusChange],claims:&[PathClaimRequ
  Ok(())
 }
 
-pub fn create_worker_commit(repository:&OpenedRepository,worktree:&Path,branch_ref:&str,message:&str,timestamp:&str)->Result<String,String>{
+pub fn create_worker_commit(repository:&OpenedRepository,branch_ref:&str,message:&str,timestamp:&str)->Result<String,String>{
  if message.is_empty()||message.contains('\0'){return Err("worker commit message is invalid".into())}
- if run_git_text(worktree,&["symbolic-ref","-q","HEAD"])?!=branch_ref{return Err("workspace branch changed before worker commit".into())}
- let head=run_git_text(worktree,&["rev-parse","--verify","HEAD"])?;repository.validate_oid(&head)?;
- let private=actual_private_git_dir(worktree)?;for marker in ["MERGE_HEAD","REBASE_HEAD","CHERRY_PICK_HEAD","BISECT_START"]{if private.join(marker).exists(){return Err(format!("worker commit refused during forbidden Git operation {marker}"))}}
- let tree=run_git_text(worktree,&["write-tree"])?;let commit=fixed_commit_tree(repository,&tree,&head,timestamp,message)?;repository.validate_oid(&commit)?;
- run_git_text(&repository.root,&["update-ref","--no-deref",branch_ref,&commit,&head])?;
+ if repository.run_git_text(&["symbolic-ref","-q","HEAD"])?!=branch_ref{return Err("workspace branch changed before worker commit".into())}
+ let head=repository.run_git_text(&["rev-parse","--verify","HEAD"])?;repository.validate_oid(&head)?;
+ for marker in ["MERGE_HEAD","REBASE_HEAD","CHERRY_PICK_HEAD","BISECT_START"]{if repository.private_git_path(marker).exists(){return Err(format!("worker commit refused during forbidden Git operation {marker}"))}}
+ let tree=repository.run_git_text(&["write-tree"])?;let commit=fixed_commit_tree(repository,&tree,&head,timestamp,message)?;repository.validate_oid(&commit)?;
+ repository.run_git_text(&["update-ref","--no-deref",branch_ref,&commit,&head])?;
  Ok(commit)
 }
 
@@ -777,7 +1001,7 @@ mod tests{
  fn artifact_bytes_are_receipt_bound_and_empty_diff_is_supported(){
   let root=std::env::temp_dir().join(format!("session-relay-artifact-{}",crate::store::uuid_v4()));fs::create_dir(&root).unwrap();let repository_root=root.join("repository");fs::create_dir(&repository_root).unwrap();
   command(&repository_root,&["init","-q"]);command(&repository_root,&["config","user.name","Test"]);command(&repository_root,&["config","user.email","test@example.invalid"]);fs::write(repository_root.join("tracked.txt"),"base\n").unwrap();command(&repository_root,&["add","tracked.txt"]);command(&repository_root,&["commit","-qm","base"]);let base=command(&repository_root,&["rev-parse","HEAD"]);
-  fs::write(repository_root.join("only-untracked.txt"),"payload\n").unwrap();let repository=OpenedRepository::open(&repository_root).unwrap();let preserve_root=root.join("preserved");let data_root=root.join("data");authority::ensure_private_directory(&data_root,unsafe{libc::geteuid()}).unwrap();
+  fs::write(repository_root.join("tracked.txt"),"changed\n").unwrap();fs::write(repository_root.join("only-untracked.txt"),"payload\n").unwrap();let repository=OpenedRepository::open(&repository_root).unwrap();let preserve_root=root.join("preserved");let data_root=root.join("data");authority::ensure_private_directory(&data_root,unsafe{libc::geteuid()}).unwrap();
   let make_request=||{let request_id=crate::store::uuid_v4();PreserveRequestV1{request_id,repository_path:repository.root.to_string_lossy().into_owned(),base_commit:base.clone(),mode:"artifact".into(),label:"smoke".into(),created_at:"2026-07-22T00:00:00.000Z".into()}};
   let tampered_request=make_request();let tampered=preserve(&repository,&tampered_request,&"a".repeat(64),&preserve_root).unwrap();
   let WipPayloadV1::Artifact{binary_diff,untracked_inventory,untracked_archive,..}=&tampered.receipt.payload else{panic!("artifact payload")};
@@ -787,8 +1011,25 @@ mod tests{
    command(&repository.root,&["worktree","unlock",tampered_worktree.to_str().unwrap()]);command(&repository.root,&["worktree","remove",tampered_worktree.to_str().unwrap()]);fs::write(path,original).unwrap();
   }
   let clean_request=make_request();let clean=preserve(&repository,&clean_request,&"b".repeat(64),&preserve_root).unwrap();let clean_worktree=data_root.join("clean");let clean_branch=format!("refs/heads/docks/{}/smoke",clean_request.request_id);provision_worktree(&repository,&clean_worktree,&clean_branch,&clean_request.request_id,"smoke",&base).unwrap();
-  let applied=apply_wip(&repository,&clean_worktree,&clean_branch,&base,&clean.receipt,"2026-07-22T00:00:00.000Z").unwrap();assert_ne!(applied,base);assert_eq!(fs::read_to_string(clean_worktree.join("only-untracked.txt")).unwrap(),"payload\n");
+  let WipPayloadV1::Artifact{binary_diff,untracked_inventory,untracked_archive,..}=&clean.receipt.payload else{panic!("artifact payload")};let replaced=[binary_diff.clone(),untracked_inventory.clone(),untracked_archive.clone()];set_after_artifact_verify(move||{for path in replaced{let verified=PathBuf::from(&path).with_file_name(format!(".verified-{}",crate::store::uuid_v4()));fs::rename(&path,verified).unwrap();fs::write(&path,b"replacement bytes").unwrap();fs::set_permissions(&path,fs::Permissions::from_mode(0o600)).unwrap();}});
+  let applied=apply_wip(&repository,&clean_worktree,&clean_branch,&base,&clean.receipt,"2026-07-22T00:00:00.000Z").unwrap();assert_ne!(applied,base);assert_eq!(fs::read_to_string(clean_worktree.join("tracked.txt")).unwrap(),"changed\n");assert_eq!(fs::read_to_string(clean_worktree.join("only-untracked.txt")).unwrap(),"payload\n");
   command(&repository.root,&["worktree","unlock",clean_worktree.to_str().unwrap()]);command(&repository.root,&["worktree","remove",clean_worktree.to_str().unwrap()]);fs::remove_dir_all(root).unwrap();
+ }
+ #[test]
+ fn empty_tracked_diff_artifact_is_supported(){
+  let root=std::env::temp_dir().join(format!("session-relay-empty-artifact-{}",crate::store::uuid_v4()));let repository_root=root.join("repository");fs::create_dir_all(&repository_root).unwrap();command(&repository_root,&["init","-q"]);command(&repository_root,&["config","user.name","Test"]);command(&repository_root,&["config","user.email","test@example.invalid"]);fs::write(repository_root.join("tracked.txt"),"base\n").unwrap();command(&repository_root,&["add","tracked.txt"]);command(&repository_root,&["commit","-qm","base"]);let base=command(&repository_root,&["rev-parse","HEAD"]);fs::write(repository_root.join("untracked.txt"),"payload\n").unwrap();
+  let repository=OpenedRepository::open(&repository_root).unwrap();let request_id=crate::store::uuid_v4();let request=PreserveRequestV1{request_id:request_id.clone(),repository_path:repository.root.to_string_lossy().into_owned(),base_commit:base.clone(),mode:"artifact".into(),label:"empty".into(),created_at:"2026-07-22T00:00:00.000Z".into()};let result=preserve(&repository,&request,&"c".repeat(64),&root.join("preserved")).unwrap();let WipPayloadV1::Artifact{binary_diff,..}=&result.receipt.payload else{panic!("artifact payload")};assert!(fs::read(binary_diff).unwrap().is_empty());
+  let data=root.join("data");authority::ensure_private_directory(&data,unsafe{libc::geteuid()}).unwrap();let worker=data.join("worker");let branch=format!("refs/heads/docks/{request_id}/empty");provision_worktree(&repository,&worker,&branch,&request_id,"empty",&base).unwrap();apply_wip(&repository,&worker,&branch,&base,&result.receipt,"2026-07-22T00:00:00.000Z").unwrap();assert_eq!(fs::read_to_string(worker.join("untracked.txt")).unwrap(),"payload\n");
+  command(&repository.root,&["worktree","unlock",worker.to_str().unwrap()]);command(&repository.root,&["worktree","remove",worker.to_str().unwrap()]);fs::remove_dir_all(root).unwrap();
+ }
+ #[test]
+ fn opened_repository_git_stays_on_held_private_git_after_dot_git_swap(){
+  let root=std::env::temp_dir().join(format!("session-relay-bound-git-{}",crate::store::uuid_v4()));let repository_root=root.join("repository");let worker=root.join("worker");fs::create_dir_all(&repository_root).unwrap();
+  command(&repository_root,&["init","-q"]);command(&repository_root,&["config","user.name","Test"]);command(&repository_root,&["config","user.email","test@example.invalid"]);fs::write(repository_root.join("tracked.txt"),"base\n").unwrap();command(&repository_root,&["add","tracked.txt"]);command(&repository_root,&["commit","-qm","base"]);
+  let branch="docks/test/bound";command(&repository_root,&["worktree","add","-q","-b",branch,worker.to_str().unwrap()]);let expected=format!("refs/heads/{branch}");let repository=OpenedRepository::open(&worker).unwrap();
+  fs::rename(worker.join(".git"),worker.join(".git.verified")).unwrap();command(&worker,&["init","-q"]);assert_ne!(run_git_text(&worker,&["symbolic-ref","-q","HEAD"]).unwrap(),expected);
+  assert_eq!(repository.run_git_text(&["symbolic-ref","-q","HEAD"]).unwrap(),expected,"Git operation followed a replacement .git entry instead of the held private Git identity");
+  fs::remove_dir_all(worker.join(".git")).unwrap();fs::rename(worker.join(".git.verified"),worker.join(".git")).unwrap();command(&repository_root,&["worktree","remove",worker.to_str().unwrap()]);fs::remove_dir_all(root).unwrap();
  }
  #[test]
  fn ordered_integration_imports_every_commit_oldest_first(){
