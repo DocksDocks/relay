@@ -7,8 +7,8 @@ use super::schema::{
 };
 use crate::sha256;
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, OpenOptions};
-use std::io::{Read, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -34,6 +34,7 @@ pub struct ResourceSet {
     session_id: String,
     inventory_created_at: String,
     ports: BTreeMap<String, TcpListener>,
+    provider_registrations: BTreeMap<String, ResourceProviderRegistrationV1>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -159,6 +160,167 @@ impl ClosedJcs for AllocationInventoryV1 {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DeletionIntentV1 {
+    allocation_id: String,
+    kind: String,
+    provider_id: String,
+    value: String,
+    provider_evidence_sha256: String,
+    prior_receipt_sha256: String,
+    request_id: String,
+    mode: String,
+    released_at: String,
+    broker_close_sha256: Option<String>,
+    runtime_empty_sha256: Option<String>,
+}
+
+impl ClosedJcs for DeletionIntentV1 {
+    fn from_jcs(value: schema::JcsValue) -> Result<Self, String> {
+        let object = value.object()?;
+        let expected = [
+            "schema",
+            "allocation_id",
+            "kind",
+            "provider_id",
+            "value",
+            "provider_evidence_sha256",
+            "prior_receipt_sha256",
+            "request_id",
+            "mode",
+            "released_at",
+            "broker_close_sha256",
+            "runtime_empty_sha256",
+        ];
+        if object.len() != expected.len()
+            || expected.iter().any(|key| !object.contains_key(*key))
+        {
+            return Err("ResourceDeletionIntentV1 keys differ from the closed schema".into());
+        }
+        if object["schema"].as_str()? != "ResourceDeletionIntentV1" {
+            return Err("ResourceDeletionIntentV1 schema mismatch".into());
+        }
+        let allocation_id = object["allocation_id"].as_str()?.to_string();
+        let request_id = object["request_id"].as_str()?.to_string();
+        schema::LowerUuidV4::parse(&allocation_id)?;
+        schema::LowerUuidV4::parse(&request_id)?;
+        let kind = object["kind"].as_str()?.to_string();
+        if !matches!(
+            kind.as_str(),
+            "port" | "temp_dir" | "build_dir" | "log_dir" | "cache_dir" | "database_schema"
+        ) {
+            return Err("resource deletion intent kind is invalid".into());
+        }
+        let provider_id = object["provider_id"].as_str()?.to_string();
+        if provider_id.is_empty() {
+            return Err("resource deletion intent provider_id is empty".into());
+        }
+        let value = object["value"].as_str()?.to_string();
+        if value.is_empty() || value.as_bytes().contains(&0) {
+            return Err("resource deletion intent value is invalid".into());
+        }
+        let provider_evidence_sha256 =
+            object["provider_evidence_sha256"].as_str()?.to_string();
+        let prior_receipt_sha256 = object["prior_receipt_sha256"].as_str()?.to_string();
+        schema::Sha256Digest::parse(&provider_evidence_sha256)?;
+        schema::Sha256Digest::parse(&prior_receipt_sha256)?;
+        let mode = object["mode"].as_str()?.to_string();
+        if !matches!(mode.as_str(), "release" | "legacy_release" | "rollback") {
+            return Err("resource deletion intent mode is invalid".into());
+        }
+        let released_at = object["released_at"].as_str()?.to_string();
+        schema::Timestamp::parse(&released_at)?;
+        let optional_digest = |key: &str| -> Result<Option<String>, String> {
+            match &object[key] {
+                schema::JcsValue::Null => Ok(None),
+                schema::JcsValue::String(value) => {
+                    schema::Sha256Digest::parse(value)?;
+                    Ok(Some(value.clone()))
+                }
+                _ => Err(format!("{key} must be a SHA-256 string or null")),
+            }
+        };
+        let broker_close_sha256 = optional_digest("broker_close_sha256")?;
+        let runtime_empty_sha256 = optional_digest("runtime_empty_sha256")?;
+        if (mode == "release")
+            != (broker_close_sha256.is_some() && runtime_empty_sha256.is_some())
+        {
+            return Err("resource deletion intent close evidence disagrees with mode".into());
+        }
+        if broker_close_sha256 == runtime_empty_sha256 && broker_close_sha256.is_some() {
+            return Err("resource deletion intent close evidence must be distinct".into());
+        }
+        Ok(Self {
+            allocation_id,
+            kind,
+            provider_id,
+            value,
+            provider_evidence_sha256,
+            prior_receipt_sha256,
+            request_id,
+            mode,
+            released_at,
+            broker_close_sha256,
+            runtime_empty_sha256,
+        })
+    }
+
+    fn to_jcs(&self) -> schema::JcsValue {
+        schema::JcsValue::Object(BTreeMap::from([
+            (
+                "allocation_id".into(),
+                schema::JcsValue::String(self.allocation_id.clone()),
+            ),
+            (
+                "broker_close_sha256".into(),
+                self.broker_close_sha256
+                    .clone()
+                    .map(schema::JcsValue::String)
+                    .unwrap_or(schema::JcsValue::Null),
+            ),
+            ("kind".into(), schema::JcsValue::String(self.kind.clone())),
+            ("mode".into(), schema::JcsValue::String(self.mode.clone())),
+            (
+                "prior_receipt_sha256".into(),
+                schema::JcsValue::String(self.prior_receipt_sha256.clone()),
+            ),
+            (
+                "provider_evidence_sha256".into(),
+                schema::JcsValue::String(self.provider_evidence_sha256.clone()),
+            ),
+            (
+                "provider_id".into(),
+                schema::JcsValue::String(self.provider_id.clone()),
+            ),
+            (
+                "released_at".into(),
+                schema::JcsValue::String(self.released_at.clone()),
+            ),
+            (
+                "request_id".into(),
+                schema::JcsValue::String(self.request_id.clone()),
+            ),
+            (
+                "runtime_empty_sha256".into(),
+                self.runtime_empty_sha256
+                    .clone()
+                    .map(schema::JcsValue::String)
+                    .unwrap_or(schema::JcsValue::Null),
+            ),
+            (
+                "schema".into(),
+                schema::JcsValue::String("ResourceDeletionIntentV1".into()),
+            ),
+            ("value".into(), schema::JcsValue::String(self.value.clone())),
+        ]))
+    }
+}
+
+struct VerifiedProviderFiles {
+    executable: File,
+    config: File,
+}
+
 pub fn provider_registry_path(roots: &AuthorityRoots) -> PathBuf {
     roots.authority.join(PROVIDER_REGISTRY_FILE)
 }
@@ -176,17 +338,21 @@ pub fn allocate_resources(
     schema::Timestamp::parse(created_at)?;
     validate_decisions(decisions)?;
     authority::ensure_private_directory(receipt_dir, roots.euid)?;
-    let resource_parent = roots.data.join(repository_id).join("resources");
-    ensure_private_ancestors(&resource_parent, &roots.data, roots.euid)?;
-    let resource_root = resource_parent.join(session_id);
+    let resource_root = roots
+        .data
+        .join(repository_id)
+        .join("resources")
+        .join(session_id);
     if resource_root.exists() || receipt_dir.join("resource-inventory-v1.json").exists() {
         return Err("resource allocation already exists; inspect it before recovery".into());
     }
+    let registry = load_registry_if_needed(roots, decisions)?;
+    validate_registry_for_decisions(registry.as_ref(), decisions)?;
+    let resource_parent = roots.data.join(repository_id).join("resources");
+    ensure_private_ancestors(&resource_parent, &roots.data, roots.euid)?;
     fs::create_dir(&resource_root).map_err(|error| format!("create session resource root {}: {error}", resource_root.display()))?;
     fs::set_permissions(&resource_root, fs::Permissions::from_mode(0o700)).map_err(|error| format!("chmod session resource root: {error}"))?;
     authority::ensure_private_directory(&resource_root, roots.euid)?;
-
-    let registry = load_registry_if_needed(roots, decisions)?;
     let mut set = ResourceSet {
         decisions: decisions.to_vec(),
         allocations: Vec::new(),
@@ -197,6 +363,7 @@ pub fn allocate_resources(
         session_id: session_id.to_string(),
         inventory_created_at: created_at.to_string(),
         ports: BTreeMap::new(),
+        provider_registrations: BTreeMap::new(),
     };
     for decision in decisions.iter().filter(|decision| decision.state == "requested") {
         let result = match decision.kind.as_str() {
@@ -211,21 +378,35 @@ pub fn allocate_resources(
             _ => Err("unknown requested resource kind".into()),
         };
         if let Err(error) = result {
-            let rollback = set.rollback_unpublished(roots.euid, registry.as_ref());
+            let rollback = set.rollback_unpublished(roots.euid);
             return Err(match rollback {
                 Ok(()) => error,
                 Err(rollback) => format!("{error}; resource rollback could not be proven: {rollback}"),
             });
         }
     }
-    set.validate_projection()?;
-    let inventory = AllocationInventoryV1 {
-        session_id: session_id.to_string(),
-        decisions: set.decisions.clone(),
-        allocations: set.allocations.clone(),
-        created_at: created_at.to_string(),
-    };
-    authority::atomic_create_jcs(&receipt_dir.join("resource-inventory-v1.json"), &inventory, 0o600)?;
+    let publication = set.validate_projection().and_then(|()| {
+        let inventory = AllocationInventoryV1 {
+            session_id: session_id.to_string(),
+            decisions: set.decisions.clone(),
+            allocations: set.allocations.clone(),
+            created_at: created_at.to_string(),
+        };
+        authority::atomic_create_jcs(
+            &receipt_dir.join("resource-inventory-v1.json"),
+            &inventory,
+            0o600,
+        )
+    });
+    if let Err(error) = publication {
+        let rollback = set.rollback_unpublished(roots.euid);
+        return Err(match rollback {
+            Ok(()) => error,
+            Err(rollback) => {
+                format!("{error}; resource rollback could not be proven: {rollback}")
+            }
+        });
+    }
     Ok(set)
 }
 
@@ -248,6 +429,7 @@ pub fn load_resources(
     }
     validate_inventory(&inventory)?;
     validate_inventory_receipts(receipt_dir, &inventory)?;
+    let provider_registrations = load_pinned_providers(receipt_dir, &inventory.allocations)?;
 
     let resource_root = roots
         .data
@@ -301,6 +483,7 @@ pub fn load_resources(
         session_id: inventory.session_id,
         inventory_created_at: inventory.created_at,
         ports: BTreeMap::new(),
+        provider_registrations,
     })
 }
 
@@ -388,31 +571,129 @@ impl ResourceSet {
         Ok(())
     }
 
-    fn allocate_database(&mut self, session_id: &str, decision: &ResourceDecisionV1, registry: &ResourceProviderRegistryV1, at: &str) -> Result<(), String> {
-        let provider_id=decision.provider_id.as_deref().ok_or_else(||"database_schema requires a registered provider_id".to_string())?;
-        let provider=registry.providers.iter().find(|provider|provider.provider_id==provider_id).ok_or_else(||format!("database provider {provider_id} is not registered"))?;
-        verify_provider_files(provider)?;
-        let allocation_id=crate::store::uuid_v4();
-        let create=invoke_provider(provider,provider_request("create",&allocation_id,session_id,&decision.name,None))?;
-        validate_provider_receipt(&create,"create","allocated",&allocation_id,None)?;
-        let create_digest=schema::jcs_sha256(&create);
-        if let Err(error)=self.persist_receipt(&allocation_id,"create",&create){
-            let rollback=rollback_created_database(provider,&allocation_id,session_id,&decision.name,&create.value,&create_digest);
-            return Err(combine_rollback_error(error,rollback))
-        }
-        let inspect=match invoke_provider(provider,provider_request("inspect",&allocation_id,session_id,&decision.name,Some(&create_digest))).and_then(|receipt|{validate_provider_receipt(&receipt,"inspect","exists",&allocation_id,Some(&create.value))?;Ok(receipt)}){
-            Ok(receipt)=>receipt,
-            Err(error)=>{let rollback=rollback_created_database(provider,&allocation_id,session_id,&decision.name,&create.value,&create_digest);return Err(combine_rollback_error(error,rollback))}
+    fn allocate_database(
+        &mut self,
+        session_id: &str,
+        decision: &ResourceDecisionV1,
+        registry: &ResourceProviderRegistryV1,
+        at: &str,
+    ) -> Result<(), String> {
+        let provider_id = decision.provider_id.as_deref().ok_or_else(|| {
+            "database_schema requires a registered provider_id".to_string()
+        })?;
+        let provider = registry
+            .providers
+            .iter()
+            .find(|provider| provider.provider_id == provider_id)
+            .ok_or_else(|| format!("database provider {provider_id} is not registered"))?;
+        let allocation_id = crate::store::uuid_v4();
+        self.persist_pinned_provider(&allocation_id, provider, &registry.updated_at)?;
+        self.provider_registrations
+            .insert(allocation_id.clone(), provider.clone());
+
+        let create = match invoke_provider(
+            provider,
+            provider_request("create", &allocation_id, session_id, &decision.name, None),
+        ) {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                self.remove_unused_provider_pin(&allocation_id);
+                return Err(error);
+            }
         };
-        let inspect_digest=schema::jcs_sha256(&inspect);
-        if let Err(error)=self.persist_receipt(&allocation_id,"inspect",&inspect){
-            let rollback=rollback_created_database(provider,&allocation_id,session_id,&decision.name,&create.value,&inspect_digest);
-            return Err(combine_rollback_error(error,rollback))
+        validate_provider_receipt(&create, "create", "allocated", &allocation_id, None)?;
+        let create_digest = schema::jcs_sha256(&create);
+        if let Err(error) = self.persist_receipt(&allocation_id, "create", &create) {
+            let rollback = rollback_created_database(
+                provider,
+                &allocation_id,
+                session_id,
+                &decision.name,
+                &create.value,
+                &create_digest,
+            )
+            .and_then(|receipt| self.persist_partial_rollback_receipt(&allocation_id, &receipt));
+            return Err(combine_rollback_error(error, rollback));
         }
-        let env=vec![EnvProjectionV1{name:format!("DOCKS_RESOURCE_{}_DATABASE_SCHEMA",decision.name.to_ascii_uppercase()),value:create.value.clone()}];
-        let allocation=ResourceAllocationV1{allocation_id,session_id:session_id.into(),kind:decision.kind.clone(),name:decision.name.clone(),provider_id:provider_id.into(),state:"allocated".into(),value:create.value,env,create_receipt_sha256:create_digest,inspect_receipt_sha256:inspect_digest,delete_receipt_sha256:None,created_at:at.into(),released_at:None};
+        let inspect = match invoke_provider(
+            provider,
+            provider_request(
+                "inspect",
+                &allocation_id,
+                session_id,
+                &decision.name,
+                Some(&create_digest),
+            ),
+        )
+        .and_then(|receipt| {
+            validate_provider_receipt(
+                &receipt,
+                "inspect",
+                "exists",
+                &allocation_id,
+                Some(&create.value),
+            )?;
+            if receipt.provider_evidence_sha256 != create.provider_evidence_sha256 {
+                return Err("database provider stable evidence changed during allocation".into());
+            }
+            Ok(receipt)
+        }) {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                let rollback = rollback_created_database(
+                    provider,
+                    &allocation_id,
+                    session_id,
+                    &decision.name,
+                    &create.value,
+                    &create_digest,
+                )
+                .and_then(|receipt| {
+                    self.persist_partial_rollback_receipt(&allocation_id, &receipt)
+                });
+                return Err(combine_rollback_error(error, rollback));
+            }
+        };
+        let inspect_digest = schema::jcs_sha256(&inspect);
+        if let Err(error) = self.persist_receipt(&allocation_id, "inspect", &inspect) {
+            let rollback = rollback_created_database(
+                provider,
+                &allocation_id,
+                session_id,
+                &decision.name,
+                &create.value,
+                &inspect_digest,
+            )
+            .and_then(|receipt| self.persist_partial_rollback_receipt(&allocation_id, &receipt));
+            return Err(combine_rollback_error(error, rollback));
+        }
+        let env = vec![EnvProjectionV1 {
+            name: format!(
+                "DOCKS_RESOURCE_{}_DATABASE_SCHEMA",
+                decision.name.to_ascii_uppercase()
+            ),
+            value: create.value.clone(),
+        }];
+        let allocation = ResourceAllocationV1 {
+            allocation_id,
+            session_id: session_id.into(),
+            kind: decision.kind.clone(),
+            name: decision.name.clone(),
+            provider_id: provider_id.into(),
+            state: "allocated".into(),
+            value: create.value,
+            env,
+            create_receipt_sha256: create_digest,
+            inspect_receipt_sha256: inspect_digest,
+            delete_receipt_sha256: None,
+            created_at: at.into(),
+            released_at: None,
+        };
         ResourceAllocationV1::from_jcs(allocation.to_jcs())?;
-        self.insert_projection(&allocation)?;
+        if let Err(error) = self.insert_projection(&allocation) {
+            self.allocations.push(allocation);
+            return Err(error);
+        }
         self.allocations.push(allocation);
         Ok(())
     }
@@ -449,22 +730,43 @@ impl ResourceSet {
         Ok(())
     }
 
-    fn rollback_unpublished(&mut self, euid: u32, registry: Option<&ResourceProviderRegistryV1>) -> Result<(), String> {
+    fn rollback_unpublished(&mut self, euid: u32) -> Result<(), String> {
         let mut failures = Vec::new();
-        for allocation in self.allocations.iter().rev() {
-            let result = match allocation.kind.as_str() {
-                "port" => { self.ports.remove(&allocation.allocation_id); Ok(()) }
-                "database_schema" => rollback_database(allocation, registry),
-                _ => remove_private_tree(Path::new(&allocation.value), euid),
-            };
-            if let Err(error) = result { failures.push(error); }
+        for index in (0..self.allocations.len()).rev() {
+            if self.allocations[index].state == "released" {
+                continue;
+            }
+            let allocation = self.allocations[index].clone();
+            let result = self
+                .persist_deletion_intent(&allocation, "rollback", None, &allocation.created_at)
+                .and_then(|intent| self.execute_deletion_intent(&allocation, &intent, euid))
+                .and_then(|receipt| {
+                    let digest = self.persist_delete_receipt(&allocation, &receipt)?;
+                    self.allocations[index].state = "released".into();
+                    self.allocations[index].delete_receipt_sha256 = Some(digest);
+                    self.allocations[index].released_at = Some(receipt.at);
+                    ResourceAllocationV1::from_jcs(self.allocations[index].to_jcs())?;
+                    self.persist_inventory()
+                });
+            if let Err(error) = result {
+                failures.push(format!("rollback resource {}: {error}", allocation.name));
+            }
         }
-        if failures.is_empty() {
-            let _ = fs::remove_dir(&self.resource_root);
-            Ok(())
-        } else {
-            Err(failures.join("; "))
+        if !failures.is_empty() {
+            return Err(failures.join("; "));
         }
+        self.persist_inventory()?;
+        match fs::remove_dir(&self.resource_root) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "remove rolled-back session resource root {}: {error}",
+                    self.resource_root.display()
+                ))
+            }
+        }
+        Ok(())
     }
 
     pub fn writable_paths(&self) -> Vec<PathBuf> {
@@ -481,52 +783,56 @@ impl ResourceSet {
             .collect()
     }
 
-    pub fn inspect(&self, roots:&AuthorityRoots)->Result<Vec<ProviderReceiptV1>,String>{
-        let registry=if self.allocations.iter().any(|allocation|allocation.kind=="database_schema"&&allocation.state=="allocated"){
-            Some(read_secure_jcs::<ResourceProviderRegistryV1>(&provider_registry_path(roots),None)?)
-        }else{None};
-        self.allocations.iter().map(|allocation|self.inspect_allocation(allocation,registry.as_ref())).collect()
+    pub fn inspect(&self, _roots: &AuthorityRoots) -> Result<Vec<ProviderReceiptV1>, String> {
+        self.allocations
+            .iter()
+            .map(|allocation| self.inspect_allocation(allocation))
+            .collect()
     }
 
-    pub fn release(&mut self,roots:&AuthorityRoots,released_at:&str)->Result<Vec<String>,String>{
+    pub fn release(
+        &mut self,
+        roots: &AuthorityRoots,
+        released_at: &str,
+    ) -> Result<Vec<String>, String> {
         schema::Timestamp::parse(released_at)?;
-        let registry=if self.allocations.iter().any(|allocation|allocation.kind=="database_schema"&&allocation.state=="allocated"){Some(schema::read_jcs_file::<ResourceProviderRegistryV1>(&provider_registry_path(roots),None)?)}else{None};
         self.inspect(roots)?;
-        let mut digests=Vec::new();
-        for index in 0..self.allocations.len(){
-            if self.allocations[index].state=="released"{digests.push(self.allocations[index].delete_receipt_sha256.clone().ok_or_else(||"released resource has no delete receipt".to_string())?);continue}
-            let allocation=self.allocations[index].clone();
-            let receipt=match allocation.kind.as_str(){
-                "port"=>{
-                    let listener=self.ports.remove(&allocation.allocation_id).ok_or_else(||format!("held port {} is unavailable; release is ambiguous",allocation.name))?;
-                    let address=listener.local_addr().map_err(|error|format!("inspect held port before close: {error}"))?.to_string();
-                    if address!=allocation.value{return Err(format!("held port {} identity drifted",allocation.name))}
-                    drop(listener);
-                    let evidence=builtin_evidence("port",&allocation.allocation_id,&allocation.value,None);
-                    builtin_receipt("delete","released",&allocation.allocation_id,&allocation.value,&evidence,released_at)
-                }
-                "database_schema"=>{
-                    let registry=registry.as_ref().ok_or_else(||"provider registry unavailable during release".to_string())?;
-                    let provider=registry.providers.iter().find(|provider|provider.provider_id==allocation.provider_id).ok_or_else(||format!("database provider {} disappeared",allocation.provider_id))?;
-                    let request=provider_request("delete",&allocation.allocation_id,&allocation.session_id,&allocation.name,Some(&allocation.inspect_receipt_sha256));
-                    let receipt=invoke_provider(provider,request)?;validate_provider_receipt(&receipt,"delete","released",&allocation.allocation_id,Some(&allocation.value))?;receipt
-                }
-                "temp_dir"|"build_dir"|"log_dir"|"cache_dir"=>{
-                    let evidence=directory_evidence(Path::new(&allocation.value))?;
-                    remove_private_tree(Path::new(&allocation.value),roots.euid)?;
-                    builtin_receipt("delete","released",&allocation.allocation_id,&allocation.value,&evidence,released_at)
-                }
-                _=>return Err("resource release encountered an unknown kind".into()),
-            };
-            let receipt_path=self.receipt_dir.join(format!("{}-delete-receipt-v1.json",allocation.allocation_id));
-            authority::atomic_create_jcs(&receipt_path,&receipt,0o600)?;
-            let digest=schema::jcs_sha256(&receipt);
-            self.allocations[index].state="released".into();self.allocations[index].delete_receipt_sha256=Some(digest.clone());self.allocations[index].released_at=Some(released_at.into());
+        let mut digests = Vec::new();
+        for index in 0..self.allocations.len() {
+            if self.allocations[index].state == "released" {
+                digests.push(
+                    self.allocations[index]
+                        .delete_receipt_sha256
+                        .clone()
+                        .ok_or_else(|| "released resource has no delete receipt".to_string())?,
+                );
+                continue;
+            }
+            let allocation = self.allocations[index].clone();
+            let intent = self.persist_deletion_intent(
+                &allocation,
+                "legacy_release",
+                None,
+                released_at,
+            )?;
+            let receipt = self.execute_deletion_intent(&allocation, &intent, roots.euid)?;
+            let digest = self.persist_delete_receipt(&allocation, &receipt)?;
+            self.allocations[index].state = "released".into();
+            self.allocations[index].delete_receipt_sha256 = Some(digest.clone());
+            self.allocations[index].released_at = Some(released_at.into());
+            ResourceAllocationV1::from_jcs(self.allocations[index].to_jcs())?;
             self.persist_inventory()?;
             digests.push(digest);
         }
-        self.environment.clear();self.resource_fds.clear();
-        match fs::remove_dir(&self.resource_root){Ok(())=>{},Err(error) if error.kind()==std::io::ErrorKind::NotFound=>{},Err(error)=>return Err(format!("remove empty session resource root: {error}"))}
+        self.environment.clear();
+        self.resource_fds.clear();
+        match fs::remove_dir(&self.resource_root) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!("remove empty session resource root: {error}"))
+            }
+        }
         Ok(digests)
     }
 
@@ -539,6 +845,7 @@ impl ResourceSet {
         close_evidence.validate()?;
         schema::Timestamp::parse(released_at)?;
         self.reconcile_durable_delete_receipts(close_evidence)?;
+        self.reconcile_deletion_intents(close_evidence, roots.euid)?;
         for allocation in self
             .allocations
             .iter()
@@ -582,23 +889,12 @@ impl ResourceSet {
             }
         }
 
-        let registry = if self.allocations.iter().any(|allocation| {
-            allocation.kind == "database_schema" && allocation.state == "allocated"
-        }) {
-            Some(read_secure_jcs::<ResourceProviderRegistryV1>(
-                &provider_registry_path(roots),
-                None,
-            )?)
-        } else {
-            None
-        };
-
         for allocation in self
             .allocations
             .iter()
             .filter(|allocation| allocation.state == "allocated")
         {
-            self.inspect_allocation(allocation, registry.as_ref())?;
+            self.inspect_allocation(allocation)?;
             match allocation.kind.as_str() {
                 "port" => prove_recorded_port_released(&allocation.value)?,
                 "temp_dir" | "build_dir" | "log_dir" | "cache_dir" => {
@@ -629,92 +925,26 @@ impl ResourceSet {
         });
         for index in release_order {
             let allocation = self.allocations[index].clone();
-            let receipt = match allocation.kind.as_str() {
-                "port" => {
-                    prove_recorded_port_released(&allocation.value)?;
-                    let close_binding = format!(
-                        "{}:{}",
-                        close_evidence.broker_close_sha256,
-                        close_evidence.runtime_empty_sha256
-                    );
-                    let evidence = builtin_evidence(
-                        "port-release",
-                        &allocation.allocation_id,
-                        &allocation.value,
-                        Some(&close_binding),
-                    );
-                    deterministic_builtin_receipt(
-                        "delete",
-                        "released",
-                        &allocation.allocation_id,
-                        &allocation.value,
-                        &evidence,
-                        released_at,
-                    )
-                }
-                "database_schema" => {
-                    let registry = registry
-                        .as_ref()
-                        .ok_or_else(|| "provider registry unavailable during release".to_string())?;
-                    let provider = registry
-                        .providers
-                        .iter()
-                        .find(|provider| provider.provider_id == allocation.provider_id)
-                        .ok_or_else(|| {
-                            format!("database provider {} disappeared", allocation.provider_id)
-                        })?;
-                    let mut request = provider_request(
-                        "delete",
-                        &allocation.allocation_id,
-                        &allocation.session_id,
-                        &allocation.name,
-                        Some(&allocation.inspect_receipt_sha256),
-                    );
-                    request.request_id = deterministic_uuid(
-                        format!(
-                            "session-relay/resource-provider-delete/v1\0{}\0{}\0{}",
-                            allocation.allocation_id,
-                            allocation.inspect_receipt_sha256,
-                            provider.provider_id
-                        )
-                        .as_bytes(),
-                    );
-                    let receipt = invoke_provider(provider, request)?;
-                    validate_provider_receipt(
-                        &receipt,
-                        "delete",
-                        "released",
-                        &allocation.allocation_id,
-                        Some(&allocation.value),
-                    )?;
-                    receipt
-                }
-                "temp_dir" | "build_dir" | "log_dir" | "cache_dir" => {
-                    let evidence = directory_evidence(Path::new(&allocation.value))?;
-                    preflight_private_tree(Path::new(&allocation.value), roots.euid)?;
-                    remove_private_tree(Path::new(&allocation.value), roots.euid)?;
-                    deterministic_builtin_receipt(
-                        "delete",
-                        "released",
-                        &allocation.allocation_id,
-                        &allocation.value,
-                        &evidence,
-                        released_at,
-                    )
-                }
-                _ => return Err("resource release encountered an unknown kind".into()),
-            };
+            let intent = self.persist_deletion_intent(
+                &allocation,
+                "release",
+                Some(close_evidence),
+                released_at,
+            )?;
+            let receipt = self.execute_deletion_intent(&allocation, &intent, roots.euid)?;
             let digest = self.persist_delete_receipt(&allocation, &receipt)?;
             self.allocations[index].state = "released".into();
             self.allocations[index].delete_receipt_sha256 = Some(digest.clone());
-            self.allocations[index].released_at = Some(receipt.at.clone());
+            self.allocations[index].released_at = Some(receipt.at);
             ResourceAllocationV1::from_jcs(self.allocations[index].to_jcs())?;
             self.persist_inventory()?;
             digests[index] = Some(digest);
         }
         let digests = digests
             .into_iter()
-            .map(|digest| digest.ok_or_else(|| "released resource has no delete receipt".to_string()))
+            .map(|digest| {
+                digest.ok_or_else(|| "released resource has no delete receipt".to_string())
+            })
             .collect::<Result<Vec<_>, _>>()?;
 
         self.environment.clear();
@@ -801,7 +1031,23 @@ impl ResourceSet {
                                 ));
                             }
                         }
-                        "database_schema" => {}
+                        "database_schema" => {
+                            let inspect = read_receipt(
+                                &self.receipt_dir.join(format!(
+                                    "{}-inspect-receipt-v1.json",
+                                    allocation.allocation_id
+                                )),
+                                &allocation.inspect_receipt_sha256,
+                            )?;
+                            if receipt.provider_evidence_sha256
+                                != inspect.provider_evidence_sha256
+                            {
+                                return Err(format!(
+                                    "database resource {} delete identity drifted",
+                                    allocation.name
+                                ));
+                            }
+                        }
                         _ => {
                             return Err(
                                 "resource delete receipt has an unknown allocation kind".into()
@@ -819,6 +1065,299 @@ impl ResourceSet {
                 Err(error) => {
                     return Err(format!(
                         "inspect delete receipt {}: {error}",
+                        path.display()
+                    ))
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn persist_pinned_provider(
+        &self,
+        allocation_id: &str,
+        provider: &ResourceProviderRegistrationV1,
+        updated_at: &str,
+    ) -> Result<(), String> {
+        let pin = ResourceProviderRegistryV1 {
+            providers: vec![provider.clone()],
+            updated_at: updated_at.to_string(),
+        };
+        authority::atomic_create_jcs(
+            &self.receipt_dir.join(format!(
+                "{allocation_id}-provider-registration-v1.json"
+            )),
+            &pin,
+            0o600,
+        )
+    }
+
+    fn remove_unused_provider_pin(&mut self, allocation_id: &str) {
+        self.provider_registrations.remove(allocation_id);
+        let _ = fs::remove_file(self.receipt_dir.join(format!(
+            "{allocation_id}-provider-registration-v1.json"
+        )));
+    }
+
+    fn persist_partial_rollback_receipt(
+        &self,
+        allocation_id: &str,
+        receipt: &ProviderReceiptV1,
+    ) -> Result<(), String> {
+        let path = self
+            .receipt_dir
+            .join(format!("{allocation_id}-delete-receipt-v1.json"));
+        match authority::atomic_create_jcs(&path, receipt, 0o600) {
+            Ok(()) => Ok(()),
+            Err(create_error) => {
+                let durable: ProviderReceiptV1 = read_secure_jcs(&path, None)
+                    .map_err(|read_error| format!("{create_error}; {read_error}"))?;
+                if durable == *receipt {
+                    Ok(())
+                } else {
+                    Err("partial rollback delete receipt has different durable bytes".into())
+                }
+            }
+        }
+    }
+
+    fn persist_deletion_intent(
+        &self,
+        allocation: &ResourceAllocationV1,
+        mode: &str,
+        close_evidence: Option<&ResourceReleaseEvidenceV1>,
+        released_at: &str,
+    ) -> Result<DeletionIntentV1, String> {
+        let durable_inspect = read_receipt(
+            &self.receipt_dir.join(format!(
+                "{}-inspect-receipt-v1.json",
+                allocation.allocation_id
+            )),
+            &allocation.inspect_receipt_sha256,
+        )?;
+        let provider_evidence_sha256 = if allocation.kind == "port" && mode == "release" {
+            let close = close_evidence
+                .ok_or_else(|| "held-port release intent requires close evidence".to_string())?;
+            let binding = format!(
+                "{}:{}",
+                close.broker_close_sha256, close.runtime_empty_sha256
+            );
+            builtin_evidence(
+                "port-release",
+                &allocation.allocation_id,
+                &allocation.value,
+                Some(&binding),
+            )
+        } else {
+            durable_inspect.provider_evidence_sha256
+        };
+        let request_id = deterministic_uuid(
+            format!(
+                "session-relay/resource-deletion-intent/v1\0{mode}\0{}\0{}\0{}\0{}\0{}",
+                allocation.allocation_id,
+                allocation.inspect_receipt_sha256,
+                allocation.provider_id,
+                close_evidence
+                    .map(|value| value.broker_close_sha256.as_str())
+                    .unwrap_or(""),
+                close_evidence
+                    .map(|value| value.runtime_empty_sha256.as_str())
+                    .unwrap_or("")
+            )
+            .as_bytes(),
+        );
+        let intent = DeletionIntentV1 {
+            allocation_id: allocation.allocation_id.clone(),
+            kind: allocation.kind.clone(),
+            provider_id: allocation.provider_id.clone(),
+            value: allocation.value.clone(),
+            provider_evidence_sha256,
+            prior_receipt_sha256: allocation.inspect_receipt_sha256.clone(),
+            request_id,
+            mode: mode.to_string(),
+            released_at: released_at.to_string(),
+            broker_close_sha256: close_evidence
+                .map(|value| value.broker_close_sha256.clone()),
+            runtime_empty_sha256: close_evidence
+                .map(|value| value.runtime_empty_sha256.clone()),
+        };
+        DeletionIntentV1::from_jcs(intent.to_jcs())?;
+        let path = self.receipt_dir.join(format!(
+            "{}-delete-intent-v1.json",
+            allocation.allocation_id
+        ));
+        match authority::atomic_create_jcs(&path, &intent, 0o600) {
+            Ok(()) => Ok(intent),
+            Err(create_error) => {
+                let durable: DeletionIntentV1 = read_secure_jcs(&path, None)
+                    .map_err(|read_error| format!("{create_error}; {read_error}"))?;
+                if durable != intent {
+                    return Err(format!(
+                        "resource {} deletion intent already exists with different bytes",
+                        allocation.name
+                    ));
+                }
+                Ok(durable)
+            }
+        }
+    }
+
+    fn execute_deletion_intent(
+        &mut self,
+        allocation: &ResourceAllocationV1,
+        intent: &DeletionIntentV1,
+        euid: u32,
+    ) -> Result<ProviderReceiptV1, String> {
+        if intent.allocation_id != allocation.allocation_id
+            || intent.kind != allocation.kind
+            || intent.provider_id != allocation.provider_id
+            || intent.value != allocation.value
+            || intent.prior_receipt_sha256 != allocation.inspect_receipt_sha256
+        {
+            return Err(format!(
+                "resource {} deletion intent identity differs from allocation",
+                allocation.name
+            ));
+        }
+        match allocation.kind.as_str() {
+            "port" => {
+                if intent.mode != "release" {
+                    if let Some(listener) = self.ports.remove(&allocation.allocation_id) {
+                        let address = listener
+                            .local_addr()
+                            .map_err(|error| format!("inspect held port before rollback: {error}"))?
+                            .to_string();
+                        if address != allocation.value {
+                            return Err(format!(
+                                "held port {} identity drifted before rollback",
+                                allocation.name
+                            ));
+                        }
+                        drop(listener);
+                    }
+                    prove_recorded_port_released(&allocation.value)?;
+                } else {
+                    prove_recorded_port_released(&allocation.value)?;
+                }
+                Ok(deterministic_builtin_receipt(
+                    "delete",
+                    "released",
+                    &allocation.allocation_id,
+                    &allocation.value,
+                    &intent.provider_evidence_sha256,
+                    &intent.released_at,
+                ))
+            }
+            "temp_dir" | "build_dir" | "log_dir" | "cache_dir" => {
+                match fs::symlink_metadata(&allocation.value) {
+                    Ok(_) => {
+                        let current = directory_evidence(Path::new(&allocation.value))?;
+                        if current != intent.provider_evidence_sha256 {
+                            return Err(format!(
+                                "resource directory {} identity drifted after deletion intent",
+                                allocation.name
+                            ));
+                        }
+                        preflight_private_tree(Path::new(&allocation.value), euid)?;
+                        remove_private_tree(Path::new(&allocation.value), euid)?;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(format!(
+                            "inspect resource directory {} after deletion intent: {error}",
+                            allocation.name
+                        ))
+                    }
+                }
+                Ok(deterministic_builtin_receipt(
+                    "delete",
+                    "released",
+                    &allocation.allocation_id,
+                    &allocation.value,
+                    &intent.provider_evidence_sha256,
+                    &intent.released_at,
+                ))
+            }
+            "database_schema" => {
+                let provider = self
+                    .provider_registrations
+                    .get(&allocation.allocation_id)
+                    .ok_or_else(|| {
+                        format!(
+                            "pinned database provider {} is unavailable",
+                            allocation.provider_id
+                        )
+                    })?;
+                let mut request = provider_request(
+                    "delete",
+                    &allocation.allocation_id,
+                    &allocation.session_id,
+                    &allocation.name,
+                    Some(&intent.prior_receipt_sha256),
+                );
+                request.request_id = intent.request_id.clone();
+                let receipt = invoke_provider(provider, request)?;
+                validate_provider_receipt(
+                    &receipt,
+                    "delete",
+                    "released",
+                    &allocation.allocation_id,
+                    Some(&allocation.value),
+                )?;
+                if receipt.provider_evidence_sha256 != intent.provider_evidence_sha256 {
+                    return Err(format!(
+                        "database resource {} delete identity drifted",
+                        allocation.name
+                    ));
+                }
+                Ok(receipt)
+            }
+            _ => Err("resource deletion intent has an unknown allocation kind".into()),
+        }
+    }
+
+    fn reconcile_deletion_intents(
+        &mut self,
+        close_evidence: &ResourceReleaseEvidenceV1,
+        euid: u32,
+    ) -> Result<(), String> {
+        for index in 0..self.allocations.len() {
+            if self.allocations[index].state == "released" {
+                continue;
+            }
+            let allocation = self.allocations[index].clone();
+            let path = self.receipt_dir.join(format!(
+                "{}-delete-intent-v1.json",
+                allocation.allocation_id
+            ));
+            match fs::symlink_metadata(&path) {
+                Ok(_) => {
+                    let intent: DeletionIntentV1 = read_secure_jcs(&path, None)?;
+                    let expected = self.persist_deletion_intent(
+                        &allocation,
+                        "release",
+                        Some(close_evidence),
+                        &intent.released_at,
+                    )?;
+                    if intent != expected {
+                        return Err(format!(
+                            "resource {} deletion intent changed during reconciliation",
+                            allocation.name
+                        ));
+                    }
+                    let receipt =
+                        self.execute_deletion_intent(&allocation, &intent, euid)?;
+                    let digest = self.persist_delete_receipt(&allocation, &receipt)?;
+                    self.allocations[index].state = "released".into();
+                    self.allocations[index].delete_receipt_sha256 = Some(digest);
+                    self.allocations[index].released_at = Some(receipt.at);
+                    ResourceAllocationV1::from_jcs(self.allocations[index].to_jcs())?;
+                    self.persist_inventory()?;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(format!(
+                        "inspect resource deletion intent {}: {error}",
                         path.display()
                     ))
                 }
@@ -852,38 +1391,98 @@ impl ResourceSet {
         }
     }
 
-    fn inspect_allocation(&self,allocation:&ResourceAllocationV1,registry:Option<&ResourceProviderRegistryV1>)->Result<ProviderReceiptV1,String>{
-        if allocation.state=="released"{
-            let digest=allocation.delete_receipt_sha256.as_deref().ok_or_else(||"released allocation has no delete receipt".to_string())?;
-            return read_receipt(&self.receipt_dir.join(format!("{}-delete-receipt-v1.json",allocation.allocation_id)),digest)
+    fn inspect_allocation(
+        &self,
+        allocation: &ResourceAllocationV1,
+    ) -> Result<ProviderReceiptV1, String> {
+        if allocation.state == "released" {
+            let digest = allocation
+                .delete_receipt_sha256
+                .as_deref()
+                .ok_or_else(|| "released allocation has no delete receipt".to_string())?;
+            return read_receipt(
+                &self.receipt_dir.join(format!(
+                    "{}-delete-receipt-v1.json",
+                    allocation.allocation_id
+                )),
+                digest,
+            );
         }
-        let durable=read_receipt(&self.receipt_dir.join(format!("{}-inspect-receipt-v1.json",allocation.allocation_id)),&allocation.inspect_receipt_sha256)?;
-        match allocation.kind.as_str(){
-            "port"=>{
-                let expected=builtin_evidence("port",&allocation.allocation_id,&allocation.value,None);
-                let address:SocketAddr=allocation.value.parse().map_err(|_|format!("held port {} address is invalid",allocation.name))?;
-                if !matches!(address,SocketAddr::V4(value) if *value.ip()==Ipv4Addr::LOCALHOST)||durable.provider_evidence_sha256!=expected{return Err(format!("held port {} identity drifted",allocation.name))}
-                if let Some(listener)=self.ports.get(&allocation.allocation_id){
-                    let value=listener.local_addr().map_err(|error|format!("inspect held port: {error}"))?.to_string();
-                    if value!=allocation.value{return Err(format!("held port {} identity drifted",allocation.name))}
+        let durable = read_receipt(
+            &self.receipt_dir.join(format!(
+                "{}-inspect-receipt-v1.json",
+                allocation.allocation_id
+            )),
+            &allocation.inspect_receipt_sha256,
+        )?;
+        match allocation.kind.as_str() {
+            "port" => {
+                let expected =
+                    builtin_evidence("port", &allocation.allocation_id, &allocation.value, None);
+                let address: SocketAddr = allocation
+                    .value
+                    .parse()
+                    .map_err(|_| format!("held port {} address is invalid", allocation.name))?;
+                if !matches!(address,SocketAddr::V4(value) if *value.ip()==Ipv4Addr::LOCALHOST)
+                    || durable.provider_evidence_sha256 != expected
+                {
+                    return Err(format!("held port {} identity drifted", allocation.name));
+                }
+                if let Some(listener) = self.ports.get(&allocation.allocation_id) {
+                    let value = listener
+                        .local_addr()
+                        .map_err(|error| format!("inspect held port: {error}"))?
+                        .to_string();
+                    if value != allocation.value {
+                        return Err(format!("held port {} identity drifted", allocation.name));
+                    }
                 }
                 Ok(durable)
             }
-            "temp_dir"|"build_dir"|"log_dir"|"cache_dir"=>{
-                let evidence=directory_evidence(Path::new(&allocation.value))?;
-                if durable.provider_evidence_sha256!=evidence{return Err(format!("resource directory {} identity drifted",allocation.name))}
+            "temp_dir" | "build_dir" | "log_dir" | "cache_dir" => {
+                let evidence = directory_evidence(Path::new(&allocation.value))?;
+                if durable.provider_evidence_sha256 != evidence {
+                    return Err(format!(
+                        "resource directory {} identity drifted",
+                        allocation.name
+                    ));
+                }
                 Ok(durable)
             }
-            "database_schema"=>{
-                let registry=registry.ok_or_else(||"provider registry unavailable during inspect".to_string())?;
-                let provider=registry.providers.iter().find(|provider|provider.provider_id==allocation.provider_id).ok_or_else(||format!("database provider {} disappeared",allocation.provider_id))?;
-                let request=provider_request("inspect",&allocation.allocation_id,&allocation.session_id,&allocation.name,Some(&allocation.create_receipt_sha256));
-                let receipt=invoke_provider(provider,request)?;
-                validate_provider_receipt(&receipt,"inspect","exists",&allocation.allocation_id,Some(&allocation.value))?;
-                if receipt.provider_evidence_sha256!=durable.provider_evidence_sha256{return Err(format!("database resource {} provider identity drifted",allocation.name))}
+            "database_schema" => {
+                let provider = self
+                    .provider_registrations
+                    .get(&allocation.allocation_id)
+                    .ok_or_else(|| {
+                        format!(
+                            "pinned database provider {} is unavailable",
+                            allocation.provider_id
+                        )
+                    })?;
+                let request = provider_request(
+                    "inspect",
+                    &allocation.allocation_id,
+                    &allocation.session_id,
+                    &allocation.name,
+                    Some(&allocation.create_receipt_sha256),
+                );
+                let receipt = invoke_provider(provider, request)?;
+                validate_provider_receipt(
+                    &receipt,
+                    "inspect",
+                    "exists",
+                    &allocation.allocation_id,
+                    Some(&allocation.value),
+                )?;
+                if receipt.provider_evidence_sha256 != durable.provider_evidence_sha256 {
+                    return Err(format!(
+                        "database resource {} provider identity drifted",
+                        allocation.name
+                    ));
+                }
                 Ok(receipt)
             }
-            _=>Err("resource inspection encountered an unknown kind".into()),
+            _ => Err("resource inspection encountered an unknown kind".into()),
         }
     }
 
@@ -1050,6 +1649,77 @@ fn load_registry_if_needed(roots: &AuthorityRoots, decisions: &[ResourceDecision
     schema::read_jcs_file(&provider_registry_path(roots), None).map(Some)
 }
 
+fn validate_registry_for_decisions(
+    registry: Option<&ResourceProviderRegistryV1>,
+    decisions: &[ResourceDecisionV1],
+) -> Result<(), String> {
+    for decision in decisions
+        .iter()
+        .filter(|decision| decision.kind == "database_schema" && decision.state == "requested")
+    {
+        let provider_id = decision
+            .provider_id
+            .as_deref()
+            .ok_or_else(|| "database_schema requires provider_id".to_string())?;
+        let provider = registry
+            .and_then(|registry| {
+                registry
+                    .providers
+                    .iter()
+                    .find(|provider| provider.provider_id == provider_id)
+            })
+            .ok_or_else(|| format!("database provider {provider_id} is not registered"))?;
+        if !provider
+            .supported_kinds
+            .iter()
+            .any(|kind| kind == "database_schema")
+        {
+            return Err(format!(
+                "database provider {provider_id} does not support database_schema"
+            ));
+        }
+        verify_provider_files(provider)?;
+    }
+    Ok(())
+}
+
+fn load_pinned_providers(
+    receipt_dir: &Path,
+    allocations: &[ResourceAllocationV1],
+) -> Result<BTreeMap<String, ResourceProviderRegistrationV1>, String> {
+    let mut providers = BTreeMap::new();
+    for allocation in allocations
+        .iter()
+        .filter(|allocation| allocation.kind == "database_schema")
+    {
+        let pin: ResourceProviderRegistryV1 = read_secure_jcs(
+            &receipt_dir.join(format!(
+                "{}-provider-registration-v1.json",
+                allocation.allocation_id
+            )),
+            None,
+        )?;
+        if pin.providers.len() != 1 || pin.providers[0].provider_id != allocation.provider_id {
+            return Err(format!(
+                "database resource {} pinned provider registration is invalid",
+                allocation.name
+            ));
+        }
+        if !pin.providers[0]
+            .supported_kinds
+            .iter()
+            .any(|kind| kind == "database_schema")
+        {
+            return Err(format!(
+                "database resource {} pinned provider does not support database_schema",
+                allocation.name
+            ));
+        }
+        providers.insert(allocation.allocation_id.clone(), pin.providers[0].clone());
+    }
+    Ok(providers)
+}
+
 fn ensure_private_ancestors(path: &Path, trusted_root: &Path, euid: u32) -> Result<(), String> {
     if !path.starts_with(trusted_root) { return Err("resource path escapes trusted data root".into()); }
     let relative = path.strip_prefix(trusted_root).map_err(|_| "resource path escapes trusted root".to_string())?;
@@ -1106,66 +1776,207 @@ fn provider_request(operation: &str, allocation_id: &str, session_id: &str, name
 }
 
 fn verify_provider_files(provider: &ResourceProviderRegistrationV1) -> Result<(), String> {
-    verify_executable(Path::new(&provider.executable_path), &provider.executable_sha256)?;
-    let config = read_verified_file(Path::new(&provider.config_path), true)?;
-    let digest = sha256::hex_digest(&config);
-    if !sha256::constant_time_eq(digest.as_bytes(), provider.config_sha256.as_bytes()) {
-        return Err(format!("provider {} config digest drift", provider.provider_id));
-    }
-    Ok(())
+    open_verified_provider_files(provider).map(|_| ())
 }
 
 fn read_verified_file(path: &Path, private: bool) -> Result<Vec<u8>, String> {
-    if !path.is_absolute() { return Err(format!("{} is not absolute", path.display())); }
-    let mut file = OpenOptions::new().read(true).custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW).open(path).map_err(|error| format!("securely open {}: {error}", path.display()))?;
-    let metadata = file.metadata().map_err(|error| format!("inspect {}: {error}", path.display()))?;
-    if !metadata.is_file() || metadata.nlink() != 1 { return Err(format!("{} is not a single-link regular file", path.display())); }
-    if private && (metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o777 != 0o600) { return Err(format!("{} is not an EUID-owned mode-0600 provider config", path.display())); }
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes).map_err(|error| format!("read {}: {error}", path.display()))?;
-    Ok(bytes)
+    open_verified_file(path, private).map(|(_, bytes)| bytes)
 }
 
-fn invoke_provider(provider: &ResourceProviderRegistrationV1, request: ProviderRequestV1) -> Result<ProviderReceiptV1, String> {
-    verify_provider_files(provider)?;
-    let config = OpenOptions::new().read(true).custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW).open(&provider.config_path).map_err(|error| format!("open provider config: {error}"))?;
-    let config_fd = config.as_raw_fd();
-    let mut command = Command::new(&provider.executable_path);
-    command.args(["--session-relay-resource-provider-v1", request.operation.as_str()]).env_clear().stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
-    if let Some(path)=std::env::var_os("PATH"){command.env("PATH",path);}
+fn invoke_provider(
+    provider: &ResourceProviderRegistrationV1,
+    request: ProviderRequestV1,
+) -> Result<ProviderReceiptV1, String> {
+    let files = open_verified_provider_files(provider)?;
+    invoke_provider_with_files(provider, request, files)
+}
+
+fn open_verified_file(path: &Path, private: bool) -> Result<(File, Vec<u8>), String> {
+    if !path.is_absolute() {
+        return Err(format!("{} is not absolute", path.display()));
+    }
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|error| format!("securely open {}: {error}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("inspect {}: {error}", path.display()))?;
+    if !metadata.is_file() || metadata.nlink() != 1 {
+        return Err(format!(
+            "{} is not a single-link regular file",
+            path.display()
+        ));
+    }
+    if private
+        && (metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.mode() & 0o777 != 0o600)
+    {
+        return Err(format!(
+            "{} is not an EUID-owned mode-0600 provider config",
+            path.display()
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|error| format!("read {}: {error}", path.display()))?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| format!("rewind {}: {error}", path.display()))?;
+    Ok((file, bytes))
+}
+
+fn relocate_file_above_stdio(file: File) -> Result<File, String> {
+    if file.as_raw_fd() >= 4 {
+        return Ok(file);
+    }
+    let duplicate = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 4) };
+    if duplicate < 0 {
+        return Err(format!(
+            "relocate verified provider FD above stdio: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(unsafe { File::from_raw_fd(duplicate) })
+}
+
+fn open_verified_provider_files(
+    provider: &ResourceProviderRegistrationV1,
+) -> Result<VerifiedProviderFiles, String> {
+    schema::Sha256Digest::parse(&provider.executable_sha256)?;
+    schema::Sha256Digest::parse(&provider.config_sha256)?;
+    let (config, config_bytes) = open_verified_file(Path::new(&provider.config_path), true)?;
+    let (executable, executable_bytes) =
+        open_verified_file(Path::new(&provider.executable_path), false)?;
+    let executable_metadata = executable
+        .metadata()
+        .map_err(|error| format!("inspect provider executable: {error}"))?;
+    if executable_metadata.mode() & 0o111 == 0 {
+        return Err(format!(
+            "provider executable {} has no execute bit",
+            provider.executable_path
+        ));
+    }
+    let executable_digest = sha256::hex_digest(&executable_bytes);
+    if !sha256::constant_time_eq(
+        executable_digest.as_bytes(),
+        provider.executable_sha256.as_bytes(),
+    ) {
+        return Err(format!(
+            "provider {} executable digest drift",
+            provider.provider_id
+        ));
+    }
+    let config_digest = sha256::hex_digest(&config_bytes);
+    if !sha256::constant_time_eq(
+        config_digest.as_bytes(),
+        provider.config_sha256.as_bytes(),
+    ) {
+        return Err(format!("provider {} config digest drift", provider.provider_id));
+    }
+    Ok(VerifiedProviderFiles {
+        executable: relocate_file_above_stdio(executable)?,
+        config,
+    })
+}
+
+fn invoke_provider_with_files(
+    provider: &ResourceProviderRegistrationV1,
+    request: ProviderRequestV1,
+    files: VerifiedProviderFiles,
+) -> Result<ProviderReceiptV1, String> {
+    let executable_fd = files.executable.as_raw_fd();
+    let config_fd = files.config.as_raw_fd();
+    let executable_path = format!("/proc/self/fd/{executable_fd}");
+    let mut command = Command::new(executable_path);
+    command
+        .args([
+            "--session-relay-resource-provider-v1",
+            request.operation.as_str(),
+        ])
+        .env_clear()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(path) = std::env::var_os("PATH") {
+        command.env("PATH", path);
+    }
     unsafe {
         command.pre_exec(move || {
-            if libc::dup2(config_fd, 3) < 0 { return Err(std::io::Error::last_os_error()); }
-            let flags=libc::fcntl(3,libc::F_GETFD);
-            if flags<0||libc::fcntl(3,libc::F_SETFD,flags&!libc::FD_CLOEXEC)<0{return Err(std::io::Error::last_os_error())}
+            if config_fd != 3 && libc::dup2(config_fd, 3) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            for fd in [3, executable_fd] {
+                let flags = libc::fcntl(fd, libc::F_GETFD);
+                if flags < 0 || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
             Ok(())
         });
     }
-    let mut child = command.spawn().map_err(|error| format!("spawn resource provider {}: {error}", provider.provider_id))?;
-    let mut stdin = child.stdin.take().ok_or_else(|| "provider stdin pipe missing".to_string())?;
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("spawn resource provider {}: {error}", provider.provider_id))?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "provider stdin pipe missing".to_string())?;
     let request_bytes = schema::serialize_jcs_lf(&request);
-    stdin.write_all(&request_bytes).map_err(|error| format!("write provider request: {error}"))?;
+    stdin
+        .write_all(&request_bytes)
+        .map_err(|error| format!("write provider request: {error}"))?;
     drop(stdin);
-    let stdout = child.stdout.take().ok_or_else(|| "provider stdout pipe missing".to_string())?;
-    let stderr = child.stderr.take().ok_or_else(|| "provider stderr pipe missing".to_string())?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "provider stdout pipe missing".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "provider stderr pipe missing".to_string())?;
     let stdout_reader = thread::spawn(move || read_bounded(stdout));
     let stderr_reader = thread::spawn(move || read_bounded(stderr));
     let deadline = Instant::now() + PROVIDER_TIMEOUT;
     let status = loop {
-        if let Some(status) = child.try_wait().map_err(|error| format!("poll resource provider: {error}"))? { break status; }
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| format!("poll resource provider: {error}"))?
+        {
+            break status;
+        }
         if Instant::now() >= deadline {
-            let _ = child.kill(); let _ = child.wait();
-            let _ = stdout_reader.join(); let _ = stderr_reader.join();
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
             return Err(format!("resource provider {} timed out", provider.provider_id));
         }
         thread::sleep(Duration::from_millis(10));
     };
-    let stdout = stdout_reader.join().map_err(|_| "provider stdout reader panicked".to_string())??;
-    let stderr = stderr_reader.join().map_err(|_| "provider stderr reader panicked".to_string())??;
-    if !status.success() { return Err(format!("resource provider {} failed: {}", provider.provider_id, String::from_utf8_lossy(&stderr))); }
-    if stdout.len() > PROVIDER_OUTPUT_MAX as usize || stderr.len() > PROVIDER_OUTPUT_MAX as usize { return Err("resource provider output exceeded 64 KiB".into()); }
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| "provider stdout reader panicked".to_string())??;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| "provider stderr reader panicked".to_string())??;
+    if !status.success() {
+        return Err(format!(
+            "resource provider {} failed: {}",
+            provider.provider_id,
+            String::from_utf8_lossy(&stderr)
+        ));
+    }
+    if stdout.len() > PROVIDER_OUTPUT_MAX as usize
+        || stderr.len() > PROVIDER_OUTPUT_MAX as usize
+    {
+        return Err("resource provider output exceeded 64 KiB".into());
+    }
     let receipt = ProviderReceiptV1::from_jcs(schema::parse_jcs(&stdout, true)?)?;
-    if receipt.request_id != request.request_id || receipt.allocation_id != request.allocation_id || receipt.operation != request.operation {
+    if receipt.request_id != request.request_id
+        || receipt.allocation_id != request.allocation_id
+        || receipt.operation != request.operation
+    {
         return Err("resource provider receipt identity differs from request".into());
     }
     Ok(receipt)
@@ -1189,23 +2000,36 @@ fn read_receipt(path:&Path,expected_sha256:&str)->Result<ProviderReceiptV1,Strin
     read_secure_jcs(path,Some(expected_sha256))
 }
 
-fn rollback_created_database(provider:&ResourceProviderRegistrationV1,allocation_id:&str,session_id:&str,name:&str,value:&str,prior_receipt_sha256:&str)->Result<(),String>{
-    let request=provider_request("delete",allocation_id,session_id,name,Some(prior_receipt_sha256));
-    let receipt=invoke_provider(provider,request)?;
-    validate_provider_receipt(&receipt,"delete","released",allocation_id,Some(value))
+fn rollback_created_database(
+    provider: &ResourceProviderRegistrationV1,
+    allocation_id: &str,
+    session_id: &str,
+    name: &str,
+    value: &str,
+    prior_receipt_sha256: &str,
+) -> Result<ProviderReceiptV1, String> {
+    let request = provider_request(
+        "delete",
+        allocation_id,
+        session_id,
+        name,
+        Some(prior_receipt_sha256),
+    );
+    let receipt = invoke_provider(provider, request)?;
+    validate_provider_receipt(
+        &receipt,
+        "delete",
+        "released",
+        allocation_id,
+        Some(value),
+    )?;
+    Ok(receipt)
 }
 
 fn combine_rollback_error(error:String,rollback:Result<(),String>)->String{
     match rollback{Ok(())=>error,Err(rollback)=>format!("{error}; database allocation cleanup could not be proven: {rollback}")}
 }
 
-fn rollback_database(allocation: &ResourceAllocationV1, registry: Option<&ResourceProviderRegistryV1>) -> Result<(), String> {
-    let registry = registry.ok_or_else(|| "provider registry unavailable during rollback".to_string())?;
-    let provider = registry.providers.iter().find(|provider| provider.provider_id == allocation.provider_id).ok_or_else(|| "database provider disappeared during rollback".to_string())?;
-    let request = provider_request("delete", &allocation.allocation_id, &allocation.session_id, &allocation.name, Some(&allocation.inspect_receipt_sha256));
-    let receipt = invoke_provider(provider, request)?;
-    validate_provider_receipt(&receipt, "delete", "released", &allocation.allocation_id, Some(&allocation.value))
-}
 
 fn read_secure_jcs<T: ClosedJcs>(path: &Path, expected_sha256: Option<&str>) -> Result<T, String> {
     let bytes = capability::read_secure_bytes(path)?;
@@ -1534,4 +2358,470 @@ fn strings_value(values:&[String])->schema::JcsValue{
 
 fn append_option(arguments: &mut Vec<String>, flag: &str, value: Option<&str>) {
     if let Some(value) = value { arguments.extend([flag.into(), value.into()]); }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const REPOSITORY_ID: &str =
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const SESSION_ID: &str = "123e4567-e89b-42d3-a456-426614174000";
+    const CREATED_AT: &str = "2026-07-22T00:00:00.000Z";
+
+    struct TestRoot(PathBuf);
+
+    impl TestRoot {
+        fn new(label: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "session-relay-resources-{label}-{}",
+                crate::store::uuid_v4()
+            ));
+            fs::create_dir(&path).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TestRoot {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn fixture_roots(temp: &TestRoot) -> (AuthorityRoots, PathBuf) {
+        let authority = temp.0.join("authority");
+        let data = temp.0.join("data");
+        let receipts = temp.0.join("receipts");
+        for path in [&authority, &data, &receipts] {
+            fs::create_dir(path).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        (
+            AuthorityRoots {
+                authority,
+                data,
+                euid: unsafe { libc::geteuid() },
+            },
+            receipts,
+        )
+    }
+
+    fn decisions(requested: &[&str]) -> Vec<ResourceDecisionV1> {
+        [
+            "port",
+            "temp_dir",
+            "build_dir",
+            "log_dir",
+            "cache_dir",
+            "database_schema",
+        ]
+        .into_iter()
+        .map(|kind| {
+            let is_requested = requested.contains(&kind);
+            ResourceDecisionV1 {
+                kind: kind.into(),
+                name: format!("{kind}_test"),
+                state: if is_requested { "requested" } else { "unused" }.into(),
+                provider_id: (kind == "database_schema" && is_requested)
+                    .then(|| "test_provider".to_string()),
+                reason: (!is_requested)
+                    .then(|| "task_does_not_use_resource".to_string()),
+            }
+        })
+        .collect()
+    }
+
+    fn provider_fixture(
+        temp: &TestRoot,
+        label: &str,
+        evidence_path: &Path,
+        collision_path: Option<&Path>,
+    ) -> ResourceProviderRegistrationV1 {
+        let executable = temp.0.join(format!("provider-{label}.py"));
+        fs::write(
+            &executable,
+            r#"#!/usr/bin/python3
+import json
+import os
+import sys
+
+config = json.load(os.fdopen(3))
+request = json.load(sys.stdin)
+if request["operation"] == "inspect" and config.get("collision"):
+    try:
+        fd = os.open(config["collision"], os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        os.write(fd, b"publication collision\n")
+        os.fsync(fd)
+        os.close(fd)
+    except FileExistsError:
+        pass
+with open(config["evidence"], "r", encoding="ascii") as source:
+    evidence = source.read().strip()
+outcomes = {"create": "allocated", "inspect": "exists", "delete": "released"}
+receipt = {
+    "allocation_id": request["allocation_id"],
+    "at": "2026-07-22T00:00:00.000Z",
+    "operation": request["operation"],
+    "outcome": outcomes[request["operation"]],
+    "provider_evidence_sha256": evidence,
+    "request_id": request["request_id"],
+    "schema": "ProviderReceiptV1",
+    "value": "schema_" + request["allocation_id"].replace("-", ""),
+}
+sys.stdout.write(json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n")
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        let config = temp.0.join(format!("provider-{label}.json"));
+        let collision = collision_path
+            .map(|path| format!("\"{}\"", path.display()))
+            .unwrap_or_else(|| "null".into());
+        fs::write(
+            &config,
+            format!(
+                "{{\"collision\":{collision},\"evidence\":\"{}\"}}\n",
+                evidence_path.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
+        ResourceProviderRegistrationV1 {
+            provider_id: "test_provider".into(),
+            executable_path: executable.to_string_lossy().into_owned(),
+            executable_sha256: sha256::hex_digest(&fs::read(&executable).unwrap()),
+            config_path: config.to_string_lossy().into_owned(),
+            config_sha256: sha256::hex_digest(&fs::read(&config).unwrap()),
+            supported_kinds: vec!["database_schema".into()],
+        }
+    }
+
+    fn install_registry(
+        roots: &AuthorityRoots,
+        provider: ResourceProviderRegistrationV1,
+        replace: bool,
+    ) {
+        let registry = ResourceProviderRegistryV1 {
+            providers: vec![provider],
+            updated_at: CREATED_AT.into(),
+        };
+        let path = provider_registry_path(roots);
+        if replace {
+            authority::atomic_replace_jcs(&path, &registry, 0o600).unwrap();
+        } else {
+            authority::atomic_create_jcs(&path, &registry, 0o600).unwrap();
+        }
+    }
+
+    fn close_evidence() -> ResourceReleaseEvidenceV1 {
+        ResourceReleaseEvidenceV1 {
+            broker_close_sha256: "b".repeat(64),
+            runtime_empty_sha256: "c".repeat(64),
+        }
+    }
+
+    #[test]
+    fn verified_provider_fds_survive_executable_and_config_rename() {
+        let temp = TestRoot::new("provider-fd-race");
+        let evidence = temp.0.join("evidence");
+        fs::write(&evidence, "b".repeat(64)).unwrap();
+        let provider = provider_fixture(&temp, "trusted", &evidence, None);
+        let files = open_verified_provider_files(&provider).unwrap();
+        let executable = PathBuf::from(&provider.executable_path);
+        let config = PathBuf::from(&provider.config_path);
+        fs::rename(&executable, temp.0.join("verified-provider")).unwrap();
+        fs::rename(&config, temp.0.join("verified-config")).unwrap();
+        fs::write(&executable, "#!/bin/sh\nexit 97\n").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(&config, b"{\"evidence\":\"malicious\"}\n").unwrap();
+        fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
+        let request = provider_request(
+            "create",
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            SESSION_ID,
+            "database_schema_test",
+            None,
+        );
+        let receipt = invoke_provider_with_files(&provider, request, files).unwrap();
+        assert_eq!(receipt.provider_evidence_sha256, "b".repeat(64));
+    }
+
+    #[test]
+    fn invalid_registry_does_not_publish_resource_root_and_retry_is_possible() {
+        let temp = TestRoot::new("invalid-registry");
+        let (roots, receipts) = fixture_roots(&temp);
+        assert!(allocate_resources(
+            &roots,
+            REPOSITORY_ID,
+            SESSION_ID,
+            &decisions(&["database_schema"]),
+            &receipts,
+            CREATED_AT,
+        )
+        .is_err());
+        let resource_root = roots
+            .data
+            .join(REPOSITORY_ID)
+            .join("resources")
+            .join(SESSION_ID);
+        assert!(!resource_root.exists());
+        let evidence = temp.0.join("retry-evidence");
+        fs::write(&evidence, "b".repeat(64)).unwrap();
+        install_registry(
+            &roots,
+            provider_fixture(&temp, "retry", &evidence, None),
+            false,
+        );
+        let resources = allocate_resources(
+            &roots,
+            REPOSITORY_ID,
+            SESSION_ID,
+            &decisions(&["database_schema"]),
+            &receipts,
+            CREATED_AT,
+        )
+        .unwrap();
+        assert_eq!(resources.allocations.len(), 1);
+    }
+
+    #[test]
+    fn publication_failure_rolls_back_every_allocation() {
+        let temp = TestRoot::new("publication-rollback");
+        let (roots, receipts) = fixture_roots(&temp);
+        let evidence = temp.0.join("publication-evidence");
+        fs::write(&evidence, "b".repeat(64)).unwrap();
+        install_registry(
+            &roots,
+            provider_fixture(
+                &temp,
+                "publication",
+                &evidence,
+                Some(&receipts.join("resource-inventory-v1.json")),
+            ),
+            false,
+        );
+        let error = allocate_resources(
+            &roots,
+            REPOSITORY_ID,
+            SESSION_ID,
+            &decisions(&[
+                "port",
+                "temp_dir",
+                "build_dir",
+                "log_dir",
+                "cache_dir",
+                "database_schema",
+            ]),
+            &receipts,
+            CREATED_AT,
+        )
+        .unwrap_err();
+        assert!(error.contains("create-once publish"));
+        let inventory: AllocationInventoryV1 =
+            read_secure_jcs(&receipts.join("resource-inventory-v1.json"), None).unwrap();
+        assert_eq!(inventory.allocations.len(), 6);
+        assert!(
+            inventory
+                .allocations
+                .iter()
+                .all(|allocation| allocation.state == "released")
+        );
+        assert!(!roots
+            .data
+            .join(REPOSITORY_ID)
+            .join("resources")
+            .join(SESSION_ID)
+            .exists());
+    }
+
+    #[test]
+    fn deletion_intent_reconciles_crash_after_delete_before_receipt() {
+        let temp = TestRoot::new("delete-intent-crash");
+        let (roots, receipts) = fixture_roots(&temp);
+        let mut resources = allocate_resources(
+            &roots,
+            REPOSITORY_ID,
+            SESSION_ID,
+            &decisions(&["temp_dir"]),
+            &receipts,
+            CREATED_AT,
+        )
+        .unwrap();
+        let allocation = resources.allocations[0].clone();
+        resources
+            .persist_deletion_intent(
+                &allocation,
+                "release",
+                Some(&close_evidence()),
+                CREATED_AT,
+            )
+            .unwrap();
+        remove_private_tree(Path::new(&allocation.value), roots.euid).unwrap();
+        drop(resources);
+        let first = release_resources(
+            &roots,
+            REPOSITORY_ID,
+            SESSION_ID,
+            &receipts,
+            &close_evidence(),
+            CREATED_AT,
+        )
+        .unwrap();
+        let second = release_resources(
+            &roots,
+            REPOSITORY_ID,
+            SESSION_ID,
+            &receipts,
+            &close_evidence(),
+            CREATED_AT,
+        )
+        .unwrap();
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn provider_registration_is_pinned_for_live_session() {
+        let temp = TestRoot::new("provider-pin");
+        let (roots, receipts) = fixture_roots(&temp);
+        let original_evidence = temp.0.join("original-evidence");
+        fs::write(&original_evidence, "b".repeat(64)).unwrap();
+        install_registry(
+            &roots,
+            provider_fixture(&temp, "original", &original_evidence, None),
+            false,
+        );
+        let resources = allocate_resources(
+            &roots,
+            REPOSITORY_ID,
+            SESSION_ID,
+            &decisions(&["database_schema"]),
+            &receipts,
+            CREATED_AT,
+        )
+        .unwrap();
+        let replacement_evidence = temp.0.join("replacement-evidence");
+        fs::write(&replacement_evidence, "c".repeat(64)).unwrap();
+        install_registry(
+            &roots,
+            provider_fixture(&temp, "replacement", &replacement_evidence, None),
+            true,
+        );
+        drop(resources);
+        let resources =
+            load_resources(&roots, REPOSITORY_ID, SESSION_ID, &receipts).unwrap();
+        let inspected = resources.inspect(&roots).unwrap();
+        assert_eq!(inspected[0].provider_evidence_sha256, "b".repeat(64));
+    }
+
+    #[test]
+    fn database_inspect_rejects_stable_evidence_mismatch() {
+        let temp = TestRoot::new("database-evidence");
+        let (roots, receipts) = fixture_roots(&temp);
+        let evidence = temp.0.join("mutable-provider-evidence");
+        fs::write(&evidence, "b".repeat(64)).unwrap();
+        install_registry(
+            &roots,
+            provider_fixture(&temp, "evidence", &evidence, None),
+            false,
+        );
+        let resources = allocate_resources(
+            &roots,
+            REPOSITORY_ID,
+            SESSION_ID,
+            &decisions(&["database_schema"]),
+            &receipts,
+            CREATED_AT,
+        )
+        .unwrap();
+        fs::write(&evidence, "c".repeat(64)).unwrap();
+        let error = resources.inspect(&roots).unwrap_err();
+        assert!(error.contains("provider identity drifted"));
+    }
+
+    #[test]
+    fn rollback_delete_receipts_and_terminal_inventory_are_durable() {
+        let temp = TestRoot::new("rollback-proof");
+        let (roots, receipts) = fixture_roots(&temp);
+        let mut resources = allocate_resources(
+            &roots,
+            REPOSITORY_ID,
+            SESSION_ID,
+            &decisions(&["temp_dir", "build_dir"]),
+            &receipts,
+            CREATED_AT,
+        )
+        .unwrap();
+        resources.rollback_unpublished(roots.euid).unwrap();
+        let inventory: AllocationInventoryV1 =
+            read_secure_jcs(&receipts.join("resource-inventory-v1.json"), None).unwrap();
+        for allocation in &inventory.allocations {
+            assert_eq!(allocation.state, "released");
+            let digest = allocation.delete_receipt_sha256.as_deref().unwrap();
+            read_receipt(
+                &receipts.join(format!(
+                    "{}-delete-receipt-v1.json",
+                    allocation.allocation_id
+                )),
+                digest,
+            )
+            .unwrap();
+        }
+        assert!(!roots
+            .data
+            .join(REPOSITORY_ID)
+            .join("resources")
+            .join(SESSION_ID)
+            .exists());
+    }
+
+    #[test]
+    fn close_bound_release_is_idempotent_and_rejects_evidence_drift() {
+        let temp = TestRoot::new("close-bound-release");
+        let (roots, receipts) = fixture_roots(&temp);
+        let resources = allocate_resources(
+            &roots,
+            REPOSITORY_ID,
+            SESSION_ID,
+            &decisions(&["port"]),
+            &receipts,
+            CREATED_AT,
+        )
+        .unwrap();
+        drop(resources);
+        let evidence = close_evidence();
+        let first = release_resources(
+            &roots,
+            REPOSITORY_ID,
+            SESSION_ID,
+            &receipts,
+            &evidence,
+            CREATED_AT,
+        )
+        .unwrap();
+        let second = release_resources(
+            &roots,
+            REPOSITORY_ID,
+            SESSION_ID,
+            &receipts,
+            &evidence,
+            CREATED_AT,
+        )
+        .unwrap();
+        assert_eq!(first, second);
+        let drifted = ResourceReleaseEvidenceV1 {
+            broker_close_sha256: "d".repeat(64),
+            runtime_empty_sha256: evidence.runtime_empty_sha256,
+        };
+        assert!(release_resources(
+            &roots,
+            REPOSITORY_ID,
+            SESSION_ID,
+            &receipts,
+            &drifted,
+            CREATED_AT,
+        )
+        .unwrap_err()
+        .contains("different close evidence"));
+    }
 }
