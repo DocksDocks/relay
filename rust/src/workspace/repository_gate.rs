@@ -635,27 +635,11 @@ pub fn admit_ext4_path(path: &Path) -> Result<MountAdmission, String> {
 pub fn admit_ext4_fd(file: &File) -> Result<MountAdmission, String> {
     #[cfg(target_os = "linux")]
     {
-        let mut stat = std::mem::MaybeUninit::<libc::statx>::zeroed();
-        let result = unsafe {
-            libc::statx(
-                file.as_raw_fd(),
-                c"".as_ptr(),
-                libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
-                libc::STATX_MNT_ID,
-                stat.as_mut_ptr(),
-            )
-        };
-        if result != 0 {
-            return Err(format!(
-                "statx STATX_MNT_ID failed: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-        let stat = unsafe { stat.assume_init() };
-        if stat.stx_mask & libc::STATX_MNT_ID == 0 {
-            return Err("statx did not report STATX_MNT_ID".into());
-        }
-        let mount_id = stat.stx_mnt_id;
+        let mount_id = super::platform::linux::statx_fd_mount_id(
+            file.as_raw_fd(),
+            "statx STATX_MNT_ID failed",
+            "statx did not report STATX_MNT_ID",
+        )?;
         let mut text = String::new();
         File::open("/proc/self/mountinfo")
             .and_then(|mut f| f.read_to_string(&mut text))

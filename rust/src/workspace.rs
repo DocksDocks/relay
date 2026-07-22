@@ -1001,27 +1001,6 @@ fn verify_open_file_identity(path: &Path, file: &File, label: &str) -> Result<()
 }
 
 #[cfg(target_os = "linux")]
-fn fd_mount_id(file: &File, label: &str) -> Result<u64, String> {
-    let mut statx = unsafe { std::mem::zeroed::<libc::statx>() };
-    let rc = unsafe {
-        libc::statx(
-            file.as_raw_fd(),
-            c"".as_ptr(),
-            libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
-            libc::STATX_MNT_ID,
-            &mut statx,
-        )
-    };
-    if rc != 0 || statx.stx_mask & libc::STATX_MNT_ID == 0 {
-        return Err(format!(
-            "statx mount identity for {label}: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    Ok(statx.stx_mnt_id)
-}
-
-#[cfg(target_os = "linux")]
 fn adopt_running_relay_fd(fd: RawFd) -> Result<File, String> {
     if fd <= libc::STDERR_FILENO {
         return Err("sealed relay FD is not above stdio".into());
@@ -1037,8 +1016,15 @@ fn adopt_running_relay_fd(fd: RawFd) -> Result<File, String> {
         .map_err(|error| format!("fstat running relay executable: {error}"))?;
     if sealed.dev() != running.dev()
         || sealed.ino() != running.ino()
-        || fd_mount_id(&file, "sealed relay FD")?
-            != fd_mount_id(&running_file, "running relay executable")?
+        || platform::linux::statx_fd_mount_id(
+            file.as_raw_fd(),
+            "statx mount identity for sealed relay FD",
+            "statx mount identity for sealed relay FD",
+        )? != platform::linux::statx_fd_mount_id(
+            running_file.as_raw_fd(),
+            "statx mount identity for running relay executable",
+            "statx mount identity for running relay executable",
+        )?
     {
         return Err("running relay executable differs from the sealed relay FD identity".into());
     }

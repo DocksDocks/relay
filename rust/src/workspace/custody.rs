@@ -1710,6 +1710,17 @@ fn validate_control_socket(fd: RawFd) -> Result<(), String> {
     Ok(())
 }
 
+fn to_abi_control_len<T: TryFrom<usize>>(value: usize, error: &'static str) -> Result<T, String> {
+    T::try_from(value).map_err(|_| error.to_string())
+}
+
+fn from_abi_control_len<T>(value: T, error: &'static str) -> Result<usize, String>
+where
+    usize: TryFrom<T>,
+{
+    usize::try_from(value).map_err(|_| error.to_string())
+}
+
 #[cfg(target_os = "linux")]
 fn sendmsg_packet(fd: RawFd, bytes: &[u8], rights: &[RawFd]) -> Result<(), String> {
     if rights.len() > 4 {
@@ -1719,24 +1730,40 @@ fn sendmsg_packet(fd: RawFd, bytes: &[u8], rights: &[RawFd]) -> Result<(), Strin
         iov_base: bytes.as_ptr().cast_mut().cast(),
         iov_len: bytes.len(),
     };
-    let control_len = if rights.is_empty() {
-        0
+    let rights_bytes = if rights.is_empty() {
+        None
     } else {
-        unsafe { libc::CMSG_SPACE(std::mem::size_of_val(rights) as u32) as usize }
+        Some(
+            libc::c_uint::try_from(std::mem::size_of_val(rights))
+                .map_err(|_| "custody SCM_RIGHTS payload exceeds C ABI".to_string())?,
+        )
+    };
+    let control_len = match rights_bytes {
+        Some(rights_bytes) => usize::try_from(unsafe { libc::CMSG_SPACE(rights_bytes) })
+            .map_err(|_| "custody SCM_RIGHTS control length does not fit usize".to_string())?,
+        None => 0,
     };
     let words = control_len.div_ceil(std::mem::size_of::<usize>());
     let mut control = vec![0_usize; words];
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
-    if !rights.is_empty() {
+    if let Some(rights_bytes) = rights_bytes {
         msg.msg_control = control.as_mut_ptr().cast();
-        msg.msg_controllen = control_len;
+        msg.msg_controllen = to_abi_control_len(
+            control_len,
+            "custody SCM_RIGHTS control length exceeds msghdr ABI",
+        )?;
         let cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
+        let cmsg_len = usize::try_from(unsafe { libc::CMSG_LEN(rights_bytes) })
+            .map_err(|_| "custody SCM_RIGHTS header length does not fit usize".to_string())?;
         unsafe {
             (*cmsg).cmsg_level = libc::SOL_SOCKET;
             (*cmsg).cmsg_type = libc::SCM_RIGHTS;
-            (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of_val(rights) as u32) as usize;
+            (*cmsg).cmsg_len = to_abi_control_len(
+                cmsg_len,
+                "custody SCM_RIGHTS header length exceeds cmsghdr ABI",
+            )?;
             std::ptr::copy_nonoverlapping(
                 rights.as_ptr(),
                 libc::CMSG_DATA(cmsg).cast(),
@@ -1768,17 +1795,31 @@ fn recvmsg_packet(fd: RawFd) -> Result<RecvmsgPacket, String> {
         iov_base: bytes.as_mut_ptr().cast(),
         iov_len: bytes.len(),
     };
-    let control_len = unsafe {
-        libc::CMSG_SPACE(std::mem::size_of::<libc::ucred>() as u32)
-            + libc::CMSG_SPACE((4 * std::mem::size_of::<RawFd>()) as u32)
-    } as usize;
+    let credentials_bytes = libc::c_uint::try_from(std::mem::size_of::<libc::ucred>())
+        .map_err(|_| "custody SCM_CREDENTIALS payload exceeds C ABI".to_string())?;
+    let rights_bytes = libc::c_uint::try_from(4 * std::mem::size_of::<RawFd>())
+        .map_err(|_| "custody SCM_RIGHTS payload exceeds C ABI".to_string())?;
+    let credentials_space = usize::try_from(unsafe { libc::CMSG_SPACE(credentials_bytes) })
+        .map_err(|_| "custody SCM_CREDENTIALS control length does not fit usize".to_string())?;
+    let rights_space = usize::try_from(unsafe { libc::CMSG_SPACE(rights_bytes) })
+        .map_err(|_| "custody SCM_RIGHTS control length does not fit usize".to_string())?;
+    let control_len = credentials_space
+        .checked_add(rights_space)
+        .ok_or_else(|| "custody ancillary control length overflow".to_string())?;
+    let credentials_len = usize::try_from(unsafe { libc::CMSG_LEN(credentials_bytes) })
+        .map_err(|_| "custody SCM_CREDENTIALS length does not fit usize".to_string())?;
+    let rights_header_len = usize::try_from(unsafe { libc::CMSG_LEN(0) })
+        .map_err(|_| "custody SCM_RIGHTS header length does not fit usize".to_string())?;
     let words = control_len.div_ceil(std::mem::size_of::<usize>());
     let mut control = vec![0_usize; words];
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
     msg.msg_control = control.as_mut_ptr().cast();
-    msg.msg_controllen = control_len;
+    msg.msg_controllen = to_abi_control_len(
+        control_len,
+        "custody ancillary control length exceeds msghdr ABI",
+    )?;
     let count = unsafe { libc::recvmsg(fd, &mut msg, libc::MSG_CMSG_CLOEXEC) };
     if count == 0 {
         return Err("custody control EOF".to_string());
@@ -1798,14 +1839,15 @@ fn recvmsg_packet(fd: RawFd) -> Result<RecvmsgPacket, String> {
     let mut cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
     while !cmsg.is_null() {
         unsafe {
+            let cmsg_len = from_abi_control_len(
+                (*cmsg).cmsg_len,
+                "custody ancillary length does not fit usize",
+            )?;
             if (*cmsg).cmsg_level != libc::SOL_SOCKET {
                 return Err("custody packet has non-socket ancillary data".to_string());
             }
             if (*cmsg).cmsg_type == libc::SCM_CREDENTIALS {
-                if credentials.is_some()
-                    || (*cmsg).cmsg_len
-                        != libc::CMSG_LEN(std::mem::size_of::<libc::ucred>() as u32) as usize
-                {
+                if credentials.is_some() || cmsg_len != credentials_len {
                     return Err(
                         "custody packet SCM_CREDENTIALS is duplicate or malformed".to_string()
                     );
@@ -1814,20 +1856,21 @@ fn recvmsg_packet(fd: RawFd) -> Result<RecvmsgPacket, String> {
             } else if (*cmsg).cmsg_type == libc::SCM_RIGHTS {
                 duplicate_rights |= saw_rights;
                 saw_rights = true;
-                let data_len = (*cmsg)
-                    .cmsg_len
-                    .checked_sub(libc::CMSG_LEN(0) as usize)
+                let data_len = cmsg_len
+                    .checked_sub(rights_header_len)
                     .ok_or_else(|| "custody SCM_RIGHTS length underflow".to_string())?;
-                if data_len % std::mem::size_of::<RawFd>() != 0 {
-                    return Err("custody SCM_RIGHTS length is malformed".to_string());
-                }
-                let count = data_len / std::mem::size_of::<RawFd>();
-                if count > 4 {
-                    return Err("custody packet has too many SCM_RIGHTS FDs".to_string());
-                }
+                let fd_size = std::mem::size_of::<RawFd>();
+                let count = data_len / fd_size;
+                let has_partial_fd = data_len % fd_size != 0;
                 let data = libc::CMSG_DATA(cmsg).cast::<RawFd>();
                 for index in 0..count {
                     rights.push(OwnedFd::from_raw_fd(*data.add(index)));
+                }
+                if has_partial_fd {
+                    return Err("custody SCM_RIGHTS length is malformed".to_string());
+                }
+                if count > 4 {
+                    return Err("custody packet has too many SCM_RIGHTS FDs".to_string());
                 }
             } else {
                 return Err("custody packet has unknown ancillary data".to_string());

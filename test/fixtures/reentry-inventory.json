@@ -180,28 +180,12 @@
       "anchor": "libc::sendmsg("
     },
     {
-      "id": "filesystem_probe:plugins/session-relay/rust/src/workspace.rs:fd_mount_id:statx:1",
-      "file": "plugins/session-relay/rust/src/workspace.rs",
-      "function": "fd_mount_id",
-      "category": "filesystem_probe",
-      "operation": "statx",
-      "anchor": "libc::statx("
-    },
-    {
-      "id": "filesystem_probe:plugins/session-relay/rust/src/workspace/platform/linux.rs:require_ext4_fd:statx:1",
-      "file": "plugins/session-relay/rust/src/workspace/platform/linux.rs",
-      "function": "require_ext4_fd",
-      "category": "filesystem_probe",
-      "operation": "statx",
-      "anchor": "libc::statx("
-    },
-    {
       "id": "filesystem_probe:plugins/session-relay/rust/src/workspace/platform/linux.rs:statx_fd_mount_id:statx:1",
       "file": "plugins/session-relay/rust/src/workspace/platform/linux.rs",
       "function": "statx_fd_mount_id",
       "category": "filesystem_probe",
       "operation": "statx",
-      "anchor": "libc::statx("
+      "anchor": "statx("
     },
     {
       "id": "filesystem_probe:plugins/session-relay/rust/src/workspace/platform/linux.rs:statx_path_mount_id:statx:1",
@@ -209,15 +193,7 @@
       "function": "statx_path_mount_id",
       "category": "filesystem_probe",
       "operation": "statx",
-      "anchor": "libc::statx("
-    },
-    {
-      "id": "filesystem_probe:plugins/session-relay/rust/src/workspace/repository_gate.rs:admit_ext4_fd:statx:1",
-      "file": "plugins/session-relay/rust/src/workspace/repository_gate.rs",
-      "function": "admit_ext4_fd",
-      "category": "filesystem_probe",
-      "operation": "statx",
-      "anchor": "libc::statx("
+      "anchor": "statx("
     },
     {
       "id": "git:plugins/session-relay/rust/src/fanout/git.rs:add_worktree:git_api:1",

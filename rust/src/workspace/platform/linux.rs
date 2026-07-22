@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-const CGROUP2_SUPER_MAGIC: libc::c_long = 0x6367_7270;
+const CGROUP2_SUPER_MAGIC: u64 = 0x6367_7270;
 const LANDLOCK_CREATE_RULESET_VERSION: u32 = 1;
 const LANDLOCK_RULE_PATH_BENEATH: i32 = 1;
 const LANDLOCK_ACCESS_FS_EXECUTE: u64 = 1 << 0;
@@ -59,6 +59,10 @@ const P_PIDFD: libc::idtype_t = 3;
 const EMPTY_DEADLINE: Duration = Duration::from_secs(10);
 const PREPARED_DEADLINE: Duration = Duration::from_secs(10);
 const GRACEFUL_STOP_DEADLINE: Duration = Duration::from_millis(500);
+
+fn is_cgroup2_statfs(statfs: &libc::statfs) -> bool {
+    u64::try_from(statfs.f_type) == Ok(CGROUP2_SUPER_MAGIC)
+}
 
 #[repr(C)]
 struct LandlockRulesetAttr {
@@ -203,24 +207,11 @@ pub struct Ext4MountIdentity {
 }
 
 pub fn require_ext4_fd(fd: RawFd) -> Result<Ext4MountIdentity, String> {
-    let mut statx: libc::statx = unsafe { std::mem::zeroed() };
-    let empty = b"\0";
-    let rc = unsafe {
-        libc::statx(
-            fd,
-            empty.as_ptr().cast(),
-            libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
-            libc::STATX_MNT_ID,
-            &mut statx,
-        )
-    };
-    if rc != 0 || statx.stx_mask & libc::STATX_MNT_ID == 0 {
-        return Err(format!(
-            "authoritative FD has no STATX_MNT_ID: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    let mount_id = statx.stx_mnt_id;
+    let mount_id = statx_fd_mount_id(
+        fd,
+        "authoritative FD has no STATX_MNT_ID",
+        "authoritative FD has no STATX_MNT_ID",
+    )?;
     let mountinfo = fs::read_to_string("/proc/self/mountinfo")
         .map_err(|error| format!("read mountinfo for authoritative FD: {error}"))?;
     let mut found = None;
@@ -379,7 +370,11 @@ pub fn reconcile_empty_delegated_cgroup(session_id: &str) -> Result<(), String> 
         return Err("cgroup delegation identity changed while opening it".into());
     }
     let root_path_mount = statx_path_mount_id(&root)?;
-    let root_fd_mount = statx_fd_mount_id(root_fd.as_raw_fd())?;
+    let root_fd_mount = statx_fd_mount_id(
+        root_fd.as_raw_fd(),
+        "opened cgroup FD has no STATX_MNT_ID",
+        "opened cgroup FD has no STATX_MNT_ID",
+    )?;
     if root_path_mount != root_fd_mount {
         return Err("cgroup delegation mount identity changed while opening it".into());
     }
@@ -400,7 +395,11 @@ pub fn reconcile_empty_delegated_cgroup(session_id: &str) -> Result<(), String> 
         return Err("session cgroup identity changed while opening it".into());
     }
     let leaf_path_mount = statx_path_mount_id(&leaf)?;
-    let leaf_fd_mount = statx_fd_mount_id(leaf_fd.as_raw_fd())?;
+    let leaf_fd_mount = statx_fd_mount_id(
+        leaf_fd.as_raw_fd(),
+        "opened cgroup FD has no STATX_MNT_ID",
+        "opened cgroup FD has no STATX_MNT_ID",
+    )?;
     if leaf_path_mount != leaf_fd_mount || leaf_fd_mount != root_fd_mount {
         return Err("session cgroup mount identity changed while opening it".into());
     }
@@ -1159,8 +1158,7 @@ pub fn validate_bootstrap_fds(fds: &[OwnedFd; 4]) -> Result<(), String> {
     }
     for fd in &fds[1..] {
         let mut statfs: libc::statfs = unsafe { std::mem::zeroed() };
-        if unsafe { libc::fstatfs(fd.as_raw_fd(), &mut statfs) } != 0
-            || statfs.f_type != CGROUP2_SUPER_MAGIC
+        if unsafe { libc::fstatfs(fd.as_raw_fd(), &mut statfs) } != 0 || !is_cgroup2_statfs(&statfs)
         {
             return Err("BOOTSTRAP cgroup FDs are not on cgroup v2".to_string());
         }
@@ -1206,9 +1204,7 @@ fn validate_delegation(root: &Path) -> Result<(), String> {
     validate_cgroup_dir(root, unsafe { libc::geteuid() })?;
     let mut statfs: libc::statfs = unsafe { std::mem::zeroed() };
     let croot = c_path(root)?;
-    if unsafe { libc::statfs(croot.as_ptr(), &mut statfs) } != 0
-        || statfs.f_type != CGROUP2_SUPER_MAGIC
-    {
+    if unsafe { libc::statfs(croot.as_ptr(), &mut statfs) } != 0 || !is_cgroup2_statfs(&statfs) {
         return Err("custody delegation is not unified cgroup v2".to_string());
     }
     for required in ["cgroup.controllers", "cgroup.subtree_control"] {
@@ -2414,46 +2410,35 @@ fn fstat_full(fd: RawFd) -> Result<libc::stat, String> {
     Ok(stat)
 }
 
-fn statx_fd_mount_id(fd: RawFd) -> Result<u64, String> {
-    let mut statx: libc::statx = unsafe { std::mem::zeroed() };
-    let empty = b"\0";
-    if unsafe {
-        libc::statx(
-            fd,
-            empty.as_ptr().cast(),
-            libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
-            libc::STATX_MNT_ID,
-            &mut statx,
-        )
-    } != 0
-        || statx.stx_mask & libc::STATX_MNT_ID == 0
-    {
-        return Err(format!(
-            "opened cgroup FD has no STATX_MNT_ID: {}",
-            std::io::Error::last_os_error()
-        ));
+pub(crate) fn statx_fd_mount_id(
+    fd: RawFd,
+    syscall_error: &str,
+    missing_mask_error: &str,
+) -> Result<u64, String> {
+    let fd = unsafe { rustix::fd::BorrowedFd::borrow_raw(fd) };
+    let statx = rustix::fs::statx(
+        fd,
+        "",
+        rustix::fs::AtFlags::EMPTY_PATH | rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+        rustix::fs::StatxFlags::MNT_ID,
+    )
+    .map_err(|error| format!("{syscall_error}: {error}"))?;
+    if statx.stx_mask & rustix::fs::StatxFlags::MNT_ID.bits() == 0 {
+        return Err(missing_mask_error.to_string());
     }
     Ok(statx.stx_mnt_id)
 }
 
 fn statx_path_mount_id(path: &Path) -> Result<u64, String> {
-    let path = c_path(path)?;
-    let mut statx: libc::statx = unsafe { std::mem::zeroed() };
-    if unsafe {
-        libc::statx(
-            libc::AT_FDCWD,
-            path.as_ptr(),
-            libc::AT_SYMLINK_NOFOLLOW,
-            libc::STATX_MNT_ID,
-            &mut statx,
-        )
-    } != 0
-        || statx.stx_mask & libc::STATX_MNT_ID == 0
-    {
-        return Err(format!(
-            "cgroup path has no STATX_MNT_ID: {}",
-            std::io::Error::last_os_error()
-        ));
+    let statx = rustix::fs::statx(
+        rustix::fs::CWD,
+        path,
+        rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+        rustix::fs::StatxFlags::MNT_ID,
+    )
+    .map_err(|error| format!("cgroup path has no STATX_MNT_ID: {error}"))?;
+    if statx.stx_mask & rustix::fs::StatxFlags::MNT_ID.bits() == 0 {
+        return Err("cgroup path has no STATX_MNT_ID".to_string());
     }
     Ok(statx.stx_mnt_id)
 }
