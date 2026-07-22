@@ -129,8 +129,10 @@ pub fn preserve_workspace_with_roots(roots:&AuthorityRoots,request_file:&Path,re
  Ok(output)
 }
 
-pub fn start_workspace(request_file:&Path,request_sha256:&str,coordinator_capability_file:Option<&Path>)->Result<StartedWorkspace,String>{let roots=SystemAuthorityRootProvider.roots()?;start_workspace_with_roots(&roots,request_file,request_sha256,coordinator_capability_file)}
-pub fn start_workspace_with_roots(roots:&AuthorityRoots,request_file:&Path,request_sha256:&str,coordinator_capability_file:Option<&Path>)->Result<StartedWorkspace,String>{
+pub fn start_workspace(request_file:&Path,request_sha256:&str,coordinator_capability_file:Option<&Path>)->Result<StartedWorkspace,String>{let roots=SystemAuthorityRootProvider.roots()?;let executable=std::env::current_exe().map_err(|e|format!("resolve relay executable: {e}"))?;start_workspace_with_roots_and_executable(&roots,request_file,request_sha256,coordinator_capability_file,&executable)}
+pub fn start_workspace_with_roots(roots:&AuthorityRoots,request_file:&Path,request_sha256:&str,coordinator_capability_file:Option<&Path>)->Result<StartedWorkspace,String>{let executable=std::env::current_exe().map_err(|e|format!("resolve relay executable: {e}"))?;start_workspace_with_roots_and_executable(roots,request_file,request_sha256,coordinator_capability_file,&executable)}
+pub fn start_workspace_with_roots_and_executable(roots:&AuthorityRoots,request_file:&Path,request_sha256:&str,coordinator_capability_file:Option<&Path>,relay_executable:&Path)->Result<StartedWorkspace,String>{
+ if !relay_executable.is_absolute()||fs::canonicalize(relay_executable).map_err(|e|format!("canonicalize relay executable: {e}"))?!=relay_executable{return Err("relay executable must be an absolute canonical path".into())}let executable_metadata=fs::symlink_metadata(relay_executable).map_err(|e|format!("inspect relay executable: {e}"))?;if !executable_metadata.is_file()||executable_metadata.permissions().mode()&0o111==0{return Err("relay executable must be an executable regular file".into())}
  let request:WorkspaceStartRequestV1=schema::read_jcs_file(request_file,Some(request_sha256))?;
  let wip:WipReceiptV1=schema::read_jcs_file(Path::new(&request.wip_receipt_path),Some(&request.wip_receipt_sha256))?;
  if wip.request_sha256.is_empty()||wip.base_commit!=request.base_commit{return Err("start request and WIP receipt base/provenance differ".into())}
@@ -177,10 +179,10 @@ pub fn start_workspace_with_roots(roots:&AuthorityRoots,request_file:&Path,reque
  let session_dir=manifest_file.parent().unwrap();let broker_socket=git::actual_private_git_dir(&worktree_root)?.join("session-relay/broker-v1.sock");let capability_file=git::actual_private_git_dir(&worktree_root)?.join("session-relay/worker-capabilities/00000000000000000001.json");
  authority::ensure_private_directory(capability_file.parent().unwrap(),roots.euid)?;let (worker_capability,record)=mint_worker(&repository.identity.repository_id,&request.request_id,1,&broker_socket,&now,"9999-12-31T23:59:59.999Z")?;
  authority::atomic_create_jcs(&capability_file,&worker_capability,0o600)?;authority::atomic_create_jcs(&session_dir.join("worker-capability-record-v1.json"),&record,0o600)?;
- create_git_shim(&worktree_root,&capability_file)?;
+ create_git_shim(&worktree_root,&capability_file,relay_executable)?;
  let event=JournalEventV1{sequence:1,previous_sha256:None,kind:"WipApplied".into(),payload:JcsValue::Object(BTreeMap::from([("applied_wip_commit".into(),JcsValue::String(applied.clone()))])),created_at:now.clone()};let head=authority::append_journal(session_dir,&event,1,None)?;
  let manifest=manifest_for(&request,&repository,&worktree_root,&branch_ref,WorkspaceState::LeaseHeld,Some(&worktree_identity),Some(&applied),Some(&capability_file),Some(&lease_path),&now,"1",Some(&head));authority::atomic_replace_jcs(&manifest_file,&manifest,0o600)?;
- start_git_broker(roots,session_dir,&worktree_root,&branch_ref,&capability_file,&lease)?;
+ start_git_broker(roots,relay_executable,session_dir,&worktree_root,&branch_ref,&capability_file,&lease)?;
  drop(gate);
  let authority_record=authority.read_repository(&repository.identity.repository_id)?;let result=WorkspaceStartResultV1{session_id:request.request_id.clone(),repository_id:repository.identity.repository_id.clone(),worktree_root:worktree_root.to_string_lossy().into_owned(),branch_ref,coordinator_capability_file:capability_path.to_string_lossy().into_owned(),coordinator_generation:authority_record.current_generation,bootstrap:match bootstrap{BootstrapOutcome::Created=>"created",BootstrapOutcome::Existing=>"existing"}.into()};
  Ok(StartedWorkspace{result,lease,manifest_file,worker_capability_file:capability_file})
@@ -199,8 +201,8 @@ fn reject_overlapping_session_claims(sessions:&Path,request:&WorkspaceStartReque
  Ok(())
 }
 
-fn create_git_shim(worktree:&Path,capability_file:&Path)->Result<PathBuf,String>{
- let private=git::actual_private_git_dir(worktree)?;let bin=private.join("session-relay/bin");authority::ensure_private_directory(&bin,unsafe{libc::geteuid()})?;let shim=bin.join("git");let executable=std::env::current_exe().map_err(|e|format!("resolve relay executable: {e}"))?;let quote=|value:&Path|value.to_string_lossy().replace('\'',"'\"'\"'");let body=format!("#!/bin/sh\nexec '{}' workspace __broker-client --worker-capability-file '{}' -- \"$@\"\n",quote(&executable),quote(capability_file));fs::write(&shim,body).map_err(|e|format!("write Git shim: {e}"))?;fs::set_permissions(&shim,fs::Permissions::from_mode(0o500)).map_err(|e|format!("chmod Git shim: {e}"))?;Ok(shim)
+fn create_git_shim(worktree:&Path,capability_file:&Path,relay_executable:&Path)->Result<PathBuf,String>{
+ let private=git::actual_private_git_dir(worktree)?;let bin=private.join("session-relay/bin");authority::ensure_private_directory(&bin,unsafe{libc::geteuid()})?;let shim=bin.join("git");let quote=|value:&Path|value.to_string_lossy().replace('\'',"'\"'\"'");let body=format!("#!/bin/sh\nexec '{}' workspace __broker-client --worker-capability-file '{}' -- \"$@\"\n",quote(relay_executable),quote(capability_file));write_private_bytes(&shim,body.as_bytes())?;fs::set_permissions(&shim,fs::Permissions::from_mode(0o500)).map_err(|e|format!("chmod Git shim: {e}"))?;Ok(shim)
 }
 
 pub fn list_workspaces(repository_path:&Path,capability_file:&Path)->Result<JcsValue,String>{
@@ -254,9 +256,9 @@ pub fn execute(command: WorkspaceCommand) -> Result<String, String> {
     Ok(format!("{}\n",schema::serialize_jcs(&value)))
 }
 
-fn start_git_broker(roots:&AuthorityRoots,session_dir:&Path,worktree:&Path,branch_ref:&str,capability_file:&Path,lease:&WorkspaceLease)->Result<(),String>{
- let executable=std::env::current_exe().map_err(|e|format!("resolve broker executable: {e}"))?;let fd=lease.as_raw_fd();let old=unsafe{libc::fcntl(fd,libc::F_GETFD)};if old<0{return Err(format!("inspect lease descriptor flags: {}",std::io::Error::last_os_error()))}if unsafe{libc::fcntl(fd,libc::F_SETFD,old&!libc::FD_CLOEXEC)}<0{return Err(format!("make lease inheritable for broker: {}",std::io::Error::last_os_error()))}
- let child=Command::new(executable).args(["workspace","__broker","--authority-root",roots.authority.to_str().ok_or_else(||"authority root is not UTF-8".to_string())?,"--data-root",roots.data.to_str().ok_or_else(||"data root is not UTF-8".to_string())?,"--session-dir",session_dir.to_str().ok_or_else(||"session dir is not UTF-8".to_string())?,"--worktree",worktree.to_str().ok_or_else(||"worktree is not UTF-8".to_string())?,"--branch-ref",branch_ref,"--worker-capability-file",capability_file.to_str().ok_or_else(||"capability path is not UTF-8".to_string())?,"--lease-fd",&fd.to_string()]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
+fn start_git_broker(roots:&AuthorityRoots,relay_executable:&Path,session_dir:&Path,worktree:&Path,branch_ref:&str,capability_file:&Path,lease:&WorkspaceLease)->Result<(),String>{
+ let fd=lease.as_raw_fd();let old=unsafe{libc::fcntl(fd,libc::F_GETFD)};if old<0{return Err(format!("inspect lease descriptor flags: {}",std::io::Error::last_os_error()))}if unsafe{libc::fcntl(fd,libc::F_SETFD,old&!libc::FD_CLOEXEC)}<0{return Err(format!("make lease inheritable for broker: {}",std::io::Error::last_os_error()))}
+ let child=Command::new(relay_executable).args(["workspace","__broker","--authority-root",roots.authority.to_str().ok_or_else(||"authority root is not UTF-8".to_string())?,"--data-root",roots.data.to_str().ok_or_else(||"data root is not UTF-8".to_string())?,"--session-dir",session_dir.to_str().ok_or_else(||"session dir is not UTF-8".to_string())?,"--worktree",worktree.to_str().ok_or_else(||"worktree is not UTF-8".to_string())?,"--branch-ref",branch_ref,"--worker-capability-file",capability_file.to_str().ok_or_else(||"capability path is not UTF-8".to_string())?,"--lease-fd",&fd.to_string()]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
  unsafe{libc::fcntl(fd,libc::F_SETFD,old)};let _child=child.map_err(|e|format!("spawn Git broker: {e}"))?;
  let capability:WorkerCapabilityV1=schema::read_jcs_file(capability_file,None)?;let deadline=Instant::now()+Duration::from_secs(3);while Instant::now()<deadline{if UnixStream::connect(&capability.broker_socket).is_ok(){return Ok(())}std::thread::sleep(Duration::from_millis(10))}Err("Git broker did not publish its socket within three seconds".into())
 }
