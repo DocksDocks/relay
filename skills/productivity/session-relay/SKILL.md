@@ -5,8 +5,8 @@ user-invocable: true
 allowed-tools: Bash, Read
 metadata:
   pattern: tool-wrapper
-  updated: "2026-07-20"
-  content_hash: "5ab246b23bb2fdc5bf8e2a8ac0e366b7b76f1f7206400148e767d824fe05cd12"
+  updated: "2026-07-22"
+  content_hash: "603ed7aefc35718ccc483cb6f55a47e39798b16652f60759aee0a8366ecf51d7"
 ---
 
 # Session relay
@@ -442,6 +442,8 @@ session-relay spawn <dir> --tool claude|codex --model <model> --effort <effort> 
 - **Billing:** every spawned child is a full agent session on your subscription
   (Claude OAuth / ChatGPT login) — heavier than a wake; spawn deliberately, never
   in loops.
+
+For managed writing, use only the exact nine `session-relay workspace` commands after reading the Linux-only admission, macOS STOP, actors, recovery, integration, and unmanaged-process limits in [`references/workspace.md`](references/workspace.md); this is neither legacy fan-out nor Docks plan-review evidence.
 
 ## Bounded worktree fan-out
 

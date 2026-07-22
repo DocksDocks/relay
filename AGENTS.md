@@ -10,7 +10,7 @@ Cross-session / cross-project / cross-tool agent message bus — the repo's seco
 | `bin/` | the tracked POSIX launcher `relay` only; it resolves `SESSION_RELAY_BIN`, then `session-relay` on `PATH`, then `~/.local/bin/session-relay`, rejecting recursion and otherwise directing the user to `docks-kit` |
 | `hooks/` | `hooks.json` (Claude: SessionStart + UserPromptSubmit → `${CLAUDE_PLUGIN_ROOT}/bin/relay hook`) + `codex-hooks.json` (Codex parallel) |
 | `skills/` | the cross-tool `session-relay` skill (productivity) |
-| `test/` | `selftest.mjs` (deterministic scenario scheduler/aggregator), `selftest-fixture.mjs` (owned-home fixture/cleanup), seven independently owned `scenario-*.mjs` modules (the 133 ordered checks), `fanout-smoke.mjs` (two-leaf lifecycle smoke), and `fake-app-server.mjs` (Codex app-server stub) |
+| `test/` | scenario self-tests plus exact Rust target inventory, recursive process/Git reentry inventory, managed-workspace smoke, legacy fan-out/lifecycle smoke, distribution contracts, and release-evidence contracts |
 | `.claude-plugin/` + `.codex-plugin/` | manifests — versions kept in lockstep with the marketplace entry by `ci.mjs`'s per-plugin gate and `release.mjs` |
 
 ## Scenario self-test topology
@@ -26,6 +26,12 @@ For every future check, choose exactly one owning scenario, update that scenario
 ## Store hygiene
 
 The shared store defaults to `~/.agent-relay` (`AGENT_RELAY_HOME`, then legacy `SESSION_RELAY_HOME`, override it). `relay hook` and `relay bus` run a six-hour-throttled sweep: the default inactivity threshold is 14 days, `AGENT_RELAY_GC_DAYS=<days>` overrides it, and `0` disables GC. Collection is all-surfaces-old and held-lock-safe; it enumerates only relay-owned mailbox/marker/watcher/resume-lock/spawn-log files, never the invoking id, and removes registry/name entries last. Spawn stderr is pumped independently of the short-lived parent and compacted from just over 4 MiB to the newest 3 MiB; `File::create` still truncates the new target before child launch.
+
+## Managed workspace boundary
+
+The exact public workspace surface is `relay workspace preserve|start|list|inspect|handback|integrate|recover|finish|abort`. Relay owns authority, deterministic worktrees/branches, repository gating, lifetime leases, capability-brokered Git, Linux worker-tree custody, claims/resources, integration, recovery, and cleanup. Claude, Codex, and OMP are untrusted launched workers. Managed writing is Linux/ext4 only; macOS is frozen negative admission and blocks managed-workspace release. Arbitrary same-UID shells, IDEs, old binaries, raw Git, and independently launched tools remain unmanaged.
+
+Workspace source gates are registry-declared: one fresh release build feeds both smoke cases and the immutable self-test parity check; four exact Rust target inventories execute every listed case; the recursive reentry inventory classifies every process, FD, signal, Git, filesystem, broker, and platform site. Never accept an ambient or committed binary, ignored/filtered test, hidden platform skip, or unclassified nested site.
 
 ## Worktree fan-out boundary
 
@@ -46,9 +52,11 @@ Generated executables and `SHA256SUMS` are external release artifacts and MUST N
 
 Release discipline: prepare and review source → run `build-binaries.yml` in `validate-only` mode against the exact reviewed commit → retain the verified producer receipt → create the reviewed `session-relay--v<version>` tag → let the tag-triggered workflow stage the public prerelease. Do not install or advertise the prerelease until downstream digests and compatibility are reviewed; stable installation is owned by `docks-kit sync`.
 
+Native producer legs must prove platform behavior before attestation or upload: both Linux runners execute positive cgroup/pidfd/Landlock custody plus smoke against that leg's explicit fresh binary; both macOS runners execute the exact negative-admission test. Preflight verifies the successful native job/runner/step order from GitHub evidence without adding receipt or attestation fields. The artifact contract remains four binary+attestation archives and one checksum artifact.
+
 ## Gates (the registry `rust` + `selftest` capabilities)
 
-`node scripts/ci.mjs --plugin session-relay` validates the source-built Rust host leg, formatting and clippy, the launcher, hook JSON, skills, manifests, distribution contract, and the plugin self-test. It does not compare Cargo output with committed executables or verify an in-tree checksum file; neither artifact belongs in the source tree.
+`node scripts/ci.mjs --plugin session-relay` validates the source-built Rust host leg, formatting and clippy, the launcher, hook JSON, skills, manifests, distribution and unchanged V1 release contracts, all four exact Rust inventories, recursive reentry, both explicit-fresh-binary workspace smokes, and the immutable self-test. It does not compare Cargo output with committed executables or verify an in-tree checksum file; neither artifact belongs in the source tree.
 
 ## Security
 
