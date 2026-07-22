@@ -156,6 +156,65 @@ impl ExecutionBackend {
     }
 }
 
+/// Non-serialized handoff from workspace custody into lifecycle consumers.
+/// Legacy lifecycle records deliberately remain byte-for-byte unchanged.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkerTreeBridge {
+    pub session_id: String,
+    pub generation: String,
+    pub backend: String,
+    pub prepared_evidence_sha256: String,
+    pub activated_evidence_sha256: String,
+    pub empty_evidence_sha256: Option<String>,
+}
+
+impl WorkerTreeBridge {
+    pub fn validate_active(&self) -> Result<(), String> {
+        validate_uuid("worker-tree session_id", &self.session_id)?;
+        canonical_u64("worker-tree generation", &self.generation)?;
+        if self.backend != "linux_cgroup_v2_pidfd" {
+            return Err("WorkerTree requires the linux_cgroup_v2_pidfd backend".to_string());
+        }
+        validate_bridge_digest("prepared", &self.prepared_evidence_sha256)?;
+        validate_bridge_digest("activated", &self.activated_evidence_sha256)?;
+        if self.empty_evidence_sha256.is_some() {
+            return Err("active WorkerTree bridge may not claim EMPTY evidence".to_string());
+        }
+        Ok(())
+    }
+
+    pub fn validate_terminal(&self) -> Result<(), String> {
+        self.validate_active_without_empty()?;
+        validate_bridge_digest(
+            "empty",
+            self.empty_evidence_sha256
+                .as_deref()
+                .ok_or_else(|| "terminal WorkerTree bridge requires EMPTY evidence".to_string())?,
+        )
+    }
+
+    fn validate_active_without_empty(&self) -> Result<(), String> {
+        validate_uuid("worker-tree session_id", &self.session_id)?;
+        canonical_u64("worker-tree generation", &self.generation)?;
+        if self.backend != "linux_cgroup_v2_pidfd" {
+            return Err("WorkerTree requires the linux_cgroup_v2_pidfd backend".to_string());
+        }
+        validate_bridge_digest("prepared", &self.prepared_evidence_sha256)?;
+        validate_bridge_digest("activated", &self.activated_evidence_sha256)
+    }
+}
+
+fn validate_bridge_digest(label: &str, digest: &str) -> Result<(), String> {
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return Err(format!("WorkerTree {label} evidence is not lowercase SHA-256"));
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReleaseReceipt {
     pub worker_id: String,

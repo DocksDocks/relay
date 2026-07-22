@@ -17,7 +17,7 @@ use crate::cli::Args;
 use crate::gc;
 use crate::lifecycle::{
     self, Admission, BindingState, ClaimManagedAttach, ClaimOutcome, LifecycleStore, ManagedState,
-    OperationKind,
+    OperationKind, WorkerTreeBridge,
 };
 use crate::store;
 use std::collections::HashMap;
@@ -311,6 +311,22 @@ fn inner(tool: &str, event: HookEvent, input: &str) -> Result<(), String> {
     }
     if let Some(receipt) = drained_receipt {
         receipt.commit();
+    }
+    Ok(())
+}
+
+/// Workspace adapters call this before making a mutation-capable hook surface
+/// visible. Ordinary V1 hooks never enter this bridge and retain their current
+/// output and failure behavior.
+pub fn validate_worker_tree_hook_bridge(
+    expected_session_id: &str,
+    bridge: Option<&WorkerTreeBridge>,
+) -> Result<(), String> {
+    let bridge = bridge
+        .ok_or_else(|| "mutation-capable workspace hook has no WorkerTree custody".to_string())?;
+    bridge.validate_active()?;
+    if bridge.session_id != expected_session_id {
+        return Err("workspace hook WorkerTree session identity changed".to_string());
     }
     Ok(())
 }
