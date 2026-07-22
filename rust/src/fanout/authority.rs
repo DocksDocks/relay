@@ -1,5 +1,6 @@
 use super::git::RepoIdentity;
 use crate::store::{self, Entry};
+use crate::workspace::schema::RepositoryIdentityV1;
 use rustix::fs::{FlockOperation, flock};
 use std::collections::HashMap;
 use std::fs;
@@ -217,6 +218,22 @@ impl FanoutStore {
     pub fn active_leaf_count(&self, root_reservation_id: &str) -> Result<usize, String> {
         self.read_transaction(|records, lifecycle| {
             Ok(active_leaf_count(records, lifecycle, root_reservation_id))
+        })
+    }
+
+    pub fn has_nonterminal_repository(
+        &self,
+        repository: &RepositoryIdentityV1,
+    ) -> Result<bool, String> {
+        self.read_transaction(|records, _| {
+            Ok(records.values().any(|record| {
+                record.repo_dev == repository.common_dir_dev
+                    && record.repo_ino == repository.common_dir_ino
+                    && !matches!(
+                        record.state,
+                        FanoutState::Collected | FanoutState::FailedNoProcess
+                    )
+            }))
         })
     }
 

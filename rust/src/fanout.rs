@@ -12,6 +12,10 @@ pub use authority::{CollectionPhase, FanoutMode, FanoutRecord, FanoutState, Fano
 
 use crate::lifecycle::LifecycleStore;
 use crate::store;
+use crate::workspace::authority::{
+    AuthorityRootProvider, AuthorityRoots, SystemAuthorityRootProvider, WorkspaceAuthority,
+};
+use crate::workspace::repository_gate::RepositoryGate;
 use authority::{
     ReservationRequest, acquire_collection_lock, increment_record_version, lifecycle_worker,
     optional_string, record_by_runtime_session_id, registered_entry, resolve_entry,
@@ -22,6 +26,16 @@ use git::{
     remove_unstarted_worktree, repo_identity, repository_head, validate_sha,
 };
 use std::path::{Path, PathBuf};
+
+fn acquire_legacy_gate(
+    identity: &git::RepoIdentity,
+) -> Result<(RepositoryGate, AuthorityRoots), String> {
+    let roots = SystemAuthorityRootProvider.roots()?;
+    WorkspaceAuthority::new(roots.clone())?;
+    let gate = RepositoryGate::acquire(&roots, identity.workspace_identity())?;
+    gate.refuse_legacy_if_managed(&roots, Path::new(&identity.common_dir))?;
+    Ok((gate, roots))
+}
 
 pub fn prepare_worktree(
     fanout: &FanoutStore,
@@ -42,8 +56,9 @@ pub fn prepare_worktree(
     if target_identity != parent_identity {
         return Err("fanout repository differs from the registered parent".to_string());
     }
+    let (_repository_gate, _roots) = acquire_legacy_gate(&target_identity)?;
     let base_sha = repository_head(&repo)?;
-    validate_sha(&base_sha)?;
+    validate_sha(&base_sha, target_identity.object_format)?;
     let reservation_id = store::uuid_v4();
     let branch = format!("relay/fanout-{reservation_id}");
     let worktrees = fanout.root().join("worktrees");
@@ -103,9 +118,11 @@ pub(crate) fn rollback_before_process_start(
         return Err("fanout worktree path is not the exact reserved path".to_string());
     }
     let worktree = Path::new(&snapshot.worktree);
+    let worktree_identity = repo_identity(worktree)?;
+    let (_repository_gate, _roots) = acquire_legacy_gate(&worktree_identity)?;
     ensure_clean(worktree, "unstarted fanout worktree")?;
     let head = repository_head(worktree)?;
-    if head != snapshot.base_sha || !repo_identity(worktree)?.matches_record(&snapshot) {
+    if head != snapshot.base_sha || !worktree_identity.matches_record(&snapshot) {
         return Err("unstarted fanout worktree changed before rollback".to_string());
     }
     let parent_dir = registered_entry(fanout, &snapshot.parent_session_id)?
@@ -162,9 +179,11 @@ pub fn handback(
         }
         Ok(record.clone())
     })?;
+    let worktree_identity = repo_identity(Path::new(&snapshot.worktree))?;
+    let (_repository_gate, _roots) = acquire_legacy_gate(&worktree_identity)?;
     ensure_clean(Path::new(&snapshot.worktree), "handback worktree")?;
     let head = repository_head(Path::new(&snapshot.worktree))?;
-    validate_sha(&head)?;
+    validate_sha(&head, worktree_identity.object_format)?;
     fanout.transaction(|records, _, _| {
         let mut record = records
             .get(&snapshot.reservation_id)
@@ -195,7 +214,15 @@ pub fn collect(
         }
         Ok(record.reservation_id.clone())
     })?;
+    let parent_before_lock = registered_entry(fanout, parent_session_id)?;
+    let parent_dir_before_lock = PathBuf::from(
+        parent_before_lock
+            .dir
+            .ok_or_else(|| "fanout collect parent has no directory".to_string())?,
+    );
     let _collection_lock = acquire_collection_lock(fanout.root(), &reservation_id)?;
+    let parent_identity = repo_identity(&parent_dir_before_lock)?;
+    let (_repository_gate, _roots) = acquire_legacy_gate(&parent_identity)?;
     let mut record = fanout.transaction(|records, lifecycle, registry| {
         let mut record = record_by_runtime_session_id(records, runtime_session_id)?.clone();
         if record.parent_session_id != parent_session_id {

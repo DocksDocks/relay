@@ -6,6 +6,11 @@ use relay::lifecycle::{
     PendingAttachSpec, ProcessObservation, RequiredScope, StartGeneration, TerminalAction,
 };
 use relay::store;
+use relay::workspace::authority::{
+    AuthorityRootProvider, SystemAuthorityRootProvider, WorkspaceAuthority,
+};
+use relay::workspace::git::OpenedRepository;
+use relay::workspace::repository_gate::RepositoryGate;
 use rustix::fs::{FlockOperation, flock};
 use std::collections::HashMap;
 use std::fs;
@@ -949,4 +954,66 @@ fn worktree_merge_conflict_aborts_cleanly_and_retries_after_parent_repair() {
     );
     assert!(!Path::new(&child.worktree).exists());
     fs::remove_dir_all(home).ok();
+}
+
+#[test]
+fn repository_gate_refuses_legacy_mode_before_fanout_mutation() {
+    let home = fresh_home("repository-gate-mode");
+    let repo = init_repo(&home);
+    let opened = OpenedRepository::open(&repo).unwrap();
+    let roots = SystemAuthorityRootProvider.roots().unwrap();
+    let authority = WorkspaceAuthority::new(roots.clone()).unwrap();
+    let gate = RepositoryGate::acquire(&roots, &opened.identity).unwrap();
+    let repository_authority = authority.repository_dir(&opened.identity.repository_id).unwrap();
+    assert!(!repository_authority.exists());
+    fs::create_dir(&repository_authority).unwrap();
+    let error = gate
+        .refuse_legacy_if_managed(
+            &roots,
+            Path::new(&opened.identity.common_dir_realpath),
+        )
+        .unwrap_err();
+    assert!(error.contains("managed workspace mode"), "{error}");
+    assert!(git(&repo, &["branch", "--list", "relay/fanout-*"]).is_empty());
+    assert!(!home.join("fanout-v1.json").exists());
+    drop(gate);
+    fs::remove_dir(&repository_authority).unwrap();
+    fs::remove_dir_all(home).ok();
+}
+
+#[test]
+fn repository_identity_accepts_reported_sha1_and_sha256_oid_widths() {
+    for format in ["sha1", "sha256"] {
+        let home = fresh_home(&format!("fanout-object-format-{format}"));
+        let repo = home.join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        let init = if format == "sha256" {
+            Command::new("git")
+                .args(["init", "-q", "--object-format=sha256"])
+                .current_dir(&repo)
+                .output()
+                .unwrap()
+        } else {
+            Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&repo)
+                .output()
+                .unwrap()
+        };
+        if format == "sha256" && !init.status.success() {
+            fs::remove_dir_all(home).ok();
+            continue;
+        }
+        assert!(init.status.success());
+        git(&repo, &["config", "user.email", "relay@example.test"]);
+        git(&repo, &["config", "user.name", "Relay Test"]);
+        fs::write(repo.join("tracked"), "data\n").unwrap();
+        git(&repo, &["add", "tracked"]);
+        git(&repo, &["commit", "-qm", "base"]);
+        let opened = OpenedRepository::open(&repo).unwrap();
+        let head = opened.head().unwrap();
+        assert_eq!(head.as_str().len(), if format == "sha1" { 40 } else { 64 });
+        assert!(opened.validate_oid(&"a".repeat(if format == "sha1" { 64 } else { 40 })).is_err());
+        fs::remove_dir_all(home).ok();
+    }
 }

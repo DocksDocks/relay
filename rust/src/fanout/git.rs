@@ -1,6 +1,7 @@
 use super::authority::FanoutRecord;
+use crate::workspace::git::OpenedRepository;
+use crate::workspace::schema::{ObjectFormat, RepositoryIdentityV1};
 use std::fs;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -9,11 +10,18 @@ pub(super) struct RepoIdentity {
     pub(super) common_dir: String,
     pub(super) dev: String,
     pub(super) ino: String,
+    pub(super) object_format: ObjectFormat,
+    pub(super) repository_id: String,
+    workspace: RepositoryIdentityV1,
 }
 
 impl RepoIdentity {
     pub(super) fn matches_record(&self, record: &FanoutRecord) -> bool {
         self.dev == record.repo_dev && self.ino == record.repo_ino
+    }
+
+    pub(super) fn workspace_identity(&self) -> &RepositoryIdentityV1 {
+        &self.workspace
     }
 }
 
@@ -23,23 +31,19 @@ pub(super) enum PreparedMergeOutcome {
 }
 
 pub(super) fn canonicalize_repository(repo: &Path) -> Result<PathBuf, String> {
-    fs::canonicalize(repo)
-        .map_err(|error| format!("resolve fanout repository {}: {error}", repo.display()))
+    OpenedRepository::open(repo).map(|opened| opened.root)
 }
 
 pub(super) fn repo_identity(repo: &Path) -> Result<RepoIdentity, String> {
-    let common = run_git(
-        repo,
-        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-    )?;
-    let common = fs::canonicalize(&common)
-        .map_err(|error| format!("resolve git common dir {common}: {error}"))?;
-    let metadata = fs::metadata(&common)
-        .map_err(|error| format!("stat git common dir {}: {error}", common.display()))?;
+    let opened = OpenedRepository::open(repo)?;
+    let workspace = opened.identity;
     Ok(RepoIdentity {
-        common_dir: common.to_string_lossy().into_owned(),
-        dev: metadata.dev().to_string(),
-        ino: metadata.ino().to_string(),
+        common_dir: workspace.common_dir_realpath.clone(),
+        dev: workspace.common_dir_dev.clone(),
+        ino: workspace.common_dir_ino.clone(),
+        object_format: workspace.object_format,
+        repository_id: workspace.repository_id.clone(),
+        workspace,
     })
 }
 
@@ -89,12 +93,8 @@ pub(super) fn remove_unstarted_worktree(repo: &Path, worktree: &Path) -> Result<
     Ok(())
 }
 
-pub(super) fn validate_sha(value: &str) -> Result<(), String> {
-    if value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        Ok(())
-    } else {
-        Err("git object id is not a full hexadecimal SHA-1".to_string())
-    }
+pub(super) fn validate_sha(value: &str, format: ObjectFormat) -> Result<(), String> {
+    crate::workspace::schema::GitOid::parse(value, format).map(|_| ())
 }
 
 pub(super) fn merge_prepared_handback(
