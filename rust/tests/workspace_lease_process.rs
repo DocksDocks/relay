@@ -2,6 +2,7 @@ pub mod support;
 
 use relay::workspace::authority::WorkspaceLease;
 use relay::workspace::capability::WorkerCapabilityV1;
+#[cfg(target_os = "linux")]
 use relay::workspace::custody::{
     CONTROL_FRAME_MAX, ControlEndpoint, ControlPacket, ControlPayload, PacketKind, PeerIdentity,
     Sender,
@@ -15,18 +16,21 @@ use relay::workspace::platform::linux::{
 use relay::workspace::platform::{
     MACOS_INADMISSIBLE_BACKEND, MACOS_STOP_REASON, admit_macos_writable_custody_for_test,
 };
+#[cfg(target_os = "linux")]
+use relay::workspace::recover_workspace_with_roots;
 use relay::workspace::schema::read_jcs_file;
-use relay::workspace::schema::{
-    AbortRequestV1, JcsValue, PathClaimRequestV1, RecoverRequestV1, WorkspaceState, parse_jcs,
-};
-use relay::workspace::{
-    abort_workspace_with_roots, recover_workspace_with_roots,
-    start_workspace_with_roots_and_executable,
-};
+use relay::workspace::schema::{AbortRequestV1, PathClaimRequestV1, parse_jcs};
+#[cfg(target_os = "linux")]
+use relay::workspace::schema::{JcsValue, RecoverRequestV1, WorkspaceState};
+use relay::workspace::{abort_workspace_with_roots, start_workspace_with_roots_and_executable};
 #[cfg(target_os = "linux")]
 use std::collections::BTreeMap;
+use std::fs;
+#[cfg(target_os = "linux")]
 use std::fs::File;
-use std::fs::{self, OpenOptions};
+#[cfg(target_os = "linux")]
+use std::fs::OpenOptions;
+#[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -592,50 +596,53 @@ fn separate_worktrees_both_hold_leases() {
     let first_index_before = exact_worktree_index(&first_root);
     let second_index_before = exact_worktree_index(&second_root);
     let first_ref_before = git_stdout(&first_root, ["rev-parse", &first.result.branch_ref]);
-    let first_index_path = PathBuf::from(git_stdout(
-        &first_root,
-        ["rev-parse", "--path-format=absolute", "--git-path", "index"],
-    ));
-    let second_index_path = PathBuf::from(git_stdout(
-        &second_root,
-        ["rev-parse", "--path-format=absolute", "--git-path", "index"],
-    ));
-    let first_ref_path = PathBuf::from(git_stdout(
-        &first_root,
-        [
-            "rev-parse",
-            "--path-format=absolute",
-            "--git-path",
-            &first.result.branch_ref,
-        ],
-    ));
-    let second_ref_path = PathBuf::from(git_stdout(
-        &second_root,
-        [
-            "rev-parse",
-            "--path-format=absolute",
-            "--git-path",
-            &second.result.branch_ref,
-        ],
-    ));
-    run_isolation_probe(
-        "separate_worktrees_both_hold_leases",
-        &first_root,
-        &first_resource,
-        &second_root,
-        &second_resource,
-        &second_index_path,
-        &second_ref_path,
-    );
-    run_isolation_probe(
-        "separate_worktrees_both_hold_leases",
-        &second_root,
-        &second_resource,
-        &first_root,
-        &first_resource,
-        &first_index_path,
-        &first_ref_path,
-    );
+    #[cfg(target_os = "linux")]
+    {
+        let first_index_path = PathBuf::from(git_stdout(
+            &first_root,
+            ["rev-parse", "--path-format=absolute", "--git-path", "index"],
+        ));
+        let second_index_path = PathBuf::from(git_stdout(
+            &second_root,
+            ["rev-parse", "--path-format=absolute", "--git-path", "index"],
+        ));
+        let first_ref_path = PathBuf::from(git_stdout(
+            &first_root,
+            [
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-path",
+                &first.result.branch_ref,
+            ],
+        ));
+        let second_ref_path = PathBuf::from(git_stdout(
+            &second_root,
+            [
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-path",
+                &second.result.branch_ref,
+            ],
+        ));
+        run_isolation_probe(
+            "separate_worktrees_both_hold_leases",
+            &first_root,
+            &first_resource,
+            &second_root,
+            &second_resource,
+            &second_index_path,
+            &second_ref_path,
+        );
+        run_isolation_probe(
+            "separate_worktrees_both_hold_leases",
+            &second_root,
+            &second_resource,
+            &first_root,
+            &first_resource,
+            &first_index_path,
+            &first_ref_path,
+        );
+    }
     let second_ref_before = git_stdout(&second_root, ["rev-parse", &second.result.branch_ref]);
 
     fs::write(first_root.join("first.txt"), b"first worker\n").unwrap();
@@ -998,76 +1005,79 @@ fn worker_merge_rebase_reset_and_force_push_are_refused() {
         bytes_before_refusals
     );
 
-    fs::write(worktree.join("base.txt"), b"absolute Git bypass\n").unwrap();
-    let bypass_index_before = exact_worktree_index(&worktree);
-    let bypass_ref_before = git_stdout(&worktree, ["rev-parse", &writer.result.branch_ref]);
-    let bypass_result = worktree.join("absolute-git-bypass.result");
-    let bypass_release = worktree.join("absolute-git-bypass.release");
-    let cgroup = DelegatedCgroup::create(&request_id())
-        .expect("native runner must provide an owned delegated cgroup-v2 root");
-    let executable = std::env::current_exe().unwrap();
-    let pinned_readable = ["/etc/gitconfig", "/usr/share/git-core"]
-        .into_iter()
-        .map(PathBuf::from)
-        .filter(|path| path.is_file())
-        .collect();
-    let launch = WorkerLaunch {
-        executable,
-        arguments: vec![
-            "worker_merge_rebase_reset_and_force_push_are_refused".to_owned(),
-            "--exact".to_owned(),
-            "--nocapture".to_owned(),
-        ],
-        environment: BTreeMap::from([
-            (
-                "SESSION_RELAY_GIT_BYPASS_RESULT".to_owned(),
-                bypass_result.to_string_lossy().into_owned(),
-            ),
-            (
-                "SESSION_RELAY_GIT_BYPASS_RELEASE".to_owned(),
-                bypass_release.to_string_lossy().into_owned(),
-            ),
-        ]),
-        cwd: worktree.clone(),
-        resource_fds: Vec::new(),
-        sandbox: LandlockPolicy {
-            workspace: worktree.clone(),
-            readable: Vec::new(),
-            executable_runtime: vec![PathBuf::from("/usr/bin/git")],
-            pinned_readable,
-            writable_resources: Vec::new(),
-        },
-    };
-    let prepared = cgroup
-        .launch_worker(&launch)
-        .expect("prepare absolute-Git bypass worker");
-    let verified = prepared
-        .verify_activation()
-        .expect("activate absolute-Git bypass worker");
-    let (identity, _) = verified.release_after_ack(|_| Ok(())).unwrap();
-    wait_until("absolute Git bypass result", Duration::from_secs(5), || {
-        bypass_result.exists()
-    });
-    let bypass = fs::read_to_string(&bypass_result).unwrap();
-    assert_ne!(
-        bypass.lines().next().unwrap(),
-        "0",
-        "absolute /usr/bin/git bypass mutated the worker index"
-    );
-    assert!(
-        bypass.contains("Permission denied") || bypass.contains("Operation not permitted"),
-        "absolute Git bypass was not denied by worker custody: {bypass}"
-    );
-    assert_eq!(exact_worktree_index(&worktree), bypass_index_before);
-    assert_eq!(
-        git_stdout(&worktree, ["rev-parse", &writer.result.branch_ref]),
-        bypass_ref_before
-    );
-    let empty = cgroup.kill_and_wait_empty(&identity).unwrap();
-    assert!(!empty.populated);
-    cgroup.remove().unwrap();
-    fs::write(worktree.join("base.txt"), b"owned commit\n").unwrap();
-    fs::remove_file(&bypass_result).unwrap();
+    #[cfg(target_os = "linux")]
+    {
+        fs::write(worktree.join("base.txt"), b"absolute Git bypass\n").unwrap();
+        let bypass_index_before = exact_worktree_index(&worktree);
+        let bypass_ref_before = git_stdout(&worktree, ["rev-parse", &writer.result.branch_ref]);
+        let bypass_result = worktree.join("absolute-git-bypass.result");
+        let bypass_release = worktree.join("absolute-git-bypass.release");
+        let cgroup = DelegatedCgroup::create(&request_id())
+            .expect("native runner must provide an owned delegated cgroup-v2 root");
+        let executable = std::env::current_exe().unwrap();
+        let pinned_readable = ["/etc/gitconfig", "/usr/share/git-core"]
+            .into_iter()
+            .map(PathBuf::from)
+            .filter(|path| path.is_file())
+            .collect();
+        let launch = WorkerLaunch {
+            executable,
+            arguments: vec![
+                "worker_merge_rebase_reset_and_force_push_are_refused".to_owned(),
+                "--exact".to_owned(),
+                "--nocapture".to_owned(),
+            ],
+            environment: BTreeMap::from([
+                (
+                    "SESSION_RELAY_GIT_BYPASS_RESULT".to_owned(),
+                    bypass_result.to_string_lossy().into_owned(),
+                ),
+                (
+                    "SESSION_RELAY_GIT_BYPASS_RELEASE".to_owned(),
+                    bypass_release.to_string_lossy().into_owned(),
+                ),
+            ]),
+            cwd: worktree.clone(),
+            resource_fds: Vec::new(),
+            sandbox: LandlockPolicy {
+                workspace: worktree.clone(),
+                readable: Vec::new(),
+                executable_runtime: vec![PathBuf::from("/usr/bin/git")],
+                pinned_readable,
+                writable_resources: Vec::new(),
+            },
+        };
+        let prepared = cgroup
+            .launch_worker(&launch)
+            .expect("prepare absolute-Git bypass worker");
+        let verified = prepared
+            .verify_activation()
+            .expect("activate absolute-Git bypass worker");
+        let (identity, _) = verified.release_after_ack(|_| Ok(())).unwrap();
+        wait_until("absolute Git bypass result", Duration::from_secs(5), || {
+            bypass_result.exists()
+        });
+        let bypass = fs::read_to_string(&bypass_result).unwrap();
+        assert_ne!(
+            bypass.lines().next().unwrap(),
+            "0",
+            "absolute /usr/bin/git bypass mutated the worker index"
+        );
+        assert!(
+            bypass.contains("Permission denied") || bypass.contains("Operation not permitted"),
+            "absolute Git bypass was not denied by worker custody: {bypass}"
+        );
+        assert_eq!(exact_worktree_index(&worktree), bypass_index_before);
+        assert_eq!(
+            git_stdout(&worktree, ["rev-parse", &writer.result.branch_ref]),
+            bypass_ref_before
+        );
+        let empty = cgroup.kill_and_wait_empty(&identity).unwrap();
+        assert!(!empty.populated);
+        cgroup.remove().unwrap();
+        fs::write(worktree.join("base.txt"), b"owned commit\n").unwrap();
+        fs::remove_file(&bypass_result).unwrap();
+    }
 
     assert!(WorkspaceLease::acquire(writer.lease.path()).is_err());
     let cleanup = abort_started_workspace(&repository, &roots, writer, "test cleanup");

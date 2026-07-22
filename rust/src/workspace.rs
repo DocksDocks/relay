@@ -5518,20 +5518,27 @@ fn wait_supervisor_bootstrap_ready(mut read_end: File, child: &mut Child) -> Res
         events: libc::POLLIN | libc::POLLHUP,
         revents: 0,
     };
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         if let Some(status) = child
             .try_wait()
             .map_err(|error| format!("inspect custody supervisor bootstrap: {error}"))?
         {
+            let stderr = take_broker_stderr(child);
+            let detail = if stderr.is_empty() {
+                String::new()
+            } else {
+                format!(": {stderr}")
+            };
             return Err(format!(
-                "custody supervisor exited before bootstrap readiness ({status})"
+                "custody supervisor exited before bootstrap readiness ({status}){detail}"
             ));
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Err(
-                "custody supervisor did not become bootstrap-ready within five seconds".to_string(),
+                "custody supervisor did not become bootstrap-ready within fifteen seconds"
+                    .to_string(),
             );
         }
         let rc = unsafe { libc::poll(&mut poll, 1, remaining.as_millis().min(100) as i32) };
@@ -5550,8 +5557,20 @@ fn wait_supervisor_bootstrap_ready(mut read_end: File, child: &mut Child) -> Res
                 .read_to_end(&mut bytes)
                 .map_err(|error| format!("read custody supervisor bootstrap readiness: {error}"))?;
             if bytes != [0x01] {
-                return Err("custody supervisor bootstrap readiness is not exact".to_string());
+                let status = child
+                    .wait()
+                    .map_err(|error| format!("wait for failed custody supervisor: {error}"))?;
+                let stderr = take_broker_stderr(child);
+                let detail = if stderr.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {stderr}")
+                };
+                return Err(format!(
+                    "custody supervisor bootstrap readiness is not exact ({status}){detail}"
+                ));
             }
+            drain_broker_stderr(child);
             return Ok(());
         }
     }
@@ -6310,7 +6329,7 @@ fn run_guardian(raw: &[String]) -> Result<(), String> {
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn();
     let restore = restore_spawn_inheritance(&prior);
     let mut supervisor = spawned.map_err(|error| format!("spawn custody supervisor: {error}"))?;
