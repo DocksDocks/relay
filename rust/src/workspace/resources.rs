@@ -1,4 +1,5 @@
 use super::authority::{self, AuthorityRoots};
+use super::capability;
 use super::schema::{
     self, ClosedJcs, EnvProjectionV1, ProviderReceiptV1, ProviderRequestV1,
     ResourceAllocationV1, ResourceDecisionV1, ResourceProviderRegistrationV1,
@@ -30,7 +31,26 @@ pub struct ResourceSet {
     pub resource_fds: Vec<RawFd>,
     receipt_dir: PathBuf,
     resource_root: PathBuf,
+    session_id: String,
+    inventory_created_at: String,
     ports: BTreeMap<String, TcpListener>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResourceReleaseEvidenceV1 {
+    pub broker_close_sha256: String,
+    pub runtime_empty_sha256: String,
+}
+
+impl ResourceReleaseEvidenceV1 {
+    fn validate(&self) -> Result<(), String> {
+        schema::Sha256Digest::parse(&self.broker_close_sha256)?;
+        schema::Sha256Digest::parse(&self.runtime_empty_sha256)?;
+        if self.broker_close_sha256 == self.runtime_empty_sha256 {
+            return Err("broker-close and runtime-empty evidence must be distinct".into());
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -174,6 +194,8 @@ pub fn allocate_resources(
         resource_fds: Vec::new(),
         receipt_dir: receipt_dir.to_path_buf(),
         resource_root,
+        session_id: session_id.to_string(),
+        inventory_created_at: created_at.to_string(),
         ports: BTreeMap::new(),
     };
     for decision in decisions.iter().filter(|decision| decision.state == "requested") {
@@ -205,6 +227,104 @@ pub fn allocate_resources(
     };
     authority::atomic_create_jcs(&receipt_dir.join("resource-inventory-v1.json"), &inventory, 0o600)?;
     Ok(set)
+}
+
+pub fn load_resources(
+    roots: &AuthorityRoots,
+    repository_id: &str,
+    session_id: &str,
+    receipt_dir: &Path,
+) -> Result<ResourceSet, String> {
+    schema::Sha256Digest::parse(repository_id)?;
+    schema::LowerUuidV4::parse(session_id)?;
+    if roots.euid != unsafe { libc::geteuid() } {
+        return Err("resource authority EUID differs from the process EUID".into());
+    }
+    require_existing_private_directory(receipt_dir, roots.euid)?;
+    let inventory: AllocationInventoryV1 =
+        read_secure_jcs(&receipt_dir.join("resource-inventory-v1.json"), None)?;
+    if inventory.session_id != session_id {
+        return Err("resource inventory session identity differs from the requested session".into());
+    }
+    validate_inventory(&inventory)?;
+    validate_inventory_receipts(receipt_dir, &inventory)?;
+
+    let resource_root = roots
+        .data
+        .join(repository_id)
+        .join("resources")
+        .join(session_id);
+    let has_allocated = inventory
+        .allocations
+        .iter()
+        .any(|allocation| allocation.state == "allocated");
+    match fs::symlink_metadata(&resource_root) {
+        Ok(_) => authority::ensure_private_directory(&resource_root, roots.euid)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && !has_allocated => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err("allocated resource inventory has no session resource root".into())
+        }
+        Err(error) => {
+            return Err(format!(
+                "inspect session resource root {}: {error}",
+                resource_root.display()
+            ))
+        }
+    }
+    validate_resource_paths(&resource_root, &inventory.allocations)?;
+
+    let mut environment = BTreeMap::new();
+    for allocation in inventory
+        .allocations
+        .iter()
+        .filter(|allocation| allocation.state == "allocated" && allocation.kind != "port")
+    {
+        for projection in &allocation.env {
+            if environment
+                .insert(projection.name.clone(), projection.value.clone())
+                .is_some()
+            {
+                return Err(format!(
+                    "resource environment projection {} collides",
+                    projection.name
+                ));
+            }
+        }
+    }
+    Ok(ResourceSet {
+        decisions: inventory.decisions,
+        allocations: inventory.allocations,
+        environment,
+        resource_fds: Vec::new(),
+        receipt_dir: receipt_dir.to_path_buf(),
+        resource_root,
+        session_id: inventory.session_id,
+        inventory_created_at: inventory.created_at,
+        ports: BTreeMap::new(),
+    })
+}
+
+pub fn inspect_resources(
+    roots: &AuthorityRoots,
+    repository_id: &str,
+    session_id: &str,
+    receipt_dir: &Path,
+) -> Result<Vec<ProviderReceiptV1>, String> {
+    load_resources(roots, repository_id, session_id, receipt_dir)?.inspect(roots)
+}
+
+pub fn release_resources(
+    roots: &AuthorityRoots,
+    repository_id: &str,
+    session_id: &str,
+    receipt_dir: &Path,
+    close_evidence: &ResourceReleaseEvidenceV1,
+    released_at: &str,
+) -> Result<Vec<String>, String> {
+    close_evidence.validate()?;
+    schema::Timestamp::parse(released_at)?;
+    let mut resources = load_resources(roots, repository_id, session_id, receipt_dir)?;
+    resources.release_after_close(roots, close_evidence, released_at)
 }
 
 impl ResourceSet {
@@ -348,11 +468,23 @@ impl ResourceSet {
     }
 
     pub fn writable_paths(&self) -> Vec<PathBuf> {
-        self.allocations.iter().filter(|allocation| matches!(allocation.kind.as_str(), "temp_dir" | "build_dir" | "log_dir" | "cache_dir")).map(|allocation| PathBuf::from(&allocation.value)).collect()
+        self.allocations
+            .iter()
+            .filter(|allocation| {
+                allocation.state == "allocated"
+                    && matches!(
+                        allocation.kind.as_str(),
+                        "temp_dir" | "build_dir" | "log_dir" | "cache_dir"
+                    )
+            })
+            .map(|allocation| PathBuf::from(&allocation.value))
+            .collect()
     }
 
     pub fn inspect(&self, roots:&AuthorityRoots)->Result<Vec<ProviderReceiptV1>,String>{
-        let registry=if self.allocations.iter().any(|allocation|allocation.kind=="database_schema"&&allocation.state=="allocated"){Some(schema::read_jcs_file::<ResourceProviderRegistryV1>(&provider_registry_path(roots),None)?)}else{None};
+        let registry=if self.allocations.iter().any(|allocation|allocation.kind=="database_schema"&&allocation.state=="allocated"){
+            Some(read_secure_jcs::<ResourceProviderRegistryV1>(&provider_registry_path(roots),None)?)
+        }else{None};
         self.allocations.iter().map(|allocation|self.inspect_allocation(allocation,registry.as_ref())).collect()
     }
 
@@ -398,6 +530,328 @@ impl ResourceSet {
         Ok(digests)
     }
 
+    pub fn release_after_close(
+        &mut self,
+        roots: &AuthorityRoots,
+        close_evidence: &ResourceReleaseEvidenceV1,
+        released_at: &str,
+    ) -> Result<Vec<String>, String> {
+        close_evidence.validate()?;
+        schema::Timestamp::parse(released_at)?;
+        self.reconcile_durable_delete_receipts(close_evidence)?;
+        for allocation in self
+            .allocations
+            .iter()
+            .filter(|allocation| allocation.kind == "port" && allocation.state == "released")
+        {
+            let digest = allocation
+                .delete_receipt_sha256
+                .as_deref()
+                .ok_or_else(|| "released held port has no delete receipt".to_string())?;
+            let receipt = read_receipt(
+                &self.receipt_dir.join(format!(
+                    "{}-delete-receipt-v1.json",
+                    allocation.allocation_id
+                )),
+                digest,
+            )?;
+            let close_binding = format!(
+                "{}:{}",
+                close_evidence.broker_close_sha256,
+                close_evidence.runtime_empty_sha256
+            );
+            let evidence = builtin_evidence(
+                "port-release",
+                &allocation.allocation_id,
+                &allocation.value,
+                Some(&close_binding),
+            );
+            let expected = deterministic_builtin_receipt(
+                "delete",
+                "released",
+                &allocation.allocation_id,
+                &allocation.value,
+                &evidence,
+                &receipt.at,
+            );
+            if receipt != expected {
+                return Err(format!(
+                    "held port {} release receipt is bound to different close evidence",
+                    allocation.name
+                ));
+            }
+        }
+
+        let registry = if self.allocations.iter().any(|allocation| {
+            allocation.kind == "database_schema" && allocation.state == "allocated"
+        }) {
+            Some(read_secure_jcs::<ResourceProviderRegistryV1>(
+                &provider_registry_path(roots),
+                None,
+            )?)
+        } else {
+            None
+        };
+
+        for allocation in self
+            .allocations
+            .iter()
+            .filter(|allocation| allocation.state == "allocated")
+        {
+            self.inspect_allocation(allocation, registry.as_ref())?;
+            match allocation.kind.as_str() {
+                "port" => prove_recorded_port_released(&allocation.value)?,
+                "temp_dir" | "build_dir" | "log_dir" | "cache_dir" => {
+                    preflight_private_tree(Path::new(&allocation.value), roots.euid)?
+                }
+                "database_schema" => {}
+                _ => return Err("resource release encountered an unknown kind".into()),
+            }
+        }
+
+        let mut digests = self
+            .allocations
+            .iter()
+            .map(|allocation| allocation.delete_receipt_sha256.clone())
+            .collect::<Vec<_>>();
+        let mut release_order = self
+            .allocations
+            .iter()
+            .enumerate()
+            .filter_map(|(index, allocation)| {
+                (allocation.state == "allocated").then_some(index)
+            })
+            .collect::<Vec<_>>();
+        release_order.sort_by_key(|index| match self.allocations[*index].kind.as_str() {
+            "database_schema" => 0,
+            "port" => 1,
+            _ => 2,
+        });
+        for index in release_order {
+            let allocation = self.allocations[index].clone();
+            let receipt = match allocation.kind.as_str() {
+                "port" => {
+                    prove_recorded_port_released(&allocation.value)?;
+                    let close_binding = format!(
+                        "{}:{}",
+                        close_evidence.broker_close_sha256,
+                        close_evidence.runtime_empty_sha256
+                    );
+                    let evidence = builtin_evidence(
+                        "port-release",
+                        &allocation.allocation_id,
+                        &allocation.value,
+                        Some(&close_binding),
+                    );
+                    deterministic_builtin_receipt(
+                        "delete",
+                        "released",
+                        &allocation.allocation_id,
+                        &allocation.value,
+                        &evidence,
+                        released_at,
+                    )
+                }
+                "database_schema" => {
+                    let registry = registry
+                        .as_ref()
+                        .ok_or_else(|| "provider registry unavailable during release".to_string())?;
+                    let provider = registry
+                        .providers
+                        .iter()
+                        .find(|provider| provider.provider_id == allocation.provider_id)
+                        .ok_or_else(|| {
+                            format!("database provider {} disappeared", allocation.provider_id)
+                        })?;
+                    let mut request = provider_request(
+                        "delete",
+                        &allocation.allocation_id,
+                        &allocation.session_id,
+                        &allocation.name,
+                        Some(&allocation.inspect_receipt_sha256),
+                    );
+                    request.request_id = deterministic_uuid(
+                        format!(
+                            "session-relay/resource-provider-delete/v1\0{}\0{}\0{}",
+                            allocation.allocation_id,
+                            allocation.inspect_receipt_sha256,
+                            provider.provider_id
+                        )
+                        .as_bytes(),
+                    );
+                    let receipt = invoke_provider(provider, request)?;
+                    validate_provider_receipt(
+                        &receipt,
+                        "delete",
+                        "released",
+                        &allocation.allocation_id,
+                        Some(&allocation.value),
+                    )?;
+                    receipt
+                }
+                "temp_dir" | "build_dir" | "log_dir" | "cache_dir" => {
+                    let evidence = directory_evidence(Path::new(&allocation.value))?;
+                    preflight_private_tree(Path::new(&allocation.value), roots.euid)?;
+                    remove_private_tree(Path::new(&allocation.value), roots.euid)?;
+                    deterministic_builtin_receipt(
+                        "delete",
+                        "released",
+                        &allocation.allocation_id,
+                        &allocation.value,
+                        &evidence,
+                        released_at,
+                    )
+                }
+                _ => return Err("resource release encountered an unknown kind".into()),
+            };
+            let digest = self.persist_delete_receipt(&allocation, &receipt)?;
+            self.allocations[index].state = "released".into();
+            self.allocations[index].delete_receipt_sha256 = Some(digest.clone());
+            self.allocations[index].released_at = Some(receipt.at.clone());
+            ResourceAllocationV1::from_jcs(self.allocations[index].to_jcs())?;
+            self.persist_inventory()?;
+            digests[index] = Some(digest);
+        }
+        let digests = digests
+            .into_iter()
+            .map(|digest| digest.ok_or_else(|| "released resource has no delete receipt".to_string()))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        self.environment.clear();
+        self.resource_fds.clear();
+        match fs::remove_dir(&self.resource_root) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "remove empty session resource root {}: {error}",
+                    self.resource_root.display()
+                ))
+            }
+        }
+        Ok(digests)
+    }
+
+    fn reconcile_durable_delete_receipts(
+        &mut self,
+        close_evidence: &ResourceReleaseEvidenceV1,
+    ) -> Result<(), String> {
+        for index in 0..self.allocations.len() {
+            if self.allocations[index].state == "released" {
+                continue;
+            }
+            let allocation = self.allocations[index].clone();
+            let path = self.receipt_dir.join(format!(
+                "{}-delete-receipt-v1.json",
+                allocation.allocation_id
+            ));
+            match fs::symlink_metadata(&path) {
+                Ok(_) => {
+                    let receipt: ProviderReceiptV1 = read_secure_jcs(&path, None)?;
+                    validate_provider_receipt(
+                        &receipt,
+                        "delete",
+                        "released",
+                        &allocation.allocation_id,
+                        Some(&allocation.value),
+                    )?;
+                    match allocation.kind.as_str() {
+                        "port" => {
+                            prove_recorded_port_released(&allocation.value)?;
+                            let close_binding = format!(
+                                "{}:{}",
+                                close_evidence.broker_close_sha256,
+                                close_evidence.runtime_empty_sha256
+                            );
+                            let expected_evidence = builtin_evidence(
+                                "port-release",
+                                &allocation.allocation_id,
+                                &allocation.value,
+                                Some(&close_binding),
+                            );
+                            let expected = deterministic_builtin_receipt(
+                                "delete",
+                                "released",
+                                &allocation.allocation_id,
+                                &allocation.value,
+                                &expected_evidence,
+                                &receipt.at,
+                            );
+                            if receipt != expected {
+                                return Err(format!(
+                                    "held port {} delete receipt is not bound to close evidence",
+                                    allocation.name
+                                ));
+                            }
+                        }
+                        "temp_dir" | "build_dir" | "log_dir" | "cache_dir" => {
+                            let inspect = read_receipt(
+                                &self.receipt_dir.join(format!(
+                                    "{}-inspect-receipt-v1.json",
+                                    allocation.allocation_id
+                                )),
+                                &allocation.inspect_receipt_sha256,
+                            )?;
+                            if receipt.provider_evidence_sha256
+                                != inspect.provider_evidence_sha256
+                            {
+                                return Err(format!(
+                                    "resource directory {} delete identity drifted",
+                                    allocation.name
+                                ));
+                            }
+                        }
+                        "database_schema" => {}
+                        _ => {
+                            return Err(
+                                "resource delete receipt has an unknown allocation kind".into()
+                            )
+                        }
+                    }
+                    let digest = schema::jcs_sha256(&receipt);
+                    self.allocations[index].state = "released".into();
+                    self.allocations[index].delete_receipt_sha256 = Some(digest);
+                    self.allocations[index].released_at = Some(receipt.at);
+                    ResourceAllocationV1::from_jcs(self.allocations[index].to_jcs())?;
+                    self.persist_inventory()?;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(format!(
+                        "inspect delete receipt {}: {error}",
+                        path.display()
+                    ))
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn persist_delete_receipt(
+        &self,
+        allocation: &ResourceAllocationV1,
+        receipt: &ProviderReceiptV1,
+    ) -> Result<String, String> {
+        let path = self.receipt_dir.join(format!(
+            "{}-delete-receipt-v1.json",
+            allocation.allocation_id
+        ));
+        match authority::atomic_create_jcs(&path, receipt, 0o600) {
+            Ok(()) => Ok(schema::jcs_sha256(receipt)),
+            Err(create_error) => {
+                let durable: ProviderReceiptV1 = read_secure_jcs(&path, None)
+                    .map_err(|read_error| format!("{create_error}; {read_error}"))?;
+                if durable != *receipt {
+                    return Err(format!(
+                        "delete receipt for resource {} already exists with different bytes",
+                        allocation.name
+                    ));
+                }
+                Ok(schema::jcs_sha256(&durable))
+            }
+        }
+    }
+
     fn inspect_allocation(&self,allocation:&ResourceAllocationV1,registry:Option<&ResourceProviderRegistryV1>)->Result<ProviderReceiptV1,String>{
         if allocation.state=="released"{
             let digest=allocation.delete_receipt_sha256.as_deref().ok_or_else(||"released allocation has no delete receipt".to_string())?;
@@ -406,10 +860,13 @@ impl ResourceSet {
         let durable=read_receipt(&self.receipt_dir.join(format!("{}-inspect-receipt-v1.json",allocation.allocation_id)),&allocation.inspect_receipt_sha256)?;
         match allocation.kind.as_str(){
             "port"=>{
-                let listener=self.ports.get(&allocation.allocation_id).ok_or_else(||format!("held port {} descriptor handshake is unavailable",allocation.name))?;
-                let value=listener.local_addr().map_err(|error|format!("inspect held port: {error}"))?.to_string();
-                let evidence=builtin_evidence("port",&allocation.allocation_id,&value,None);
-                if value!=allocation.value||durable.provider_evidence_sha256!=evidence{return Err(format!("held port {} identity drifted",allocation.name))}
+                let expected=builtin_evidence("port",&allocation.allocation_id,&allocation.value,None);
+                let address:SocketAddr=allocation.value.parse().map_err(|_|format!("held port {} address is invalid",allocation.name))?;
+                if !matches!(address,SocketAddr::V4(value) if *value.ip()==Ipv4Addr::LOCALHOST)||durable.provider_evidence_sha256!=expected{return Err(format!("held port {} identity drifted",allocation.name))}
+                if let Some(listener)=self.ports.get(&allocation.allocation_id){
+                    let value=listener.local_addr().map_err(|error|format!("inspect held port: {error}"))?.to_string();
+                    if value!=allocation.value{return Err(format!("held port {} identity drifted",allocation.name))}
+                }
                 Ok(durable)
             }
             "temp_dir"|"build_dir"|"log_dir"|"cache_dir"=>{
@@ -421,22 +878,30 @@ impl ResourceSet {
                 let registry=registry.ok_or_else(||"provider registry unavailable during inspect".to_string())?;
                 let provider=registry.providers.iter().find(|provider|provider.provider_id==allocation.provider_id).ok_or_else(||format!("database provider {} disappeared",allocation.provider_id))?;
                 let request=provider_request("inspect",&allocation.allocation_id,&allocation.session_id,&allocation.name,Some(&allocation.create_receipt_sha256));
-                let receipt=invoke_provider(provider,request)?;validate_provider_receipt(&receipt,"inspect","exists",&allocation.allocation_id,Some(&allocation.value))?;Ok(receipt)
+                let receipt=invoke_provider(provider,request)?;
+                validate_provider_receipt(&receipt,"inspect","exists",&allocation.allocation_id,Some(&allocation.value))?;
+                if receipt.provider_evidence_sha256!=durable.provider_evidence_sha256{return Err(format!("database resource {} provider identity drifted",allocation.name))}
+                Ok(receipt)
             }
             _=>Err("resource inspection encountered an unknown kind".into()),
         }
     }
 
     fn persist_inventory(&self)->Result<(),String>{
-        let created_at=self.allocations.first().map(|allocation|allocation.created_at.clone()).unwrap_or_else(||"1970-01-01T00:00:00.000Z".into());
-        let session_id=self.allocations.first().map(|allocation|allocation.session_id.clone()).ok_or_else(||"cannot rewrite empty resource inventory".to_string())?;
-        let inventory=AllocationInventoryV1{session_id,decisions:self.decisions.clone(),allocations:self.allocations.clone(),created_at};
+        let inventory=AllocationInventoryV1{
+            session_id:self.session_id.clone(),
+            decisions:self.decisions.clone(),
+            allocations:self.allocations.clone(),
+            created_at:self.inventory_created_at.clone(),
+        };
         authority::atomic_replace_jcs(&self.receipt_dir.join("resource-inventory-v1.json"),&inventory,0o600)
     }
 }
 
 pub(crate) fn validate_held_resource_fds(receipt_dir:&Path,fds:&[RawFd])->Result<(),String>{
-    let inventory:AllocationInventoryV1=schema::read_jcs_file(&receipt_dir.join("resource-inventory-v1.json"),None)?;
+    let inventory:AllocationInventoryV1=read_secure_jcs(&receipt_dir.join("resource-inventory-v1.json"),None)?;
+    validate_inventory(&inventory)?;
+    validate_inventory_receipts(receipt_dir,&inventory)?;
     let mut expected=Vec::new();
     for allocation in inventory.allocations.iter().filter(|allocation|allocation.state=="allocated"&&allocation.kind=="port"){
         let projection=allocation.env.iter().find(|projection|projection.name==format!("DOCKS_RESOURCE_{}_FD",allocation.name.to_ascii_uppercase())).ok_or_else(||format!("held port {} has no FD projection",allocation.name))?;
@@ -721,7 +1186,7 @@ fn validate_provider_receipt(receipt: &ProviderReceiptV1, operation: &str, outco
 }
 
 fn read_receipt(path:&Path,expected_sha256:&str)->Result<ProviderReceiptV1,String>{
-    schema::read_jcs_file(path,Some(expected_sha256))
+    read_secure_jcs(path,Some(expected_sha256))
 }
 
 fn rollback_created_database(provider:&ResourceProviderRegistrationV1,allocation_id:&str,session_id:&str,name:&str,value:&str,prior_receipt_sha256:&str)->Result<(),String>{
@@ -740,6 +1205,308 @@ fn rollback_database(allocation: &ResourceAllocationV1, registry: Option<&Resour
     let request = provider_request("delete", &allocation.allocation_id, &allocation.session_id, &allocation.name, Some(&allocation.inspect_receipt_sha256));
     let receipt = invoke_provider(provider, request)?;
     validate_provider_receipt(&receipt, "delete", "released", &allocation.allocation_id, Some(&allocation.value))
+}
+
+fn read_secure_jcs<T: ClosedJcs>(path: &Path, expected_sha256: Option<&str>) -> Result<T, String> {
+    let bytes = capability::read_secure_bytes(path)?;
+    if let Some(expected) = expected_sha256 {
+        schema::Sha256Digest::parse(expected)?;
+        let actual = sha256::hex_digest(&bytes);
+        if !sha256::constant_time_eq(actual.as_bytes(), expected.as_bytes()) {
+            return Err(format!("digest mismatch for {}", path.display()));
+        }
+    }
+    T::from_jcs(schema::parse_jcs(&bytes, true)?)
+}
+
+fn require_existing_private_directory(path: &Path, euid: u32) -> Result<(), String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => return Err(format!("{} is not a real directory", path.display())),
+        Err(error) => {
+            return Err(format!(
+                "inspect existing private directory {}: {error}",
+                path.display()
+            ))
+        }
+    }
+    authority::ensure_private_directory(path, euid)
+}
+
+fn validate_inventory(inventory: &AllocationInventoryV1) -> Result<(), String> {
+    validate_decisions(&inventory.decisions)?;
+    let requested = inventory
+        .decisions
+        .iter()
+        .filter(|decision| decision.state == "requested")
+        .map(|decision| ((decision.kind.as_str(), decision.name.as_str()), decision))
+        .collect::<BTreeMap<_, _>>();
+    if requested.len() != inventory.allocations.len() {
+        return Err("resource inventory allocations do not match requested decisions".into());
+    }
+    let mut allocation_ids = BTreeSet::new();
+    let mut allocation_keys = BTreeSet::new();
+    for allocation in &inventory.allocations {
+        if allocation.session_id != inventory.session_id
+            || allocation.created_at != inventory.created_at
+        {
+            return Err("resource allocation identity differs from its inventory".into());
+        }
+        if !allocation_ids.insert(allocation.allocation_id.as_str())
+            || !allocation_keys.insert((allocation.kind.as_str(), allocation.name.as_str()))
+        {
+            return Err("resource inventory contains duplicate allocations".into());
+        }
+        let decision = requested
+            .get(&(allocation.kind.as_str(), allocation.name.as_str()))
+            .ok_or_else(|| "resource allocation has no matching requested decision".to_string())?;
+        let expected_provider = if allocation.kind == "database_schema" {
+            decision
+                .provider_id
+                .as_deref()
+                .ok_or_else(|| "database resource decision has no provider".to_string())?
+        } else {
+            BUILTIN_PROVIDER
+        };
+        if allocation.provider_id != expected_provider {
+            return Err(format!(
+                "resource {} provider differs from its decision",
+                allocation.name
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_inventory_receipts(
+    receipt_dir: &Path,
+    inventory: &AllocationInventoryV1,
+) -> Result<(), String> {
+    for allocation in &inventory.allocations {
+        let create: ProviderReceiptV1 = read_secure_jcs(
+            &receipt_dir.join(format!(
+                "{}-create-receipt-v1.json",
+                allocation.allocation_id
+            )),
+            Some(&allocation.create_receipt_sha256),
+        )?;
+        validate_provider_receipt(
+            &create,
+            "create",
+            "allocated",
+            &allocation.allocation_id,
+            Some(&allocation.value),
+        )?;
+        let inspect: ProviderReceiptV1 = read_secure_jcs(
+            &receipt_dir.join(format!(
+                "{}-inspect-receipt-v1.json",
+                allocation.allocation_id
+            )),
+            Some(&allocation.inspect_receipt_sha256),
+        )?;
+        validate_provider_receipt(
+            &inspect,
+            "inspect",
+            "exists",
+            &allocation.allocation_id,
+            Some(&allocation.value),
+        )?;
+        if allocation.provider_id == BUILTIN_PROVIDER {
+            let evidence_matches = if allocation.kind == "port" {
+                let expected = builtin_evidence(
+                    "port",
+                    &allocation.allocation_id,
+                    &allocation.value,
+                    None,
+                );
+                create.provider_evidence_sha256 == expected
+                    && inspect.provider_evidence_sha256 == expected
+            } else {
+                create.provider_evidence_sha256 == inspect.provider_evidence_sha256
+            };
+            if !evidence_matches {
+                return Err(format!(
+                    "builtin resource {} receipt identity drifted",
+                    allocation.name
+                ));
+            }
+        }
+        if allocation.state == "released" {
+            let digest = allocation
+                .delete_receipt_sha256
+                .as_deref()
+                .ok_or_else(|| "released resource has no delete receipt".to_string())?;
+            let delete: ProviderReceiptV1 = read_secure_jcs(
+                &receipt_dir.join(format!(
+                    "{}-delete-receipt-v1.json",
+                    allocation.allocation_id
+                )),
+                Some(digest),
+            )?;
+            validate_provider_receipt(
+                &delete,
+                "delete",
+                "released",
+                &allocation.allocation_id,
+                Some(&allocation.value),
+            )?;
+            if allocation.released_at.as_deref() != Some(delete.at.as_str()) {
+                return Err(format!(
+                    "resource {} release time differs from its receipt",
+                    allocation.name
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_resource_paths(
+    resource_root: &Path,
+    allocations: &[ResourceAllocationV1],
+) -> Result<(), String> {
+    for allocation in allocations.iter().filter(|allocation| {
+        matches!(
+            allocation.kind.as_str(),
+            "temp_dir" | "build_dir" | "log_dir" | "cache_dir"
+        )
+    }) {
+        let expected = resource_root.join(format!("{}-{}", allocation.kind, allocation.name));
+        if Path::new(&allocation.value) != expected {
+            return Err(format!(
+                "resource directory {} escapes its deterministic root",
+                allocation.name
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn deterministic_builtin_receipt(
+    operation: &str,
+    outcome: &str,
+    allocation_id: &str,
+    value: &str,
+    evidence: &str,
+    at: &str,
+) -> ProviderReceiptV1 {
+    let request_id = deterministic_uuid(
+        format!(
+            "session-relay/resource-receipt-request/v1\0{operation}\0{outcome}\0{allocation_id}\0{value}\0{evidence}\0{at}"
+        )
+        .as_bytes(),
+    );
+    ProviderReceiptV1 {
+        request_id,
+        allocation_id: allocation_id.into(),
+        operation: operation.into(),
+        outcome: outcome.into(),
+        value: value.into(),
+        provider_evidence_sha256: evidence.into(),
+        at: at.into(),
+    }
+}
+
+fn deterministic_uuid(context: &[u8]) -> String {
+    let digest = sha256::hex_digest(context);
+    let mut uuid = digest.into_bytes();
+    uuid[12] = b'4';
+    uuid[16] = b'8';
+    format!(
+        "{}-{}-{}-{}-{}",
+        std::str::from_utf8(&uuid[0..8]).expect("hex digest is UTF-8"),
+        std::str::from_utf8(&uuid[8..12]).expect("hex digest is UTF-8"),
+        std::str::from_utf8(&uuid[12..16]).expect("hex digest is UTF-8"),
+        std::str::from_utf8(&uuid[16..20]).expect("hex digest is UTF-8"),
+        std::str::from_utf8(&uuid[20..32]).expect("hex digest is UTF-8"),
+    )
+}
+
+fn preflight_private_tree(path: &Path, euid: u32) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("inspect resource path {}: {error}", path.display()))?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() || metadata.uid() != euid {
+        return Err(format!(
+            "resource path {} identity is not deletable",
+            path.display()
+        ));
+    }
+    for entry in fs::read_dir(path)
+        .map_err(|error| format!("read resource path {}: {error}", path.display()))?
+    {
+        let entry = entry.map_err(|error| format!("read resource entry: {error}"))?;
+        let child = entry.path();
+        let metadata = fs::symlink_metadata(&child)
+            .map_err(|error| format!("inspect resource entry {}: {error}", child.display()))?;
+        if metadata.uid() != euid || metadata.file_type().is_symlink() {
+            return Err(format!(
+                "resource entry {} is not safely removable",
+                child.display()
+            ));
+        }
+        if metadata.is_dir() {
+            preflight_private_tree(&child, euid)?;
+        } else if !metadata.is_file() || metadata.nlink() != 1 {
+            return Err(format!(
+                "resource entry {} has unsupported type or link count",
+                child.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn prove_recorded_port_released(value: &str) -> Result<(), String> {
+    const PROC_TCP_MAX: u64 = 1024 * 1024;
+    let address: SocketAddr = value
+        .parse()
+        .map_err(|_| "recorded held-port address is invalid".to_string())?;
+    let SocketAddr::V4(address) = address else {
+        return Err("recorded held-port address is not IPv4".into());
+    };
+    if *address.ip() != Ipv4Addr::LOCALHOST || address.port() == 0 {
+        return Err("recorded held-port address is not canonical IPv4 loopback".into());
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC)
+        .open("/proc/net/tcp")
+        .map_err(|error| format!("open kernel TCP inventory: {error}"))?;
+    let mut bytes = Vec::new();
+    file.take(PROC_TCP_MAX + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("read kernel TCP inventory: {error}"))?;
+    if bytes.len() as u64 > PROC_TCP_MAX {
+        return Err("kernel TCP inventory exceeded 1 MiB".into());
+    }
+    let inventory =
+        std::str::from_utf8(&bytes).map_err(|_| "kernel TCP inventory is not UTF-8".to_string())?;
+    for line in inventory.lines().skip(1) {
+        let fields = line.split_ascii_whitespace().collect::<Vec<_>>();
+        if fields.len() < 4 || fields[3] != "0A" {
+            continue;
+        }
+        let Some((ip_hex, port_hex)) = fields[1].split_once(':') else {
+            return Err("kernel TCP inventory has a malformed local address".into());
+        };
+        let raw_ip = u32::from_str_radix(ip_hex, 16)
+            .map_err(|_| "kernel TCP inventory has a malformed IPv4 address".to_string())?;
+        let port = u16::from_str_radix(port_hex, 16)
+            .map_err(|_| "kernel TCP inventory has a malformed port".to_string())?;
+        if Ipv4Addr::from(raw_ip.to_ne_bytes()) == *address.ip() && port == address.port() {
+            return Err(format!(
+                "held port {} remains present after broker/runtime close",
+                value
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn prove_recorded_port_released(_value: &str) -> Result<(), String> {
+    Err("held-port release proof is available only on Linux".into())
 }
 
 fn remove_private_tree(path: &Path, euid: u32) -> Result<(), String> {

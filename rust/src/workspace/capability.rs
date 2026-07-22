@@ -1,3 +1,4 @@
+use super::authority::AuthorityExclusionLock;
 use super::schema::{
     self, COORDINATOR_ACTIONS, CapabilityRecordV1, ClosedJcs, CoordinatorCapabilityV1, Decimal,
     JcsValue, LowerUuidV4, Sha256Digest, Timestamp, WORKER_ACTIONS,
@@ -192,6 +193,28 @@ pub fn revoke(record: &mut CapabilityRecordV1, revoked_at: &str) -> Result<(), S
             Ok(())
         }
     }
+}
+
+pub fn revoke_worker_durable(exclusion:&AuthorityExclusionLock,record_path:&Path,capability_id:&str,generation:u64,revoked_at:&str)->Result<CapabilityRecordV1,String>{
+    LowerUuidV4::parse(capability_id)?;
+    Timestamp::parse(revoked_at)?;
+    let parent=record_path.parent().ok_or_else(||"worker capability record path has no parent".to_string())?;
+    let repository=fs::canonicalize(exclusion.repository_dir()).map_err(|error|format!("canonicalize locked repository authority: {error}"))?;
+    let parent=fs::canonicalize(parent).map_err(|error|format!("canonicalize worker capability record parent: {error}"))?;
+    if !parent.starts_with(&repository){return Err("worker capability record is outside the locked repository authority".into())}
+    exclusion.revalidate()?;
+    let bytes=read_secure_bytes(record_path)?;
+    let mut record=CapabilityRecordV1::from_jcs(schema::parse_jcs(&bytes,true)?)?;
+    if record.capability_id!=capability_id||record.generation!=generation.to_string(){
+        return Err("worker capability revocation expectation differs from the durable record".into())
+    }
+    if record.revoked_at.is_some(){return Ok(record)}
+    revoke(&mut record,revoked_at)?;
+    exclusion.revalidate()?;
+    super::authority::atomic_replace_jcs(record_path,&record,0o600)?;
+    let durable=CapabilityRecordV1::from_jcs(schema::parse_jcs(&read_secure_bytes(record_path)?,true)?)?;
+    if durable!=record{return Err("worker capability revocation is not durably re-readable".into())}
+    Ok(durable)
 }
 
 fn record_for(

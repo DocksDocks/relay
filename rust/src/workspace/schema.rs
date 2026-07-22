@@ -337,7 +337,7 @@ pub enum WorkspaceState { Reserved, Provisioning, LeaseHeld, Ready, Running, Han
 impl WorkspaceState {
     pub fn as_str(self)->&'static str{match self{Self::Reserved=>"Reserved",Self::Provisioning=>"Provisioning",Self::LeaseHeld=>"LeaseHeld",Self::Ready=>"Ready",Self::Running=>"Running",Self::HandbackReady=>"HandbackReady",Self::IntegrationQueued=>"IntegrationQueued",Self::Integrated=>"Integrated",Self::IntegrationBlocked=>"IntegrationBlocked",Self::Rejected=>"Rejected",Self::AbortedRetained=>"AbortedRetained",Self::Releasing=>"Releasing",Self::Closed=>"Closed"}}
     pub fn parse(v:&str)->Result<Self,String>{Ok(match v{"Reserved"=>Self::Reserved,"Provisioning"=>Self::Provisioning,"LeaseHeld"=>Self::LeaseHeld,"Ready"=>Self::Ready,"Running"=>Self::Running,"HandbackReady"=>Self::HandbackReady,"IntegrationQueued"=>Self::IntegrationQueued,"Integrated"=>Self::Integrated,"IntegrationBlocked"=>Self::IntegrationBlocked,"Rejected"=>Self::Rejected,"AbortedRetained"=>Self::AbortedRetained,"Releasing"=>Self::Releasing,"Closed"=>Self::Closed,_=>return Err("unknown WorkspaceState".to_string())})}
-    pub fn may_transition_to(self,next:Self)->bool{matches!((self,next),(Self::Reserved,Self::Provisioning)|(Self::Provisioning,Self::LeaseHeld)|(Self::LeaseHeld,Self::Ready)|(Self::Ready,Self::Running)|(Self::Running,Self::HandbackReady)|(Self::HandbackReady,Self::IntegrationQueued)|(Self::IntegrationQueued,Self::Integrated)|(Self::IntegrationQueued,Self::IntegrationBlocked)|(Self::Running,Self::Rejected)|(Self::Running,Self::AbortedRetained)|(Self::HandbackReady,Self::AbortedRetained)|(Self::Integrated,Self::Releasing)|(Self::Rejected,Self::Releasing)|(Self::AbortedRetained,Self::Releasing)|(Self::Releasing,Self::Closed))}
+    pub fn may_transition_to(self,next:Self)->bool{matches!((self,next),(Self::Reserved,Self::Provisioning)|(Self::Provisioning,Self::LeaseHeld)|(Self::LeaseHeld,Self::Ready)|(Self::Ready,Self::Running)|(Self::Running,Self::HandbackReady)|(Self::HandbackReady,Self::IntegrationQueued)|(Self::IntegrationQueued,Self::Integrated)|(Self::IntegrationQueued,Self::IntegrationBlocked)|(Self::IntegrationQueued,Self::Rejected)|(Self::Running,Self::Rejected)|(Self::Running,Self::AbortedRetained)|(Self::HandbackReady,Self::AbortedRetained)|(Self::Integrated,Self::Releasing)|(Self::Rejected,Self::Releasing)|(Self::AbortedRetained,Self::Releasing)|(Self::Releasing,Self::Closed))}
 }
 
 fn require_keys(object:&BTreeMap<String,JcsValue>, keys:&[&str])->Result<(),String>{
@@ -569,6 +569,176 @@ impl ClosedJcs for WorkspaceStartResultV1{
  fn from_jcs(value:JcsValue)->Result<Self,String>{let o=value.object()?;require_keys(&o,&["schema","session_id","repository_id","worktree_root","branch_ref","coordinator_capability_file","coordinator_generation","bootstrap"])?;let session_id=get_string(&o,"session_id")?;LowerUuidV4::parse(&session_id)?;let bootstrap=get_string(&o,"bootstrap")?;if !matches!(bootstrap.as_str(),"created"|"existing"){return Err("bootstrap outcome invalid".into())}Ok(Self{session_id,repository_id:get_string(&o,"repository_id")?,worktree_root:get_string(&o,"worktree_root")?,branch_ref:get_string(&o,"branch_ref")?,coordinator_capability_file:get_string(&o,"coordinator_capability_file")?,coordinator_generation:get_string(&o,"coordinator_generation")?,bootstrap})}
  fn to_jcs(&self)->JcsValue{object([("bootstrap",JcsValue::String(self.bootstrap.clone())),("branch_ref",JcsValue::String(self.branch_ref.clone())),("coordinator_capability_file",JcsValue::String(self.coordinator_capability_file.clone())),("coordinator_generation",JcsValue::String(self.coordinator_generation.clone())),("repository_id",JcsValue::String(self.repository_id.clone())),("schema",JcsValue::String(SCHEMA_V1.into())),("session_id",JcsValue::String(self.session_id.clone())),("worktree_root",JcsValue::String(self.worktree_root.clone()))])}
 }
+
+pub fn validate_git_oid(value:&str)->Result<(),String>{
+ if (value.len()==40||value.len()==64)&&value.bytes().all(|byte|byte.is_ascii_digit()||matches!(byte,b'a'..=b'f')){Ok(())}else{Err("Git OID is not lowercase 40- or 64-character hexadecimal".into())}
+}
+
+fn validate_oid_list(values:&[String],name:&str,nonempty:bool)->Result<(),String>{
+ if nonempty&&values.is_empty(){return Err(format!("{name} must be nonempty"))}
+ for value in values{validate_git_oid(value)?;}
+ if let Some(first)=values.first(){if values.iter().any(|value|value.len()!=first.len()){return Err(format!("{name} mixes Git object formats"))}}
+ Ok(())
+}
+
+fn validate_sorted_unique(values:&[String],name:&str,nonempty:bool)->Result<(),String>{
+ if nonempty&&values.is_empty(){return Err(format!("{name} must be nonempty"))}
+ if values.windows(2).any(|pair|pair[0]>=pair[1]){return Err(format!("{name} must be sorted and unique"))}
+ Ok(())
+}
+
+fn get_bool(object:&BTreeMap<String,JcsValue>,key:&str)->Result<bool,String>{
+ match object.get(key){Some(JcsValue::Bool(value))=>Ok(*value),_=>Err(format!("{key} must be a boolean"))}
+}
+
+#[derive(Clone,Debug,Eq,PartialEq)]
+pub struct HandbackRequestV1{pub request_id:String,pub session_id:String,pub expected_head:String,pub created_at:String}
+impl HandbackRequestV1{
+ pub fn validate(&self)->Result<(),String>{LowerUuidV4::parse(&self.request_id)?;LowerUuidV4::parse(&self.session_id)?;validate_git_oid(&self.expected_head)?;Timestamp::parse(&self.created_at)?;Ok(())}
+}
+impl ClosedJcs for HandbackRequestV1{
+ fn from_jcs(value:JcsValue)->Result<Self,String>{let o=value.object()?;require_keys(&o,&["schema","request_id","session_id","expected_head","created_at"])?;if get_string(&o,"schema")?!=SCHEMA_V1{return Err("HandbackRequestV1 schema mismatch".into())}let request=Self{request_id:get_string(&o,"request_id")?,session_id:get_string(&o,"session_id")?,expected_head:get_string(&o,"expected_head")?,created_at:get_string(&o,"created_at")?};request.validate()?;Ok(request)}
+ fn to_jcs(&self)->JcsValue{object([("created_at",JcsValue::String(self.created_at.clone())),("expected_head",JcsValue::String(self.expected_head.clone())),("request_id",JcsValue::String(self.request_id.clone())),("schema",JcsValue::String(SCHEMA_V1.into())),("session_id",JcsValue::String(self.session_id.clone()))])}
+}
+
+#[derive(Clone,Debug,Eq,PartialEq)]
+pub struct HandbackReceiptV1{pub request_id:String,pub session_id:String,pub head_oid:String,pub outcome:String,pub produced_commits:Vec<String>,pub created_at:String}
+impl HandbackReceiptV1{
+ pub fn validate(&self)->Result<(),String>{
+  LowerUuidV4::parse(&self.request_id)?;LowerUuidV4::parse(&self.session_id)?;validate_git_oid(&self.head_oid)?;Timestamp::parse(&self.created_at)?;
+  if self.outcome!="validated"{return Err("handback outcome must be validated".into())}
+  validate_oid_list(&self.produced_commits,"produced_commits",true)?;
+  if self.produced_commits.last().map(String::as_str)!=Some(self.head_oid.as_str()){return Err("handback head_oid must equal the last produced commit".into())}
+  Ok(())
+ }
+}
+impl ClosedJcs for HandbackReceiptV1{
+ fn from_jcs(value:JcsValue)->Result<Self,String>{let o=value.object()?;require_keys(&o,&["schema","request_id","session_id","head_oid","outcome","produced_commits","created_at"])?;if get_string(&o,"schema")?!=SCHEMA_V1{return Err("HandbackReceiptV1 schema mismatch".into())}let receipt=Self{request_id:get_string(&o,"request_id")?,session_id:get_string(&o,"session_id")?,head_oid:get_string(&o,"head_oid")?,outcome:get_string(&o,"outcome")?,produced_commits:string_array(&o["produced_commits"],"produced_commits")?,created_at:get_string(&o,"created_at")?};receipt.validate()?;Ok(receipt)}
+ fn to_jcs(&self)->JcsValue{object([("created_at",JcsValue::String(self.created_at.clone())),("head_oid",JcsValue::String(self.head_oid.clone())),("outcome",JcsValue::String(self.outcome.clone())),("produced_commits",JcsValue::Array(self.produced_commits.iter().cloned().map(JcsValue::String).collect())),("request_id",JcsValue::String(self.request_id.clone())),("schema",JcsValue::String(SCHEMA_V1.into())),("session_id",JcsValue::String(self.session_id.clone()))])}
+}
+
+fn validate_coordinator_cas(repository_path:&str,repository_id:&str,request_id:&str,session_id:&str,expected_journal_head_sha256:&str,expected_head:&str,created_at:&str)->Result<(),String>{
+ AbsPath::parse(repository_path)?;Sha256Digest::parse(repository_id)?;LowerUuidV4::parse(request_id)?;LowerUuidV4::parse(session_id)?;Sha256Digest::parse(expected_journal_head_sha256)?;validate_git_oid(expected_head)?;Timestamp::parse(created_at)?;Ok(())
+}
+
+#[derive(Clone,Debug,Eq,PartialEq)]
+pub struct IntegrateRequestV1{pub request_id:String,pub repository_path:String,pub repository_id:String,pub session_id:String,pub expected_state:WorkspaceState,pub expected_journal_head_sha256:String,pub expected_head:String,pub disposition:String,pub created_at:String}
+impl IntegrateRequestV1{
+ pub fn validate(&self)->Result<(),String>{
+  validate_coordinator_cas(&self.repository_path,&self.repository_id,&self.request_id,&self.session_id,&self.expected_journal_head_sha256,&self.expected_head,&self.created_at)?;
+  if self.expected_state!=WorkspaceState::HandbackReady{return Err("integration expected_state must be HandbackReady".into())}
+  if !matches!(self.disposition.as_str(),"integrate"|"reject"){return Err("integration disposition must be integrate|reject".into())}
+  Ok(())
+ }
+}
+impl ClosedJcs for IntegrateRequestV1{
+ fn from_jcs(value:JcsValue)->Result<Self,String>{let o=value.object()?;require_keys(&o,&["schema","request_id","repository_path","repository_id","session_id","expected_state","expected_journal_head_sha256","expected_head","disposition","created_at"])?;if get_string(&o,"schema")?!=SCHEMA_V1{return Err("IntegrateRequestV1 schema mismatch".into())}let request=Self{request_id:get_string(&o,"request_id")?,repository_path:get_string(&o,"repository_path")?,repository_id:get_string(&o,"repository_id")?,session_id:get_string(&o,"session_id")?,expected_state:WorkspaceState::parse(&get_string(&o,"expected_state")?)?,expected_journal_head_sha256:get_string(&o,"expected_journal_head_sha256")?,expected_head:get_string(&o,"expected_head")?,disposition:get_string(&o,"disposition")?,created_at:get_string(&o,"created_at")?};request.validate()?;Ok(request)}
+ fn to_jcs(&self)->JcsValue{object([("created_at",JcsValue::String(self.created_at.clone())),("disposition",JcsValue::String(self.disposition.clone())),("expected_head",JcsValue::String(self.expected_head.clone())),("expected_journal_head_sha256",JcsValue::String(self.expected_journal_head_sha256.clone())),("expected_state",JcsValue::String(self.expected_state.as_str().into())),("repository_id",JcsValue::String(self.repository_id.clone())),("repository_path",JcsValue::String(self.repository_path.clone())),("request_id",JcsValue::String(self.request_id.clone())),("schema",JcsValue::String(SCHEMA_V1.into())),("session_id",JcsValue::String(self.session_id.clone()))])}
+}
+
+#[derive(Clone,Debug,Eq,PartialEq)]
+pub struct IntegrationReceiptV1{pub request_id:String,pub session_id:String,pub pre_integration_head:String,pub worker_commits:Vec<String>,pub integration_commits:Vec<String>,pub post_integration_head:String,pub outcome:String,pub conflict_paths:Vec<String>,pub created_at:String}
+impl IntegrationReceiptV1{
+ pub fn validate(&self)->Result<(),String>{
+  LowerUuidV4::parse(&self.request_id)?;LowerUuidV4::parse(&self.session_id)?;validate_git_oid(&self.pre_integration_head)?;validate_git_oid(&self.post_integration_head)?;validate_oid_list(&self.worker_commits,"worker_commits",true)?;validate_oid_list(&self.integration_commits,"integration_commits",false)?;Timestamp::parse(&self.created_at)?;
+  for path in &self.conflict_paths{RelPath::parse(path)?;}
+  match self.outcome.as_str(){
+   "integrated"=>{if self.integration_commits.len()!=self.worker_commits.len(){return Err("integrated receipt requires one integration output per worker input".into())}if !self.conflict_paths.is_empty(){return Err("integrated receipt cannot contain conflict paths".into())}if self.integration_commits.last().map(String::as_str)!=Some(self.post_integration_head.as_str()){return Err("integrated post head must equal the last integration commit".into())}}
+   "rejected"=>{if self.pre_integration_head!=self.post_integration_head{return Err("rejected receipt must preserve integration HEAD".into())}if !self.integration_commits.is_empty()||!self.conflict_paths.is_empty(){return Err("rejected receipt cannot contain integration outputs or conflicts".into())}}
+   "needs_user_action"=>{if self.pre_integration_head!=self.post_integration_head{return Err("conflict receipt must preserve integration HEAD".into())}if !self.integration_commits.is_empty(){return Err("conflict receipt cannot contain partial integration outputs".into())}validate_sorted_unique(&self.conflict_paths,"conflict_paths",true)?;}
+   _=>return Err("integration outcome must be integrated|rejected|needs_user_action".into())
+  }
+  Ok(())
+ }
+}
+impl ClosedJcs for IntegrationReceiptV1{
+ fn from_jcs(value:JcsValue)->Result<Self,String>{let o=value.object()?;require_keys(&o,&["schema","request_id","session_id","pre_integration_head","worker_commits","integration_commits","post_integration_head","outcome","conflict_paths","created_at"])?;if get_string(&o,"schema")?!=SCHEMA_V1{return Err("IntegrationReceiptV1 schema mismatch".into())}let receipt=Self{request_id:get_string(&o,"request_id")?,session_id:get_string(&o,"session_id")?,pre_integration_head:get_string(&o,"pre_integration_head")?,worker_commits:string_array(&o["worker_commits"],"worker_commits")?,integration_commits:string_array(&o["integration_commits"],"integration_commits")?,post_integration_head:get_string(&o,"post_integration_head")?,outcome:get_string(&o,"outcome")?,conflict_paths:string_array(&o["conflict_paths"],"conflict_paths")?,created_at:get_string(&o,"created_at")?};receipt.validate()?;Ok(receipt)}
+ fn to_jcs(&self)->JcsValue{object([("conflict_paths",JcsValue::Array(self.conflict_paths.iter().cloned().map(JcsValue::String).collect())),("created_at",JcsValue::String(self.created_at.clone())),("integration_commits",JcsValue::Array(self.integration_commits.iter().cloned().map(JcsValue::String).collect())),("outcome",JcsValue::String(self.outcome.clone())),("post_integration_head",JcsValue::String(self.post_integration_head.clone())),("pre_integration_head",JcsValue::String(self.pre_integration_head.clone())),("request_id",JcsValue::String(self.request_id.clone())),("schema",JcsValue::String(SCHEMA_V1.into())),("session_id",JcsValue::String(self.session_id.clone())),("worker_commits",JcsValue::Array(self.worker_commits.iter().cloned().map(JcsValue::String).collect()))])}
+}
+
+#[derive(Clone,Debug,Eq,PartialEq)]
+pub struct RecoverRequestV1{pub request_id:String,pub repository_path:String,pub repository_id:String,pub session_id:String,pub expected_state:WorkspaceState,pub expected_journal_head_sha256:String,pub expected_head:String,pub action:String,pub created_at:String}
+impl RecoverRequestV1{
+ pub fn validate(&self)->Result<(),String>{
+  validate_coordinator_cas(&self.repository_path,&self.repository_id,&self.request_id,&self.session_id,&self.expected_journal_head_sha256,&self.expected_head,&self.created_at)?;
+  if !matches!(self.action.as_str(),"inspect"|"resume_prelaunch"|"retain_abort"|"rotate_coordinator"){return Err("recover action must be inspect|resume_prelaunch|retain_abort|rotate_coordinator".into())}
+  if self.expected_state==WorkspaceState::IntegrationBlocked&&self.action!="inspect"{return Err("IntegrationBlocked permits inspection only; integration is never retried".into())}
+  if self.action=="resume_prelaunch"&&!matches!(self.expected_state,WorkspaceState::Reserved|WorkspaceState::Provisioning|WorkspaceState::LeaseHeld|WorkspaceState::Ready){return Err("resume_prelaunch requires a prelaunch state".into())}
+  if self.action=="retain_abort"&&!matches!(self.expected_state,WorkspaceState::Running|WorkspaceState::HandbackReady){return Err("retain_abort requires Running or HandbackReady".into())}
+  if self.action=="rotate_coordinator"&&self.expected_state==WorkspaceState::Closed{return Err("Closed coordinator authority cannot be rotated".into())}
+  Ok(())
+ }
+}
+impl ClosedJcs for RecoverRequestV1{
+ fn from_jcs(value:JcsValue)->Result<Self,String>{let o=value.object()?;require_keys(&o,&["schema","request_id","repository_path","repository_id","session_id","expected_state","expected_journal_head_sha256","expected_head","action","created_at"])?;if get_string(&o,"schema")?!=SCHEMA_V1{return Err("RecoverRequestV1 schema mismatch".into())}let request=Self{request_id:get_string(&o,"request_id")?,repository_path:get_string(&o,"repository_path")?,repository_id:get_string(&o,"repository_id")?,session_id:get_string(&o,"session_id")?,expected_state:WorkspaceState::parse(&get_string(&o,"expected_state")?)?,expected_journal_head_sha256:get_string(&o,"expected_journal_head_sha256")?,expected_head:get_string(&o,"expected_head")?,action:get_string(&o,"action")?,created_at:get_string(&o,"created_at")?};request.validate()?;Ok(request)}
+ fn to_jcs(&self)->JcsValue{object([("action",JcsValue::String(self.action.clone())),("created_at",JcsValue::String(self.created_at.clone())),("expected_head",JcsValue::String(self.expected_head.clone())),("expected_journal_head_sha256",JcsValue::String(self.expected_journal_head_sha256.clone())),("expected_state",JcsValue::String(self.expected_state.as_str().into())),("repository_id",JcsValue::String(self.repository_id.clone())),("repository_path",JcsValue::String(self.repository_path.clone())),("request_id",JcsValue::String(self.request_id.clone())),("schema",JcsValue::String(SCHEMA_V1.into())),("session_id",JcsValue::String(self.session_id.clone()))])}
+}
+
+#[derive(Clone,Debug,Eq,PartialEq)]
+pub struct AbortRequestV1{pub request_id:String,pub repository_path:String,pub repository_id:String,pub session_id:String,pub expected_state:WorkspaceState,pub expected_journal_head_sha256:String,pub expected_head:String,pub reason:String,pub created_at:String}
+impl AbortRequestV1{
+ pub fn validate(&self)->Result<(),String>{validate_coordinator_cas(&self.repository_path,&self.repository_id,&self.request_id,&self.session_id,&self.expected_journal_head_sha256,&self.expected_head,&self.created_at)?;if self.reason.is_empty()||self.reason.contains('\0'){return Err("abort reason must be nonempty and contain no NUL".into())}if !matches!(self.expected_state,WorkspaceState::Running|WorkspaceState::HandbackReady){return Err("abort expected_state must be Running or HandbackReady".into())}Ok(())}
+}
+impl ClosedJcs for AbortRequestV1{
+ fn from_jcs(value:JcsValue)->Result<Self,String>{let o=value.object()?;require_keys(&o,&["schema","request_id","repository_path","repository_id","session_id","expected_state","expected_journal_head_sha256","expected_head","reason","created_at"])?;if get_string(&o,"schema")?!=SCHEMA_V1{return Err("AbortRequestV1 schema mismatch".into())}let request=Self{request_id:get_string(&o,"request_id")?,repository_path:get_string(&o,"repository_path")?,repository_id:get_string(&o,"repository_id")?,session_id:get_string(&o,"session_id")?,expected_state:WorkspaceState::parse(&get_string(&o,"expected_state")?)?,expected_journal_head_sha256:get_string(&o,"expected_journal_head_sha256")?,expected_head:get_string(&o,"expected_head")?,reason:get_string(&o,"reason")?,created_at:get_string(&o,"created_at")?};request.validate()?;Ok(request)}
+ fn to_jcs(&self)->JcsValue{object([("created_at",JcsValue::String(self.created_at.clone())),("expected_head",JcsValue::String(self.expected_head.clone())),("expected_journal_head_sha256",JcsValue::String(self.expected_journal_head_sha256.clone())),("expected_state",JcsValue::String(self.expected_state.as_str().into())),("reason",JcsValue::String(self.reason.clone())),("repository_id",JcsValue::String(self.repository_id.clone())),("repository_path",JcsValue::String(self.repository_path.clone())),("request_id",JcsValue::String(self.request_id.clone())),("schema",JcsValue::String(SCHEMA_V1.into())),("session_id",JcsValue::String(self.session_id.clone()))])}
+}
+
+#[derive(Clone,Debug,Eq,PartialEq)]
+pub struct FinishRequestV1{pub request_id:String,pub repository_path:String,pub repository_id:String,pub session_id:String,pub expected_state:WorkspaceState,pub expected_journal_head_sha256:String,pub expected_head:String,pub acknowledge_needs_user_action:bool,pub created_at:String}
+impl FinishRequestV1{
+ pub fn validate(&self)->Result<(),String>{validate_coordinator_cas(&self.repository_path,&self.repository_id,&self.request_id,&self.session_id,&self.expected_journal_head_sha256,&self.expected_head,&self.created_at)?;if !matches!(self.expected_state,WorkspaceState::Integrated|WorkspaceState::Rejected|WorkspaceState::AbortedRetained){return Err("finish expected_state must be Integrated, Rejected, or AbortedRetained".into())}if self.acknowledge_needs_user_action{return Err("acknowledge_needs_user_action is invalid outside IntegrationBlocked".into())}Ok(())}
+}
+impl ClosedJcs for FinishRequestV1{
+ fn from_jcs(value:JcsValue)->Result<Self,String>{let o=value.object()?;require_keys(&o,&["schema","request_id","repository_path","repository_id","session_id","expected_state","expected_journal_head_sha256","expected_head","acknowledge_needs_user_action","created_at"])?;if get_string(&o,"schema")?!=SCHEMA_V1{return Err("FinishRequestV1 schema mismatch".into())}let request=Self{request_id:get_string(&o,"request_id")?,repository_path:get_string(&o,"repository_path")?,repository_id:get_string(&o,"repository_id")?,session_id:get_string(&o,"session_id")?,expected_state:WorkspaceState::parse(&get_string(&o,"expected_state")?)?,expected_journal_head_sha256:get_string(&o,"expected_journal_head_sha256")?,expected_head:get_string(&o,"expected_head")?,acknowledge_needs_user_action:get_bool(&o,"acknowledge_needs_user_action")?,created_at:get_string(&o,"created_at")?};request.validate()?;Ok(request)}
+ fn to_jcs(&self)->JcsValue{object([("acknowledge_needs_user_action",JcsValue::Bool(self.acknowledge_needs_user_action)),("created_at",JcsValue::String(self.created_at.clone())),("expected_head",JcsValue::String(self.expected_head.clone())),("expected_journal_head_sha256",JcsValue::String(self.expected_journal_head_sha256.clone())),("expected_state",JcsValue::String(self.expected_state.as_str().into())),("repository_id",JcsValue::String(self.repository_id.clone())),("repository_path",JcsValue::String(self.repository_path.clone())),("request_id",JcsValue::String(self.request_id.clone())),("schema",JcsValue::String(SCHEMA_V1.into())),("session_id",JcsValue::String(self.session_id.clone()))])}
+}
+
+#[derive(Clone,Debug,Eq,PartialEq)]
+pub struct HashedFileV1{pub path:String,pub sha256:String,pub size:String}
+impl HashedFileV1{
+ pub fn validate(&self)->Result<(),String>{AbsPath::parse(&self.path)?;Sha256Digest::parse(&self.sha256)?;Decimal::parse(&self.size)?;Ok(())}
+ pub fn from_value(value:JcsValue)->Result<Self,String>{let o=value.object()?;require_keys(&o,&["path","sha256","size"])?;let file=Self{path:get_string(&o,"path")?,sha256:get_string(&o,"sha256")?,size:get_string(&o,"size")?};file.validate()?;Ok(file)}
+ pub fn value(&self)->JcsValue{object([("path",JcsValue::String(self.path.clone())),("sha256",JcsValue::String(self.sha256.clone())),("size",JcsValue::String(self.size.clone()))])}
+}
+
+#[derive(Clone,Debug,Eq,PartialEq)]
+pub struct RetentionProofV1{pub session_id:String,pub branch_ref:String,pub head_oid:String,pub bundle:HashedFileV1,pub dirty_artifact:Option<HashedFileV1>,pub reachable_oids:Vec<String>,pub reason:String,pub proven_at:String}
+impl RetentionProofV1{
+ pub fn validate(&self)->Result<(),String>{
+  LowerUuidV4::parse(&self.session_id)?;validate_branch_ref(&self.branch_ref,&self.session_id)?;validate_git_oid(&self.head_oid)?;self.bundle.validate()?;if let Some(artifact)=&self.dirty_artifact{artifact.validate()?;}validate_oid_list(&self.reachable_oids,"reachable_oids",true)?;Timestamp::parse(&self.proven_at)?;
+  if !matches!(self.reason.as_str(),"rejected"|"integration_blocked"|"abort"){return Err("retention reason must be rejected|integration_blocked|abort".into())}
+  let unique:BTreeSet<_>=self.reachable_oids.iter().collect();if unique.len()!=self.reachable_oids.len(){return Err("reachable_oids must be unique".into())}
+  if !self.reachable_oids.iter().any(|oid|oid==&self.head_oid){return Err("retention head_oid must be present in reachable_oids".into())}
+  if self.reason!="abort"&&self.dirty_artifact.is_some(){return Err("dirty_artifact is admissible only for abort retention".into())}
+  Ok(())
+ }
+}
+impl ClosedJcs for RetentionProofV1{
+ fn from_jcs(value:JcsValue)->Result<Self,String>{let mut o=value.object()?;require_keys(&o,&["schema","session_id","branch_ref","head_oid","bundle","dirty_artifact","reachable_oids","reason","proven_at"])?;if get_string(&o,"schema")?!=SCHEMA_V1{return Err("RetentionProofV1 schema mismatch".into())}let dirty_artifact=match o.remove("dirty_artifact").unwrap(){JcsValue::Null=>None,value=>Some(HashedFileV1::from_value(value)?)};let proof=Self{session_id:get_string(&o,"session_id")?,branch_ref:get_string(&o,"branch_ref")?,head_oid:get_string(&o,"head_oid")?,bundle:HashedFileV1::from_value(o.remove("bundle").unwrap())?,dirty_artifact,reachable_oids:string_array(&o["reachable_oids"],"reachable_oids")?,reason:get_string(&o,"reason")?,proven_at:get_string(&o,"proven_at")?};proof.validate()?;Ok(proof)}
+ fn to_jcs(&self)->JcsValue{object([("branch_ref",JcsValue::String(self.branch_ref.clone())),("bundle",self.bundle.value()),("dirty_artifact",self.dirty_artifact.as_ref().map(HashedFileV1::value).unwrap_or(JcsValue::Null)),("head_oid",JcsValue::String(self.head_oid.clone())),("proven_at",JcsValue::String(self.proven_at.clone())),("reachable_oids",JcsValue::Array(self.reachable_oids.iter().cloned().map(JcsValue::String).collect())),("reason",JcsValue::String(self.reason.clone())),("schema",JcsValue::String(SCHEMA_V1.into())),("session_id",JcsValue::String(self.session_id.clone()))])}
+}
+
+pub fn validate_branch_ref(branch_ref:&str,session_id:&str)->Result<(),String>{
+ let prefix=format!("refs/heads/docks/{session_id}/");
+ if !branch_ref.starts_with(&prefix){return Err("retention branch_ref is outside the session namespace".into())}
+ TaskSlug::parse(&branch_ref[prefix.len()..])?;Ok(())
+}
+
+#[derive(Clone,Debug,Eq,PartialEq)]
+pub struct CleanupReceiptV1{pub request_id:String,pub session_id:String,pub retention_sha256:Option<String>,pub resource_receipts:Vec<String>,pub worktree_removed:bool,pub branch_removed:bool,pub capabilities_revoked:bool,pub custody_empty_sha256:String,pub lease_released:bool,pub outcome:String,pub created_at:String}
+impl CleanupReceiptV1{
+ pub fn validate(&self)->Result<(),String>{
+  LowerUuidV4::parse(&self.request_id)?;LowerUuidV4::parse(&self.session_id)?;if let Some(digest)=&self.retention_sha256{Sha256Digest::parse(digest)?;}for digest in &self.resource_receipts{Sha256Digest::parse(digest)?;}validate_sorted_unique(&self.resource_receipts,"resource_receipts",false)?;Sha256Digest::parse(&self.custody_empty_sha256)?;Timestamp::parse(&self.created_at)?;
+  if !self.capabilities_revoked{return Err("cleanup receipt requires proven capability revocation".into())}if !self.lease_released{return Err("cleanup receipt requires proven lease release".into())}if self.outcome!="closed"{return Err("cleanup outcome must be closed".into())}
+  if self.retention_sha256.is_none()&&(!self.worktree_removed||!self.branch_removed){return Err("cleanup without retention proof must remove the worktree and branch".into())}
+  Ok(())
+ }
+}
+impl ClosedJcs for CleanupReceiptV1{
+ fn from_jcs(value:JcsValue)->Result<Self,String>{let o=value.object()?;require_keys(&o,&["schema","request_id","session_id","retention_sha256","resource_receipts","worktree_removed","branch_removed","capabilities_revoked","custody_empty_sha256","lease_released","outcome","created_at"])?;if get_string(&o,"schema")?!=SCHEMA_V1{return Err("CleanupReceiptV1 schema mismatch".into())}let receipt=Self{request_id:get_string(&o,"request_id")?,session_id:get_string(&o,"session_id")?,retention_sha256:optional_string(&o["retention_sha256"],"retention_sha256")?,resource_receipts:string_array(&o["resource_receipts"],"resource_receipts")?,worktree_removed:get_bool(&o,"worktree_removed")?,branch_removed:get_bool(&o,"branch_removed")?,capabilities_revoked:get_bool(&o,"capabilities_revoked")?,custody_empty_sha256:get_string(&o,"custody_empty_sha256")?,lease_released:get_bool(&o,"lease_released")?,outcome:get_string(&o,"outcome")?,created_at:get_string(&o,"created_at")?};receipt.validate()?;Ok(receipt)}
+ fn to_jcs(&self)->JcsValue{object([("branch_removed",JcsValue::Bool(self.branch_removed)),("capabilities_revoked",JcsValue::Bool(self.capabilities_revoked)),("created_at",JcsValue::String(self.created_at.clone())),("custody_empty_sha256",JcsValue::String(self.custody_empty_sha256.clone())),("lease_released",JcsValue::Bool(self.lease_released)),("outcome",JcsValue::String(self.outcome.clone())),("request_id",JcsValue::String(self.request_id.clone())),("resource_receipts",JcsValue::Array(self.resource_receipts.iter().cloned().map(JcsValue::String).collect())),("retention_sha256",self.retention_sha256.clone().map(JcsValue::String).unwrap_or(JcsValue::Null)),("schema",JcsValue::String(SCHEMA_V1.into())),("session_id",JcsValue::String(self.session_id.clone())),("worktree_removed",JcsValue::Bool(self.worktree_removed))])}
+}
 #[cfg(test)]
 mod tests {
  use super::*;
@@ -576,4 +746,25 @@ mod tests {
  #[test] fn primitives_are_closed(){assert!(LowerUuidV4::parse("11111111-1111-4111-8111-111111111111").is_ok());assert!(LowerUuidV4::parse("11111111-1111-4111-7111-111111111111").is_err());assert!(RelPath::parse("a/b").is_ok());assert!(RelPath::parse("a/../b").is_err());}
  #[test] fn decimal_requires_at_least_one_digit(){assert!(Decimal::parse("").is_err());assert!(Decimal::parse("0").is_ok());assert!(Decimal::parse("1").is_ok());assert!(Decimal::parse("01").is_err());}
  #[test] fn case_alias_claims_remain_mutually_exclusive(){let claims=[PathClaimRequestV1{path:"Foo".into(),path_type:"directory".into(),mode:"exclusive".into()},PathClaimRequestV1{path:"foo/bar".into(),path_type:"file".into(),mode:"exclusive".into()}];assert!(validate_non_overlapping_claims(&claims).is_err());}
+ #[test] fn lifecycle_schemas_canonical_roundtrip(){
+  fn roundtrip<T:ClosedJcs+Eq+std::fmt::Debug>(value:T){let bytes=serialize_jcs_lf(&value);let parsed=T::from_jcs(parse_jcs(&bytes,true).unwrap()).unwrap();assert_eq!(parsed,value);}
+  let request_id="11111111-1111-4111-8111-111111111111".to_string();let session_id="22222222-2222-4222-8222-222222222222".to_string();let oid="a".repeat(40);let output_oid="b".repeat(40);let digest="c".repeat(64);let at="2026-07-22T12:34:56.789Z".to_string();
+  roundtrip(HandbackRequestV1{request_id:request_id.clone(),session_id:session_id.clone(),expected_head:oid.clone(),created_at:at.clone()});
+  roundtrip(HandbackReceiptV1{request_id:request_id.clone(),session_id:session_id.clone(),head_oid:oid.clone(),outcome:"validated".into(),produced_commits:vec![oid.clone()],created_at:at.clone()});
+  roundtrip(IntegrateRequestV1{request_id:request_id.clone(),repository_path:"/repo".into(),repository_id:digest.clone(),session_id:session_id.clone(),expected_state:WorkspaceState::HandbackReady,expected_journal_head_sha256:digest.clone(),expected_head:oid.clone(),disposition:"integrate".into(),created_at:at.clone()});
+  roundtrip(IntegrationReceiptV1{request_id:request_id.clone(),session_id:session_id.clone(),pre_integration_head:oid.clone(),worker_commits:vec![oid.clone()],integration_commits:vec![output_oid.clone()],post_integration_head:output_oid,outcome:"integrated".into(),conflict_paths:Vec::new(),created_at:at.clone()});
+  roundtrip(RecoverRequestV1{request_id:request_id.clone(),repository_path:"/repo".into(),repository_id:digest.clone(),session_id:session_id.clone(),expected_state:WorkspaceState::Running,expected_journal_head_sha256:digest.clone(),expected_head:oid.clone(),action:"inspect".into(),created_at:at.clone()});
+  roundtrip(AbortRequestV1{request_id:request_id.clone(),repository_path:"/repo".into(),repository_id:digest.clone(),session_id:session_id.clone(),expected_state:WorkspaceState::Running,expected_journal_head_sha256:digest.clone(),expected_head:oid.clone(),reason:"operator requested abort".into(),created_at:at.clone()});
+  roundtrip(FinishRequestV1{request_id:request_id.clone(),repository_path:"/repo".into(),repository_id:digest.clone(),session_id:session_id.clone(),expected_state:WorkspaceState::Integrated,expected_journal_head_sha256:digest.clone(),expected_head:oid.clone(),acknowledge_needs_user_action:false,created_at:at.clone()});
+  roundtrip(RetentionProofV1{session_id:session_id.clone(),branch_ref:format!("refs/heads/docks/{session_id}/task"),head_oid:oid.clone(),bundle:HashedFileV1{path:"/proof/bundle".into(),sha256:digest.clone(),size:"1".into()},dirty_artifact:None,reachable_oids:vec![oid],reason:"rejected".into(),proven_at:at.clone()});
+  roundtrip(CleanupReceiptV1{request_id,session_id,retention_sha256:None,resource_receipts:vec![digest.clone()],worktree_removed:true,branch_removed:true,capabilities_revoked:true,custody_empty_sha256:digest,lease_released:true,outcome:"closed".into(),created_at:at});
+ }
+ #[test] fn lifecycle_schemas_reject_wrong_keys_outcomes_and_nullability(){
+  let request_id="11111111-1111-4111-8111-111111111111".to_string();let session_id="22222222-2222-4222-8222-222222222222".to_string();let oid="a".repeat(40);let digest="c".repeat(64);let at="2026-07-22T12:34:56.789Z".to_string();
+  let mut handback=HandbackRequestV1{request_id:request_id.clone(),session_id:session_id.clone(),expected_head:oid.clone(),created_at:at.clone()}.to_jcs().object().unwrap();handback.insert("extra".into(),JcsValue::Null);assert!(HandbackRequestV1::from_jcs(JcsValue::Object(handback)).is_err());
+  let bad_handback=HandbackReceiptV1{request_id:request_id.clone(),session_id:session_id.clone(),head_oid:oid.clone(),outcome:"accepted".into(),produced_commits:vec![oid.clone()],created_at:at.clone()};assert!(HandbackReceiptV1::from_jcs(bad_handback.to_jcs()).is_err());
+  let conflict=IntegrationReceiptV1{request_id:request_id.clone(),session_id:session_id.clone(),pre_integration_head:oid.clone(),worker_commits:vec![oid.clone()],integration_commits:Vec::new(),post_integration_head:oid.clone(),outcome:"needs_user_action".into(),conflict_paths:Vec::new(),created_at:at.clone()};assert!(IntegrationReceiptV1::from_jcs(conflict.to_jcs()).is_err());
+  let proof=RetentionProofV1{session_id:session_id.clone(),branch_ref:format!("refs/heads/docks/{session_id}/task"),head_oid:oid.clone(),bundle:HashedFileV1{path:"/proof/bundle".into(),sha256:digest.clone(),size:"1".into()},dirty_artifact:None,reachable_oids:vec![oid],reason:"rejected".into(),proven_at:at.clone()};let mut proof_object=proof.to_jcs().object().unwrap();proof_object.insert("dirty_artifact".into(),JcsValue::String("invented".into()));assert!(RetentionProofV1::from_jcs(JcsValue::Object(proof_object)).is_err());
+  let cleanup=CleanupReceiptV1{request_id,session_id,retention_sha256:None,resource_receipts:Vec::new(),worktree_removed:true,branch_removed:true,capabilities_revoked:true,custody_empty_sha256:digest,lease_released:true,outcome:"closed".into(),created_at:at};let mut cleanup_object=cleanup.to_jcs().object().unwrap();cleanup_object.insert("retention_sha256".into(),JcsValue::Bool(false));assert!(CleanupReceiptV1::from_jcs(JcsValue::Object(cleanup_object)).is_err());
+ }
 }

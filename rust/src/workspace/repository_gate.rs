@@ -1,16 +1,122 @@
 use super::authority::{self, AuthorityRoots};
 use super::schema::{self, ClosedJcs, JcsValue, RepositoryIdentityV1};
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read,Write};
+use std::marker::PhantomData;
 use std::os::fd::{AsRawFd,FromRawFd};
 use std::os::unix::fs::{MetadataExt,OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 pub const GATE_PROTOCOL: &str = "RepositoryGateV1";
 pub const GATE_TIMEOUT: Duration = Duration::from_secs(3);
 const MARKER_RELATIVE: &str = "docks/workspace-admission-v1.json";
+
+#[derive(Clone,Copy,Debug,Eq,Ord,PartialEq,PartialOrd)]
+pub enum ShortLockRank {
+    IntegrationQueue = 10,
+    RepositoryGate = 20,
+    RelayStore = 30,
+    AuthorityExclusion = 35,
+    WorkspaceJournal = 40,
+}
+
+thread_local! {
+    static HELD_SHORT_LOCKS: RefCell<Vec<ShortLockRank>> = const { RefCell::new(Vec::new()) };
+}
+
+pub(crate) fn assert_no_short_locks(operation:&str)->Result<(),String>{
+    HELD_SHORT_LOCKS.with(|held|{
+        let held=held.borrow();
+        if held.is_empty(){Ok(())}else{Err(format!("{operation} cannot run while short lock {:?} is held",held.last().unwrap()))}
+    })
+}
+
+pub(crate) struct ShortLockToken {
+    rank: ShortLockRank,
+    _not_send: PhantomData<Rc<()>>,
+}
+
+impl Drop for ShortLockToken {
+    fn drop(&mut self) {
+        HELD_SHORT_LOCKS.with(|held|{
+            let mut held=held.borrow_mut();
+            if let Some(index)=held.iter().rposition(|rank|*rank==self.rank){held.remove(index);}
+        });
+    }
+}
+
+#[derive(Clone,Copy,Debug,Eq,PartialEq)]
+pub struct LockFileIdentity {
+    pub device:u64,
+    pub inode:u64,
+}
+
+fn enter_short_lock(rank:ShortLockRank)->Result<ShortLockToken,String>{
+    HELD_SHORT_LOCKS.with(|held|{
+        let mut held=held.borrow_mut();
+        if let Some(current)=held.iter().max().copied(){
+            if current>=rank{return Err(format!("short-lock rank reversal: cannot acquire {rank:?} while {current:?} is held"))}
+        }
+        held.push(rank);
+        Ok(ShortLockToken{rank,_not_send:PhantomData})
+    })
+}
+
+pub fn with_relay_store_rank<T>(operation:impl FnOnce()->Result<T,String>)->Result<T,String>{
+    let _rank=enter_short_lock(ShortLockRank::RelayStore)?;
+    operation()
+}
+
+pub(crate) fn acquire_ranked_lock(path:&Path,euid:u32,label:&str,rank:ShortLockRank)->Result<(File,LockFileIdentity,ShortLockToken),String>{
+    let token=enter_short_lock(rank)?;
+    let (file,created)=match OpenOptions::new().create_new(true).read(true).write(true).mode(0o600).custom_flags(libc::O_CLOEXEC|libc::O_NOFOLLOW).open(path){
+        Ok(file)=>(file,true),
+        Err(error) if error.kind()==std::io::ErrorKind::AlreadyExists=>{
+            let file=OpenOptions::new().read(true).write(true).custom_flags(libc::O_CLOEXEC|libc::O_NOFOLLOW).open(path)
+                .map_err(|open_error|format!("open existing {label} {}: {open_error}",path.display()))?;
+            (file,false)
+        }
+        Err(error)=>return Err(format!("create {label} {}: {error}",path.display())),
+    };
+    let metadata=file.metadata().map_err(|error|format!("fstat {label}: {error}"))?;
+    if !metadata.is_file()||metadata.uid()!=euid||metadata.nlink()!=1||metadata.mode()&0o777!=0o600{
+        return Err(format!("{label} has unsafe owner/type/link/mode"))
+    }
+    let identity=LockFileIdentity{device:metadata.dev(),inode:metadata.ino()};
+    if created{
+        file.sync_all().map_err(|error|format!("fsync new {label}: {error}"))?;
+        let parent=path.parent().ok_or_else(||format!("{label} path has no parent"))?;
+        let directory=OpenOptions::new().read(true).custom_flags(libc::O_CLOEXEC|libc::O_NOFOLLOW|libc::O_DIRECTORY).open(parent)
+            .map_err(|error|format!("open {label} parent for fsync: {error}"))?;
+        directory.sync_all().map_err(|error|format!("fsync {label} parent: {error}"))?;
+    }
+    let deadline=Instant::now()+GATE_TIMEOUT;
+    loop {
+        if Instant::now()>=deadline{return Err(format!("{label} contention exceeded three seconds; no mutation performed"))}
+        let result=unsafe{libc::flock(file.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)};
+        if result==0{break}
+        let error=std::io::Error::last_os_error();
+        if error.raw_os_error()!=Some(libc::EINTR)&&error.raw_os_error()!=Some(libc::EAGAIN)&&error.raw_os_error()!=Some(libc::EWOULDBLOCK){
+            return Err(format!("lock {label}: {error}"))
+        }
+        let remaining=deadline.saturating_duration_since(Instant::now());
+        if error.raw_os_error()!=Some(libc::EINTR){std::thread::sleep(remaining.min(Duration::from_millis(10)));}
+    }
+    if let Err(error)=revalidate_ranked_lock(&file,path,identity,euid,label){return Err(error)}
+    Ok((file,identity,token))
+}
+
+pub(crate) fn revalidate_ranked_lock(file:&File,path:&Path,expected:LockFileIdentity,euid:u32,label:&str)->Result<(),String>{
+    let opened=file.metadata().map_err(|error|format!("fstat {label}: {error}"))?;
+    let named=fs::symlink_metadata(path).map_err(|error|format!("revalidate {label} path {}: {error}",path.display()))?;
+    let safe=|metadata:&fs::Metadata|metadata.is_file()&&metadata.uid()==euid&&metadata.nlink()==1&&metadata.mode()&0o777==0o600&&metadata.dev()==expected.device&&metadata.ino()==expected.inode;
+    if !safe(&opened)||!safe(&named){return Err(format!("{label} inode identity changed while locked"))}
+    Ok(())
+}
 
 fn open_private_marker_directory(repository:&RepositoryIdentityV1,euid:u32)->Result<(File,PathBuf),String>{
     let common_path=Path::new(&repository.common_dir_realpath);
@@ -46,31 +152,59 @@ fn read_marker_at(directory:&File,euid:u32)->Result<Option<Vec<u8>>,String>{
     let mut bytes=Vec::new();file.read_to_end(&mut bytes).map_err(|e|format!("read managed marker: {e}"))?;Ok(Some(bytes))
 }
 
-pub struct RepositoryGate { file: File, path: PathBuf, repository_id: String }
+#[derive(Clone,Debug,Eq,PartialEq)]
+pub struct RepositoryGateIdentity {
+    pub path:PathBuf,
+    pub repository_id:String,
+    pub lock_file:LockFileIdentity,
+}
+
+pub struct RepositoryGate {
+    file:File,
+    path:PathBuf,
+    repository_id:String,
+    lock_file:LockFileIdentity,
+    _rank:ShortLockToken,
+}
 impl RepositoryGate {
     pub fn acquire(roots:&AuthorityRoots,repository:&RepositoryIdentityV1)->Result<Self,String>{
         if repository.euid!=roots.euid.to_string(){return Err("repository identity EUID differs from authority root".into())}
         let gates=roots.authority.join("repository-gates");authority::ensure_private_directory(&gates,roots.euid)?;
         let path=gates.join(format!("{}.lock",repository.repository_id));
-        let file=OpenOptions::new().create(true).truncate(false).read(true).write(true).mode(0o600).custom_flags(libc::O_CLOEXEC|libc::O_NOFOLLOW).open(&path).map_err(|e|format!("open RepositoryGate {}: {e}",path.display()))?;
-        let metadata=file.metadata().map_err(|e|format!("fstat RepositoryGate: {e}"))?;
-        if !metadata.is_file()||metadata.uid()!=roots.euid||metadata.nlink()!=1||metadata.mode()&0o777!=0o600{return Err("RepositoryGate has unsafe owner/type/link/mode".into())}
-        let deadline=Instant::now()+GATE_TIMEOUT;
-        loop {let result=unsafe{libc::flock(file.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)};if result==0{break}let error=std::io::Error::last_os_error();if error.raw_os_error()!=Some(libc::EINTR)&&error.raw_os_error()!=Some(libc::EAGAIN){return Err(format!("lock RepositoryGate: {error}"))}if Instant::now()>=deadline{return Err("RepositoryGate contention exceeded three seconds; no mutation performed".into())}std::thread::sleep(Duration::from_millis(10));}
-        Ok(Self{file,path,repository_id:repository.repository_id.clone()})
+        let (file,lock_file,rank)=acquire_ranked_lock(&path,roots.euid,"RepositoryGate",ShortLockRank::RepositoryGate)?;
+        Ok(Self{file,path,repository_id:repository.repository_id.clone(),lock_file,_rank:rank})
     }
     pub fn path(&self)->&Path{&self.path}
     pub fn repository_id(&self)->&str{&self.repository_id}
     pub fn as_raw_fd(&self)->i32{self.file.as_raw_fd()}
+    pub fn identity(&self)->RepositoryGateIdentity{RepositoryGateIdentity{path:self.path.clone(),repository_id:self.repository_id.clone(),lock_file:self.lock_file}}
+    pub fn revalidate_lock(&self,roots:&AuthorityRoots)->Result<(),String>{revalidate_ranked_lock(&self.file,&self.path,self.lock_file,roots.euid,"RepositoryGate")}
+    pub fn revalidate(&self,roots:&AuthorityRoots,repository:&RepositoryIdentityV1)->Result<(),String>{
+        if roots.euid.to_string()!=repository.euid||self.repository_id!=repository.repository_id{
+            return Err("RepositoryGate identity differs from current repository authority".into())
+        }
+        revalidate_ranked_lock(&self.file,&self.path,self.lock_file,roots.euid,"RepositoryGate")?;
+        let common=OpenOptions::new().read(true).custom_flags(libc::O_CLOEXEC|libc::O_NOFOLLOW|libc::O_DIRECTORY).open(&repository.common_dir_realpath)
+            .map_err(|error|format!("reopen Git common directory for RepositoryGate revalidation: {error}"))?;
+        let metadata=common.metadata().map_err(|error|format!("fstat Git common directory for RepositoryGate revalidation: {error}"))?;
+        let named=fs::symlink_metadata(&repository.common_dir_realpath).map_err(|error|format!("revalidate Git common directory path: {error}"))?;
+        let device=repository.common_dir_dev.parse::<u64>().map_err(|_|"repository common-dir device is not decimal".to_string())?;
+        let inode=repository.common_dir_ino.parse::<u64>().map_err(|_|"repository common-dir inode is not decimal".to_string())?;
+        if !metadata.is_dir()||metadata.uid()!=roots.euid||metadata.dev()!=device||metadata.ino()!=inode||!named.is_dir()||named.file_type().is_symlink()||named.uid()!=roots.euid||named.dev()!=device||named.ino()!=inode{
+            return Err("repository identity changed while RepositoryGate was held".into())
+        }
+        Ok(())
+    }
 
     pub fn admit_workspace_storage(&self,roots:&AuthorityRoots,repository:&RepositoryIdentityV1)->Result<(),String>{
-        if self.repository_id!=repository.repository_id{return Err("RepositoryGate identity differs from workspace admission".into())}
+        self.revalidate(roots,repository)?;
         admit_ext4_path(&roots.data)?;
         admit_ext4_path(Path::new(&repository.common_dir_realpath))?;
         Ok(())
     }
 
     pub fn refuse_legacy_if_managed(&self,roots:&AuthorityRoots,common_dir:&Path)->Result<(),String>{
+        self.revalidate_lock(roots)?;
         let authority=roots.authority.join("repositories").join(&self.repository_id);
         let marker=common_dir.join(MARKER_RELATIVE);
         if fs::symlink_metadata(&authority).is_ok()||fs::symlink_metadata(&marker).is_ok(){return Err("repository is in managed workspace mode; legacy fanout mutation is refused".into())}
@@ -78,7 +212,7 @@ impl RepositoryGate {
     }
 
     pub fn publish_workspace_marker(&self,roots:&AuthorityRoots,repository:&RepositoryIdentityV1,minimum_relay_version:&str,created_at:&str)->Result<PathBuf,String>{
-        if self.repository_id!=repository.repository_id{return Err("RepositoryGate identity differs from marker repository".into())}
+        self.revalidate(roots,repository)?;
         schema::Timestamp::parse(created_at)?;
         let authority_repository=roots.authority.join("repositories").join(&repository.repository_id);
         if !authority_repository.is_dir(){return Err("workspace authority must be durable before marker publication".into())}

@@ -1,4 +1,5 @@
 use super::capability::{self, read_secure_bytes};
+use super::repository_gate::{self,LockFileIdentity,ShortLockRank,ShortLockToken};
 use super::schema::{
     self, CapabilityRecordV1, ClosedJcs, CoordinatorCapabilityV1, JcsValue,
     PathClaimRequestV1, RepositoryIdentityV1, Sha256Digest,
@@ -22,6 +23,74 @@ pub struct AuthorityRoots {
     pub authority: PathBuf,
     pub data: PathBuf,
     pub euid: u32,
+}
+
+pub struct IntegrationQueueLock {
+    file:File,
+    path:PathBuf,
+    repository_dir:PathBuf,
+    identity:LockFileIdentity,
+    euid:u32,
+    _rank:ShortLockToken,
+}
+
+impl IntegrationQueueLock {
+    pub fn acquire(repository_dir:&Path)->Result<Self,String>{
+        let euid=unsafe{libc::geteuid()};
+        verify_existing_private_directory(repository_dir,euid)?;
+        let path=repository_dir.join("integration-queue.lock");
+        let (file,identity,rank)=repository_gate::acquire_ranked_lock(&path,euid,"IntegrationQueueLock",ShortLockRank::IntegrationQueue)?;
+        Ok(Self{file,path,repository_dir:repository_dir.to_path_buf(),identity,euid,_rank:rank})
+    }
+    pub fn path(&self)->&Path{&self.path}
+    pub fn repository_dir(&self)->&Path{&self.repository_dir}
+    pub fn revalidate(&self)->Result<(),String>{repository_gate::revalidate_ranked_lock(&self.file,&self.path,self.identity,self.euid,"IntegrationQueueLock")}
+}
+
+pub struct AuthorityExclusionLock {
+    file:File,
+    path:PathBuf,
+    repository_dir:PathBuf,
+    identity:LockFileIdentity,
+    euid:u32,
+    _rank:ShortLockToken,
+}
+
+impl AuthorityExclusionLock {
+    pub fn acquire(repository_dir:&Path)->Result<Self,String>{
+        let euid=unsafe{libc::geteuid()};
+        verify_existing_private_directory(repository_dir,euid)?;
+        let path=repository_dir.join("authority-exclusion.lock");
+        let (file,identity,rank)=repository_gate::acquire_ranked_lock(&path,euid,"WorkspaceAuthorityExclusionLock",ShortLockRank::AuthorityExclusion)?;
+        Ok(Self{file,path,repository_dir:repository_dir.to_path_buf(),identity,euid,_rank:rank})
+    }
+    pub fn path(&self)->&Path{&self.path}
+    pub fn repository_dir(&self)->&Path{&self.repository_dir}
+    pub fn revalidate(&self)->Result<(),String>{repository_gate::revalidate_ranked_lock(&self.file,&self.path,self.identity,self.euid,"WorkspaceAuthorityExclusionLock")}
+    pub fn contains(&self,path:&Path)->bool{path.starts_with(&self.repository_dir)}
+}
+
+pub struct WorkspaceJournalLock {
+    file:File,
+    path:PathBuf,
+    session_dir:PathBuf,
+    identity:LockFileIdentity,
+    euid:u32,
+    _rank:ShortLockToken,
+}
+
+impl WorkspaceJournalLock {
+    pub fn acquire(session_dir:&Path)->Result<Self,String>{
+        let euid=unsafe{libc::geteuid()};
+        verify_existing_private_directory(session_dir,euid)?;
+        verify_existing_private_directory(&session_dir.join("journal"),euid)?;
+        let path=session_dir.join("workspace-journal.lock");
+        let (file,identity,rank)=repository_gate::acquire_ranked_lock(&path,euid,"WorkspaceJournalLock",ShortLockRank::WorkspaceJournal)?;
+        Ok(Self{file,path,session_dir:session_dir.to_path_buf(),identity,euid,_rank:rank})
+    }
+    pub fn path(&self)->&Path{&self.path}
+    pub fn session_dir(&self)->&Path{&self.session_dir}
+    pub fn revalidate(&self)->Result<(),String>{repository_gate::revalidate_ranked_lock(&self.file,&self.path,self.identity,self.euid,"WorkspaceJournalLock")}
 }
 
 pub trait AuthorityRootProvider {
@@ -155,6 +224,8 @@ impl WorkspaceAuthority {
     pub fn roots(&self) -> &AuthorityRoots { &self.roots }
     pub fn repository_dir(&self, repository_id: &str) -> Result<PathBuf, String> { Sha256Digest::parse(repository_id)?; Ok(self.roots.authority.join("repositories").join(repository_id)) }
     pub fn capability_path(&self, repository_id: &str, generation: u64) -> Result<PathBuf, String> { Ok(self.repository_dir(repository_id)?.join("coordinator-capabilities").join(format!("{generation:020}.json"))) }
+    pub fn acquire_integration_queue(&self,repository_id:&str)->Result<IntegrationQueueLock,String>{IntegrationQueueLock::acquire(&self.repository_dir(repository_id)?)}
+    pub fn acquire_authority_exclusion(&self,repository_id:&str)->Result<AuthorityExclusionLock,String>{AuthorityExclusionLock::acquire(&self.repository_dir(repository_id)?)}
 
     pub fn bootstrap_coordinator(&self, repository: &RepositoryIdentityV1, now: &str) -> Result<BootstrapResult, String> {
         schema::Timestamp::parse(now)?;
@@ -196,18 +267,38 @@ impl WorkspaceAuthority {
     }
 
     pub fn rotate_coordinator(&self, repository_id: &str, current_path: &Path, now: &str) -> Result<BootstrapResult, String> {
-        let (mut authority, _) = self.authenticate(repository_id, current_path, "recover")?;
-        let current = authority.current_generation.parse::<u64>().map_err(|_| "authority generation overflow".to_string())?;
-        let next = current.checked_add(1).ok_or_else(|| "coordinator generation exhausted".to_string())?;
-        let (capability, record) = capability::mint_coordinator(repository_id, next, now)?;
-        let path = self.capability_path(repository_id, next)?;
-        atomic_create_jcs(&path, &capability, 0o600)?;
-        fsync_directory(path.parent().unwrap())?;
-        authority.current_generation = next.to_string();
-        authority.coordinator = record;
-        authority.updated_at = now.to_string();
-        atomic_replace_jcs(&self.repository_dir(repository_id)?.join(REPOSITORY_RECORD), &authority, 0o600)?;
-        Ok(BootstrapResult { capability, capability_file: path, bootstrap: BootstrapOutcome::Existing })
+        let repository_dir=self.repository_dir(repository_id)?;
+        let exclusion=AuthorityExclusionLock::acquire(&repository_dir)?;
+        self.rotate_coordinator_cas(&exclusion,repository_id,current_path,now)
+    }
+
+    pub fn rotate_coordinator_cas(&self,exclusion:&AuthorityExclusionLock,repository_id:&str,current_path:&Path,now:&str)->Result<BootstrapResult,String>{
+        schema::Timestamp::parse(now)?;
+        let repository_dir=self.repository_dir(repository_id)?;
+        if exclusion.repository_dir()!=repository_dir{return Err("coordinator rotation authority exclusion has the wrong repository identity".into())}
+        exclusion.revalidate()?;
+        let (expected,current_capability)=self.authenticate(repository_id,current_path,"recover")?;
+        let current=expected.current_generation.parse::<u64>().map_err(|_|"authority generation overflow".to_string())?;
+        let next=current.checked_add(1).ok_or_else(||"coordinator generation exhausted".to_string())?;
+        let (capability,record)=capability::mint_coordinator(repository_id,next,now)?;
+        let path=self.capability_path(repository_id,next)?;
+        atomic_create_jcs(&path,&capability,0o600)?;
+        fsync_directory(path.parent().ok_or_else(||"coordinator capability path has no parent".to_string())?)?;
+
+        exclusion.revalidate()?;
+        let observed=self.read_repository(repository_id)?;
+        if observed!=expected{return Err("coordinator authority changed after next-generation publication; refusing CAS replacement".into())}
+        capability::authenticate_coordinator(&current_capability,&observed.coordinator,repository_id,current,"recover")?;
+
+        let mut replacement=observed;
+        replacement.current_generation=next.to_string();
+        replacement.coordinator=record;
+        replacement.updated_at=now.to_string();
+        exclusion.revalidate()?;
+        atomic_replace_jcs(&repository_dir.join(REPOSITORY_RECORD),&replacement,0o600)?;
+        let durable=self.read_repository(repository_id)?;
+        if durable!=replacement{return Err("coordinator authority CAS publication is not durably re-readable".into())}
+        Ok(BootstrapResult{capability,capability_file:path,bootstrap:BootstrapOutcome::Existing})
     }
 
     pub fn read_repository(&self, repository_id: &str) -> Result<RepositoryAuthorityV1, String> {
@@ -226,9 +317,16 @@ impl ClosedJcs for LeaseOwnerV1 {
     fn to_jcs(&self)->JcsValue{JcsValue::Object(BTreeMap::from([("acquired_at".into(),JcsValue::String(self.acquired_at.clone())),("schema".into(),JcsValue::String(schema::SCHEMA_V1.into())),("session_id".into(),JcsValue::String(self.session_id.clone()))]))}
 }
 
+#[derive(Clone,Copy,Debug,Eq,PartialEq)]
+pub struct LeaseIdentity {
+    pub device:u64,
+    pub inode:u64,
+}
+
 pub struct WorkspaceLease { file: File, path: PathBuf }
 impl WorkspaceLease {
     pub fn acquire(path: &Path) -> Result<Self, String> {
+        repository_gate::assert_no_short_locks("lifetime WorkspaceLease acquisition")?;
         if let Some(parent) = path.parent() { ensure_private_directory(parent, unsafe { libc::geteuid() })?; }
         let file = OpenOptions::new().create(true).truncate(false).read(true).write(true).mode(0o600).custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW).open(path)
             .map_err(|error| format!("open workspace lease {}: {error}", path.display()))?;
@@ -274,6 +372,58 @@ impl WorkspaceLease {
     pub fn duplicate(&self)->Result<File,String>{self.file.try_clone().map_err(|error|format!("duplicate workspace lease: {error}"))}
     pub fn as_raw_fd(&self) -> RawFd { self.file.as_raw_fd() }
     pub fn path(&self) -> &Path { &self.path }
+    pub fn identity(&self)->Result<LeaseIdentity,String>{
+        let metadata=self.file.metadata().map_err(|error|format!("fstat workspace lease {}: {error}",self.path.display()))?;
+        Ok(LeaseIdentity{device:metadata.dev(),inode:metadata.ino()})
+    }
+}
+
+pub struct WorkspaceLeaseProbe {
+    file:File,
+    path:PathBuf,
+    identity:LeaseIdentity,
+}
+
+impl WorkspaceLeaseProbe {
+    pub fn acquire(path:&Path,expected:LeaseIdentity)->Result<Self,String>{
+        #[cfg(not(target_os="linux"))]
+        {
+            let _=(path,expected);
+            return Err(super::platform::MACOS_STOP_REASON.to_string())
+        }
+        #[cfg(target_os="linux")]
+        {
+            let euid=unsafe{libc::geteuid()};
+            let file=OpenOptions::new().read(true).write(true).custom_flags(libc::O_CLOEXEC|libc::O_NOFOLLOW).open(path)
+                .map_err(|error|format!("securely open workspace lease probe {}: {error}",path.display()))?;
+            verify_regular(&file,path,0o600,euid)?;
+            let opened=file.metadata().map_err(|error|format!("fstat workspace lease probe: {error}"))?;
+            let named=fs::symlink_metadata(path).map_err(|error|format!("revalidate workspace lease probe path: {error}"))?;
+            let exact=|metadata:&fs::Metadata|metadata.is_file()&&metadata.uid()==euid&&metadata.nlink()==1&&metadata.mode()&0o777==0o600&&metadata.dev()==expected.device&&metadata.ino()==expected.inode;
+            if !exact(&opened)||!exact(&named){return Err("workspace lease probe did not open the exact durable lease inode".into())}
+            let mut lock=libc::flock{l_type:libc::F_WRLCK as i16,l_whence:libc::SEEK_SET as i16,l_start:0,l_len:0,l_pid:0};
+            let result=unsafe{libc::fcntl(file.as_raw_fd(),libc::F_OFD_SETLK,&mut lock)};
+            if result<0{
+                let error=std::io::Error::last_os_error();
+                if matches!(error.raw_os_error(),Some(libc::EAGAIN|libc::EACCES)){return Err("workspace lease custodians have not closed the exact lease inode".into())}
+                return Err(format!("acquire independent workspace lease probe: {error}"))
+            }
+            let named=fs::symlink_metadata(path).map_err(|error|format!("revalidate locked workspace lease probe path: {error}"))?;
+            if !exact(&named){return Err("workspace lease path changed while acquiring the exact probe inode".into())}
+            Ok(Self{file,path:path.to_path_buf(),identity:expected})
+        }
+    }
+    pub fn path(&self)->&Path{&self.path}
+    pub fn identity(&self)->LeaseIdentity{self.identity}
+    pub fn as_raw_fd(&self)->RawFd{self.file.as_raw_fd()}
+    pub fn revalidate(&self)->Result<(),String>{
+        let euid=unsafe{libc::geteuid()};
+        let opened=self.file.metadata().map_err(|error|format!("fstat held workspace lease probe: {error}"))?;
+        let named=fs::symlink_metadata(&self.path).map_err(|error|format!("revalidate held workspace lease probe path: {error}"))?;
+        let exact=|metadata:&fs::Metadata|metadata.is_file()&&metadata.uid()==euid&&metadata.nlink()==1&&metadata.mode()&0o777==0o600&&metadata.dev()==self.identity.device&&metadata.ino()==self.identity.inode;
+        if !exact(&opened)||!exact(&named){return Err("held workspace lease probe no longer excludes the exact durable lease inode".into())}
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -283,9 +433,101 @@ impl ClosedJcs for JournalEventV1 {
  fn to_jcs(&self)->JcsValue{JcsValue::Object(BTreeMap::from([("created_at".into(),JcsValue::String(self.created_at.clone())),("kind".into(),JcsValue::String(self.kind.clone())),("payload".into(),self.payload.clone()),("previous_sha256".into(),self.previous_sha256.clone().map(JcsValue::String).unwrap_or(JcsValue::Null)),("schema".into(),JcsValue::String(schema::SCHEMA_V1.into())),("sequence".into(),JcsValue::String(self.sequence.to_string()))]))}
 }
 
-pub fn append_journal(repository_dir:&Path,event:&JournalEventV1,expected_sequence:u64,expected_head:Option<&str>)->Result<String,String>{
- if event.sequence!=expected_sequence||event.previous_sha256.as_deref()!=expected_head{return Err("journal CAS sequence/head mismatch".into())}
- let path=repository_dir.join("journal").join(format!("{:020}.json",event.sequence)); atomic_create_jcs(&path,event,0o600)?;let digest=schema::jcs_sha256(event);fsync_directory(path.parent().unwrap())?;Ok(digest)
+#[derive(Clone,Debug,Eq,PartialEq)]
+pub struct JournalPosition {
+    pub sequence:u64,
+    pub head:Option<String>,
+}
+
+pub fn read_journal_position(session_dir:&Path)->Result<JournalPosition,String>{
+    let journal=session_dir.join("journal");
+    verify_existing_private_directory(&journal,unsafe{libc::geteuid()})?;
+    let mut entries=Vec::new();
+    for entry in fs::read_dir(&journal).map_err(|error|format!("read workspace journal {}: {error}",journal.display()))?{
+        let entry=entry.map_err(|error|format!("read workspace journal entry: {error}"))?;
+        let name=entry.file_name().into_string().map_err(|_|"workspace journal contains a non-UTF-8 entry".to_string())?;
+        if name.len()!=25||!name.ends_with(".json")||!name[..20].bytes().all(|byte|byte.is_ascii_digit()){
+            return Err(format!("workspace journal contains unexpected entry {name}"))
+        }
+        let sequence=name[..20].parse::<u64>().map_err(|_|"workspace journal sequence overflows u64".to_string())?;
+        if sequence==0{return Err("workspace journal sequence must begin at one".into())}
+        entries.push((sequence,entry.path()));
+    }
+    entries.sort_by_key(|entry|entry.0);
+    let mut head=None;
+    for (index,(sequence,path)) in entries.iter().enumerate(){
+        let expected=(index as u64)+1;
+        if *sequence!=expected{return Err("workspace journal is not a contiguous sequence".into())}
+        let bytes=read_secure_bytes(path)?;
+        let event=JournalEventV1::from_jcs(schema::parse_jcs(&bytes,true)?)?;
+        if event.sequence!=*sequence||event.previous_sha256!=head{return Err("workspace journal event sequence or hash chain differs from durable position".into())}
+        head=Some(schema::jcs_sha256(&event));
+    }
+    Ok(JournalPosition{sequence:entries.len() as u64,head})
+}
+
+pub fn append_journal(session_dir:&Path,event:&JournalEventV1,expected_sequence:u64,expected_head:Option<&str>)->Result<String,String>{
+    if event.sequence!=expected_sequence{return Err("journal event sequence differs from the requested publication sequence".into())}
+    let current=expected_sequence.checked_sub(1).ok_or_else(||"journal sequence must begin at one".to_string())?;
+    let lock=WorkspaceJournalLock::acquire(session_dir)?;
+    append_journal_cas(&lock,event,current,expected_head)
+}
+
+pub fn append_journal_cas(lock:&WorkspaceJournalLock,event:&JournalEventV1,expected_current_sequence:u64,expected_head:Option<&str>)->Result<String,String>{
+    lock.revalidate()?;
+    let next=expected_current_sequence.checked_add(1).ok_or_else(||"journal sequence exhausted".to_string())?;
+    if event.sequence!=next||event.previous_sha256.as_deref()!=expected_head{return Err("journal CAS sequence/head mismatch".into())}
+    let durable=read_journal_position(lock.session_dir())?;
+    if durable.sequence!=expected_current_sequence||durable.head.as_deref()!=expected_head{return Err("durable journal position changed before publication".into())}
+    let path=lock.session_dir().join("journal").join(format!("{:020}.json",event.sequence));
+    atomic_create_jcs(&path,event,0o600)?;
+    let digest=schema::jcs_sha256(event);
+    let published=read_journal_position(lock.session_dir())?;
+    if published.sequence!=event.sequence||published.head.as_deref()!=Some(digest.as_str()){return Err("published journal event is not durably re-readable".into())}
+    Ok(digest)
+}
+
+pub fn replace_manifest_cas<T:ClosedJcs>(lock:&WorkspaceJournalLock,path:&Path,expected_state:&str,expected_sequence:u64,expected_head:Option<&str>,replacement:&T)->Result<(),String>{
+    if path.parent()!=Some(lock.session_dir()){return Err("manifest CAS path is outside the locked workspace session".into())}
+    lock.revalidate()?;
+    let current=read_secure_bytes(path)?;
+    let current=schema::parse_jcs(&current,true)?;
+    let (state,sequence,head)=manifest_cas_position(&current)?;
+    if state!=expected_state||sequence!=expected_sequence||head.as_deref()!=expected_head{return Err("manifest CAS state/sequence/head changed before publication".into())}
+    let (_,replacement_sequence,replacement_head)=manifest_cas_position(&replacement.to_jcs())?;
+    let journal=read_journal_position(lock.session_dir())?;
+    if replacement_sequence!=journal.sequence||replacement_head!=journal.head{return Err("replacement manifest does not name the exact durable journal position".into())}
+    lock.revalidate()?;
+    atomic_replace_jcs(path,replacement,0o600)
+}
+
+pub fn commit_closed_manifest_cas<T:ClosedJcs>(gate:&repository_gate::RepositoryGate,roots:&AuthorityRoots,exclusion:&AuthorityExclusionLock,probe:&WorkspaceLeaseProbe,lock:&WorkspaceJournalLock,path:&Path,expected_state:&str,expected_sequence:u64,expected_head:Option<&str>,replacement:&T)->Result<(),String>{
+    let repository_id=exclusion.repository_dir().file_name().and_then(OsStr::to_str).ok_or_else(||"authority exclusion repository path has no UTF-8 identity".to_string())?;
+    if gate.repository_id()!=repository_id{return Err("RepositoryGate and authority exclusion identify different repositories".into())}
+    let (state,_,_)=manifest_cas_position(&replacement.to_jcs())?;
+    if state!="Closed"{return Err("lease probe publication is restricted to the terminal Closed manifest".into())}
+    gate.revalidate_lock(roots)?;
+    exclusion.revalidate()?;
+    probe.revalidate()?;
+    replace_manifest_cas(lock,path,expected_state,expected_sequence,expected_head,replacement)?;
+    probe.revalidate()?;
+    exclusion.revalidate()?;
+    gate.revalidate_lock(roots)
+}
+
+fn manifest_cas_position(value:&JcsValue)->Result<(String,u64,Option<String>),String>{
+    let object=match value{JcsValue::Object(object)=>object,_=>return Err("workspace manifest must be an object".into())};
+    let state=object.get("state").ok_or_else(||"workspace manifest has no state".to_string())?.as_str()?.to_string();
+    let sequence_text=object.get("journal_sequence").ok_or_else(||"workspace manifest has no journal_sequence".to_string())?.as_str()?;
+    schema::Decimal::parse(sequence_text)?;
+    let sequence=sequence_text.parse::<u64>().map_err(|_|"workspace manifest journal_sequence overflows u64".to_string())?;
+    let head=match object.get("journal_head_sha256").ok_or_else(||"workspace manifest has no journal_head_sha256".to_string())?{
+        JcsValue::Null=>None,
+        JcsValue::String(value)=>{Sha256Digest::parse(value)?;Some(value.clone())},
+        _=>return Err("workspace manifest journal_head has invalid nullability".into()),
+    };
+    if (sequence==0)!=head.is_none(){return Err("workspace manifest journal sequence/head nullability mismatch".into())}
+    Ok((state,sequence,head))
 }
 
 pub fn atomic_create_jcs<T:ClosedJcs>(path:&Path,value:&T,mode:u32)->Result<(),String>{atomic_write(path,&schema::serialize_jcs_lf(value),mode,false)}
@@ -293,6 +535,18 @@ pub fn atomic_replace_jcs<T:ClosedJcs>(path:&Path,value:&T,mode:u32)->Result<(),
 fn atomic_write(path:&Path,bytes:&[u8],mode:u32,replace:bool)->Result<(),String>{
  let parent=path.parent().ok_or_else(||"record path has no parent".to_string())?;let temp=parent.join(format!(".tmp-{}",crate::store::uuid_v4()));let mut file=OpenOptions::new().create_new(true).write(true).mode(mode).custom_flags(libc::O_CLOEXEC|libc::O_NOFOLLOW).open(&temp).map_err(|e|format!("create {}: {e}",temp.display()))?;file.write_all(bytes).and_then(|_|file.sync_all()).map_err(|e|format!("persist {}: {e}",temp.display()))?;drop(file);
  let result=if replace{fs::rename(&temp,path).map_err(|e|format!("replace {}: {e}",path.display()))}else{rename_noreplace(&temp,path).map_err(|e|format!("create-once publish {}: {e}",path.display()))};if result.is_err(){fs::remove_file(&temp).ok();return result}fsync_directory(parent)
+}
+
+fn verify_existing_private_directory(path:&Path,euid:u32)->Result<(),String>{
+    if !path.is_absolute(){return Err(format!("private directory {} is not absolute",path.display()))}
+    let file=OpenOptions::new().read(true).custom_flags(libc::O_CLOEXEC|libc::O_NOFOLLOW|libc::O_DIRECTORY).open(path)
+        .map_err(|error|format!("securely open existing private directory {}: {error}",path.display()))?;
+    let metadata=file.metadata().map_err(|error|format!("fstat existing private directory {}: {error}",path.display()))?;
+    let named=fs::symlink_metadata(path).map_err(|error|format!("revalidate existing private directory {}: {error}",path.display()))?;
+    if !metadata.is_dir()||metadata.uid()!=euid||metadata.mode()&0o777!=0o700||!named.is_dir()||named.file_type().is_symlink()||named.uid()!=euid||named.dev()!=metadata.dev()||named.ino()!=metadata.ino(){
+        return Err(format!("{} is not an exact EUID-owned mode-0700 real directory",path.display()))
+    }
+    Ok(())
 }
 
 pub fn ensure_private_directory(path:&Path,euid:u32)->Result<(),String>{

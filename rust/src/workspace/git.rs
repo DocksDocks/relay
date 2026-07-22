@@ -220,6 +220,532 @@ pub fn create_worker_commit(repository:&OpenedRepository,worktree:&Path,branch_r
  Ok(commit)
 }
 
+#[derive(Clone,Debug,Eq,PartialEq)]
+pub struct OrderedProducedCommit {
+ pub oid:String,
+ pub parent_oid:String,
+ pub source:String,
+}
+
+#[derive(Clone,Debug,Eq,PartialEq)]
+pub struct OrderedIntegrationRequest {
+ pub integration_root:PathBuf,
+ pub integration_branch_ref:String,
+ pub expected_integration_head:String,
+ pub worker_root:PathBuf,
+ pub worker_branch_ref:String,
+ pub expected_worker_head:String,
+ pub base_commit:String,
+ pub produced_commits:Vec<OrderedProducedCommit>,
+}
+
+#[derive(Clone,Copy,Debug,Eq,PartialEq)]
+pub enum CoordinatorIntegrationOutcome { Integrated, NeedsUserAction, Rejected }
+impl CoordinatorIntegrationOutcome {
+ pub fn as_str(self)->&'static str{match self{Self::Integrated=>"integrated",Self::NeedsUserAction=>"needs_user_action",Self::Rejected=>"rejected"}}
+}
+
+#[derive(Clone,Debug,Eq,PartialEq)]
+pub struct CoordinatorIntegrationResult {
+ pub outcome:CoordinatorIntegrationOutcome,
+ pub pre_head:String,
+ pub post_head:String,
+ pub output_oids:Vec<String>,
+ pub conflict_paths:Vec<String>,
+}
+
+#[derive(Clone,Debug,Eq,PartialEq)]
+pub struct PristineGitState {
+ pub head_oid:String,
+ pub head_tree_oid:String,
+ pub index_tree_oid:String,
+ pub index_file_sha256:String,
+ pub index_entries_sha256:String,
+ pub status_sha256:String,
+}
+
+#[derive(Debug)]
+struct PreparedIntegration {
+ integration:OpenedRepository,
+ worker:OpenedRepository,
+ integration_state:PristineGitState,
+ worker_state:PristineGitState,
+ integration_index_bytes:Vec<u8>,
+ worker_index_bytes:Vec<u8>,
+}
+
+fn same_pristine_semantics(left:&PristineGitState,right:&PristineGitState)->bool{
+ left.head_oid==right.head_oid&&left.head_tree_oid==right.head_tree_oid&&left.index_tree_oid==right.index_tree_oid&&left.index_entries_sha256==right.index_entries_sha256&&left.status_sha256==right.status_sha256
+}
+
+const COORDINATOR_GIT_ENVIRONMENT:[&str;10]=[
+ "GIT_DIR","GIT_WORK_TREE","GIT_INDEX_FILE","GIT_OBJECT_DIRECTORY",
+ "GIT_ALTERNATE_OBJECT_DIRECTORIES","GIT_COMMON_DIR","GIT_NAMESPACE",
+ "GIT_CEILING_DIRECTORIES","GIT_DISCOVERY_ACROSS_FILESYSTEM","GIT_PREFIX",
+];
+
+fn coordinator_git_output(cwd:&Path,args:&[&str])->Result<Output,String>{
+ let mut command=Command::new("git");
+ command.args(args).current_dir(cwd).stdin(Stdio::null());
+ for name in COORDINATOR_GIT_ENVIRONMENT{command.env_remove(name);}
+ command.env("GIT_OPTIONAL_LOCKS","0");
+ command.output().map_err(|e|format!("run coordinator git {} in {}: {e}",args.join(" "),cwd.display()))
+}
+
+fn coordinator_git_text(cwd:&Path,args:&[&str])->Result<String,String>{
+ let output=coordinator_git_output(cwd,args)?;
+ if !output.status.success(){return Err(format!("coordinator git {} failed in {}: {}",args.join(" "),cwd.display(),String::from_utf8_lossy(&output.stderr).trim()))}
+ let text=String::from_utf8(output.stdout).map_err(|_|"coordinator Git output was not UTF-8".to_string())?;
+ Ok(text.trim_end_matches(['\r','\n']).to_string())
+}
+
+fn coordinator_git_bytes(cwd:&Path,args:&[&str])->Result<Vec<u8>,String>{
+ let output=coordinator_git_output(cwd,args)?;
+ if !output.status.success(){return Err(format!("coordinator git {} failed in {}: {}",args.join(" "),cwd.display(),String::from_utf8_lossy(&output.stderr).trim()))}
+ Ok(output.stdout)
+}
+
+fn exact_index_file(root:&Path)->Result<Vec<u8>,String>{
+ let index=coordinator_git_text(root,&["rev-parse","--path-format=absolute","--git-path","index"])?;
+ let mut file=OpenOptions::new().read(true).custom_flags(libc::O_CLOEXEC|libc::O_NOFOLLOW).open(&index).map_err(|e|format!("securely open coordinator index {index}: {e}"))?;
+ let metadata=file.metadata().map_err(|e|format!("fstat coordinator index {index}: {e}"))?;
+ if !metadata.is_file()||metadata.uid()!=unsafe{libc::geteuid()}||metadata.nlink()!=1{return Err("coordinator index is not an EUID-owned single-link regular file".into())}
+ let mut bytes=Vec::new();use std::io::Read;file.read_to_end(&mut bytes).map_err(|e|format!("read coordinator index {index}: {e}"))?;
+ Ok(bytes)
+}
+
+fn restore_exact_index_file(root:&Path,bytes:&[u8])->Result<(),String>{
+ if exact_index_file(root)?==bytes{return Ok(())}
+ let index=PathBuf::from(coordinator_git_text(root,&["rev-parse","--path-format=absolute","--git-path","index"])?);
+ let current=OpenOptions::new().read(true).custom_flags(libc::O_CLOEXEC|libc::O_NOFOLLOW).open(&index).map_err(|e|format!("securely open current coordinator index: {e}"))?;
+ let metadata=current.metadata().map_err(|e|format!("fstat current coordinator index: {e}"))?;
+ if !metadata.is_file()||metadata.uid()!=unsafe{libc::geteuid()}||metadata.nlink()!=1{return Err("current coordinator index is not an EUID-owned single-link regular file".into())}
+ let parent=index.parent().ok_or_else(||"coordinator index has no parent".to_string())?;
+ let staging=parent.join(format!(".session-relay-index-restore-{}",crate::store::uuid_v4()));
+ let mut file=OpenOptions::new().create_new(true).write(true).mode(metadata.mode()&0o777).custom_flags(libc::O_CLOEXEC|libc::O_NOFOLLOW).open(&staging).map_err(|e|format!("create exact index restore file: {e}"))?;
+ file.write_all(bytes).and_then(|_|file.sync_all()).map_err(|e|format!("persist exact index restore file: {e}"))?;
+ fs::rename(&staging,&index).map_err(|e|format!("atomically restore exact coordinator index: {e}"))?;
+ let directory=OpenOptions::new().read(true).custom_flags(libc::O_CLOEXEC|libc::O_NOFOLLOW|libc::O_DIRECTORY).open(parent).map_err(|e|format!("open coordinator index directory: {e}"))?;
+ directory.sync_all().map_err(|e|format!("fsync restored coordinator index: {e}"))?;
+ if exact_index_file(root)?!=bytes{return Err("restored coordinator index bytes differ from pre-integration bytes".into())}
+ Ok(())
+}
+
+fn validate_coordinator_environment()->Result<(),String>{
+ for name in COORDINATOR_GIT_ENVIRONMENT{
+  if std::env::var_os(name).is_some(){return Err(format!("coordinator integration refuses ambient {name}"))}
+ }
+ Ok(())
+}
+
+fn validate_branch_ref(value:&str,label:&str)->Result<(),String>{
+ if !value.starts_with("refs/heads/"){return Err(format!("{label} is not under refs/heads"))}
+ let output=coordinator_git_output(Path::new("."),&["check-ref-format",value])?;
+ if !output.status.success(){return Err(format!("{label} is not a valid full Git ref"))}
+ Ok(())
+}
+
+fn open_exact_checkout(repository:&OpenedRepository,root:&Path,label:&str)->Result<OpenedRepository,String>{
+ if !root.is_absolute(){return Err(format!("{label} is not absolute"))}
+ let canonical=fs::canonicalize(root).map_err(|e|format!("canonicalize {label} {}: {e}",root.display()))?;
+ if canonical!=root{return Err(format!("{label} is not canonical or traverses a symlink"))}
+ let opened=OpenedRepository::open(root)?;
+ if opened.root!=root{return Err(format!("{label} differs from its Git top-level"))}
+ if opened.identity!=repository.identity{return Err(format!("{label} repository identity or object format differs"))}
+ Ok(opened)
+}
+
+fn exact_ref_head(root:&Path,branch_ref:&str)->Result<String,String>{
+ let symbolic=coordinator_git_text(root,&["symbolic-ref","-q","HEAD"])?;
+ if symbolic!=branch_ref{return Err(format!("symbolic HEAD is {symbolic}, expected {branch_ref}"))}
+ let head=coordinator_git_text(root,&["rev-parse","--verify","HEAD"])?;
+ let branch=coordinator_git_text(root,&["show-ref","--verify","--hash",branch_ref])?;
+ if branch!=head{return Err("symbolic branch ref and HEAD differ".into())}
+ Ok(head)
+}
+
+fn command_is_quiet(root:&Path,args:&[&str],dirty_message:&str)->Result<(),String>{
+ let output=coordinator_git_output(root,args)?;
+ if output.status.success(){return Ok(())}
+ if output.status.code()==Some(1){return Err(dirty_message.into())}
+ Err(format!("coordinator git {} could not prove cleanliness: {}",args.join(" "),String::from_utf8_lossy(&output.stderr).trim()))
+}
+
+pub fn pristine_git_state(repository:&OpenedRepository,root:&Path,branch_ref:&str,expected_head:&str)->Result<PristineGitState,String>{
+ repository.validate_unchanged()?;
+ let head=exact_ref_head(root,branch_ref)?;
+ let expected=repository.validate_oid(expected_head)?;
+ if expected.as_str()!=expected_head||head!=expected_head{return Err("checkout HEAD differs from the exact expected OID".into())}
+ let private=actual_private_git_dir(root)?;
+ for marker in ["MERGE_HEAD","REBASE_HEAD","CHERRY_PICK_HEAD","BISECT_START","REVERT_HEAD"]{
+  if private.join(marker).exists(){return Err(format!("checkout has forbidden Git operation marker {marker}"))}
+ }
+ let status=coordinator_git_bytes(root,&["status","--porcelain=v2","-z","--untracked-files=all"])?;
+ if !status.is_empty(){return Err("checkout status is not pristine".into())}
+ command_is_quiet(root,&["diff","--quiet","--"],"checkout worktree differs from its index")?;
+ command_is_quiet(root,&["diff","--cached","--quiet","HEAD","--"],"checkout index differs from HEAD")?;
+ let head_tree=coordinator_git_text(root,&["rev-parse","--verify",&format!("{head}^{{tree}}")])?;
+ let index_tree=head_tree.clone();
+ repository.validate_oid(&head_tree)?;
+ let index_entries=coordinator_git_bytes(root,&["ls-files","--stage","-z"])?;
+ let index_file=exact_index_file(root)?;
+ Ok(PristineGitState{head_oid:head,head_tree_oid:head_tree,index_tree_oid:index_tree,index_file_sha256:sha256::hex_digest(&index_file),index_entries_sha256:sha256::hex_digest(&index_entries),status_sha256:sha256::hex_digest(&status)})
+}
+
+fn validate_commit_object(repository:&OpenedRepository,root:&Path,oid:&str,label:&str)->Result<(),String>{
+ let parsed=repository.validate_oid(oid)?;
+ if parsed.as_str()!=oid{return Err(format!("{label} is not a canonical OID"))}
+ let object_type=coordinator_git_text(root,&["cat-file","-t",oid])?;
+ if object_type!="commit"{return Err(format!("{label} is not a commit object"))}
+ Ok(())
+}
+
+fn validate_ancestor(root:&Path,ancestor:&str,descendant:&str,label:&str)->Result<(),String>{
+ let output=coordinator_git_output(root,&["merge-base","--is-ancestor",ancestor,descendant])?;
+ if output.status.success(){return Ok(())}
+ if output.status.code()==Some(1){return Err(format!("{label} ancestry differs"))}
+ Err(format!("could not validate {label} ancestry: {}",String::from_utf8_lossy(&output.stderr).trim()))
+}
+
+fn validate_produced_chain(repository:&OpenedRepository,request:&OrderedIntegrationRequest)->Result<(),String>{
+ if request.produced_commits.is_empty(){return Err("produced commit chain is empty; applied WIP must be index zero".into())}
+ validate_commit_object(repository,&request.worker_root,&request.base_commit,"base commit")?;
+ validate_commit_object(repository,&request.worker_root,&request.expected_worker_head,"expected worker HEAD")?;
+ let mut expected_parent=request.base_commit.as_str();
+ for (index,commit) in request.produced_commits.iter().enumerate(){
+  validate_commit_object(repository,&request.worker_root,&commit.oid,&format!("produced commit {index}"))?;
+  let parent=repository.validate_oid(&commit.parent_oid)?;
+  if parent.as_str()!=commit.parent_oid{return Err(format!("produced commit {index} parent is not canonical"))}
+  let expected_source=if index==0{"applied_wip"}else{"worker"};
+  if commit.source!=expected_source{return Err(format!("produced commit {index} source must be {expected_source}"))}
+  if commit.parent_oid!=expected_parent{return Err(format!("produced commit {index} is out of strict linear order"))}
+  let row=coordinator_git_text(&request.worker_root,&["rev-list","--parents","-n","1",&commit.oid])?;
+  let fields=row.split_whitespace().collect::<Vec<_>>();
+  if fields.len()!=2||fields[0]!=commit.oid||fields[1]!=commit.parent_oid{return Err(format!("produced commit {index} is not a single-parent commit with its declared parent"))}
+  expected_parent=&commit.oid;
+ }
+ if expected_parent!=request.expected_worker_head{return Err("last produced commit differs from expected worker HEAD".into())}
+ validate_ancestor(&request.worker_root,&request.base_commit,&request.expected_worker_head,"worker base")?;
+ let range=format!("{}..{}",request.base_commit,request.expected_worker_head);
+ let actual=coordinator_git_text(&request.worker_root,&["rev-list","--reverse","--topo-order",&range])?.lines().map(str::to_string).filter(|line|!line.is_empty()).collect::<Vec<_>>();
+ let declared=request.produced_commits.iter().map(|commit|commit.oid.clone()).collect::<Vec<_>>();
+ if actual!=declared{return Err("produced commit list is not the complete oldest-first worker history".into())}
+ Ok(())
+}
+
+fn prepare_ordered_integration(repository:&OpenedRepository,request:&OrderedIntegrationRequest)->Result<PreparedIntegration,String>{
+ validate_coordinator_environment()?;
+ repository.validate_unchanged()?;
+ validate_branch_ref(&request.integration_branch_ref,"integration branch ref")?;
+ validate_branch_ref(&request.worker_branch_ref,"worker branch ref")?;
+ if request.integration_root==request.worker_root{return Err("integration and worker roots must be distinct".into())}
+ if request.integration_branch_ref==request.worker_branch_ref{return Err("integration and worker branch refs must be distinct".into())}
+ let integration=open_exact_checkout(repository,&request.integration_root,"integration root")?;
+ let worker=open_exact_checkout(repository,&request.worker_root,"worker root")?;
+ validate_commit_object(repository,&integration.root,&request.expected_integration_head,"expected integration HEAD")?;
+ let integration_index_bytes=exact_index_file(&integration.root)?;
+ let worker_index_bytes=exact_index_file(&worker.root)?;
+ let mut integration_state=pristine_git_state(&integration,&integration.root,&request.integration_branch_ref,&request.expected_integration_head)?;
+ integration_state.index_file_sha256=sha256::hex_digest(&integration_index_bytes);
+ let mut worker_state=pristine_git_state(&worker,&worker.root,&request.worker_branch_ref,&request.expected_worker_head)?;
+ worker_state.index_file_sha256=sha256::hex_digest(&worker_index_bytes);
+ validate_produced_chain(repository,request)?;
+ validate_ancestor(&integration.root,&request.base_commit,&request.expected_integration_head,"integration base")?;
+ Ok(PreparedIntegration{integration,worker,integration_state,worker_state,integration_index_bytes,worker_index_bytes})
+}
+
+pub fn validate_ordered_integration(repository:&OpenedRepository,request:&OrderedIntegrationRequest)->Result<(PristineGitState,PristineGitState),String>{
+ let prepared=prepare_ordered_integration(repository,request)?;
+ restore_exact_index_file(&prepared.integration.root,&prepared.integration_index_bytes)?;
+ restore_exact_index_file(&prepared.worker.root,&prepared.worker_index_bytes)?;
+ Ok((prepared.integration_state,prepared.worker_state))
+}
+
+fn parse_unmerged_paths(bytes:&[u8])->Result<Vec<String>,String>{
+ if bytes.is_empty(){return Ok(Vec::new())}
+ if !bytes.ends_with(&[0]){return Err("unmerged path output is truncated".into())}
+ let mut paths=Vec::new();
+ for field in bytes[..bytes.len()-1].split(|byte|*byte==0){
+  if field.is_empty(){return Err("unmerged path output contains an empty path".into())}
+  let path=std::str::from_utf8(field).map_err(|_|"unmerged path is not UTF-8".to_string())?.to_string();
+  schema::RelPath::parse(&path)?;
+  paths.push(path);
+ }
+ paths.sort();
+ paths.dedup();
+ Ok(paths)
+}
+
+fn restore_preintegration_state(prepared:&PreparedIntegration,request:&OrderedIntegrationRequest,current_head:&str)->Result<(),String>{
+ let root=&prepared.integration.root;
+ let current=pristine_git_state(&prepared.integration,root,&request.integration_branch_ref,current_head)?;
+ if current.head_oid!=prepared.integration_state.head_oid{
+  coordinator_git_text(root,&["update-ref","--no-deref",&request.integration_branch_ref,&prepared.integration_state.head_oid,current_head])?;
+  coordinator_git_text(root,&["read-tree","--reset","-u",&prepared.integration_state.head_oid])?;
+ }
+ restore_exact_index_file(root,&prepared.integration_index_bytes)?;
+ let restored=pristine_git_state(&prepared.integration,root,&request.integration_branch_ref,&prepared.integration_state.head_oid)?;
+ if !same_pristine_semantics(&restored,&prepared.integration_state){return Err(format!("integration rollback did not restore the exact clean pre-head/index/tree/status: pre={:?}, restored={restored:?}",prepared.integration_state))}
+ restore_exact_index_file(root,&prepared.integration_index_bytes)?;
+ Ok(())
+}
+
+fn settle_failed_cherry_pick(prepared:&PreparedIntegration,request:&OrderedIntegrationRequest,current_head:&str,command_error:&str)->Result<CoordinatorIntegrationResult,String>{
+ let root=&prepared.integration.root;
+ let paths_result=coordinator_git_bytes(root,&["diff","--name-only","--diff-filter=U","-z","--"]).and_then(|bytes|parse_unmerged_paths(&bytes));
+ let marker=actual_private_git_dir(root)?.join("CHERRY_PICK_HEAD");
+ if marker.exists(){
+  if exact_ref_head(root,&request.integration_branch_ref)?!=current_head{return Err(format!("cherry-pick failed and integration ref drifted before abort: {command_error}"))}
+  let abort=coordinator_git_output(root,&["-c","core.hooksPath=/dev/null","cherry-pick","--abort"])?;
+  if !abort.status.success(){return Err(format!("cherry-pick abort was ambiguous after {command_error}: {}",String::from_utf8_lossy(&abort.stderr).trim()))}
+ }else{
+  let unchanged=pristine_git_state(&prepared.integration,root,&request.integration_branch_ref,current_head);
+  if unchanged.is_err(){return Err(format!("cherry-pick failed without an abortable operation and state is ambiguous: {command_error}"))}
+ }
+ restore_preintegration_state(prepared,request,current_head)?;
+ let worker_after=pristine_git_state(&prepared.worker,&prepared.worker.root,&request.worker_branch_ref,&request.expected_worker_head)?;
+ if !same_pristine_semantics(&worker_after,&prepared.worker_state){return Err("worker branch/work changed while restoring integration conflict".into())}
+ restore_exact_index_file(&prepared.worker.root,&prepared.worker_index_bytes)?;
+ let paths=paths_result.map_err(|error|format!("integration was restored but conflict paths were ambiguous after {command_error}: {error}"))?;
+ if paths.is_empty(){return Err(format!("integration was restored after a non-conflict cherry-pick failure: {command_error}"))}
+ Ok(CoordinatorIntegrationResult{outcome:CoordinatorIntegrationOutcome::NeedsUserAction,pre_head:prepared.integration_state.head_oid.clone(),post_head:prepared.integration_state.head_oid.clone(),output_oids:Vec::new(),conflict_paths:paths})
+}
+
+pub fn integrate_ordered(repository:&OpenedRepository,request:&OrderedIntegrationRequest)->Result<CoordinatorIntegrationResult,String>{
+ let prepared=prepare_ordered_integration(repository,request)?;
+ let mut current=prepared.integration_state.head_oid.clone();
+ let mut outputs=Vec::with_capacity(request.produced_commits.len());
+ for commit in &request.produced_commits{
+  let before=pristine_git_state(&prepared.integration,&prepared.integration.root,&request.integration_branch_ref,&current)?;
+  let output=coordinator_git_output(&prepared.integration.root,&["-c","core.hooksPath=/dev/null","-c","commit.gpgSign=false","cherry-pick","--no-gpg-sign","--allow-empty","--keep-redundant-commits",&commit.oid])?;
+  if !output.status.success(){
+   let message=String::from_utf8_lossy(&output.stderr).trim().to_string();
+   return settle_failed_cherry_pick(&prepared,request,&current,&message)
+  }
+  let next=exact_ref_head(&prepared.integration.root,&request.integration_branch_ref)?;
+  validate_commit_object(&prepared.integration,&prepared.integration.root,&next,"integration output")?;
+  let row=coordinator_git_text(&prepared.integration.root,&["rev-list","--parents","-n","1",&next])?;
+  let fields=row.split_whitespace().collect::<Vec<_>>();
+  if fields.len()!=2||fields[0]!=next||fields[1]!=current{return Err("integration output is not the exact next single-parent commit".into())}
+  let after=pristine_git_state(&prepared.integration,&prepared.integration.root,&request.integration_branch_ref,&next)?;
+  if before.head_oid!=current||after.head_oid==current{return Err("integration cherry-pick did not advance exactly once".into())}
+  outputs.push(next.clone());
+  current=next;
+ }
+ if outputs.len()!=request.produced_commits.len(){return Err("integration output cardinality differs from produced chain".into())}
+ let worker_after=pristine_git_state(&prepared.worker,&prepared.worker.root,&request.worker_branch_ref,&request.expected_worker_head)?;
+ if !same_pristine_semantics(&worker_after,&prepared.worker_state){return Err("worker branch/work changed during coordinator integration".into())}
+ restore_exact_index_file(&prepared.worker.root,&prepared.worker_index_bytes)?;
+ Ok(CoordinatorIntegrationResult{outcome:CoordinatorIntegrationOutcome::Integrated,pre_head:prepared.integration_state.head_oid,post_head:current,output_oids:outputs,conflict_paths:Vec::new()})
+}
+
+pub fn reject_ordered(repository:&OpenedRepository,request:&OrderedIntegrationRequest)->Result<CoordinatorIntegrationResult,String>{
+ let prepared=prepare_ordered_integration(repository,request)?;
+ let integration_after=pristine_git_state(&prepared.integration,&prepared.integration.root,&request.integration_branch_ref,&request.expected_integration_head)?;
+ let worker_after=pristine_git_state(&prepared.worker,&prepared.worker.root,&request.worker_branch_ref,&request.expected_worker_head)?;
+ if !same_pristine_semantics(&integration_after,&prepared.integration_state)||!same_pristine_semantics(&worker_after,&prepared.worker_state){return Err("rejection validation observed checkout drift".into())}
+ restore_exact_index_file(&prepared.integration.root,&prepared.integration_index_bytes)?;
+ restore_exact_index_file(&prepared.worker.root,&prepared.worker_index_bytes)?;
+ Ok(CoordinatorIntegrationResult{outcome:CoordinatorIntegrationOutcome::Rejected,pre_head:prepared.integration_state.head_oid.clone(),post_head:prepared.integration_state.head_oid,output_oids:Vec::new(),conflict_paths:Vec::new()})
+}
+
+#[derive(Clone,Debug,Eq,PartialEq)]
+pub enum GitCleanupProof {
+ Integrated(CoordinatorIntegrationResult),
+ Rejected(CoordinatorIntegrationResult),
+ Retained { retention_proof_sha256:String },
+}
+
+#[derive(Clone,Debug,Eq,PartialEq)]
+pub struct GitCleanupResult {
+ pub removed_worktree:PathBuf,
+ pub removed_branch_ref:String,
+ pub retained_head_oid:String,
+}
+
+fn validate_output_chain(repository:&OpenedRepository,root:&Path,pre_head:&str,post_head:&str,outputs:&[String],expected_len:usize)->Result<(),String>{
+ validate_commit_object(repository,root,pre_head,"integration pre-head")?;
+ validate_commit_object(repository,root,post_head,"integration post-head")?;
+ if outputs.len()!=expected_len{return Err("integrated cleanup proof output cardinality differs from produced chain".into())}
+ let mut parent=pre_head;
+ for (index,oid) in outputs.iter().enumerate(){
+  validate_commit_object(repository,root,oid,&format!("integration output {index}"))?;
+  let row=coordinator_git_text(root,&["rev-list","--parents","-n","1",oid])?;
+  let fields=row.split_whitespace().collect::<Vec<_>>();
+  if fields.len()!=2||fields[0]!=oid||fields[1]!=parent{return Err(format!("integration output {index} is not in exact receipt order"))}
+  parent=oid;
+ }
+ if parent!=post_head{return Err("integrated cleanup proof last output differs from post-head".into())}
+ Ok(())
+}
+
+pub fn verify_ordered_cleanup(repository:&OpenedRepository,request:&OrderedIntegrationRequest,proof:&GitCleanupProof)->Result<(),String>{
+ validate_coordinator_environment()?;
+ repository.validate_unchanged()?;
+ validate_branch_ref(&request.integration_branch_ref,"integration branch ref")?;
+ validate_branch_ref(&request.worker_branch_ref,"worker branch ref")?;
+ let integration=open_exact_checkout(repository,&request.integration_root,"integration root")?;
+ let worker=open_exact_checkout(repository,&request.worker_root,"worker root")?;
+ let integration_index_bytes=exact_index_file(&integration.root)?;
+ let worker_index_bytes=exact_index_file(&worker.root)?;
+ let worker_state=pristine_git_state(&worker,&worker.root,&request.worker_branch_ref,&request.expected_worker_head)?;
+ if worker_state.head_oid!=request.expected_worker_head{return Err("cleanup worker HEAD differs".into())}
+ validate_produced_chain(repository,request)?;
+ match proof{
+  GitCleanupProof::Integrated(result)=>{
+   if result.outcome!=CoordinatorIntegrationOutcome::Integrated||result.pre_head!=request.expected_integration_head||!result.conflict_paths.is_empty(){return Err("integrated cleanup proof has an invalid outcome or pre-head".into())}
+   pristine_git_state(&integration,&integration.root,&request.integration_branch_ref,&result.post_head)?;
+   validate_output_chain(&integration,&integration.root,&result.pre_head,&result.post_head,&result.output_oids,request.produced_commits.len())?;
+  }
+  GitCleanupProof::Rejected(result)=>{
+   if result.outcome!=CoordinatorIntegrationOutcome::Rejected||result.pre_head!=request.expected_integration_head||result.post_head!=result.pre_head||!result.output_oids.is_empty()||!result.conflict_paths.is_empty(){return Err("rejected cleanup proof is not exact and mutation-free".into())}
+   pristine_git_state(&integration,&integration.root,&request.integration_branch_ref,&result.post_head)?;
+  }
+  GitCleanupProof::Retained{retention_proof_sha256}=>{
+   schema::Sha256Digest::parse(retention_proof_sha256)?;
+   pristine_git_state(&integration,&integration.root,&request.integration_branch_ref,&request.expected_integration_head)?;
+  }
+ }
+ restore_exact_index_file(&integration.root,&integration_index_bytes)?;
+ restore_exact_index_file(&worker.root,&worker_index_bytes)?;
+ Ok(())
+}
+
+pub fn cleanup_ordered_worktree(repository:&OpenedRepository,request:&OrderedIntegrationRequest,proof:&GitCleanupProof)->Result<GitCleanupResult,String>{
+ verify_ordered_cleanup(repository,request,proof)?;
+ let root_text=request.worker_root.to_str().ok_or_else(||"worker root is not UTF-8".to_string())?;
+ coordinator_git_text(&repository.root,&["worktree","unlock",root_text])?;
+ if let Err(error)=verify_ordered_cleanup(repository,request,proof){
+  return Err(format!("cleanup proof drifted after unlock; worktree retained: {error}"))
+ }
+ coordinator_git_text(&repository.root,&["worktree","remove",root_text])?;
+ if request.worker_root.exists(){return Err("Git reported worktree removal but the exact worker root remains".into())}
+ let branch=coordinator_git_text(&repository.root,&["show-ref","--verify","--hash",&request.worker_branch_ref])?;
+ if branch!=request.expected_worker_head{return Err("worker ref drifted after worktree removal; ref retained".into())}
+ coordinator_git_text(&repository.root,&["update-ref","--no-deref","-d",&request.worker_branch_ref,&request.expected_worker_head])?;
+ let probe=coordinator_git_output(&repository.root,&["show-ref","--verify","--quiet",&request.worker_branch_ref])?;
+ if probe.status.success(){return Err("worker branch ref remains after cleanup".into())}
+ if probe.status.code()!=Some(1){return Err("worker branch ref absence could not be proven after cleanup".into())}
+ Ok(GitCleanupResult{removed_worktree:request.worker_root.clone(),removed_branch_ref:request.worker_branch_ref.clone(),retained_head_oid:request.expected_worker_head.clone()})
+}
+
+pub fn cleanup_prelaunch_worktree(
+    repository: &OpenedRepository,
+    worker_root: &Path,
+    worker_branch_ref: &str,
+    expected_worker_head: &str,
+) -> Result<GitCleanupResult, String> {
+    validate_coordinator_environment()?;
+    repository.validate_unchanged()?;
+    validate_branch_ref(worker_branch_ref, "prelaunch worker branch ref")?;
+    let worker = open_exact_checkout(repository, worker_root, "prelaunch worker root")?;
+    let index = exact_index_file(worker_root)?;
+    let state =
+        pristine_git_state(&worker, worker_root, worker_branch_ref, expected_worker_head)?;
+    restore_exact_index_file(worker_root, &index)?;
+    let root_text = worker_root
+        .to_str()
+        .ok_or_else(|| "prelaunch worker root is not UTF-8".to_string())?;
+    coordinator_git_text(&repository.root, &["worktree", "unlock", root_text])?;
+    let after =
+        pristine_git_state(&worker, worker_root, worker_branch_ref, expected_worker_head)?;
+    if !same_pristine_semantics(&state, &after) {
+        return Err("prelaunch checkout drifted after unlock; worktree retained".into());
+    }
+    restore_exact_index_file(worker_root, &index)?;
+    coordinator_git_text(&repository.root, &["worktree", "remove", root_text])?;
+    if worker_root.exists() {
+        return Err("prelaunch worktree remains after exact cleanup".into());
+    }
+    if exact_ref_head(&repository.root, worker_branch_ref)? != expected_worker_head {
+        return Err("prelaunch worker ref drifted after worktree removal; ref retained".into());
+    }
+    coordinator_git_text(
+        &repository.root,
+        &[
+            "update-ref",
+            "--no-deref",
+            "-d",
+            worker_branch_ref,
+            expected_worker_head,
+        ],
+    )?;
+    let probe = coordinator_git_output(
+        &repository.root,
+        &["show-ref", "--verify", "--quiet", worker_branch_ref],
+    )?;
+    if probe.status.success() || probe.status.code() != Some(1) {
+        return Err("prelaunch worker branch absence could not be proven".into());
+    }
+    Ok(GitCleanupResult {
+        removed_worktree: worker_root.to_path_buf(),
+        removed_branch_ref: worker_branch_ref.into(),
+        retained_head_oid: expected_worker_head.into(),
+    })
+}
+
+pub fn cleanup_retained_worktree(
+    repository: &OpenedRepository,
+    worker_root: &Path,
+    worker_branch_ref: &str,
+    expected_worker_head: &str,
+    retention_proof_sha256: &str,
+) -> Result<GitCleanupResult, String> {
+    validate_coordinator_environment()?;
+    repository.validate_unchanged()?;
+    schema::Sha256Digest::parse(retention_proof_sha256)?;
+    validate_branch_ref(worker_branch_ref, "worker branch ref")?;
+    let _worker = open_exact_checkout(repository, worker_root, "retained worker root")?;
+    validate_commit_object(
+        repository,
+        worker_root,
+        expected_worker_head,
+        "retained worker HEAD",
+    )?;
+    if exact_ref_head(worker_root, worker_branch_ref)? != expected_worker_head {
+        return Err("retained worker ref drifted before cleanup".into());
+    }
+    let root_text = worker_root
+        .to_str()
+        .ok_or_else(|| "retained worker root is not UTF-8".to_string())?;
+    coordinator_git_text(&repository.root, &["worktree", "unlock", root_text])?;
+    if exact_ref_head(&repository.root, worker_branch_ref)? != expected_worker_head {
+        return Err("retained worker ref drifted after unlock; worktree retained".into());
+    }
+    coordinator_git_text(
+        &repository.root,
+        &["worktree", "remove", "--force", root_text],
+    )?;
+    if worker_root.exists() {
+        return Err("Git reported retained worktree removal but the exact root remains".into());
+    }
+    if exact_ref_head(&repository.root, worker_branch_ref)? != expected_worker_head {
+        return Err("retained worker ref drifted after worktree removal; ref retained".into());
+    }
+    coordinator_git_text(
+        &repository.root,
+        &[
+            "update-ref",
+            "--no-deref",
+            "-d",
+            worker_branch_ref,
+            expected_worker_head,
+        ],
+    )?;
+    let probe = coordinator_git_output(
+        &repository.root,
+        &["show-ref", "--verify", "--quiet", worker_branch_ref],
+    )?;
+    if probe.status.success() || probe.status.code() != Some(1) {
+        return Err("retained worker branch ref absence could not be proven".into());
+    }
+    Ok(GitCleanupResult {
+        removed_worktree: worker_root.to_path_buf(),
+        removed_branch_ref: worker_branch_ref.into(),
+        retained_head_oid: expected_worker_head.into(),
+    })
+}
+
 #[cfg(test)]
 mod tests{
  use super::*;
@@ -263,5 +789,26 @@ mod tests{
   let clean_request=make_request();let clean=preserve(&repository,&clean_request,&"b".repeat(64),&preserve_root).unwrap();let clean_worktree=data_root.join("clean");let clean_branch=format!("refs/heads/docks/{}/smoke",clean_request.request_id);provision_worktree(&repository,&clean_worktree,&clean_branch,&clean_request.request_id,"smoke",&base).unwrap();
   let applied=apply_wip(&repository,&clean_worktree,&clean_branch,&base,&clean.receipt,"2026-07-22T00:00:00.000Z").unwrap();assert_ne!(applied,base);assert_eq!(fs::read_to_string(clean_worktree.join("only-untracked.txt")).unwrap(),"payload\n");
   command(&repository.root,&["worktree","unlock",clean_worktree.to_str().unwrap()]);command(&repository.root,&["worktree","remove",clean_worktree.to_str().unwrap()]);fs::remove_dir_all(root).unwrap();
+ }
+ #[test]
+ fn ordered_integration_imports_every_commit_oldest_first(){
+  let root=std::env::temp_dir().join(format!("session-relay-integrate-{}",crate::store::uuid_v4()));fs::create_dir(&root).unwrap();let integration=root.join("integration");let worker=root.join("worker");fs::create_dir(&integration).unwrap();
+  command(&integration,&["init","-q"]);command(&integration,&["config","user.name","Test"]);command(&integration,&["config","user.email","test@example.invalid"]);fs::write(integration.join("tracked.txt"),"base\n").unwrap();command(&integration,&["add","tracked.txt"]);command(&integration,&["commit","-qm","base"]);let base=command(&integration,&["rev-parse","HEAD"]);let integration_branch=command(&integration,&["symbolic-ref","HEAD"]);let session=crate::store::uuid_v4();let worker_branch=format!("refs/heads/docks/{session}/ordered");command(&integration,&["worktree","add","-q","-b",worker_branch.strip_prefix("refs/heads/").unwrap(),worker.to_str().unwrap(),&base]);
+  command(&worker,&["commit","--allow-empty","-qm","applied WIP"]);let applied=command(&worker,&["rev-parse","HEAD"]);fs::write(worker.join("tracked.txt"),"worker\n").unwrap();command(&worker,&["add","tracked.txt"]);command(&worker,&["commit","-qm","worker"]);let produced=command(&worker,&["rev-parse","HEAD"]);
+  let repository=OpenedRepository::open(&integration).unwrap();let request=OrderedIntegrationRequest{integration_root:integration.clone(),integration_branch_ref:integration_branch,expected_integration_head:base.clone(),worker_root:worker.clone(),worker_branch_ref:worker_branch.clone(),expected_worker_head:produced.clone(),base_commit:base.clone(),produced_commits:vec![OrderedProducedCommit{oid:applied.clone(),parent_oid:base.clone(),source:"applied_wip".into()},OrderedProducedCommit{oid:produced.clone(),parent_oid:applied,source:"worker".into()}]};
+  let integration_index_before=exact_index_file(&integration).unwrap();let worker_index_before=exact_index_file(&worker).unwrap();
+  let rejected=reject_ordered(&repository,&request).unwrap();assert_eq!(rejected.outcome,CoordinatorIntegrationOutcome::Rejected);assert_eq!(rejected.pre_head,base);assert_eq!(rejected.post_head,base);assert!(rejected.output_oids.is_empty());assert!(rejected.conflict_paths.is_empty());assert_eq!(command(&integration,&["rev-parse","HEAD"]),base);assert_eq!(exact_index_file(&integration).unwrap(),integration_index_before);assert_eq!(exact_index_file(&worker).unwrap(),worker_index_before);
+  let result=integrate_ordered(&repository,&request).unwrap();assert_eq!(result.outcome,CoordinatorIntegrationOutcome::Integrated);assert_eq!(result.pre_head,base);assert_eq!(result.output_oids.len(),2);assert_eq!(result.post_head,result.output_oids[1]);assert_eq!(command(&integration,&["rev-parse","HEAD"]),result.post_head);assert_eq!(command(&integration,&["rev-parse",&format!("{}^",result.output_oids[1])]),result.output_oids[0]);assert_eq!(command(&worker,&["rev-parse","HEAD"]),produced);
+  command(&integration,&["worktree","lock","--reason","session-relay:test",worker.to_str().unwrap()]);let cleanup=cleanup_ordered_worktree(&repository,&request,&GitCleanupProof::Integrated(result)).unwrap();assert_eq!(cleanup.removed_worktree,worker);assert!(!cleanup.removed_worktree.exists());assert!(coordinator_git_output(&integration,&["show-ref","--verify","--quiet",&worker_branch]).unwrap().status.code()==Some(1));fs::remove_dir_all(root).unwrap();
+ }
+ #[test]
+ fn integration_conflict_restores_exact_prestate_without_partial_outputs(){
+  let root=std::env::temp_dir().join(format!("session-relay-conflict-{}",crate::store::uuid_v4()));fs::create_dir(&root).unwrap();let integration=root.join("integration");let worker=root.join("worker");fs::create_dir(&integration).unwrap();
+  command(&integration,&["init","-q"]);command(&integration,&["config","user.name","Test"]);command(&integration,&["config","user.email","test@example.invalid"]);fs::write(integration.join("tracked.txt"),"base\n").unwrap();command(&integration,&["add","tracked.txt"]);command(&integration,&["commit","-qm","base"]);let base=command(&integration,&["rev-parse","HEAD"]);let integration_branch=command(&integration,&["symbolic-ref","HEAD"]);let session=crate::store::uuid_v4();let worker_branch=format!("refs/heads/docks/{session}/conflict");command(&integration,&["worktree","add","-q","-b",worker_branch.strip_prefix("refs/heads/").unwrap(),worker.to_str().unwrap(),&base]);
+  command(&worker,&["commit","--allow-empty","-qm","applied WIP"]);let applied=command(&worker,&["rev-parse","HEAD"]);fs::write(worker.join("tracked.txt"),"worker\n").unwrap();command(&worker,&["add","tracked.txt"]);command(&worker,&["commit","-qm","worker"]);let produced=command(&worker,&["rev-parse","HEAD"]);
+  fs::write(integration.join("tracked.txt"),"integration\n").unwrap();command(&integration,&["add","tracked.txt"]);command(&integration,&["commit","-qm","integration"]);let pre_head=command(&integration,&["rev-parse","HEAD"]);let repository=OpenedRepository::open(&integration).unwrap();let pre=pristine_git_state(&repository,&integration,&integration_branch,&pre_head).unwrap();
+  let request=OrderedIntegrationRequest{integration_root:integration.clone(),integration_branch_ref:integration_branch.clone(),expected_integration_head:pre_head.clone(),worker_root:worker.clone(),worker_branch_ref:worker_branch.clone(),expected_worker_head:produced.clone(),base_commit:base.clone(),produced_commits:vec![OrderedProducedCommit{oid:applied.clone(),parent_oid:base,source:"applied_wip".into()},OrderedProducedCommit{oid:produced.clone(),parent_oid:applied,source:"worker".into()}]};
+  let result=integrate_ordered(&repository,&request).unwrap();assert_eq!(result.outcome,CoordinatorIntegrationOutcome::NeedsUserAction);assert_eq!(result.pre_head,pre_head);assert_eq!(result.post_head,pre_head);assert!(result.output_oids.is_empty());assert_eq!(result.conflict_paths,vec!["tracked.txt"]);assert_eq!(sha256::hex_digest(&exact_index_file(&integration).unwrap()),pre.index_file_sha256);let mut restored=pristine_git_state(&repository,&integration,&integration_branch,&pre_head).unwrap();restored.index_file_sha256=pre.index_file_sha256.clone();assert_eq!(restored,pre);assert_eq!(command(&worker,&["rev-parse","HEAD"]),produced);
+  command(&integration,&["worktree","remove",worker.to_str().unwrap()]);command(&integration,&["branch","-D",worker_branch.strip_prefix("refs/heads/").unwrap()]);fs::remove_dir_all(root).unwrap();
  }
 }
