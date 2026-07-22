@@ -24,6 +24,7 @@ use crate::sha256::hex_digest;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
+use std::path::Path;
 use std::time::{Duration, Instant};
 use tinyjson::JsonValue;
 
@@ -166,6 +167,8 @@ pub(crate) fn deliver_with_guard(
     let target = guard
         .authorize_use(kind)
         .map_err(DeliveryError::BeforeInject)?;
+    crate::workspace::refuse_unsupported_managed_mutation(Path::new(&target.canonical_cwd), false, "wake/watch app-server")
+        .map_err(DeliveryError::BeforeInject)?;
     let server = target
         .server
         .ok_or_else(|| DeliveryError::BeforeInject("guard has no app-server".to_string()))?;
@@ -247,6 +250,7 @@ pub(crate) fn start_thread(
     sandbox: &str,
     service_tier: ServiceTier,
 ) -> Result<SpawnedThread, String> {
+    crate::workspace::refuse_unsupported_managed_mutation(Path::new(cwd), sandbox == "read-only", "shared Codex app-server")?;
     let mut ws = connect_initialized(server, "session-relay-spawn", "session-relay spawn")?;
     let result = ws.request(
         1,
@@ -306,6 +310,7 @@ pub(crate) fn acknowledge_with_guard(
     service_tier: ServiceTier,
 ) -> Result<DeliveryOutcome, String> {
     let target = guard.authorize_use(OperationKind::WatchAck)?;
+    crate::workspace::refuse_unsupported_managed_mutation(Path::new(&target.canonical_cwd), false, "watch app-server acknowledgement")?;
     let server = target
         .server
         .ok_or_else(|| "guard has no app-server".to_string())?;

@@ -1549,6 +1549,11 @@ fn spawn_owned_child(
     resolved: &ResolvedSupervisorLaunch,
 ) -> Result<(Child, Option<ChildInput>, ChildOutputs), String> {
     let (program, args, cwd) = derive_command(resolved)?;
+    crate::workspace::refuse_unsupported_managed_mutation(
+        &PathBuf::from(&resolved.canonical_cwd),
+        false,
+        "wake/attach/watch supervisor",
+    )?;
     let mut command = Command::new(&program);
     command.args(args).env_clear();
     if let Some(cwd) = cwd {

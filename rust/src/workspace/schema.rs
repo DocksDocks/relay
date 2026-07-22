@@ -445,8 +445,8 @@ impl ToolLaunchV1{
 #[derive(Clone,Debug,Eq,PartialEq)]
 pub struct ResourceDecisionV1{pub kind:String,pub name:String,pub state:String,pub provider_id:Option<String>,pub reason:Option<String>}
 impl ResourceDecisionV1{
- fn from_value(value:JcsValue)->Result<Self,String>{let o=value.object()?;let state=get_string(&o,"state")?;let kind=get_string(&o,"kind")?;if !matches!(kind.as_str(),"port"|"temp_dir"|"build_dir"|"database_schema"|"log_dir"|"cache_dir"){return Err("unknown resource kind".into())}let name=get_string(&o,"name")?;if name.is_empty()||name.len()>32||!name.bytes().enumerate().all(|(i,b)|if i==0{b.is_ascii_lowercase()}else{b.is_ascii_lowercase()||b.is_ascii_digit()||b==b'_'}){return Err("resource name is invalid".into())}match state.as_str(){"requested"=>{require_keys(&o,&["kind","name","state","provider_id"])?;Ok(Self{kind,name,state,provider_id:optional_string(&o["provider_id"],"provider_id")?,reason:None})},"unused"=>{require_keys(&o,&["kind","name","state","reason"])?;if get_string(&o,"reason")?!="task_does_not_use_resource"{return Err("unused resource reason is not closed".into())}Ok(Self{kind,name,state,provider_id:None,reason:Some("task_does_not_use_resource".into())})},_=>Err("resource state must be requested|unused".into())}}
- fn value(&self)->JcsValue{if self.state=="requested"{object([("kind",JcsValue::String(self.kind.clone())),("name",JcsValue::String(self.name.clone())),("provider_id",self.provider_id.clone().map(JcsValue::String).unwrap_or(JcsValue::Null)),("state",JcsValue::String(self.state.clone()))])}else{object([("kind",JcsValue::String(self.kind.clone())),("name",JcsValue::String(self.name.clone())),("reason",JcsValue::String("task_does_not_use_resource".into())),("state",JcsValue::String(self.state.clone()))])}}
+ pub fn from_value(value:JcsValue)->Result<Self,String>{let o=value.object()?;let state=get_string(&o,"state")?;let kind=get_string(&o,"kind")?;if !matches!(kind.as_str(),"port"|"temp_dir"|"build_dir"|"database_schema"|"log_dir"|"cache_dir"){return Err("unknown resource kind".into())}let name=get_string(&o,"name")?;if name.is_empty()||name.len()>32||!name.bytes().enumerate().all(|(i,b)|if i==0{b.is_ascii_lowercase()}else{b.is_ascii_lowercase()||b.is_ascii_digit()||b==b'_'}){return Err("resource name is invalid".into())}match state.as_str(){"requested"=>{require_keys(&o,&["kind","name","state","provider_id"])?;Ok(Self{kind,name,state,provider_id:optional_string(&o["provider_id"],"provider_id")?,reason:None})},"unused"=>{require_keys(&o,&["kind","name","state","reason"])?;if get_string(&o,"reason")?!="task_does_not_use_resource"{return Err("unused resource reason is not closed".into())}Ok(Self{kind,name,state,provider_id:None,reason:Some("task_does_not_use_resource".into())})},_=>Err("resource state must be requested|unused".into())}}
+ pub fn value(&self)->JcsValue{if self.state=="requested"{object([("kind",JcsValue::String(self.kind.clone())),("name",JcsValue::String(self.name.clone())),("provider_id",self.provider_id.clone().map(JcsValue::String).unwrap_or(JcsValue::Null)),("state",JcsValue::String(self.state.clone()))])}else{object([("kind",JcsValue::String(self.kind.clone())),("name",JcsValue::String(self.name.clone())),("reason",JcsValue::String("task_does_not_use_resource".into())),("state",JcsValue::String(self.state.clone()))])}}
 }
 
 fn claim_from_value(value:JcsValue)->Result<PathClaimRequestV1,String>{let o=value.object()?;require_keys(&o,&["path","path_type","mode"])?;let claim=PathClaimRequestV1{path:get_string(&o,"path")?,path_type:get_string(&o,"path_type")?,mode:get_string(&o,"mode")?};claim.validate()?;Ok(claim)}
@@ -472,6 +472,88 @@ impl ClosedJcs for WorkspaceStartRequestV1{
   Ok(Self{request_id:get_string(&o,"request_id")?,repository_path:get_string(&o,"repository_path")?,integration_root:get_string(&o,"integration_root")?,base_commit:get_string(&o,"base_commit")?,task_slug:get_string(&o,"task_slug")?,task:get_string(&o,"task")?,tool:ToolLaunchV1::from_value(o["tool"].clone())?,wip_receipt_path:get_string(&o,"wip_receipt_path")?,wip_receipt_sha256:get_string(&o,"wip_receipt_sha256")?,owned_paths,coordinator_owned_paths,coordinator_owned_overrides,resources,created_at:get_string(&o,"created_at")?})
  }
  fn to_jcs(&self)->JcsValue{object([("base_commit",JcsValue::String(self.base_commit.clone())),("coordinator_owned_overrides",JcsValue::Array(self.coordinator_owned_overrides.clone())),("coordinator_owned_paths",JcsValue::Array(self.coordinator_owned_paths.iter().map(claim_value).collect())),("created_at",JcsValue::String(self.created_at.clone())),("integration_root",JcsValue::String(self.integration_root.clone())),("owned_paths",JcsValue::Array(self.owned_paths.iter().map(claim_value).collect())),("repository_path",JcsValue::String(self.repository_path.clone())),("request_id",JcsValue::String(self.request_id.clone())),("resources",JcsValue::Array(self.resources.iter().map(ResourceDecisionV1::value).collect())),("schema",JcsValue::String(SCHEMA_V1.into())),("task",JcsValue::String(self.task.clone())),("task_slug",JcsValue::String(self.task_slug.clone())),("tool",self.tool.value()),("wip_receipt_path",JcsValue::String(self.wip_receipt_path.clone())),("wip_receipt_sha256",JcsValue::String(self.wip_receipt_sha256.clone()))])}
+}
+
+#[derive(Clone,Debug,Eq,PartialEq)]
+pub struct EnvProjectionV1 { pub name:String,pub value:String }
+impl EnvProjectionV1 {
+ pub fn from_value(value:JcsValue)->Result<Self,String>{let object=value.object()?;require_keys(&object,&["name","value"])?;let name=get_string(&object,"name")?;let value=get_string(&object,"value")?;if name.is_empty()||name.contains('=')||name.as_bytes().contains(&0)||value.as_bytes().contains(&0){return Err("resource environment projection is invalid".into())}Ok(Self{name,value})}
+ pub fn value(&self)->JcsValue{object([("name",JcsValue::String(self.name.clone())),("value",JcsValue::String(self.value.clone()))])}
+}
+
+#[derive(Clone,Debug,Eq,PartialEq)]
+pub struct ResourceAllocationV1 {
+ pub allocation_id:String,pub session_id:String,pub kind:String,pub name:String,pub provider_id:String,
+ pub state:String,pub value:String,pub env:Vec<EnvProjectionV1>,pub create_receipt_sha256:String,
+ pub inspect_receipt_sha256:String,pub delete_receipt_sha256:Option<String>,pub created_at:String,pub released_at:Option<String>,
+}
+impl ClosedJcs for ResourceAllocationV1 {
+ fn from_jcs(value:JcsValue)->Result<Self,String>{
+  let object=value.object()?;require_keys(&object,&["schema","allocation_id","session_id","kind","name","provider_id","state","value","env","create_receipt_sha256","inspect_receipt_sha256","delete_receipt_sha256","created_at","released_at"])?;
+  if get_string(&object,"schema")?!="ResourceAllocationV1"{return Err("ResourceAllocationV1 schema mismatch".into())}
+  let allocation_id=get_string(&object,"allocation_id")?;let session_id=get_string(&object,"session_id")?;LowerUuidV4::parse(&allocation_id)?;LowerUuidV4::parse(&session_id)?;
+  let kind=get_string(&object,"kind")?;if !matches!(kind.as_str(),"port"|"temp_dir"|"build_dir"|"database_schema"|"log_dir"|"cache_dir"){return Err("unknown resource allocation kind".into())}
+  let name=get_string(&object,"name")?;validate_resource_name(&name)?;
+  let provider_id=get_string(&object,"provider_id")?;if provider_id.is_empty()||provider_id.as_bytes().contains(&0){return Err("resource provider_id is invalid".into())}
+  let state=get_string(&object,"state")?;if !matches!(state.as_str(),"allocated"|"released"){return Err("resource allocation state must be allocated|released".into())}
+  let env=match &object["env"]{JcsValue::Array(values)=>values.iter().cloned().map(EnvProjectionV1::from_value).collect::<Result<Vec<_>,_>>()?,_=>return Err("resource env must be an array".into())};
+  let mut names=BTreeSet::new();if env.iter().any(|projection|!names.insert(projection.name.as_str())){return Err("resource environment projection names must be unique".into())}
+  let allocation_value=get_string(&object,"value")?;validate_resource_allocation_projection(&kind,&name,&provider_id,&allocation_value,&env)?;
+  let create_receipt_sha256=get_string(&object,"create_receipt_sha256")?;let inspect_receipt_sha256=get_string(&object,"inspect_receipt_sha256")?;Sha256Digest::parse(&create_receipt_sha256)?;Sha256Digest::parse(&inspect_receipt_sha256)?;
+  let delete_receipt_sha256=optional_string(&object["delete_receipt_sha256"],"delete_receipt_sha256")?;if let Some(value)=&delete_receipt_sha256{Sha256Digest::parse(value)?;}
+  let created_at=get_string(&object,"created_at")?;Timestamp::parse(&created_at)?;let released_at=optional_string(&object["released_at"],"released_at")?;if let Some(value)=&released_at{Timestamp::parse(value)?;}
+  if (state=="allocated"&&(delete_receipt_sha256.is_some()||released_at.is_some()))||(state=="released"&&(delete_receipt_sha256.is_none()||released_at.is_none())){return Err("resource release fields disagree with state".into())}
+  Ok(Self{allocation_id,session_id,kind,name,provider_id,state,value:allocation_value,env,create_receipt_sha256,inspect_receipt_sha256,delete_receipt_sha256,created_at,released_at})
+ }
+ fn to_jcs(&self)->JcsValue{object([("allocation_id",JcsValue::String(self.allocation_id.clone())),("create_receipt_sha256",JcsValue::String(self.create_receipt_sha256.clone())),("created_at",JcsValue::String(self.created_at.clone())),("delete_receipt_sha256",self.delete_receipt_sha256.clone().map(JcsValue::String).unwrap_or(JcsValue::Null)),("env",JcsValue::Array(self.env.iter().map(EnvProjectionV1::value).collect())),("inspect_receipt_sha256",JcsValue::String(self.inspect_receipt_sha256.clone())),("kind",JcsValue::String(self.kind.clone())),("name",JcsValue::String(self.name.clone())),("provider_id",JcsValue::String(self.provider_id.clone())),("released_at",self.released_at.clone().map(JcsValue::String).unwrap_or(JcsValue::Null)),("schema",JcsValue::String("ResourceAllocationV1".into())),("session_id",JcsValue::String(self.session_id.clone())),("state",JcsValue::String(self.state.clone())),("value",JcsValue::String(self.value.clone()))])}
+}
+
+#[derive(Clone,Debug,Eq,PartialEq)]
+pub struct ResourceProviderRegistrationV1 { pub provider_id:String,pub executable_path:String,pub executable_sha256:String,pub config_path:String,pub config_sha256:String,pub supported_kinds:Vec<String> }
+impl ResourceProviderRegistrationV1 {
+ fn from_value(value:JcsValue)->Result<Self,String>{let object=value.object()?;require_keys(&object,&["provider_id","executable_path","executable_sha256","config_path","config_sha256","supported_kinds"])?;let provider_id=get_string(&object,"provider_id")?;if provider_id.is_empty()||provider_id=="builtin"||!provider_id.bytes().all(|b|b.is_ascii_lowercase()||b.is_ascii_digit()||b==b'_'||b==b'-'){return Err("resource provider_id is invalid".into())}let executable_path=get_string(&object,"executable_path")?;let config_path=get_string(&object,"config_path")?;AbsPath::parse(&executable_path)?;AbsPath::parse(&config_path)?;let executable_sha256=get_string(&object,"executable_sha256")?;let config_sha256=get_string(&object,"config_sha256")?;Sha256Digest::parse(&executable_sha256)?;Sha256Digest::parse(&config_sha256)?;let supported_kinds=match &object["supported_kinds"]{JcsValue::Array(values)=>values.iter().map(|value|value.as_str().map(str::to_string)).collect::<Result<Vec<_>,_>>()?,_=>return Err("supported_kinds must be an array".into())};if supported_kinds!=["database_schema"]{return Err("provider supported_kinds must be exactly database_schema".into())}Ok(Self{provider_id,executable_path,executable_sha256,config_path,config_sha256,supported_kinds})}
+ fn value(&self)->JcsValue{object([("config_path",JcsValue::String(self.config_path.clone())),("config_sha256",JcsValue::String(self.config_sha256.clone())),("executable_path",JcsValue::String(self.executable_path.clone())),("executable_sha256",JcsValue::String(self.executable_sha256.clone())),("provider_id",JcsValue::String(self.provider_id.clone())),("supported_kinds",JcsValue::Array(self.supported_kinds.iter().cloned().map(JcsValue::String).collect()))])}
+}
+
+#[derive(Clone,Debug,Eq,PartialEq)]
+pub struct ResourceProviderRegistryV1 { pub providers:Vec<ResourceProviderRegistrationV1>,pub updated_at:String }
+impl ClosedJcs for ResourceProviderRegistryV1 {
+ fn from_jcs(value:JcsValue)->Result<Self,String>{let object=value.object()?;require_keys(&object,&["schema","providers","updated_at"])?;if get_string(&object,"schema")?!="ResourceProviderRegistryV1"{return Err("ResourceProviderRegistryV1 schema mismatch".into())}let providers=match &object["providers"]{JcsValue::Array(values)=>values.iter().cloned().map(ResourceProviderRegistrationV1::from_value).collect::<Result<Vec<_>,_>>()?,_=>return Err("providers must be an array".into())};let mut ids=BTreeSet::new();if providers.iter().any(|provider|!ids.insert(provider.provider_id.as_str())){return Err("provider registry contains duplicate ids".into())}let updated_at=get_string(&object,"updated_at")?;Timestamp::parse(&updated_at)?;Ok(Self{providers,updated_at})}
+ fn to_jcs(&self)->JcsValue{object([("providers",JcsValue::Array(self.providers.iter().map(ResourceProviderRegistrationV1::value).collect())),("schema",JcsValue::String("ResourceProviderRegistryV1".into())),("updated_at",JcsValue::String(self.updated_at.clone()))])}
+}
+
+#[derive(Clone,Debug,Eq,PartialEq)]
+pub struct ProviderRequestV1 { pub operation:String,pub request_id:String,pub allocation_id:String,pub session_id:String,pub kind:String,pub name:String,pub prior_receipt_sha256:Option<String> }
+impl ClosedJcs for ProviderRequestV1 {
+ fn from_jcs(value:JcsValue)->Result<Self,String>{let object=value.object()?;require_keys(&object,&["schema","operation","request_id","allocation_id","session_id","kind","name","prior_receipt_sha256"])?;if get_string(&object,"schema")?!="ProviderRequestV1"{return Err("ProviderRequestV1 schema mismatch".into())}let operation=get_string(&object,"operation")?;if !matches!(operation.as_str(),"create"|"inspect"|"delete"){return Err("provider operation is invalid".into())}let request_id=get_string(&object,"request_id")?;let allocation_id=get_string(&object,"allocation_id")?;let session_id=get_string(&object,"session_id")?;LowerUuidV4::parse(&request_id)?;LowerUuidV4::parse(&allocation_id)?;LowerUuidV4::parse(&session_id)?;if get_string(&object,"kind")?!="database_schema"{return Err("provider kind must be database_schema".into())}let name=get_string(&object,"name")?;validate_resource_name(&name)?;let prior_receipt_sha256=optional_string(&object["prior_receipt_sha256"],"prior_receipt_sha256")?;if let Some(value)=&prior_receipt_sha256{Sha256Digest::parse(value)?;}if (operation=="create")!=prior_receipt_sha256.is_none(){return Err("provider prior receipt nullability disagrees with operation".into())}Ok(Self{operation,request_id,allocation_id,session_id,kind:"database_schema".into(),name,prior_receipt_sha256})}
+ fn to_jcs(&self)->JcsValue{object([("allocation_id",JcsValue::String(self.allocation_id.clone())),("kind",JcsValue::String(self.kind.clone())),("name",JcsValue::String(self.name.clone())),("operation",JcsValue::String(self.operation.clone())),("prior_receipt_sha256",self.prior_receipt_sha256.clone().map(JcsValue::String).unwrap_or(JcsValue::Null)),("request_id",JcsValue::String(self.request_id.clone())),("schema",JcsValue::String("ProviderRequestV1".into())),("session_id",JcsValue::String(self.session_id.clone()))])}
+}
+
+#[derive(Clone,Debug,Eq,PartialEq)]
+pub struct ProviderReceiptV1 { pub request_id:String,pub allocation_id:String,pub operation:String,pub outcome:String,pub value:String,pub provider_evidence_sha256:String,pub at:String }
+impl ClosedJcs for ProviderReceiptV1 {
+ fn from_jcs(value:JcsValue)->Result<Self,String>{let object=value.object()?;require_keys(&object,&["schema","request_id","allocation_id","operation","outcome","value","provider_evidence_sha256","at"])?;if get_string(&object,"schema")?!="ProviderReceiptV1"{return Err("ProviderReceiptV1 schema mismatch".into())}let request_id=get_string(&object,"request_id")?;let allocation_id=get_string(&object,"allocation_id")?;LowerUuidV4::parse(&request_id)?;LowerUuidV4::parse(&allocation_id)?;let operation=get_string(&object,"operation")?;if !matches!(operation.as_str(),"create"|"inspect"|"delete"){return Err("provider receipt operation is invalid".into())}let outcome=get_string(&object,"outcome")?;if !matches!(outcome.as_str(),"allocated"|"exists"|"released"){return Err("provider receipt outcome is invalid".into())}let provider_evidence_sha256=get_string(&object,"provider_evidence_sha256")?;Sha256Digest::parse(&provider_evidence_sha256)?;let at=get_string(&object,"at")?;Timestamp::parse(&at)?;Ok(Self{request_id,allocation_id,operation,outcome,value:get_string(&object,"value")?,provider_evidence_sha256,at})}
+ fn to_jcs(&self)->JcsValue{object([("allocation_id",JcsValue::String(self.allocation_id.clone())),("at",JcsValue::String(self.at.clone())),("operation",JcsValue::String(self.operation.clone())),("outcome",JcsValue::String(self.outcome.clone())),("provider_evidence_sha256",JcsValue::String(self.provider_evidence_sha256.clone())),("request_id",JcsValue::String(self.request_id.clone())),("schema",JcsValue::String("ProviderReceiptV1".into())),("value",JcsValue::String(self.value.clone()))])}
+}
+
+pub fn validate_resource_name(name:&str)->Result<(),String>{if name.is_empty()||name.len()>32||!name.bytes().enumerate().all(|(index,byte)|if index==0{byte.is_ascii_lowercase()}else{byte.is_ascii_lowercase()||byte.is_ascii_digit()||byte==b'_'}){return Err("resource name is invalid".into())}Ok(())}
+
+fn validate_resource_allocation_projection(kind:&str,name:&str,provider_id:&str,value:&str,env:&[EnvProjectionV1])->Result<(),String>{
+ let exact=|names:&[&str]|env.len()==names.len()&&env.iter().zip(names).all(|(projection,name)|projection.name==*name&&projection.value==value);
+ match kind{
+  "port"=>{
+   if provider_id!="builtin"||env.len()!=1||env[0].name!=format!("DOCKS_RESOURCE_{}_FD",name.to_ascii_uppercase()){return Err("port allocation projection is invalid".into())}
+   let fd=env[0].value.parse::<i32>().map_err(|_|"port allocation FD is not decimal".to_string())?;if fd<3||fd.to_string()!=env[0].value{return Err("port allocation FD is not canonical".into())}
+   let address=value.parse::<std::net::SocketAddr>().map_err(|_|"port allocation value is not a socket address".to_string())?;if address.ip()!=std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)||address.port()==0{return Err("port allocation is not held IPv4 loopback".into())}
+  }
+  "temp_dir"=>{if provider_id!="builtin"||!exact(&["TMPDIR","TMP","TEMP"]){return Err("temp_dir allocation projection is invalid".into())}AbsPath::parse(value)?;}
+  "build_dir"=>{if provider_id!="builtin"||!exact(&["DOCKS_BUILD_DIR"]){return Err("build_dir allocation projection is invalid".into())}AbsPath::parse(value)?;}
+  "log_dir"=>{if provider_id!="builtin"||!exact(&["DOCKS_LOG_DIR"]){return Err("log_dir allocation projection is invalid".into())}AbsPath::parse(value)?;}
+  "cache_dir"=>{if provider_id!="builtin"||!exact(&["DOCKS_CACHE_DIR"]){return Err("cache_dir allocation projection is invalid".into())}AbsPath::parse(value)?;}
+  "database_schema"=>{if provider_id=="builtin"||value.is_empty()||value.as_bytes().contains(&0)||!exact(&[&format!("DOCKS_RESOURCE_{}_DATABASE_SCHEMA",name.to_ascii_uppercase())]){return Err("database_schema allocation projection is invalid".into())}}
+  _=>return Err("unknown resource allocation projection kind".into()),
+ }
+ Ok(())
 }
 
 #[derive(Clone,Debug,Eq,PartialEq)]

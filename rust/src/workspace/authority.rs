@@ -1,10 +1,10 @@
 use super::capability::{self, read_secure_bytes};
 use super::schema::{
     self, CapabilityRecordV1, ClosedJcs, CoordinatorCapabilityV1, JcsValue,
-    RepositoryIdentityV1, Sha256Digest,
+    PathClaimRequestV1, RepositoryIdentityV1, Sha256Digest,
 };
 use crate::sha256;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{CStr, CString, OsStr};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -322,5 +322,96 @@ fn rename_noreplace(source:&Path,target:&Path)->Result<(),String>{
 pub fn repository_id(euid:u32,dev:u64,ino:u64)->String{sha256::hex_digest(format!("session-relay/repository/v1\0{euid}\0{dev}\0{ino}").as_bytes())}
 
 pub fn now_timestamp()->Result<String,String>{let mut time=libc::timespec{tv_sec:0,tv_nsec:0};if unsafe{libc::clock_gettime(libc::CLOCK_REALTIME,&mut time)}!=0{return Err(format!("clock_gettime: {}",std::io::Error::last_os_error()))}let mut tm=std::mem::MaybeUninit::<libc::tm>::uninit();if unsafe{libc::gmtime_r(&time.tv_sec,tm.as_mut_ptr())}.is_null(){return Err("gmtime_r failed".into())}let tm=unsafe{tm.assume_init()};Ok(format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",tm.tm_year+1900,tm.tm_mon+1,tm.tm_mday,tm.tm_hour,tm.tm_min,tm.tm_sec,time.tv_nsec/1_000_000))}
+
+pub fn resolve_path_policy(
+    root:&Path,
+    owned_paths:&[PathClaimRequestV1],
+    explicit_coordinator_paths:&[PathClaimRequestV1],
+    overrides:&[JcsValue],
+    allow_overrides:bool,
+)->Result<Vec<PathClaimRequestV1>,String>{
+ let root=fs::canonicalize(root).map_err(|error|format!("canonicalize claim root {}: {error}",root.display()))?;
+ let mut coordinator=BTreeMap::<String,PathClaimRequestV1>::new();
+ classify_coordinator_paths(&root,&root,&mut coordinator)?;
+ for claim in explicit_coordinator_paths{
+  claim.validate()?;
+  validate_claim_target(&root,claim)?;
+  let key=claim.path.to_ascii_lowercase();
+  if coordinator.insert(key,claim.clone()).is_some(){return Err(format!("coordinator-owned path {} is duplicated or case-aliased",claim.path))}
+ }
+ let mut override_paths=BTreeSet::new();
+ for value in overrides{
+  let object=match value{JcsValue::Object(object)=>object,_=>return Err("CoordinatorOwnedOverrideV1 must be an object".into())};
+  if object.len()!=2||!object.contains_key("path")||!object.contains_key("reason"){return Err("CoordinatorOwnedOverrideV1 keys differ from the closed schema".into())}
+  let path=object["path"].as_str()?;schema::RelPath::parse(path)?;
+  let reason=object["reason"].as_str()?;if reason.is_empty()||reason.as_bytes().contains(&0){return Err("coordinator-owned override reason is invalid".into())}
+  if !allow_overrides{return Err("first workspace start cannot override coordinator-owned paths".into())}
+  let key=path.to_ascii_lowercase();
+  let Some(default)=coordinator.get(&key) else{return Err(format!("coordinator-owned override {path} does not name an exact resolved default"))};
+  if default.path!=path{return Err(format!("coordinator-owned override {path} is a case alias"))}
+  if !override_paths.insert(key){return Err(format!("coordinator-owned override {path} is duplicated"))}
+ }
+ for path in &override_paths{coordinator.remove(path);}
+ for claim in owned_paths{
+  claim.validate()?;
+  validate_claim_target(&root,claim)?;
+  let key=claim.path.to_ascii_lowercase();
+  for default in coordinator.values(){
+   let default_key=default.path.to_ascii_lowercase();
+   if key==default_key||key.strip_prefix(&format!("{default_key}/")).is_some()||default_key.strip_prefix(&format!("{key}/")).is_some(){
+    return Err(format!("owned path {} overlaps coordinator-owned default {}",claim.path,default.path))
+   }
+  }
+ }
+ let mut resolved=coordinator.into_values().collect::<Vec<_>>();
+ resolved.sort_by(|left,right|left.path.as_bytes().cmp(right.path.as_bytes()));
+ schema::validate_non_overlapping_claims(&resolved)?;
+ Ok(resolved)
+}
+
+fn validate_claim_target(root:&Path,claim:&PathClaimRequestV1)->Result<(),String>{
+ let path=root.join(&claim.path);
+ let metadata=fs::symlink_metadata(&path).map_err(|error|if error.kind()==std::io::ErrorKind::NotFound{format!("claim {} does not exist; claim an existing directory when atomic replacement or new files are required",claim.path)}else{format!("inspect claim {}: {error}",claim.path)})?;
+ if metadata.file_type().is_symlink(){return Err(format!("claim {} is a symlink",claim.path))}
+ match claim.path_type.as_str(){
+  "file" if !metadata.is_file()=>Err(format!("file claim {} is not a regular file",claim.path)),
+  "directory" if !metadata.is_dir()=>Err(format!("directory claim {} is not a directory",claim.path)),
+  _=>Ok(()),
+ }
+}
+
+fn classify_coordinator_paths(root:&Path,current:&Path,output:&mut BTreeMap<String,PathClaimRequestV1>)->Result<(),String>{
+ let mut entries=fs::read_dir(current).map_err(|error|format!("scan coordinator-owned defaults in {}: {error}",current.display()))?.collect::<Result<Vec<_>,_>>().map_err(|error|format!("scan coordinator-owned default entry: {error}"))?;
+ entries.sort_by_key(|entry|entry.file_name());
+ for entry in entries{
+  let path=entry.path();let relative=path.strip_prefix(root).map_err(|_|"coordinator classifier path escaped root".to_string())?;
+  let relative=relative.to_str().ok_or_else(||"coordinator-owned path is not UTF-8".to_string())?.to_string();
+  schema::RelPath::parse(&relative)?;
+  let metadata=fs::symlink_metadata(&path).map_err(|error|format!("inspect coordinator-owned candidate {relative}: {error}"))?;
+  if metadata.file_type().is_symlink(){continue}
+  let name=entry.file_name();let name=name.to_str().ok_or_else(||"coordinator-owned filename is not UTF-8".to_string())?;
+  let classified=coordinator_default(name,&relative,metadata.is_dir());
+  if classified{
+   let path_type=if metadata.is_dir(){"directory"}else if metadata.is_file(){"file"}else{return Err(format!("coordinator-owned default {relative} has unsupported type"))};
+   let key=relative.to_ascii_lowercase();
+   if output.insert(key,PathClaimRequestV1{path:relative,path_type:path_type.into(),mode:"exclusive".into()}).is_some(){return Err("coordinator-owned defaults contain case aliases".into())}
+  }else if metadata.is_dir()&&name!=".git"{
+   classify_coordinator_paths(root,&path,output)?;
+  }
+ }
+ Ok(())
+}
+
+fn coordinator_default(name:&str,relative:&str,is_directory:bool)->bool{
+ let lower=name.to_ascii_lowercase();
+ let components=relative.split('/').map(str::to_ascii_lowercase).collect::<Vec<_>>();
+ if is_directory&&(matches!(lower.as_str(),".github"|".gitlab"|".circleci")||components.iter().any(|component|component=="migrations")){return true}
+ if is_directory{return false}
+ const MANIFESTS:&[&str]=&["package.json","cargo.toml","pyproject.toml","go.mod","go.sum","pom.xml","build.gradle","build.gradle.kts","settings.gradle","settings.gradle.kts","composer.json","gemfile","mix.exs","deno.json","deno.jsonc"];
+ const LOCKFILES:&[&str]=&["package-lock.json","npm-shrinkwrap.json","pnpm-lock.yaml","yarn.lock","bun.lock","bun.lockb","cargo.lock","poetry.lock","uv.lock","composer.lock","gemfile.lock","mix.lock"];
+ MANIFESTS.contains(&lower.as_str())||LOCKFILES.contains(&lower.as_str())||lower.ends_with(".lock")||
+ matches!(lower.as_str(),"agents.md"|"claude.md")||lower.starts_with(".env")||lower.contains("config")||
+ ((lower.contains("manifest")||lower.contains("catalog")||lower=="marketplace.json")&&matches!(Path::new(&lower).extension().and_then(OsStr::to_str),Some("json"|"toml"|"yaml"|"yml")))
+}
 
 #[cfg(test)] mod tests{use super::*;#[test]fn repository_id_is_domain_separated(){assert_eq!(repository_id(1,2,3).len(),64);assert_ne!(repository_id(1,2,3),repository_id(1,2,4));}#[test]fn timestamp_shape(){assert!(schema::Timestamp::parse(&now_timestamp().unwrap()).is_ok());}}
