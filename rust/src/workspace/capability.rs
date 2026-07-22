@@ -27,14 +27,24 @@ impl ClosedJcs for WorkerCapabilityV1 {
     fn from_jcs(value: JcsValue) -> Result<Self, String> {
         let object = value.object()?;
         let keys = [
-            "schema", "capability_id", "repository_id", "session_id", "generation", "actions",
-            "secret_b64url", "broker_socket", "issued_at", "expires_at",
+            "schema",
+            "capability_id",
+            "repository_id",
+            "session_id",
+            "generation",
+            "actions",
+            "secret_b64url",
+            "broker_socket",
+            "issued_at",
+            "expires_at",
         ];
         if object.len() != keys.len() || keys.iter().any(|key| !object.contains_key(*key)) {
             return Err("WorkerCapabilityV1 keys differ from the closed schema".to_string());
         }
         let string = |key: &str| object[key].as_str().map(str::to_string);
-        if string("schema")? != schema::SCHEMA_V1 { return Err("WorkerCapabilityV1 schema mismatch".to_string()); }
+        if string("schema")? != schema::SCHEMA_V1 {
+            return Err("WorkerCapabilityV1 schema mismatch".to_string());
+        }
         LowerUuidV4::parse(&string("capability_id")?)?;
         LowerUuidV4::parse(&string("session_id")?)?;
         Sha256Digest::parse(&string("repository_id")?)?;
@@ -42,29 +52,70 @@ impl ClosedJcs for WorkerCapabilityV1 {
         Timestamp::parse(&string("issued_at")?)?;
         Timestamp::parse(&string("expires_at")?)?;
         let actions = match &object["actions"] {
-            JcsValue::Array(values) => values.iter().map(|value| value.as_str().map(str::to_string)).collect::<Result<Vec<_>, _>>()?,
+            JcsValue::Array(values) => values
+                .iter()
+                .map(|value| value.as_str().map(str::to_string))
+                .collect::<Result<Vec<_>, _>>()?,
             _ => return Err("worker actions must be an array".to_string()),
         };
-        if actions != WORKER_ACTIONS.map(str::to_string) { return Err("worker actions differ from the closed set".to_string()); }
+        if actions != WORKER_ACTIONS.map(str::to_string) {
+            return Err("worker actions differ from the closed set".to_string());
+        }
         let secret_b64url = string("secret_b64url")?;
         decode_base64url(&secret_b64url)?;
         let broker_socket = string("broker_socket")?;
-        if !Path::new(&broker_socket).is_absolute() { return Err("worker broker socket is not absolute".to_string()); }
-        Ok(Self { capability_id:string("capability_id")?, repository_id:string("repository_id")?, session_id:string("session_id")?, generation:string("generation")?, actions, secret_b64url, broker_socket, issued_at:string("issued_at")?, expires_at:string("expires_at")? })
+        if !Path::new(&broker_socket).is_absolute() {
+            return Err("worker broker socket is not absolute".to_string());
+        }
+        Ok(Self {
+            capability_id: string("capability_id")?,
+            repository_id: string("repository_id")?,
+            session_id: string("session_id")?,
+            generation: string("generation")?,
+            actions,
+            secret_b64url,
+            broker_socket,
+            issued_at: string("issued_at")?,
+            expires_at: string("expires_at")?,
+        })
     }
 
     fn to_jcs(&self) -> JcsValue {
         JcsValue::Object(BTreeMap::from([
-            ("actions".into(), JcsValue::Array(self.actions.iter().cloned().map(JcsValue::String).collect())),
-            ("broker_socket".into(), JcsValue::String(self.broker_socket.clone())),
-            ("capability_id".into(), JcsValue::String(self.capability_id.clone())),
-            ("expires_at".into(), JcsValue::String(self.expires_at.clone())),
-            ("generation".into(), JcsValue::String(self.generation.clone())),
+            (
+                "actions".into(),
+                JcsValue::Array(self.actions.iter().cloned().map(JcsValue::String).collect()),
+            ),
+            (
+                "broker_socket".into(),
+                JcsValue::String(self.broker_socket.clone()),
+            ),
+            (
+                "capability_id".into(),
+                JcsValue::String(self.capability_id.clone()),
+            ),
+            (
+                "expires_at".into(),
+                JcsValue::String(self.expires_at.clone()),
+            ),
+            (
+                "generation".into(),
+                JcsValue::String(self.generation.clone()),
+            ),
             ("issued_at".into(), JcsValue::String(self.issued_at.clone())),
-            ("repository_id".into(), JcsValue::String(self.repository_id.clone())),
+            (
+                "repository_id".into(),
+                JcsValue::String(self.repository_id.clone()),
+            ),
             ("schema".into(), JcsValue::String(schema::SCHEMA_V1.into())),
-            ("secret_b64url".into(), JcsValue::String(self.secret_b64url.clone())),
-            ("session_id".into(), JcsValue::String(self.session_id.clone())),
+            (
+                "secret_b64url".into(),
+                JcsValue::String(self.secret_b64url.clone()),
+            ),
+            (
+                "session_id".into(),
+                JcsValue::String(self.session_id.clone()),
+            ),
         ]))
     }
 }
@@ -148,7 +199,10 @@ pub fn authenticate_coordinator(
         || record.generation != capability.generation
         || record.capability_id != capability.capability_id
         || record.revoked_at.is_some()
-        || !capability.actions.iter().any(|candidate| candidate == action)
+        || !capability
+            .actions
+            .iter()
+            .any(|candidate| candidate == action)
         || !record.actions.iter().any(|candidate| candidate == action)
     {
         return Err("coordinator capability scope, generation, or revocation mismatch".to_string());
@@ -173,10 +227,15 @@ pub fn authenticate_worker(
         || record.generation != capability.generation
         || record.capability_id != capability.capability_id
         || record.revoked_at.is_some()
-        || !capability.actions.iter().any(|candidate| candidate == action)
+        || !capability
+            .actions
+            .iter()
+            .any(|candidate| candidate == action)
         || !record.actions.iter().any(|candidate| candidate == action)
     {
-        return Err("worker capability scope, generation, expiry, or revocation mismatch".to_string());
+        return Err(
+            "worker capability scope, generation, expiry, or revocation mismatch".to_string(),
+        );
     }
     authenticate_secret(&capability.secret_b64url, &record.secret_sha256)
 }
@@ -195,25 +254,44 @@ pub fn revoke(record: &mut CapabilityRecordV1, revoked_at: &str) -> Result<(), S
     }
 }
 
-pub fn revoke_worker_durable(exclusion:&AuthorityExclusionLock,record_path:&Path,capability_id:&str,generation:u64,revoked_at:&str)->Result<CapabilityRecordV1,String>{
+pub fn revoke_worker_durable(
+    exclusion: &AuthorityExclusionLock,
+    record_path: &Path,
+    capability_id: &str,
+    generation: u64,
+    revoked_at: &str,
+) -> Result<CapabilityRecordV1, String> {
     LowerUuidV4::parse(capability_id)?;
     Timestamp::parse(revoked_at)?;
-    let parent=record_path.parent().ok_or_else(||"worker capability record path has no parent".to_string())?;
-    let repository=fs::canonicalize(exclusion.repository_dir()).map_err(|error|format!("canonicalize locked repository authority: {error}"))?;
-    let parent=fs::canonicalize(parent).map_err(|error|format!("canonicalize worker capability record parent: {error}"))?;
-    if !parent.starts_with(&repository){return Err("worker capability record is outside the locked repository authority".into())}
-    exclusion.revalidate()?;
-    let bytes=read_secure_bytes(record_path)?;
-    let mut record=CapabilityRecordV1::from_jcs(schema::parse_jcs(&bytes,true)?)?;
-    if record.capability_id!=capability_id||record.generation!=generation.to_string(){
-        return Err("worker capability revocation expectation differs from the durable record".into())
+    let parent = record_path
+        .parent()
+        .ok_or_else(|| "worker capability record path has no parent".to_string())?;
+    let repository = fs::canonicalize(exclusion.repository_dir())
+        .map_err(|error| format!("canonicalize locked repository authority: {error}"))?;
+    let parent = fs::canonicalize(parent)
+        .map_err(|error| format!("canonicalize worker capability record parent: {error}"))?;
+    if !parent.starts_with(&repository) {
+        return Err("worker capability record is outside the locked repository authority".into());
     }
-    if record.revoked_at.is_some(){return Ok(record)}
-    revoke(&mut record,revoked_at)?;
     exclusion.revalidate()?;
-    super::authority::atomic_replace_jcs(record_path,&record,0o600)?;
-    let durable=CapabilityRecordV1::from_jcs(schema::parse_jcs(&read_secure_bytes(record_path)?,true)?)?;
-    if durable!=record{return Err("worker capability revocation is not durably re-readable".into())}
+    let bytes = read_secure_bytes(record_path)?;
+    let mut record = CapabilityRecordV1::from_jcs(schema::parse_jcs(&bytes, true)?)?;
+    if record.capability_id != capability_id || record.generation != generation.to_string() {
+        return Err(
+            "worker capability revocation expectation differs from the durable record".into(),
+        );
+    }
+    if record.revoked_at.is_some() {
+        return Ok(record);
+    }
+    revoke(&mut record, revoked_at)?;
+    exclusion.revalidate()?;
+    super::authority::atomic_replace_jcs(record_path, &record, 0o600)?;
+    let durable =
+        CapabilityRecordV1::from_jcs(schema::parse_jcs(&read_secure_bytes(record_path)?, true)?)?;
+    if durable != record {
+        return Err("worker capability revocation is not durably re-readable".into());
+    }
     Ok(durable)
 }
 
@@ -278,15 +356,21 @@ pub fn encode_base64url(bytes: &[u8]) -> String {
             | chunk.get(2).copied().unwrap_or(0) as u32;
         output.push(TABLE[((value >> 18) & 63) as usize] as char);
         output.push(TABLE[((value >> 12) & 63) as usize] as char);
-        if chunk.len() > 1 { output.push(TABLE[((value >> 6) & 63) as usize] as char); }
-        if chunk.len() > 2 { output.push(TABLE[(value & 63) as usize] as char); }
+        if chunk.len() > 1 {
+            output.push(TABLE[((value >> 6) & 63) as usize] as char);
+        }
+        if chunk.len() > 2 {
+            output.push(TABLE[(value & 63) as usize] as char);
+        }
     }
     output
 }
 
 pub fn decode_base64url(value: &str) -> Result<[u8; 32], String> {
     if value.len() != 43 || value.contains('=') {
-        return Err("capability secret must be exactly 43 unpadded base64url characters".to_string());
+        return Err(
+            "capability secret must be exactly 43 unpadded base64url characters".to_string(),
+        );
     }
     let mut output = Vec::with_capacity(32);
     let mut accumulator = 0_u32;
@@ -331,16 +415,32 @@ fn decode_hex_32(value: &str) -> Result<[u8; 32], String> {
     Ok(output)
 }
 fn hex_nibble(value: u8) -> Result<u8, String> {
-    match value { b'0'..=b'9' => Ok(value-b'0'), b'a'..=b'f' => Ok(value-b'a'+10), _ => Err("invalid lowercase hexadecimal digest".to_string()) }
+    match value {
+        b'0'..=b'9' => Ok(value - b'0'),
+        b'a'..=b'f' => Ok(value - b'a' + 10),
+        _ => Err("invalid lowercase hexadecimal digest".to_string()),
+    }
 }
 
 pub fn secure_regular_file(path: &Path, expected_mode: u32) -> Result<File, String> {
-    let file = OpenOptions::new().read(true).custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW).open(path)
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)
         .map_err(|error| format!("securely open {}: {error}", path.display()))?;
-    let metadata = file.metadata().map_err(|error| format!("fstat {}: {error}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("fstat {}: {error}", path.display()))?;
     use std::os::unix::fs::MetadataExt;
-    if !metadata.is_file() || metadata.uid() != unsafe { libc::geteuid() } || metadata.nlink() != 1 || metadata.mode() & 0o777 != expected_mode {
-        return Err(format!("{} has unsafe owner/type/link/mode", path.display()));
+    if !metadata.is_file()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.nlink() != 1
+        || metadata.mode() & 0o777 != expected_mode
+    {
+        return Err(format!(
+            "{} has unsafe owner/type/link/mode",
+            path.display()
+        ));
     }
     Ok(file)
 }
@@ -348,18 +448,33 @@ pub fn secure_regular_file(path: &Path, expected_mode: u32) -> Result<File, Stri
 pub fn read_secure_bytes(path: &Path) -> Result<Vec<u8>, String> {
     let mut file = secure_regular_file(path, 0o600)?;
     let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes).map_err(|error| format!("read {}: {error}", path.display()))?;
+    file.read_to_end(&mut bytes)
+        .map_err(|error| format!("read {}: {error}", path.display()))?;
     Ok(bytes)
 }
 
 pub fn set_private_mode(path: &Path, mode: u32) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(mode)).map_err(|error| format!("chmod {}: {error}", path.display()))
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))
+        .map_err(|error| format!("chmod {}: {error}", path.display()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test] fn base64_secret_round_trips() { let bytes=[0xa5;32]; let encoded=encode_base64url(&bytes); assert_eq!(encoded.len(),43); assert_eq!(decode_base64url(&encoded).unwrap(),bytes); }
-    #[test] fn wrong_secret_fails() { let (cap,record)=mint_coordinator(&"a".repeat(64),1,"2026-01-01T00:00:00.000Z").unwrap(); let mut changed=cap; changed.secret_b64url=encode_base64url(&[7;32]); assert!(authenticate_coordinator(&changed,&record,&"a".repeat(64),1,"start").is_err()); }
+    #[test]
+    fn base64_secret_round_trips() {
+        let bytes = [0xa5; 32];
+        let encoded = encode_base64url(&bytes);
+        assert_eq!(encoded.len(), 43);
+        assert_eq!(decode_base64url(&encoded).unwrap(), bytes);
+    }
+    #[test]
+    fn wrong_secret_fails() {
+        let (cap, record) =
+            mint_coordinator(&"a".repeat(64), 1, "2026-01-01T00:00:00.000Z").unwrap();
+        let mut changed = cap;
+        changed.secret_b64url = encode_base64url(&[7; 32]);
+        assert!(authenticate_coordinator(&changed, &record, &"a".repeat(64), 1, "start").is_err());
+    }
 }

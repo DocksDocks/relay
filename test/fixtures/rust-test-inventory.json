@@ -1,64 +1,84 @@
 {
-  "schema_version": 1,
+  "schema_version": 3,
+  "acceptance_owners": {
+    "A01": "workspace_lease_process::two_writers_same_worktree_exactly_one_lease",
+    "A02": "workspace_lease_process::separate_worktrees_both_hold_leases",
+    "A03": "workspace_lease_process::read_only_spawn_coexists_with_writer",
+    "A04": "workspace_lease_process::crashed_writer_recovers_only_after_empty_proof",
+    "A05": "workspace_identity::symlink_relative_case_aliases_share_one_identity",
+    "A06": "workspace_coordination_process::unexpected_branch_switch_is_refused",
+    "A07": "workspace_identity::unexpected_head_or_base_drift_is_refused",
+    "A08": "workspace_identity::unowned_dirty_path_blocks_handback",
+    "A09": "workspace_lease_process::worker_merge_rebase_reset_and_force_push_are_refused",
+    "A10": "workspace_coordination_process::overlapping_path_claims_are_atomic_and_refused",
+    "A11": "workspace_coordination_process::coordinator_integrates_commits_serially",
+    "A12": "workspace_coordination_process::conflicting_commits_settle_once_needs_user_action",
+    "A13": "scripts/tests/plan-review-policy-regressions.mjs --orchestration-oracle",
+    "A14": "workspace_resources::all_six_resource_kinds_are_isolated_and_receipted",
+    "A15": "workspace_coordination_process::cleanup_refuses_dirty_or_unretained_work",
+    "A16": "workspace_identity::integration_checkout_refuses_supported_writer",
+    "A17": "workspace_identity::failed_preflight_or_lease_changes_no_source_bytes",
+    "A18": "workspace_identity::preserve_commit_mode_uses_temp_index_ref_and_no_source_mutation",
+    "A19": "workspace_identity::preserve_artifact_mode_round_trips_binary_and_untracked_pax",
+    "A20": "workspace_coordination_process::applied_wip_is_first_produced_and_integrated_commit",
+    "A21": "workspace_coordination_process::workspace_and_legacy_fanout_share_repository_gate",
+    "A22": "workspace_lease_process::linux_cgroup_pidfd_guardian_kills_hostile_descendants",
+    "A23": "workspace_lease_process::macos_process_group_recursive_guardian_kills_hostile_descendants",
+    "A24": "workspace_identity::sha1_and_sha256_object_formats_validate_reported_oid_width",
+    "A25": "workspace_coordination_process::coordinator_bootstrap_worker_scope_and_replay_are_closed",
+    "A26": "workspace_coordination_process::recovery_matrix_has_no_unproven_progress",
+    "A27": "test/selftest.mjs::fresh-binary-jobs-parity",
+    "A28": "test/workspace-smoke.mjs::single-session-compat",
+    "A29": "test/workspace-smoke.mjs::docs-contract"
+  },
+  "pending_api_gaps": {},
   "cases": {
-    "lifecycle_managed": {
+    "workspace_identity": {
       "tests": [
-        "managed_attach_claude_prebound_id_claims_active",
-        "managed_attach_closed_transition_graph_and_exact_versions",
-        "managed_attach_codex_claiming_invalidates_old_epoch_and_waits_for_drain",
-        "managed_attach_concurrent_exact_duplicate_joins_one_claim",
-        "managed_attach_conflicting_binding_refuses_second_worker",
-        "managed_attach_drain_timeout_binds_fencing_never_active",
-        "managed_attach_expiry_fences_worker_without_binding_session",
-        "managed_attach_hook_claims_before_register_and_drains_only_after_active",
-        "managed_attach_hook_refusal_stops_before_register_marker_or_mailbox_drain",
-        "managed_attach_replay_and_tuple_mismatches_fail_without_rebinding",
-        "managed_attach_resume_is_exact_and_does_not_churn_state",
-        "managed_gc_claimant_before_cas_preserves_every_candidate_byte",
-        "managed_gc_crash_after_first_delete_resumes_without_early_record_removal",
-        "managed_gc_crash_after_lock_unlink_keeps_record_until_final_cas",
-        "managed_gc_gcdel_wins_claimant_writes_nothing_and_exact_epoch_resumes",
-        "managed_gc_live_lock_and_malformed_binding_are_fail_closed",
-        "managed_gc_non_releasable_workers_pending_and_managed_bindings_survive_age",
-        "managed_gc_old_standalone_unmanaged_uses_gcdel_cas_and_removes_record_last"
+        "failed_preflight_or_lease_changes_no_source_bytes",
+        "integration_checkout_refuses_supported_writer",
+        "mixed_changes_apply_index_then_worktree_payload",
+        "preserve_artifact_mode_round_trips_binary_and_untracked_pax",
+        "preserve_commit_mode_uses_temp_index_ref_and_no_source_mutation",
+        "schema_records_reject_noncanonical_unknown_and_duplicate_fields",
+        "sha1_and_sha256_object_formats_validate_reported_oid_width",
+        "symlink_relative_case_aliases_share_one_identity",
+        "unexpected_head_or_base_drift_is_refused",
+        "unowned_dirty_path_blocks_handback"
       ]
     },
-    "lifecycle_supervisor": {
+    "workspace_lease_process": {
       "tests": [
-        "lifecycle_supervisor_disconnect_linearizes_unmanaged_cancel_and_reap",
-        "lifecycle_supervisor_pipe_preserves_bytes_eof_streams_and_reap_custody",
-        "lifecycle_supervisor_wake_uses_closed_stdin_and_separate_output",
-        "lifecycle_supervisor_watchdog_first_loss_refuses_next_reentry",
-        "lifecycle_supervisor_watchdog_marks_managed_worker_on_supervisor_death",
-        "managed_attach_cancel_deadline_binds_fencing_unconfirmed_never_active",
-        "managed_attach_cancel_first_reap_transfers_waiting_claim_exactly_once"
+        "cgroup_reconcile_removes_empty_orphan_and_refuses_nonempty_or_foreign_identity",
+        "crashed_writer_recovers_only_after_empty_proof",
+        "custody_packets_reject_malformed_frames_replay_and_wrong_fds",
+        "linux_cgroup_pidfd_guardian_kills_hostile_descendants",
+        "macos_process_group_recursive_guardian_kills_hostile_descendants",
+        "read_only_spawn_coexists_with_writer",
+        "separate_worktrees_both_hold_leases",
+        "two_writers_same_worktree_exactly_one_lease",
+        "worker_merge_rebase_reset_and_force_push_are_refused"
       ]
     },
-    "lifecycle_admission": {
+    "workspace_coordination_process": {
       "tests": [
-        "lifecycle_admission_closed_launch_payload_rejects_invalid_and_mismatched_variants",
-        "lifecycle_admission_drain_receipt_rolls_back_exact_lines_before_new_mail",
-        "lifecycle_admission_drain_timeout_exact_cas_persists_active_operations",
-        "lifecycle_admission_guard_a_cannot_name_or_mutate_b",
-        "lifecycle_admission_publish_fence_precedes_exclusive_drain",
-        "lifecycle_admission_reentry_matrix",
-        "lifecycle_admission_revalidates_registry_tool_cwd_and_server_authority",
-        "lifecycle_admission_stale_unmanaged_guard_refuses_after_claiming",
-        "lifecycle_admission_unmanaged_attach_claiming_kills_waits_and_releases_guard",
-        "lifecycle_admission_unmanaged_guard_binds_target_kind_and_epoch"
+        "applied_wip_is_first_produced_and_integrated_commit",
+        "cleanup_refuses_dirty_or_unretained_work",
+        "conflicting_commits_settle_once_needs_user_action",
+        "coordinator_bootstrap_worker_scope_and_replay_are_closed",
+        "coordinator_integrates_commits_serially",
+        "overlapping_path_claims_are_atomic_and_refused",
+        "recovery_matrix_has_no_unproven_progress",
+        "unexpected_branch_switch_is_refused",
+        "workspace_and_legacy_fanout_share_repository_gate"
+      ]
+    },
+    "workspace_resources": {
+      "tests": [
+        "all_six_resource_kinds_are_isolated_and_receipted",
+        "provider_timeout_fences_setsid_and_terminates_inherited_pipe_descendant",
+        "resource_decisions_require_closed_six_kind_matrix"
       ]
     }
-  },
-  "startup_phases": [
-    "WatchdogBootstrap",
-    "SupervisorBootstrap",
-    "ListenerBound",
-    "GlobalQueuesReady",
-    "AcceptorsReady",
-    "ControlAuthenticated",
-    "OperationQueuesReady",
-    "ChildSpawned",
-    "ProxyThreadsReady",
-    "StartedPublished"
-  ]
+  }
 }

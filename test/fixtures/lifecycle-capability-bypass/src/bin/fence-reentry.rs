@@ -6,5 +6,5 @@ fn main() {
     )
     .unwrap();
     let mut permit = relay::lifecycle::drain_prior_operations(intent).unwrap();
-    let _ = relay::store::drain_with_guard(&mut permit);
+    let _ = relay::lifecycle::drain_with_guard(&mut permit);
 }

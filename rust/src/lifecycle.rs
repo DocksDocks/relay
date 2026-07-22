@@ -210,7 +210,9 @@ fn validate_bridge_digest(label: &str, digest: &str) -> Result<(), String> {
             .bytes()
             .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
     {
-        return Err(format!("WorkerTree {label} evidence is not lowercase SHA-256"));
+        return Err(format!(
+            "WorkerTree {label} evidence is not lowercase SHA-256"
+        ));
     }
     Ok(())
 }

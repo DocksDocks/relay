@@ -1027,19 +1027,11 @@ function testNativeProducerEvidence(temp) {
   const expectJobsReject = (label, mutate, pattern) => {
     const fixture = artifactFixture();
     mutate(fixture.jobs);
-    expectReject(
-      label,
-      () => runPreflight(temp, fixture),
-      pattern,
-    );
+    expectReject(label, () => runPreflight(temp, fixture), pattern);
     adversary += 1;
   };
 
-  expectJobsReject(
-    'missing native job',
-    (jobs) => jobs.pop(),
-    /native job|exactly once/i,
-  );
+  expectJobsReject('missing native job', (jobs) => jobs.pop(), /native job|exactly once/i);
   expectJobsReject(
     'cross-built native job',
     (jobs) => {
@@ -1057,8 +1049,7 @@ function testNativeProducerEvidence(temp) {
   expectJobsReject(
     'failed macOS negative admission',
     (jobs) => {
-      jobs[2].steps.find(({ name }) => name === 'prove macOS managed-workspace admission STOP').conclusion =
-        'failure';
+      jobs[2].steps.find(({ name }) => name === 'prove macOS managed-workspace admission STOP').conclusion = 'failure';
     },
     /admission STOP|conclusion/i,
   );
@@ -1081,8 +1072,7 @@ function testNativeProducerEvidence(temp) {
   expectJobsReject(
     'skipped fresh-binary smoke',
     (jobs) => {
-      jobs[1].steps.find(({ name }) => name === 'smoke explicit fresh Linux workspace binary').conclusion =
-        'skipped';
+      jobs[1].steps.find(({ name }) => name === 'smoke explicit fresh Linux workspace binary').conclusion = 'skipped';
     },
     /smoke|conclusion/i,
   );

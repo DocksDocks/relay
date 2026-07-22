@@ -5,25 +5,26 @@
 //! resolves all executable/session/cwd authority from the durable operation
 //! record and owns the runtime `Child` from birth through reap.
 
+#[cfg(target_os = "linux")]
+use crate::lifecycle::WorkerTreeBridge;
 use crate::lifecycle::{
     ChildLaunchSpec, LifecycleStore, PreparedSupervisorLaunch, ProcessObservation, ReentryGuard,
     ResolvedSupervisorLaunch, StartGeneration, StdioEndpointMode, StdioProfile, SupervisorRecord,
     SupervisorState,
 };
-#[cfg(target_os = "linux")]
-use crate::lifecycle::WorkerTreeBridge;
-#[cfg(target_os = "linux")]
-use crate::workspace::custody::{
-    ControlPayload, CustodianServer, CustodyController, LeaseCloseEvidence,
-    LeaseReference, PacketKind, PayloadValue,
-};
-#[cfg(target_os = "linux")]
-use crate::workspace::platform::linux::{
-    ActivatedEvidence, DelegatedCgroup, EmptyEvidence, ProcessIdentity, WorkerLaunch,
-};
 use crate::sha256::hex_digest;
 use crate::spawn::CHILD_ENV_ALLOWLIST;
 use crate::store;
+#[cfg(target_os = "linux")]
+use crate::workspace::custody::{
+    ControlPayload, CustodianServer, CustodyController, LeaseCloseEvidence, LeaseReference,
+    PacketKind, PayloadValue,
+};
+#[cfg(target_os = "linux")]
+use crate::workspace::platform::linux::{
+    ActivatedEvidence, DelegatedCgroup, EmptyEvidence, ProcessIdentity, VerifiedWorkerLaunch,
+    WorkerLaunch,
+};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 use std::fs::{self, File};
@@ -70,16 +71,38 @@ pub struct GuardianWorkerActivation {
 }
 
 #[cfg(target_os = "linux")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RetainedBootstrapEvidence {
+    pub session_id: String,
+    pub generation: u64,
+    pub cgroup_membership: String,
+    pub lease_device: u64,
+    pub lease_inode: u64,
+    pub guardian_pid: libc::pid_t,
+    pub guardian_start_token: String,
+    pub supervisor_pid: libc::pid_t,
+    pub supervisor_start_token: String,
+    pub code: String,
+    pub error: String,
+    pub evidence_sha256: String,
+    pub empty_sha256: String,
+}
+
+#[cfg(target_os = "linux")]
 pub fn run_workspace_guardian_bootstrap(
     controller: &mut CustodyController,
     cgroup: &DelegatedCgroup,
     lease: &LeaseReference,
+    wait_until_prepared: &mut dyn FnMut() -> Result<(), String>,
 ) -> Result<GuardianWorkerActivation, String> {
-    let bootstrap_fds =
-        cgroup.duplicate_bootstrap_fds(lease.as_raw_fd())?;
+    let bootstrap_fds = cgroup.duplicate_bootstrap_fds(lease.as_raw_fd())?;
     let raw = bootstrap_fds.each_ref().map(AsRawFd::as_raw_fd);
     let payload = guardian_bootstrap_payload(cgroup.membership());
-    let ready = controller.bootstrap(payload, &raw)?;
+    let bootstrap_seq = controller.begin_bootstrap(payload, &raw)?;
+    wait_until_prepared()?;
+    let ready = controller
+        .finish_bootstrap(bootstrap_seq)
+        .map_err(|error| format!("receive authenticated SUPERVISOR_READY: {error}"))?;
     let (root, prepared_evidence_sha256, activated) =
         run_workspace_guardian_activation(controller, cgroup)?;
     Ok(GuardianWorkerActivation {
@@ -103,11 +126,11 @@ pub fn run_workspace_guardian_activation(
     controller: &mut CustodyController,
     cgroup: &DelegatedCgroup,
 ) -> Result<(ProcessIdentity, String, ControlPayload), String> {
-    let root = controller.worker_prepared()?;
+    let root = controller
+        .worker_prepared()
+        .map_err(|error| format!("receive authenticated WORKER_PREPARED: {error}"))?;
     if root.cgroup_membership != cgroup.membership() {
-        return Err(
-            "guardian WORKER_PREPARED cgroup membership changed".to_string(),
-        );
+        return Err("guardian WORKER_PREPARED cgroup membership changed".to_string());
     }
     let prepared_evidence_sha256 = root.evidence_sha256;
     let root = ProcessIdentity {
@@ -116,15 +139,18 @@ pub fn run_workspace_guardian_activation(
         start_token: root.start_token,
     };
     cgroup.verify_pre_activation(&root)?;
-    let activated = controller.activate()?;
+    let activated = controller
+        .activate()
+        .map_err(|error| format!("receive authenticated ACTIVATED: {error}"))?;
     Ok((root, prepared_evidence_sha256, activated))
 }
 
 #[cfg(target_os = "linux")]
 pub fn run_workspace_supervisor_entrypoint(
     server: &mut CustodianServer,
-    launch: &WorkerLaunch,
-    fault_sink: &mut dyn FnMut(&str),
+    prepare_launch: &mut dyn FnMut() -> Result<VerifiedWorkerLaunch, String>,
+    publish_bootstrap_ready: &mut dyn FnMut() -> Result<(), String>,
+    fault_sink: &mut dyn FnMut(&RetainedBootstrapEvidence) -> Result<(), String>,
 ) -> Result<WorkerTreeCustody, String> {
     let bootstrap = server.next_command(PacketKind::Bootstrap, 4)?;
     let bootstrap_packet = bootstrap.packet.clone();
@@ -138,9 +164,7 @@ pub fn run_workspace_supervisor_entrypoint(
         ));
     }
     let membership = match bootstrap.packet.payload.get("cgroup_membership") {
-        Some(PayloadValue::String(value)) if value.starts_with('/') => {
-            value.clone()
-        }
+        Some(PayloadValue::String(value)) if value.starts_with('/') => value.clone(),
         _ => {
             return Err(admitted_fault(
                 server,
@@ -163,36 +187,99 @@ pub fn run_workspace_supervisor_entrypoint(
             ));
         }
     };
-    let (lease, cgroup) =
-        match DelegatedCgroup::from_bootstrap(fds, &membership) {
-            Ok(custody) => custody,
-            Err(error) => {
-                return Err(admitted_fault(
-                    server,
-                    &bootstrap_packet,
-                    PacketKind::SupervisorReady,
-                    "bootstrap_invalid",
-                    &error,
-                ));
-            }
-        };
-    let ready_evidence = hex_digest(
-        format!("supervisor-ready-v1\0{membership}").as_bytes(),
-    );
+    let (lease, cgroup) = match DelegatedCgroup::from_bootstrap(fds, &membership) {
+        Ok(custody) => custody,
+        Err(error) => {
+            return Err(admitted_fault(
+                server,
+                &bootstrap_packet,
+                PacketKind::SupervisorReady,
+                "bootstrap_invalid",
+                &error,
+            ));
+        }
+    };
+    let ready_evidence = hex_digest(format!("supervisor-ready-v1\0{membership}").as_bytes());
     if let Err(error) = server.acknowledge(
         &bootstrap_packet,
         PacketKind::SupervisorReady,
         &ready_evidence,
     ) {
-        retain_bootstrap_fault(lease, cgroup, error, fault_sink);
+        let error = admitted_fault(
+            server,
+            &bootstrap_packet,
+            PacketKind::SupervisorReady,
+            "bootstrap_ack_failed",
+            &error,
+        );
+        let error = match publish_bootstrap_ready() {
+            Ok(()) => error,
+            Err(ready_error) => format!("{error}; {ready_error}"),
+        };
+        retain_bootstrap_fault(
+            server,
+            lease,
+            cgroup,
+            &bootstrap_packet,
+            "bootstrap_ack_failed",
+            error,
+            fault_sink,
+        );
     }
-    let prepared = match cgroup.launch_worker(launch) {
+    let launch = match prepare_launch() {
+        Ok(launch) => launch,
+        Err(error) => {
+            let code = worker_preparation_fault_code(&error);
+            let error = match publish_bootstrap_ready() {
+                Ok(()) => error,
+                Err(ready_error) => format!("{error}; {ready_error}"),
+            };
+            retain_bootstrap_fault(
+                server,
+                lease,
+                cgroup,
+                &bootstrap_packet,
+                code,
+                error,
+                fault_sink,
+            )
+        }
+    };
+    let prepared = match cgroup.launch_verified_worker(&launch) {
         Ok(prepared) => prepared,
-        Err(error) => retain_bootstrap_fault(lease, cgroup, error, fault_sink),
+        Err(error) => {
+            let code = worker_preparation_fault_code(&error);
+            let error = match publish_bootstrap_ready() {
+                Ok(()) => error,
+                Err(ready_error) => format!("{error}; {ready_error}"),
+            };
+            retain_bootstrap_fault(
+                server,
+                lease,
+                cgroup,
+                &bootstrap_packet,
+                code,
+                error,
+                fault_sink,
+            )
+        }
     };
     if let Err(error) = cgroup.verify_pre_activation(&prepared.identity) {
         let error = prepared.abort(error);
-        retain_bootstrap_fault(lease, cgroup, error, fault_sink);
+        let code = worker_preparation_fault_code(&error);
+        let error = match publish_bootstrap_ready() {
+            Ok(()) => error,
+            Err(ready_error) => format!("{error}; {ready_error}"),
+        };
+        retain_bootstrap_fault(
+            server,
+            lease,
+            cgroup,
+            &bootstrap_packet,
+            code,
+            error,
+            fault_sink,
+        );
     }
     let prepared_evidence = prepared.prepared_evidence.clone();
     let prepared_seq = match server.send_worker_prepared(
@@ -205,22 +292,62 @@ pub fn run_workspace_supervisor_entrypoint(
         Ok(seq) => seq,
         Err(error) => {
             let error = prepared.abort(error);
-            retain_bootstrap_fault(lease, cgroup, error, fault_sink);
+            let error = match publish_bootstrap_ready() {
+                Ok(()) => error,
+                Err(ready_error) => format!("{error}; {ready_error}"),
+            };
+            retain_bootstrap_fault(
+                server,
+                lease,
+                cgroup,
+                &bootstrap_packet,
+                "worker_prepared_send_failed",
+                error,
+                fault_sink,
+            );
         }
     };
+    if let Err(error) = publish_bootstrap_ready() {
+        let error = prepared.abort(error);
+        retain_bootstrap_fault(
+            server,
+            lease,
+            cgroup,
+            &bootstrap_packet,
+            "bootstrap_ready_publish_failed",
+            error,
+            fault_sink,
+        );
+    }
     if let Err(error) = server.wait_ack(
         PacketKind::WorkerPrepared,
         prepared_seq,
         Some(&prepared_evidence.evidence_sha256),
     ) {
         let error = prepared.abort(error);
-        retain_bootstrap_fault(lease, cgroup, error, fault_sink);
+        retain_bootstrap_fault(
+            server,
+            lease,
+            cgroup,
+            &bootstrap_packet,
+            "worker_prepared_ack_failed",
+            error,
+            fault_sink,
+        );
     }
     let activate = match server.next_command(PacketKind::Activate, 0) {
         Ok(activate) => activate,
         Err(error) => {
             let error = prepared.abort(error);
-            retain_bootstrap_fault(lease, cgroup, error, fault_sink);
+            retain_bootstrap_fault(
+                server,
+                lease,
+                cgroup,
+                &bootstrap_packet,
+                "activation_command_failed",
+                error,
+                fault_sink,
+            );
         }
     };
     if !activate.packet.payload.is_empty() {
@@ -232,7 +359,15 @@ pub fn run_workspace_supervisor_entrypoint(
             "ACTIVATE payload must be empty",
         );
         let error = prepared.abort(error);
-        retain_bootstrap_fault(lease, cgroup, error, fault_sink);
+        retain_bootstrap_fault(
+            server,
+            lease,
+            cgroup,
+            &bootstrap_packet,
+            "activation_failed",
+            error,
+            fault_sink,
+        );
     }
     if let Err(error) = cgroup.verify_pre_activation(&prepared.identity) {
         let error = admitted_fault(
@@ -243,7 +378,15 @@ pub fn run_workspace_supervisor_entrypoint(
             &error,
         );
         let error = prepared.abort(error);
-        retain_bootstrap_fault(lease, cgroup, error, fault_sink);
+        retain_bootstrap_fault(
+            server,
+            lease,
+            cgroup,
+            &bootstrap_packet,
+            "activation_failed",
+            error,
+            fault_sink,
+        );
     }
     let verified = match prepared.verify_activation() {
         Ok(verified) => verified,
@@ -255,7 +398,15 @@ pub fn run_workspace_supervisor_entrypoint(
                 "activation_failed",
                 &error,
             );
-            retain_bootstrap_fault(lease, cgroup, error, fault_sink);
+            retain_bootstrap_fault(
+                server,
+                lease,
+                cgroup,
+                &bootstrap_packet,
+                "activation_failed",
+                error,
+                fault_sink,
+            );
         }
     };
     let (process, activation) = match verified.release_after_ack(|evidence| {
@@ -267,11 +418,15 @@ pub fn run_workspace_supervisor_entrypoint(
     }) {
         Ok(activated) => activated,
         Err(error) => {
-            let evidence =
-                custody_fault_evidence("activation_release_failed", &error);
-            let _ =
-                server.send_fault("activation_release_failed", &evidence);
-            retain_bootstrap_fault(lease, cgroup, error, fault_sink);
+            retain_bootstrap_fault(
+                server,
+                lease,
+                cgroup,
+                &bootstrap_packet,
+                "activation_release_failed",
+                error,
+                fault_sink,
+            );
         }
     };
     let lifecycle = WorkerTreeBridge {
@@ -293,6 +448,25 @@ pub fn run_workspace_supervisor_entrypoint(
 }
 
 #[cfg(target_os = "linux")]
+fn worker_preparation_fault_code(error: &str) -> &'static str {
+    if error.contains("executable identity") {
+        "worker_executable_identity_failed"
+    } else if error.contains("clone3") || error.contains("fork blocked") {
+        "worker_process_creation_failed"
+    } else if error.contains("custody pipe") || error.contains("sandbox-prepared byte") {
+        "worker_preparation_pipe_failed"
+    } else if error.contains("cgroup")
+        || error.contains("membership")
+        || error.contains("pidfd")
+        || error.contains("start token")
+    {
+        "worker_identity_preparation_failed"
+    } else {
+        "worker_preparation_failed"
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn custody_fault_evidence(code: &str, error: &str) -> String {
     hex_digest(format!("custody-fault-v1\0{code}\0{error}").as_bytes())
 }
@@ -306,12 +480,7 @@ fn admitted_fault(
     error: &str,
 ) -> String {
     let evidence = custody_fault_evidence(code, error);
-    match server.acknowledge_fault(
-        command,
-        response,
-        code,
-        &evidence,
-    ) {
+    match server.acknowledge_fault(command, response, code, &evidence) {
         Ok(()) => error.to_string(),
         Err(ack_error) => {
             format!("{error}; send authenticated fault ACK: {ack_error}")
@@ -321,17 +490,193 @@ fn admitted_fault(
 
 #[cfg(target_os = "linux")]
 fn retain_bootstrap_fault(
+    server: &mut CustodianServer,
     lease: LeaseReference,
     cgroup: DelegatedCgroup,
+    bootstrap: &crate::workspace::custody::ControlPacket,
+    code: &str,
     error: impl Into<String>,
-    fault_sink: &mut dyn FnMut(&str),
+    fault_sink: &mut dyn FnMut(&RetainedBootstrapEvidence) -> Result<(), String>,
 ) -> ! {
     let error = error.into();
-    fault_sink(&error);
-    let _retained = (lease, cgroup);
-    loop {
-        std::thread::park();
+    let empty = match cgroup.wait_empty() {
+        Ok(empty) => empty,
+        Err(empty_error) => terminate_bootstrap_fault(
+            lease,
+            cgroup,
+            format!("{error}; prove bootstrap fault cgroup empty: {empty_error}"),
+        ),
+    };
+    let (lease_device, lease_inode) = lease.identity();
+    let supervisor_pid = unsafe { libc::getpid() };
+    let supervisor_start_token =
+        match crate::workspace::platform::linux::process_start_token(supervisor_pid) {
+            Ok(token) => token,
+            Err(identity_error) => terminate_bootstrap_fault(
+                lease,
+                cgroup,
+                format!("{error}; identify retained supervisor: {identity_error}"),
+            ),
+        };
+    let guardian = server.peer_identity().clone();
+    let evidence_sha256 = hex_digest(
+        format!(
+            "custody-bootstrap-fault-v1\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
+            bootstrap.session_id,
+            bootstrap.generation,
+            cgroup.membership(),
+            lease_device,
+            lease_inode,
+            supervisor_pid,
+            supervisor_start_token,
+            guardian.pid,
+            guardian.start_token,
+            code,
+            error,
+        )
+        .as_bytes(),
+    );
+    let retained = RetainedBootstrapEvidence {
+        session_id: bootstrap.session_id.clone(),
+        generation: bootstrap.generation,
+        cgroup_membership: cgroup.membership().to_string(),
+        lease_device,
+        lease_inode,
+        guardian_pid: guardian.pid,
+        guardian_start_token: guardian.start_token,
+        supervisor_pid,
+        supervisor_start_token,
+        code: code.to_string(),
+        error,
+        evidence_sha256: evidence_sha256.clone(),
+        empty_sha256: empty.evidence_sha256.clone(),
+    };
+    if let Err(persist_error) = fault_sink(&retained) {
+        terminate_bootstrap_fault(
+            lease,
+            cgroup,
+            format!(
+                "{}; persist bootstrap fault evidence: {persist_error}",
+                retained.error
+            ),
+        );
     }
+    let fault_seq = match server.send_fault(code, &evidence_sha256) {
+        Ok(seq) => seq,
+        Err(control_error) => terminate_bootstrap_fault(lease, cgroup, control_error),
+    };
+    if let Err(control_error) =
+        server.wait_ack(PacketKind::Fault, fault_seq, Some(&evidence_sha256))
+    {
+        terminate_bootstrap_fault(lease, cgroup, control_error);
+    }
+    let empty_seq = match server.send_empty(&empty.evidence_sha256) {
+        Ok(seq) => seq,
+        Err(control_error) => terminate_bootstrap_fault(lease, cgroup, control_error),
+    };
+    if let Err(control_error) =
+        server.wait_ack(PacketKind::Empty, empty_seq, Some(&empty.evidence_sha256))
+    {
+        terminate_bootstrap_fault(lease, cgroup, control_error);
+    }
+    let cgroup =
+        match run_bootstrap_fault_release_protocol(server, lease, cgroup, &empty.evidence_sha256) {
+            Ok(cgroup) => cgroup,
+            Err((lease, cgroup, control_error)) => {
+                terminate_bootstrap_fault(lease, cgroup, control_error)
+            }
+        };
+    if cgroup.remove().is_err() {
+        std::process::exit(1);
+    }
+    std::process::exit(0);
+}
+
+#[cfg(target_os = "linux")]
+fn run_bootstrap_fault_release_protocol(
+    server: &mut CustodianServer,
+    lease: LeaseReference,
+    cgroup: DelegatedCgroup,
+    empty_sha256: &str,
+) -> Result<DelegatedCgroup, (LeaseReference, DelegatedCgroup, String)> {
+    let prepare = match server.next_command(PacketKind::PrepareRelease, 0) {
+        Ok(command) => command,
+        Err(error) => return Err((lease, cgroup, error)),
+    };
+    if !prepare.packet.payload.is_empty() {
+        return Err((
+            lease,
+            cgroup,
+            "PREPARE_RELEASE payload must be empty".to_string(),
+        ));
+    }
+    let release_evidence = hex_digest(format!("release-prepared-v1\0{empty_sha256}").as_bytes());
+    if let Err(error) = server.acknowledge(
+        &prepare.packet,
+        PacketKind::ReleasePrepared,
+        &release_evidence,
+    ) {
+        return Err((lease, cgroup, error));
+    }
+    let close = match server.next_command(PacketKind::CloseLease, 0) {
+        Ok(command) => command,
+        Err(error) => return Err((lease, cgroup, error)),
+    };
+    if !close.packet.payload.is_empty() {
+        return Err((
+            lease,
+            cgroup,
+            "CLOSE_LEASE payload must be empty".to_string(),
+        ));
+    }
+    let lease_close = lease.close();
+    if server
+        .acknowledge(
+            &close.packet,
+            PacketKind::LeaseClosed,
+            &lease_close.evidence_sha256,
+        )
+        .is_err()
+    {
+        std::process::exit(1);
+    }
+    let committed = match server.next_command(PacketKind::ClosedCommitted, 0) {
+        Ok(command) => command,
+        Err(_) => std::process::exit(1),
+    };
+    let closed_evidence = match (
+        committed.packet.payload.len(),
+        committed.packet.payload.get("evidence_sha256"),
+    ) {
+        (1, Some(PayloadValue::String(evidence)))
+            if evidence.len() == 64
+                && evidence
+                    .bytes()
+                    .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')) =>
+        {
+            evidence
+        }
+        _ => std::process::exit(1),
+    };
+    server
+        .acknowledge(
+            &committed.packet,
+            PacketKind::ClosedCommitted,
+            closed_evidence,
+        )
+        .unwrap_or_else(|_| std::process::exit(1));
+    Ok(cgroup)
+}
+
+#[cfg(target_os = "linux")]
+fn terminate_bootstrap_fault(
+    lease: LeaseReference,
+    cgroup: DelegatedCgroup,
+    _error: impl Into<String>,
+) -> ! {
+    drop(lease);
+    let _ = cgroup.remove();
+    std::process::exit(1);
 }
 #[cfg(target_os = "linux")]
 #[derive(Debug)]
@@ -347,10 +692,7 @@ pub fn run_workspace_supervisor_release_protocol(
     mut custody: WorkerTreeCustody,
     fault_sink: &mut dyn FnMut(&str),
 ) -> Result<ReleasedWorkerTree, String> {
-    let termination = match server.next_admitted(
-        &[PacketKind::Quiesce, PacketKind::Terminate],
-        0,
-    ) {
+    let termination = match server.next_admitted(&[PacketKind::Quiesce, PacketKind::Terminate], 0) {
         Ok(command) => command,
         Err(error) => retain_runtime_fault(custody, error, fault_sink),
     };
@@ -372,7 +714,7 @@ pub fn run_workspace_supervisor_release_protocol(
     let empty = if termination.packet.kind == PacketKind::Quiesce {
         let empty = match custody
             .cgroup
-            .wait_root_and_empty(&custody.process)
+            .graceful_stop_and_wait_empty(&custody.process)
         {
             Ok(empty) => empty,
             Err(error) => {
@@ -397,19 +739,14 @@ pub fn run_workspace_supervisor_release_protocol(
             Ok(seq) => seq,
             Err(error) => retain_runtime_fault(custody, error, fault_sink),
         };
-        if let Err(error) = server.wait_ack(
-            PacketKind::Empty,
-            empty_seq,
-            Some(&empty.evidence_sha256),
-        ) {
+        if let Err(error) =
+            server.wait_ack(PacketKind::Empty, empty_seq, Some(&empty.evidence_sha256))
+        {
             retain_runtime_fault(custody, error, fault_sink);
         }
         empty
     } else {
-        let empty = match custody
-            .cgroup
-            .kill_and_wait_empty(&custody.process)
-        {
+        let empty = match custody.cgroup.kill_and_wait_empty(&custody.process) {
             Ok(empty) => empty,
             Err(error) => {
                 let error = admitted_fault(
@@ -431,8 +768,7 @@ pub fn run_workspace_supervisor_release_protocol(
         }
         empty
     };
-    custody.lifecycle.empty_evidence_sha256 =
-        Some(empty.evidence_sha256.clone());
+    custody.lifecycle.empty_evidence_sha256 = Some(empty.evidence_sha256.clone());
     if let Err(error) = custody.lifecycle.validate_terminal() {
         retain_runtime_fault(custody, error, fault_sink);
     }
@@ -451,13 +787,8 @@ pub fn run_workspace_supervisor_release_protocol(
         );
         retain_runtime_fault(custody, error, fault_sink);
     }
-    let release_evidence = hex_digest(
-        format!(
-            "release-prepared-v1\0{}",
-            empty.evidence_sha256
-        )
-        .as_bytes(),
-    );
+    let release_evidence =
+        hex_digest(format!("release-prepared-v1\0{}", empty.evidence_sha256).as_bytes());
     if let Err(error) = server.acknowledge(
         &prepare.packet,
         PacketKind::ReleasePrepared,
@@ -497,9 +828,9 @@ pub fn run_workspace_supervisor_release_protocol(
     ) {
         (1, Some(PayloadValue::String(evidence)))
             if evidence.len() == 64
-                && evidence.bytes().all(|byte| {
-                    matches!(byte, b'0'..=b'9' | b'a'..=b'f')
-                }) =>
+                && evidence
+                    .bytes()
+                    .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')) =>
         {
             evidence.clone()
         }
@@ -541,7 +872,6 @@ fn retain_runtime_fault(
     })
 }
 
-
 #[cfg(target_os = "linux")]
 pub fn launch_worker_tree_bridge<F>(
     session_id: &str,
@@ -560,8 +890,7 @@ where
     }
     let prepared_evidence = prepared.prepared_evidence.clone();
     let verified = prepared.verify_activation()?;
-    let (process, activation) =
-        verified.release_after_ack(acknowledge_activated)?;
+    let (process, activation) = verified.release_after_ack(acknowledge_activated)?;
     let lifecycle = WorkerTreeBridge {
         session_id: session_id.to_string(),
         generation: generation.to_string(),
@@ -592,15 +921,12 @@ pub fn quiesce_worker_tree_bridge(
     ),
     String,
 > {
-    let empty = custody.cgroup.wait_root_and_empty(&custody.process)?;
+    let empty = custody
+        .cgroup
+        .graceful_stop_and_wait_empty(&custody.process)?;
     custody.lifecycle.empty_evidence_sha256 = Some(empty.evidence_sha256.clone());
     custody.lifecycle.validate_terminal()?;
-    Ok((
-        custody.cgroup,
-        custody.lease,
-        custody.lifecycle,
-        empty,
-    ))
+    Ok((custody.cgroup, custody.lease, custody.lifecycle, empty))
 }
 
 #[cfg(target_os = "linux")]
@@ -618,12 +944,7 @@ pub fn fence_worker_tree_bridge(
     let empty = custody.cgroup.kill_and_wait_empty(&custody.process)?;
     custody.lifecycle.empty_evidence_sha256 = Some(empty.evidence_sha256.clone());
     custody.lifecycle.validate_terminal()?;
-    Ok((
-        custody.cgroup,
-        custody.lease,
-        custody.lifecycle,
-        empty,
-    ))
+    Ok((custody.cgroup, custody.lease, custody.lifecycle, empty))
 }
 
 /// Guardian and supervisor both use this fail-closed path on authenticated
@@ -635,13 +956,10 @@ pub fn fence_and_retain_worker_tree_after_peer_loss(
     mut custody: WorkerTreeCustody,
     evidence_sink: impl FnOnce(Result<&EmptyEvidence, &str>),
 ) -> ! {
-    let result = custody
-        .cgroup
-        .kill_and_wait_empty(&custody.process);
+    let result = custody.cgroup.kill_and_wait_empty(&custody.process);
     match &result {
         Ok(empty) => {
-            custody.lifecycle.empty_evidence_sha256 =
-                Some(empty.evidence_sha256.clone());
+            custody.lifecycle.empty_evidence_sha256 = Some(empty.evidence_sha256.clone());
             evidence_sink(Ok(empty));
         }
         Err(error) => evidence_sink(Err(error)),
@@ -656,14 +974,7 @@ pub fn close_worker_tree_bridge_lease(
     cgroup: DelegatedCgroup,
     lease: LeaseReference,
     lifecycle: WorkerTreeBridge,
-) -> Result<
-    (
-        DelegatedCgroup,
-        WorkerTreeBridge,
-        LeaseCloseEvidence,
-    ),
-    String,
-> {
+) -> Result<(DelegatedCgroup, WorkerTreeBridge, LeaseCloseEvidence), String> {
     lifecycle.validate_terminal()?;
     let close = lease.close();
     Ok((cgroup, lifecycle, close))
@@ -2471,23 +2782,18 @@ mod workspace_custody_tests {
 
     #[test]
     fn admitted_activation_failure_sends_authenticated_fault_ack() {
-        use crate::workspace::custody::{
-            ControlEndpoint, PeerIdentity, Sender,
-        };
+        use crate::workspace::custody::{ControlEndpoint, PeerIdentity, Sender};
 
         let pid = unsafe { libc::getpid() };
         let peer = PeerIdentity {
             pid,
             euid: unsafe { libc::geteuid() },
             gid: unsafe { libc::getegid() },
-            start_token:
-                crate::workspace::platform::linux::process_start_token(pid)
-                    .unwrap(),
+            start_token: crate::workspace::platform::linux::process_start_token(pid).unwrap(),
         };
         let (guardian_fd, supervisor_fd) = ControlEndpoint::pair().unwrap();
         let key = [0x31; 32];
-        let session_id =
-            "00000000-0000-4000-8000-000000000001".to_string();
+        let session_id = "00000000-0000-4000-8000-000000000001".to_string();
         let mut guardian = ControlEndpoint::new(
             guardian_fd,
             key,
@@ -2497,28 +2803,18 @@ mod workspace_custody_tests {
             peer.clone(),
         )
         .unwrap();
-        let supervisor = ControlEndpoint::new(
-            supervisor_fd,
-            key,
-            session_id,
-            1,
-            Sender::Supervisor,
-            peer,
-        )
-        .unwrap();
+        let supervisor =
+            ControlEndpoint::new(supervisor_fd, key, session_id, 1, Sender::Supervisor, peer)
+                .unwrap();
         let receiver = std::thread::spawn(move || {
             let command_seq = guardian
                 .send(PacketKind::Activate, ControlPayload::new(), &[])
                 .unwrap();
-            let received = guardian
-                .receive(Duration::from_secs(1), 0)
-                .unwrap();
+            let received = guardian.receive(Duration::from_secs(1), 0).unwrap();
             (command_seq, received)
         });
         let mut server = CustodianServer::new(supervisor);
-        let command = server
-            .next_command(PacketKind::Activate, 0)
-            .unwrap();
+        let command = server.next_command(PacketKind::Activate, 0).unwrap();
         let error = admitted_fault(
             &mut server,
             &command.packet,

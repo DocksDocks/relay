@@ -1,9 +1,8 @@
 use super::authority::{self, AuthorityRoots};
 use super::capability;
 use super::schema::{
-    self, ClosedJcs, EnvProjectionV1, ProviderReceiptV1, ProviderRequestV1,
-    ResourceAllocationV1, ResourceDecisionV1, ResourceProviderRegistrationV1,
-    ResourceProviderRegistryV1, ToolLaunchV1,
+    self, ClosedJcs, EnvProjectionV1, ProviderReceiptV1, ProviderRequestV1, ResourceAllocationV1,
+    ResourceDecisionV1, ResourceProviderRegistrationV1, ResourceProviderRegistryV1, ToolLaunchV1,
 };
 use crate::sha256;
 use std::collections::{BTreeMap, BTreeSet};
@@ -14,12 +13,14 @@ use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
 pub const PROVIDER_REGISTRY_FILE: &str = "resource-provider-registry-v1.json";
 const PROVIDER_TIMEOUT: Duration = Duration::from_secs(5);
+const PROVIDER_TERMINATION_GRACE: Duration = Duration::from_millis(100);
+const PROVIDER_PIPE_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 const PROVIDER_OUTPUT_MAX: u64 = 64 * 1024;
 const BUILTIN_PROVIDER: &str = "builtin";
 
@@ -54,6 +55,17 @@ impl ResourceReleaseEvidenceV1 {
     }
 }
 
+pub struct ToolLaunchContext<'a> {
+    pub tool: &'a ToolLaunchV1,
+    pub session_id: &'a str,
+    pub workspace: &'a Path,
+    pub prompt: &'a str,
+    pub generated_policy: &'a str,
+    pub git_shim_dir: &'a Path,
+    pub worker_capability_file: &'a Path,
+    pub resources: &'a ResourceSet,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PreparedToolLaunch {
     pub executable: PathBuf,
@@ -81,29 +93,114 @@ pub struct ToolLaunchDecisionV1 {
 impl ClosedJcs for ToolLaunchDecisionV1 {
     fn from_jcs(value: schema::JcsValue) -> Result<Self, String> {
         let object = value.object()?;
-        let keys = ["schema","session_id","kind","executable_path","executable_sha256","arguments","cwd","environment","resource_fds","writable_resources","created_at"];
-        if object.len()!=keys.len()||keys.iter().any(|key|!object.contains_key(*key)){return Err("ToolLaunchDecisionV1 keys differ from the closed schema".into())}
-        if object["schema"].as_str()?!="ToolLaunchDecisionV1"{return Err("ToolLaunchDecisionV1 schema mismatch".into())}
-        let session_id=object["session_id"].as_str()?.to_string();schema::LowerUuidV4::parse(&session_id)?;
-        let kind=object["kind"].as_str()?.to_string();if !matches!(kind.as_str(),"claude"|"codex"|"omp"){return Err("launch decision kind is invalid".into())}
-        let executable_path=object["executable_path"].as_str()?.to_string();schema::AbsPath::parse(&executable_path)?;
-        let executable_sha256=object["executable_sha256"].as_str()?.to_string();schema::Sha256Digest::parse(&executable_sha256)?;
-        let arguments=string_array(&object["arguments"],"launch arguments")?;
-        let cwd=object["cwd"].as_str()?.to_string();schema::AbsPath::parse(&cwd)?;
-        let environment=match &object["environment"]{schema::JcsValue::Array(values)=>values.iter().cloned().map(EnvProjectionV1::from_value).collect::<Result<Vec<_>,_>>()?,_=>return Err("launch environment must be an array".into())};
-        let resource_fds=string_array(&object["resource_fds"],"launch resource_fds")?;for value in &resource_fds{let fd=value.parse::<RawFd>().map_err(|_|"launch resource FD is not decimal".to_string())?;if fd<3||fd.to_string()!=*value{return Err("launch resource FD is not canonical".into())}}
-        let writable_resources=string_array(&object["writable_resources"],"launch writable_resources")?;for value in &writable_resources{schema::AbsPath::parse(value)?;}
-        let created_at=object["created_at"].as_str()?.to_string();schema::Timestamp::parse(&created_at)?;
-        Ok(Self{session_id,kind,executable_path,executable_sha256,arguments,cwd,environment,resource_fds,writable_resources,created_at})
+        let keys = [
+            "schema",
+            "session_id",
+            "kind",
+            "executable_path",
+            "executable_sha256",
+            "arguments",
+            "cwd",
+            "environment",
+            "resource_fds",
+            "writable_resources",
+            "created_at",
+        ];
+        if object.len() != keys.len() || keys.iter().any(|key| !object.contains_key(*key)) {
+            return Err("ToolLaunchDecisionV1 keys differ from the closed schema".into());
+        }
+        if object["schema"].as_str()? != "ToolLaunchDecisionV1" {
+            return Err("ToolLaunchDecisionV1 schema mismatch".into());
+        }
+        let session_id = object["session_id"].as_str()?.to_string();
+        schema::LowerUuidV4::parse(&session_id)?;
+        let kind = object["kind"].as_str()?.to_string();
+        if !matches!(kind.as_str(), "claude" | "codex" | "omp") {
+            return Err("launch decision kind is invalid".into());
+        }
+        let executable_path = object["executable_path"].as_str()?.to_string();
+        schema::AbsPath::parse(&executable_path)?;
+        let executable_sha256 = object["executable_sha256"].as_str()?.to_string();
+        schema::Sha256Digest::parse(&executable_sha256)?;
+        let arguments = string_array(&object["arguments"], "launch arguments")?;
+        let cwd = object["cwd"].as_str()?.to_string();
+        schema::AbsPath::parse(&cwd)?;
+        let environment = match &object["environment"] {
+            schema::JcsValue::Array(values) => values
+                .iter()
+                .cloned()
+                .map(EnvProjectionV1::from_value)
+                .collect::<Result<Vec<_>, _>>()?,
+            _ => return Err("launch environment must be an array".into()),
+        };
+        let resource_fds = string_array(&object["resource_fds"], "launch resource_fds")?;
+        for value in &resource_fds {
+            let fd = value
+                .parse::<RawFd>()
+                .map_err(|_| "launch resource FD is not decimal".to_string())?;
+            if fd < 3 || fd.to_string() != *value {
+                return Err("launch resource FD is not canonical".into());
+            }
+        }
+        let writable_resources =
+            string_array(&object["writable_resources"], "launch writable_resources")?;
+        for value in &writable_resources {
+            schema::AbsPath::parse(value)?;
+        }
+        let created_at = object["created_at"].as_str()?.to_string();
+        schema::Timestamp::parse(&created_at)?;
+        Ok(Self {
+            session_id,
+            kind,
+            executable_path,
+            executable_sha256,
+            arguments,
+            cwd,
+            environment,
+            resource_fds,
+            writable_resources,
+            created_at,
+        })
     }
-    fn to_jcs(&self)->schema::JcsValue{
+    fn to_jcs(&self) -> schema::JcsValue {
         schema::JcsValue::Object(BTreeMap::from([
-            ("arguments".into(),strings_value(&self.arguments)),("created_at".into(),schema::JcsValue::String(self.created_at.clone())),
-            ("cwd".into(),schema::JcsValue::String(self.cwd.clone())),("environment".into(),schema::JcsValue::Array(self.environment.iter().map(EnvProjectionV1::value).collect())),
-            ("executable_path".into(),schema::JcsValue::String(self.executable_path.clone())),("executable_sha256".into(),schema::JcsValue::String(self.executable_sha256.clone())),
-            ("kind".into(),schema::JcsValue::String(self.kind.clone())),("resource_fds".into(),strings_value(&self.resource_fds)),
-            ("schema".into(),schema::JcsValue::String("ToolLaunchDecisionV1".into())),("session_id".into(),schema::JcsValue::String(self.session_id.clone())),
-            ("writable_resources".into(),strings_value(&self.writable_resources)),
+            ("arguments".into(), strings_value(&self.arguments)),
+            (
+                "created_at".into(),
+                schema::JcsValue::String(self.created_at.clone()),
+            ),
+            ("cwd".into(), schema::JcsValue::String(self.cwd.clone())),
+            (
+                "environment".into(),
+                schema::JcsValue::Array(
+                    self.environment
+                        .iter()
+                        .map(EnvProjectionV1::value)
+                        .collect(),
+                ),
+            ),
+            (
+                "executable_path".into(),
+                schema::JcsValue::String(self.executable_path.clone()),
+            ),
+            (
+                "executable_sha256".into(),
+                schema::JcsValue::String(self.executable_sha256.clone()),
+            ),
+            ("kind".into(), schema::JcsValue::String(self.kind.clone())),
+            ("resource_fds".into(), strings_value(&self.resource_fds)),
+            (
+                "schema".into(),
+                schema::JcsValue::String("ToolLaunchDecisionV1".into()),
+            ),
+            (
+                "session_id".into(),
+                schema::JcsValue::String(self.session_id.clone()),
+            ),
+            (
+                "writable_resources".into(),
+                strings_value(&self.writable_resources),
+            ),
         ]))
     }
 }
@@ -119,7 +216,13 @@ struct AllocationInventoryV1 {
 impl ClosedJcs for AllocationInventoryV1 {
     fn from_jcs(value: schema::JcsValue) -> Result<Self, String> {
         let object = value.object()?;
-        let expected = ["schema", "session_id", "decisions", "allocations", "created_at"];
+        let expected = [
+            "schema",
+            "session_id",
+            "decisions",
+            "allocations",
+            "created_at",
+        ];
         if object.len() != expected.len() || expected.iter().any(|key| !object.contains_key(*key)) {
             return Err("ResourceInventoryV1 keys differ from the closed schema".into());
         }
@@ -146,16 +249,41 @@ impl ClosedJcs for AllocationInventoryV1 {
         };
         let created_at = object["created_at"].as_str()?.to_string();
         schema::Timestamp::parse(&created_at)?;
-        Ok(Self { session_id, decisions, allocations, created_at })
+        Ok(Self {
+            session_id,
+            decisions,
+            allocations,
+            created_at,
+        })
     }
 
     fn to_jcs(&self) -> schema::JcsValue {
         schema::JcsValue::Object(BTreeMap::from([
-            ("allocations".into(), schema::JcsValue::Array(self.allocations.iter().map(ClosedJcs::to_jcs).collect())),
-            ("created_at".into(), schema::JcsValue::String(self.created_at.clone())),
-            ("decisions".into(), schema::JcsValue::Array(self.decisions.iter().map(ResourceDecisionV1::value).collect())),
-            ("schema".into(), schema::JcsValue::String("ResourceInventoryV1".into())),
-            ("session_id".into(), schema::JcsValue::String(self.session_id.clone())),
+            (
+                "allocations".into(),
+                schema::JcsValue::Array(self.allocations.iter().map(ClosedJcs::to_jcs).collect()),
+            ),
+            (
+                "created_at".into(),
+                schema::JcsValue::String(self.created_at.clone()),
+            ),
+            (
+                "decisions".into(),
+                schema::JcsValue::Array(
+                    self.decisions
+                        .iter()
+                        .map(ResourceDecisionV1::value)
+                        .collect(),
+                ),
+            ),
+            (
+                "schema".into(),
+                schema::JcsValue::String("ResourceInventoryV1".into()),
+            ),
+            (
+                "session_id".into(),
+                schema::JcsValue::String(self.session_id.clone()),
+            ),
         ]))
     }
 }
@@ -192,9 +320,7 @@ impl ClosedJcs for DeletionIntentV1 {
             "broker_close_sha256",
             "runtime_empty_sha256",
         ];
-        if object.len() != expected.len()
-            || expected.iter().any(|key| !object.contains_key(*key))
-        {
+        if object.len() != expected.len() || expected.iter().any(|key| !object.contains_key(*key)) {
             return Err("ResourceDeletionIntentV1 keys differ from the closed schema".into());
         }
         if object["schema"].as_str()? != "ResourceDeletionIntentV1" {
@@ -219,8 +345,7 @@ impl ClosedJcs for DeletionIntentV1 {
         if value.is_empty() || value.as_bytes().contains(&0) {
             return Err("resource deletion intent value is invalid".into());
         }
-        let provider_evidence_sha256 =
-            object["provider_evidence_sha256"].as_str()?.to_string();
+        let provider_evidence_sha256 = object["provider_evidence_sha256"].as_str()?.to_string();
         let prior_receipt_sha256 = object["prior_receipt_sha256"].as_str()?.to_string();
         schema::Sha256Digest::parse(&provider_evidence_sha256)?;
         schema::Sha256Digest::parse(&prior_receipt_sha256)?;
@@ -242,8 +367,7 @@ impl ClosedJcs for DeletionIntentV1 {
         };
         let broker_close_sha256 = optional_digest("broker_close_sha256")?;
         let runtime_empty_sha256 = optional_digest("runtime_empty_sha256")?;
-        if (mode == "release")
-            != (broker_close_sha256.is_some() && runtime_empty_sha256.is_some())
+        if (mode == "release") != (broker_close_sha256.is_some() && runtime_empty_sha256.is_some())
         {
             return Err("resource deletion intent close evidence disagrees with mode".into());
         }
@@ -336,7 +460,7 @@ pub fn allocate_resources(
     schema::Sha256Digest::parse(repository_id)?;
     schema::LowerUuidV4::parse(session_id)?;
     schema::Timestamp::parse(created_at)?;
-    validate_decisions(decisions)?;
+    preflight_resources(roots, decisions)?;
     authority::ensure_private_directory(receipt_dir, roots.euid)?;
     let resource_root = roots
         .data
@@ -350,8 +474,14 @@ pub fn allocate_resources(
     validate_registry_for_decisions(registry.as_ref(), decisions)?;
     let resource_parent = roots.data.join(repository_id).join("resources");
     ensure_private_ancestors(&resource_parent, &roots.data, roots.euid)?;
-    fs::create_dir(&resource_root).map_err(|error| format!("create session resource root {}: {error}", resource_root.display()))?;
-    fs::set_permissions(&resource_root, fs::Permissions::from_mode(0o700)).map_err(|error| format!("chmod session resource root: {error}"))?;
+    fs::create_dir(&resource_root).map_err(|error| {
+        format!(
+            "create session resource root {}: {error}",
+            resource_root.display()
+        )
+    })?;
+    fs::set_permissions(&resource_root, fs::Permissions::from_mode(0o700))
+        .map_err(|error| format!("chmod session resource root: {error}"))?;
     authority::ensure_private_directory(&resource_root, roots.euid)?;
     let mut set = ResourceSet {
         decisions: decisions.to_vec(),
@@ -365,14 +495,19 @@ pub fn allocate_resources(
         ports: BTreeMap::new(),
         provider_registrations: BTreeMap::new(),
     };
-    for decision in decisions.iter().filter(|decision| decision.state == "requested") {
+    for decision in decisions
+        .iter()
+        .filter(|decision| decision.state == "requested")
+    {
         let result = match decision.kind.as_str() {
             "port" => set.allocate_port(session_id, decision, created_at),
             "temp_dir" | "build_dir" | "log_dir" | "cache_dir" => {
                 set.allocate_directory(session_id, decision, created_at)
             }
             "database_schema" => {
-                let registry = registry.as_ref().ok_or_else(|| "database provider registry is unavailable".to_string())?;
+                let registry = registry
+                    .as_ref()
+                    .ok_or_else(|| "database provider registry is unavailable".to_string())?;
                 set.allocate_database(session_id, decision, registry, created_at)
             }
             _ => Err("unknown requested resource kind".into()),
@@ -381,7 +516,9 @@ pub fn allocate_resources(
             let rollback = set.rollback_unpublished(roots.euid);
             return Err(match rollback {
                 Ok(()) => error,
-                Err(rollback) => format!("{error}; resource rollback could not be proven: {rollback}"),
+                Err(rollback) => {
+                    format!("{error}; resource rollback could not be proven: {rollback}")
+                }
             });
         }
     }
@@ -425,7 +562,9 @@ pub fn load_resources(
     let inventory: AllocationInventoryV1 =
         read_secure_jcs(&receipt_dir.join("resource-inventory-v1.json"), None)?;
     if inventory.session_id != session_id {
-        return Err("resource inventory session identity differs from the requested session".into());
+        return Err(
+            "resource inventory session identity differs from the requested session".into(),
+        );
     }
     validate_inventory(&inventory)?;
     validate_inventory_receipts(receipt_dir, &inventory)?;
@@ -444,13 +583,13 @@ pub fn load_resources(
         Ok(_) => authority::ensure_private_directory(&resource_root, roots.euid)?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound && !has_allocated => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Err("allocated resource inventory has no session resource root".into())
+            return Err("allocated resource inventory has no session resource root".into());
         }
         Err(error) => {
             return Err(format!(
                 "inspect session resource root {}: {error}",
                 resource_root.display()
-            ))
+            ));
         }
     }
     validate_resource_paths(&resource_root, &inventory.allocations)?;
@@ -511,12 +650,20 @@ pub fn release_resources(
 }
 
 impl ResourceSet {
-    fn allocate_port(&mut self, session_id: &str, decision: &ResourceDecisionV1, at: &str) -> Result<(), String> {
+    fn allocate_port(
+        &mut self,
+        session_id: &str,
+        decision: &ResourceDecisionV1,
+        at: &str,
+    ) -> Result<(), String> {
         if decision.provider_id.is_some() {
             return Err("port must use the builtin provider".into());
         }
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).map_err(|error| format!("bind held loopback port: {error}"))?;
-        let address = listener.local_addr().map_err(|error| format!("inspect held loopback port: {error}"))?;
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .map_err(|error| format!("bind held loopback port: {error}"))?;
+        let address = listener
+            .local_addr()
+            .map_err(|error| format!("inspect held loopback port: {error}"))?;
         if !matches!(address, SocketAddr::V4(value) if *value.ip() == Ipv4Addr::LOCALHOST) {
             return Err("held port did not bind IPv4 loopback".into());
         }
@@ -524,17 +671,29 @@ impl ResourceSet {
         let allocation_id = crate::store::uuid_v4();
         let value = address.to_string();
         let env_name = format!("DOCKS_RESOURCE_{}_FD", decision.name.to_ascii_uppercase());
-        let env = vec![EnvProjectionV1 { name: env_name, value: listener.as_raw_fd().to_string() }];
+        let env = vec![EnvProjectionV1 {
+            name: env_name,
+            value: listener.as_raw_fd().to_string(),
+        }];
         let evidence = builtin_evidence("port", &allocation_id, &value, None);
         let create = builtin_receipt("create", "allocated", &allocation_id, &value, &evidence, at);
         let inspect = builtin_receipt("inspect", "exists", &allocation_id, &value, &evidence, at);
         let create_digest = self.persist_receipt(&allocation_id, "create", &create)?;
         let inspect_digest = self.persist_receipt(&allocation_id, "inspect", &inspect)?;
         let allocation = ResourceAllocationV1 {
-            allocation_id: allocation_id.clone(), session_id: session_id.into(), kind: decision.kind.clone(),
-            name: decision.name.clone(), provider_id: BUILTIN_PROVIDER.into(), state: "allocated".into(), value,
-            env, create_receipt_sha256: create_digest, inspect_receipt_sha256: inspect_digest,
-            delete_receipt_sha256: None, created_at: at.into(), released_at: None,
+            allocation_id: allocation_id.clone(),
+            session_id: session_id.into(),
+            kind: decision.kind.clone(),
+            name: decision.name.clone(),
+            provider_id: BUILTIN_PROVIDER.into(),
+            state: "allocated".into(),
+            value,
+            env,
+            create_receipt_sha256: create_digest,
+            inspect_receipt_sha256: inspect_digest,
+            delete_receipt_sha256: None,
+            created_at: at.into(),
+            released_at: None,
         };
         ResourceAllocationV1::from_jcs(allocation.to_jcs())?;
         self.insert_projection(&allocation)?;
@@ -544,29 +703,78 @@ impl ResourceSet {
         Ok(())
     }
 
-    fn allocate_directory(&mut self, session_id: &str, decision: &ResourceDecisionV1, at: &str) -> Result<(), String> {
-        if decision.provider_id.is_some() { return Err(format!("{} must use the builtin provider", decision.kind)); }
-        let allocation_id=crate::store::uuid_v4();
-        let path=self.resource_root.join(format!("{}-{}",decision.kind,decision.name));
-        fs::create_dir(&path).map_err(|error|format!("create {} resource {}: {error}",decision.kind,path.display()))?;
-        let result=(||{
-            fs::set_permissions(&path,fs::Permissions::from_mode(0o700)).map_err(|error|format!("chmod resource directory: {error}"))?;
-            let evidence=directory_evidence(&path)?;
-            let value=path.to_str().ok_or_else(||"resource directory path is not UTF-8".to_string())?.to_string();
-            let env=directory_env(&decision.kind,&value)?;
-            let create=builtin_receipt("create","allocated",&allocation_id,&value,&evidence,at);
-            let inspect_evidence=directory_evidence(&path)?;if inspect_evidence!=evidence{return Err("resource directory identity changed after creation".into())}
-            let inspect=builtin_receipt("inspect","exists",&allocation_id,&value,&inspect_evidence,at);
-            let create_digest=self.persist_receipt(&allocation_id,"create",&create)?;
-            let inspect_digest=self.persist_receipt(&allocation_id,"inspect",&inspect)?;
-            let allocation=ResourceAllocationV1{allocation_id:allocation_id.clone(),session_id:session_id.into(),kind:decision.kind.clone(),name:decision.name.clone(),provider_id:BUILTIN_PROVIDER.into(),state:"allocated".into(),value,env,create_receipt_sha256:create_digest,inspect_receipt_sha256:inspect_digest,delete_receipt_sha256:None,created_at:at.into(),released_at:None};
+    fn allocate_directory(
+        &mut self,
+        session_id: &str,
+        decision: &ResourceDecisionV1,
+        at: &str,
+    ) -> Result<(), String> {
+        if decision.provider_id.is_some() {
+            return Err(format!("{} must use the builtin provider", decision.kind));
+        }
+        let allocation_id = crate::store::uuid_v4();
+        let path = self
+            .resource_root
+            .join(format!("{}-{}", decision.kind, decision.name));
+        fs::create_dir(&path).map_err(|error| {
+            format!(
+                "create {} resource {}: {error}",
+                decision.kind,
+                path.display()
+            )
+        })?;
+        let result = (|| {
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+                .map_err(|error| format!("chmod resource directory: {error}"))?;
+            let evidence = directory_evidence(&path)?;
+            let value = path
+                .to_str()
+                .ok_or_else(|| "resource directory path is not UTF-8".to_string())?
+                .to_string();
+            let env = directory_env(&decision.kind, &value)?;
+            let create =
+                builtin_receipt("create", "allocated", &allocation_id, &value, &evidence, at);
+            let inspect_evidence = directory_evidence(&path)?;
+            if inspect_evidence != evidence {
+                return Err("resource directory identity changed after creation".into());
+            }
+            let inspect = builtin_receipt(
+                "inspect",
+                "exists",
+                &allocation_id,
+                &value,
+                &inspect_evidence,
+                at,
+            );
+            let create_digest = self.persist_receipt(&allocation_id, "create", &create)?;
+            let inspect_digest = self.persist_receipt(&allocation_id, "inspect", &inspect)?;
+            let allocation = ResourceAllocationV1 {
+                allocation_id: allocation_id.clone(),
+                session_id: session_id.into(),
+                kind: decision.kind.clone(),
+                name: decision.name.clone(),
+                provider_id: BUILTIN_PROVIDER.into(),
+                state: "allocated".into(),
+                value,
+                env,
+                create_receipt_sha256: create_digest,
+                inspect_receipt_sha256: inspect_digest,
+                delete_receipt_sha256: None,
+                created_at: at.into(),
+                released_at: None,
+            };
             ResourceAllocationV1::from_jcs(allocation.to_jcs())?;
             self.insert_projection(&allocation)?;
             self.allocations.push(allocation);
             Ok(())
         })();
-        if let Err(error)=result{
-            return match remove_private_tree(&path,unsafe{libc::geteuid()}){Ok(())=>Err(error),Err(cleanup)=>Err(format!("{error}; created directory cleanup could not be proven: {cleanup}"))}
+        if let Err(error) = result {
+            return match remove_private_tree(&path, unsafe { libc::geteuid() }) {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(format!(
+                    "{error}; created directory cleanup could not be proven: {cleanup}"
+                )),
+            };
         }
         Ok(())
     }
@@ -578,9 +786,10 @@ impl ResourceSet {
         registry: &ResourceProviderRegistryV1,
         at: &str,
     ) -> Result<(), String> {
-        let provider_id = decision.provider_id.as_deref().ok_or_else(|| {
-            "database_schema requires a registered provider_id".to_string()
-        })?;
+        let provider_id = decision
+            .provider_id
+            .as_deref()
+            .ok_or_else(|| "database_schema requires a registered provider_id".to_string())?;
         let provider = registry
             .providers
             .iter()
@@ -698,16 +907,30 @@ impl ResourceSet {
         Ok(())
     }
 
-    fn persist_receipt(&self, allocation_id: &str, operation: &str, receipt: &ProviderReceiptV1) -> Result<String, String> {
-        let path = self.receipt_dir.join(format!("{allocation_id}-{operation}-receipt-v1.json"));
+    fn persist_receipt(
+        &self,
+        allocation_id: &str,
+        operation: &str,
+        receipt: &ProviderReceiptV1,
+    ) -> Result<String, String> {
+        let path = self
+            .receipt_dir
+            .join(format!("{allocation_id}-{operation}-receipt-v1.json"));
         authority::atomic_create_jcs(&path, receipt, 0o600)?;
         Ok(schema::jcs_sha256(receipt))
     }
 
     fn insert_projection(&mut self, allocation: &ResourceAllocationV1) -> Result<(), String> {
         for projection in &allocation.env {
-            if self.environment.insert(projection.name.clone(), projection.value.clone()).is_some() {
-                return Err(format!("resource environment projection {} collides", projection.name));
+            if self
+                .environment
+                .insert(projection.name.clone(), projection.value.clone())
+                .is_some()
+            {
+                return Err(format!(
+                    "resource environment projection {} collides",
+                    projection.name
+                ));
             }
         }
         Ok(())
@@ -717,13 +940,18 @@ impl ResourceSet {
         let mut projected_fds = Vec::new();
         for (name, value) in &self.environment {
             if name.starts_with("DOCKS_RESOURCE_") && name.ends_with("_FD") {
-                let fd = value.parse::<RawFd>().map_err(|_| "resource FD projection is not decimal".to_string())?;
-                if fd.to_string() != *value { return Err("resource FD projection is not canonical decimal".into()); }
+                let fd = value
+                    .parse::<RawFd>()
+                    .map_err(|_| "resource FD projection is not decimal".to_string())?;
+                if fd.to_string() != *value {
+                    return Err("resource FD projection is not canonical decimal".into());
+                }
                 projected_fds.push(fd);
             }
         }
         let mut actual = self.resource_fds.clone();
-        projected_fds.sort_unstable(); actual.sort_unstable();
+        projected_fds.sort_unstable();
+        actual.sort_unstable();
         if projected_fds != actual || actual.windows(2).any(|pair| pair[0] == pair[1]) {
             return Err("resource FD projection is not one-to-one".into());
         }
@@ -763,7 +991,7 @@ impl ResourceSet {
                 return Err(format!(
                     "remove rolled-back session resource root {}: {error}",
                     self.resource_root.display()
-                ))
+                ));
             }
         }
         Ok(())
@@ -809,12 +1037,8 @@ impl ResourceSet {
                 continue;
             }
             let allocation = self.allocations[index].clone();
-            let intent = self.persist_deletion_intent(
-                &allocation,
-                "legacy_release",
-                None,
-                released_at,
-            )?;
+            let intent =
+                self.persist_deletion_intent(&allocation, "legacy_release", None, released_at)?;
             let receipt = self.execute_deletion_intent(&allocation, &intent, roots.euid)?;
             let digest = self.persist_delete_receipt(&allocation, &receipt)?;
             self.allocations[index].state = "released".into();
@@ -829,9 +1053,7 @@ impl ResourceSet {
         match fs::remove_dir(&self.resource_root) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(format!("remove empty session resource root: {error}"))
-            }
+            Err(error) => return Err(format!("remove empty session resource root: {error}")),
         }
         Ok(digests)
     }
@@ -864,8 +1086,7 @@ impl ResourceSet {
             )?;
             let close_binding = format!(
                 "{}:{}",
-                close_evidence.broker_close_sha256,
-                close_evidence.runtime_empty_sha256
+                close_evidence.broker_close_sha256, close_evidence.runtime_empty_sha256
             );
             let evidence = builtin_evidence(
                 "port-release",
@@ -914,9 +1135,7 @@ impl ResourceSet {
             .allocations
             .iter()
             .enumerate()
-            .filter_map(|(index, allocation)| {
-                (allocation.state == "allocated").then_some(index)
-            })
+            .filter_map(|(index, allocation)| (allocation.state == "allocated").then_some(index))
             .collect::<Vec<_>>();
         release_order.sort_by_key(|index| match self.allocations[*index].kind.as_str() {
             "database_schema" => 0,
@@ -956,7 +1175,7 @@ impl ResourceSet {
                 return Err(format!(
                     "remove empty session resource root {}: {error}",
                     self.resource_root.display()
-                ))
+                ));
             }
         }
         Ok(digests)
@@ -1022,8 +1241,7 @@ impl ResourceSet {
                                 )),
                                 &allocation.inspect_receipt_sha256,
                             )?;
-                            if receipt.provider_evidence_sha256
-                                != inspect.provider_evidence_sha256
+                            if receipt.provider_evidence_sha256 != inspect.provider_evidence_sha256
                             {
                                 return Err(format!(
                                     "resource directory {} delete identity drifted",
@@ -1039,8 +1257,7 @@ impl ResourceSet {
                                 )),
                                 &allocation.inspect_receipt_sha256,
                             )?;
-                            if receipt.provider_evidence_sha256
-                                != inspect.provider_evidence_sha256
+                            if receipt.provider_evidence_sha256 != inspect.provider_evidence_sha256
                             {
                                 return Err(format!(
                                     "database resource {} delete identity drifted",
@@ -1051,7 +1268,7 @@ impl ResourceSet {
                         _ => {
                             return Err(
                                 "resource delete receipt has an unknown allocation kind".into()
-                            )
+                            );
                         }
                     }
                     let digest = schema::jcs_sha256(&receipt);
@@ -1066,7 +1283,7 @@ impl ResourceSet {
                     return Err(format!(
                         "inspect delete receipt {}: {error}",
                         path.display()
-                    ))
+                    ));
                 }
             }
         }
@@ -1084,9 +1301,9 @@ impl ResourceSet {
             updated_at: updated_at.to_string(),
         };
         authority::atomic_create_jcs(
-            &self.receipt_dir.join(format!(
-                "{allocation_id}-provider-registration-v1.json"
-            )),
+            &self
+                .receipt_dir
+                .join(format!("{allocation_id}-provider-registration-v1.json")),
             &pin,
             0o600,
         )
@@ -1094,9 +1311,10 @@ impl ResourceSet {
 
     fn remove_unused_provider_pin(&mut self, allocation_id: &str) {
         self.provider_registrations.remove(allocation_id);
-        let _ = fs::remove_file(self.receipt_dir.join(format!(
-            "{allocation_id}-provider-registration-v1.json"
-        )));
+        let _ = fs::remove_file(
+            self.receipt_dir
+                .join(format!("{allocation_id}-provider-registration-v1.json")),
+        );
     }
 
     fn persist_partial_rollback_receipt(
@@ -1176,10 +1394,8 @@ impl ResourceSet {
             request_id,
             mode: mode.to_string(),
             released_at: released_at.to_string(),
-            broker_close_sha256: close_evidence
-                .map(|value| value.broker_close_sha256.clone()),
-            runtime_empty_sha256: close_evidence
-                .map(|value| value.runtime_empty_sha256.clone()),
+            broker_close_sha256: close_evidence.map(|value| value.broker_close_sha256.clone()),
+            runtime_empty_sha256: close_evidence.map(|value| value.runtime_empty_sha256.clone()),
         };
         DeletionIntentV1::from_jcs(intent.to_jcs())?;
         let path = self.receipt_dir.join(format!(
@@ -1266,7 +1482,7 @@ impl ResourceSet {
                         return Err(format!(
                             "inspect resource directory {} after deletion intent: {error}",
                             allocation.name
-                        ))
+                        ));
                     }
                 }
                 Ok(deterministic_builtin_receipt(
@@ -1345,8 +1561,7 @@ impl ResourceSet {
                             allocation.name
                         ));
                     }
-                    let receipt =
-                        self.execute_deletion_intent(&allocation, &intent, euid)?;
+                    let receipt = self.execute_deletion_intent(&allocation, &intent, euid)?;
                     let digest = self.persist_delete_receipt(&allocation, &receipt)?;
                     self.allocations[index].state = "released".into();
                     self.allocations[index].delete_receipt_sha256 = Some(digest);
@@ -1359,7 +1574,7 @@ impl ResourceSet {
                     return Err(format!(
                         "inspect resource deletion intent {}: {error}",
                         path.display()
-                    ))
+                    ));
                 }
             }
         }
@@ -1486,72 +1701,140 @@ impl ResourceSet {
         }
     }
 
-    fn persist_inventory(&self)->Result<(),String>{
-        let inventory=AllocationInventoryV1{
-            session_id:self.session_id.clone(),
-            decisions:self.decisions.clone(),
-            allocations:self.allocations.clone(),
-            created_at:self.inventory_created_at.clone(),
+    fn persist_inventory(&self) -> Result<(), String> {
+        let inventory = AllocationInventoryV1 {
+            session_id: self.session_id.clone(),
+            decisions: self.decisions.clone(),
+            allocations: self.allocations.clone(),
+            created_at: self.inventory_created_at.clone(),
         };
-        authority::atomic_replace_jcs(&self.receipt_dir.join("resource-inventory-v1.json"),&inventory,0o600)
+        authority::atomic_replace_jcs(
+            &self.receipt_dir.join("resource-inventory-v1.json"),
+            &inventory,
+            0o600,
+        )
     }
 }
 
-pub(crate) fn validate_held_resource_fds(receipt_dir:&Path,fds:&[RawFd])->Result<(),String>{
-    let inventory:AllocationInventoryV1=read_secure_jcs(&receipt_dir.join("resource-inventory-v1.json"),None)?;
+pub(crate) fn validate_held_resource_fds(receipt_dir: &Path, fds: &[RawFd]) -> Result<(), String> {
+    let inventory: AllocationInventoryV1 =
+        read_secure_jcs(&receipt_dir.join("resource-inventory-v1.json"), None)?;
     validate_inventory(&inventory)?;
-    validate_inventory_receipts(receipt_dir,&inventory)?;
-    let mut expected=Vec::new();
-    for allocation in inventory.allocations.iter().filter(|allocation|allocation.state=="allocated"&&allocation.kind=="port"){
-        let projection=allocation.env.iter().find(|projection|projection.name==format!("DOCKS_RESOURCE_{}_FD",allocation.name.to_ascii_uppercase())).ok_or_else(||format!("held port {} has no FD projection",allocation.name))?;
-        let fd:RawFd=projection.value.parse().map_err(|_|format!("held port {} FD is not decimal",allocation.name))?;
-        expected.push((fd,allocation.value.as_str()));
+    validate_inventory_receipts(receipt_dir, &inventory)?;
+    let mut expected = Vec::new();
+    for allocation in inventory
+        .allocations
+        .iter()
+        .filter(|allocation| allocation.state == "allocated" && allocation.kind == "port")
+    {
+        let projection = allocation
+            .env
+            .iter()
+            .find(|projection| {
+                projection.name
+                    == format!("DOCKS_RESOURCE_{}_FD", allocation.name.to_ascii_uppercase())
+            })
+            .ok_or_else(|| format!("held port {} has no FD projection", allocation.name))?;
+        let fd: RawFd = projection
+            .value
+            .parse()
+            .map_err(|_| format!("held port {} FD is not decimal", allocation.name))?;
+        expected.push((fd, allocation.value.as_str()));
     }
-    let mut actual=fds.to_vec();actual.sort_unstable();
-    let mut expected_numbers=expected.iter().map(|(fd,_)|*fd).collect::<Vec<_>>();expected_numbers.sort_unstable();
-    if actual!=expected_numbers||actual.windows(2).any(|pair|pair[0]==pair[1]){return Err("broker held resource FD inventory mismatch".into())}
-    for (fd,address) in expected{
-        if fd<=2{return Err("held resource FD overlaps stdio".into())}
-        let duplicate=unsafe{libc::dup(fd)};
-        if duplicate<0{return Err(format!("duplicate held resource FD {fd}: {}",std::io::Error::last_os_error()))}
-        let listener=unsafe{TcpListener::from_raw_fd(duplicate)};
-        let local=listener.local_addr().map_err(|error|format!("inspect held resource FD {fd}: {error}"))?;
-        let mut accepts=0i32;let mut length=std::mem::size_of::<i32>() as libc::socklen_t;
-        if unsafe{libc::getsockopt(fd,libc::SOL_SOCKET,libc::SO_ACCEPTCONN,(&mut accepts as *mut i32).cast(),&mut length)}<0||accepts!=1{return Err(format!("held resource FD {fd} is not a listening socket"))}
-        if local.to_string()!=address||!matches!(local,SocketAddr::V4(value) if *value.ip()==Ipv4Addr::LOCALHOST){return Err(format!("held resource FD {fd} identity drifted"))}
+    let mut actual = fds.to_vec();
+    actual.sort_unstable();
+    let mut expected_numbers = expected.iter().map(|(fd, _)| *fd).collect::<Vec<_>>();
+    expected_numbers.sort_unstable();
+    if actual != expected_numbers || actual.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err("broker held resource FD inventory mismatch".into());
+    }
+    for (fd, address) in expected {
+        if fd <= 2 {
+            return Err("held resource FD overlaps stdio".into());
+        }
+        let duplicate = unsafe { libc::dup(fd) };
+        if duplicate < 0 {
+            return Err(format!(
+                "duplicate held resource FD {fd}: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let listener = unsafe { TcpListener::from_raw_fd(duplicate) };
+        let local = listener
+            .local_addr()
+            .map_err(|error| format!("inspect held resource FD {fd}: {error}"))?;
+        let mut accepts = 0i32;
+        let mut length = std::mem::size_of::<i32>() as libc::socklen_t;
+        if unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_ACCEPTCONN,
+                (&mut accepts as *mut i32).cast(),
+                &mut length,
+            )
+        } < 0
+            || accepts != 1
+        {
+            return Err(format!("held resource FD {fd} is not a listening socket"));
+        }
+        if local.to_string() != address
+            || !matches!(local,SocketAddr::V4(value) if *value.ip()==Ipv4Addr::LOCALHOST)
+        {
+            return Err(format!("held resource FD {fd} identity drifted"));
+        }
     }
     Ok(())
 }
 
-pub fn preflight_tool_launch(tool:&ToolLaunchV1)->Result<(),String>{
-    verify_executable(Path::new(&tool.executable_path),&tool.executable_sha256)?;
-    for (name,value) in [("model",tool.model.as_deref()),("effort",tool.effort.as_deref())]{
-        if value.is_some_and(|value|value.is_empty()||value.as_bytes().contains(&0)){return Err(format!("tool {name} is invalid"))}
+pub fn preflight_tool_launch(tool: &ToolLaunchV1) -> Result<(), String> {
+    verify_executable(Path::new(&tool.executable_path), &tool.executable_sha256)?;
+    for (name, value) in [
+        ("model", tool.model.as_deref()),
+        ("effort", tool.effort.as_deref()),
+    ] {
+        if value.is_some_and(|value| value.is_empty() || value.as_bytes().contains(&0)) {
+            return Err(format!("tool {name} is invalid"));
+        }
     }
-    match tool.kind.as_str(){
-        "claude"|"omp" if tool.service_tier.is_some()=>Err(format!("{} does not support service_tier in ToolLaunchV1",tool.kind)),
-        "claude"|"codex"|"omp"=>Ok(()),
-        _=>Err("tool kind must be claude|codex|omp".into()),
+    match tool.kind.as_str() {
+        "claude" | "omp" if tool.service_tier.is_some() => Err(format!(
+            "{} does not support service_tier in ToolLaunchV1",
+            tool.kind
+        )),
+        "claude" | "codex" | "omp" => Ok(()),
+        _ => Err("tool kind must be claude|codex|omp".into()),
     }
 }
 
-pub fn prepare_tool_launch(
-    tool: &ToolLaunchV1,
-    session_id: &str,
-    workspace: &Path,
-    prompt: &str,
-    generated_policy: &str,
-    git_shim_dir: &Path,
-    worker_capability_file: &Path,
-    resources: &ResourceSet,
-) -> Result<PreparedToolLaunch, String> {
+pub fn prepare_tool_launch(context: ToolLaunchContext<'_>) -> Result<PreparedToolLaunch, String> {
+    let ToolLaunchContext {
+        tool,
+        session_id,
+        workspace,
+        prompt,
+        generated_policy,
+        git_shim_dir,
+        worker_capability_file,
+        resources,
+    } = context;
     schema::LowerUuidV4::parse(session_id)?;
     preflight_tool_launch(tool)?;
-    if prompt.as_bytes().contains(&0) || generated_policy.as_bytes().contains(&0) { return Err("tool prompt or generated policy contains NUL".into()); }
+    if prompt.as_bytes().contains(&0) || generated_policy.as_bytes().contains(&0) {
+        return Err("tool prompt or generated policy contains NUL".into());
+    }
     let mut arguments = match tool.kind.as_str() {
         "claude" => {
-            if tool.service_tier.is_some() { return Err("Claude does not support service_tier in ToolLaunchV1".into()); }
-            let mut values = vec!["-p".into(), "--session-id".into(), session_id.into(), "--permission-mode".into(), "auto".into()];
+            if tool.service_tier.is_some() {
+                return Err("Claude does not support service_tier in ToolLaunchV1".into());
+            }
+            let mut values = vec![
+                "-p".into(),
+                "--session-id".into(),
+                session_id.into(),
+                "--permission-mode".into(),
+                "auto".into(),
+            ];
             append_option(&mut values, "--model", tool.model.as_deref());
             append_option(&mut values, "--effort", tool.effort.as_deref());
             values
@@ -1559,14 +1842,30 @@ pub fn prepare_tool_launch(
         "codex" => {
             let mut values = vec!["exec".into(), "--sandbox".into(), "workspace-write".into()];
             append_option(&mut values, "-m", tool.model.as_deref());
-            if let Some(effort) = &tool.effort { values.extend(["-c".into(), format!("model_reasoning_effort={effort}")]); }
-            if let Some(tier) = &tool.service_tier { values.extend(["-c".into(), format!("service_tier={tier}")]); }
+            if let Some(effort) = &tool.effort {
+                values.extend(["-c".into(), format!("model_reasoning_effort={effort}")]);
+            }
+            if let Some(tier) = &tool.service_tier {
+                values.extend(["-c".into(), format!("service_tier={tier}")]);
+            }
             values
         }
         "omp" => {
-            if tool.service_tier.is_some() { return Err("OMP does not support service_tier in ToolLaunchV1".into()); }
-            let root = workspace.to_str().ok_or_else(|| "workspace path is not UTF-8".to_string())?;
-            let mut values = vec!["-p".into(), "--cwd".into(), root.into(), "--approval-mode".into(), "write".into(), "--append-system-prompt".into(), generated_policy.into()];
+            if tool.service_tier.is_some() {
+                return Err("OMP does not support service_tier in ToolLaunchV1".into());
+            }
+            let root = workspace
+                .to_str()
+                .ok_or_else(|| "workspace path is not UTF-8".to_string())?;
+            let mut values = vec![
+                "-p".into(),
+                "--cwd".into(),
+                root.into(),
+                "--approval-mode".into(),
+                "write".into(),
+                "--append-system-prompt".into(),
+                generated_policy.into(),
+            ];
             append_option(&mut values, "--model", tool.model.as_deref());
             append_option(&mut values, "--thinking", tool.effort.as_deref());
             values
@@ -1574,78 +1873,186 @@ pub fn prepare_tool_launch(
         _ => return Err("tool kind must be claude|codex|omp".into()),
     };
     arguments.extend(["--".into(), prompt.into()]);
-    let shim = git_shim_dir.to_str().ok_or_else(|| "Git shim directory is not UTF-8".to_string())?;
+    let shim = git_shim_dir
+        .to_str()
+        .ok_or_else(|| "Git shim directory is not UTF-8".to_string())?;
     let mut environment = resources.environment.clone();
-    environment.insert("PATH".into(), format!("{shim}:/usr/local/bin:/usr/bin:/bin"));
-    environment.insert("DOCKS_WORKER_CAPABILITY_FILE".into(), worker_capability_file.to_str().ok_or_else(|| "worker capability path is not UTF-8".to_string())?.into());
+    environment.insert(
+        "PATH".into(),
+        format!("{shim}:/usr/local/bin:/usr/bin:/bin"),
+    );
+    environment.insert(
+        "DOCKS_WORKER_CAPABILITY_FILE".into(),
+        worker_capability_file
+            .to_str()
+            .ok_or_else(|| "worker capability path is not UTF-8".to_string())?
+            .into(),
+    );
     Ok(PreparedToolLaunch {
-        executable: PathBuf::from(&tool.executable_path), arguments, environment,
-        resource_fds: resources.resource_fds.clone(), cwd: workspace.to_path_buf(),
+        executable: PathBuf::from(&tool.executable_path),
+        arguments,
+        environment,
+        resource_fds: resources.resource_fds.clone(),
+        cwd: workspace.to_path_buf(),
         writable_resources: resources.writable_paths(),
     })
 }
 
 pub fn persist_tool_launch_decision(
-    path:&Path,
-    session_id:&str,
-    tool:&ToolLaunchV1,
-    prepared:&PreparedToolLaunch,
-    created_at:&str,
-)->Result<(ToolLaunchDecisionV1,String),String>{
+    path: &Path,
+    session_id: &str,
+    tool: &ToolLaunchV1,
+    prepared: &PreparedToolLaunch,
+    created_at: &str,
+) -> Result<(ToolLaunchDecisionV1, String), String> {
     schema::Timestamp::parse(created_at)?;
-    let mut resource_fds=prepared.resource_fds.iter().map(ToString::to_string).collect::<Vec<_>>();
+    let mut resource_fds = prepared
+        .resource_fds
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
     resource_fds.sort();
-    let decision=ToolLaunchDecisionV1{
-        session_id:session_id.into(),kind:tool.kind.clone(),
-        executable_path:prepared.executable.to_str().ok_or_else(||"launch executable path is not UTF-8".to_string())?.into(),
-        executable_sha256:tool.executable_sha256.clone(),arguments:prepared.arguments.clone(),
-        cwd:prepared.cwd.to_str().ok_or_else(||"launch cwd is not UTF-8".to_string())?.into(),
-        environment:prepared.environment.iter().map(|(name,value)|EnvProjectionV1{name:name.clone(),value:value.clone()}).collect(),
-        resource_fds,writable_resources:prepared.writable_resources.iter().map(|path|path.to_str().ok_or_else(||"writable resource path is not UTF-8".to_string()).map(str::to_string)).collect::<Result<Vec<_>,_>>()?,
-        created_at:created_at.into(),
+    let decision = ToolLaunchDecisionV1 {
+        session_id: session_id.into(),
+        kind: tool.kind.clone(),
+        executable_path: prepared
+            .executable
+            .to_str()
+            .ok_or_else(|| "launch executable path is not UTF-8".to_string())?
+            .into(),
+        executable_sha256: tool.executable_sha256.clone(),
+        arguments: prepared.arguments.clone(),
+        cwd: prepared
+            .cwd
+            .to_str()
+            .ok_or_else(|| "launch cwd is not UTF-8".to_string())?
+            .into(),
+        environment: prepared
+            .environment
+            .iter()
+            .map(|(name, value)| EnvProjectionV1 {
+                name: name.clone(),
+                value: value.clone(),
+            })
+            .collect(),
+        resource_fds,
+        writable_resources: prepared
+            .writable_resources
+            .iter()
+            .map(|path| {
+                path.to_str()
+                    .ok_or_else(|| "writable resource path is not UTF-8".to_string())
+                    .map(str::to_string)
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        created_at: created_at.into(),
     };
     ToolLaunchDecisionV1::from_jcs(decision.to_jcs())?;
-    authority::atomic_create_jcs(path,&decision,0o600)?;
-    let digest=schema::jcs_sha256(&decision);
-    Ok((decision,digest))
+    authority::atomic_create_jcs(path, &decision, 0o600)?;
+    let digest = schema::jcs_sha256(&decision);
+    Ok((decision, digest))
 }
 
-pub fn executable_sha256(path:&Path)->Result<String,String>{
-    let bytes=read_verified_file(path,false)?;
-    let metadata=fs::symlink_metadata(path).map_err(|error|format!("inspect executable {}: {error}",path.display()))?;
-    if metadata.mode()&0o111==0{return Err(format!("tool executable {} has no execute bit",path.display()))}
+pub fn executable_sha256(path: &Path) -> Result<String, String> {
+    let bytes = read_verified_file(path, false)?;
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("inspect executable {}: {error}", path.display()))?;
+    if metadata.mode() & 0o111 == 0 {
+        return Err(format!(
+            "tool executable {} has no execute bit",
+            path.display()
+        ));
+    }
     Ok(sha256::hex_digest(&bytes))
 }
 
 pub fn verify_executable(path: &Path, expected_sha256: &str) -> Result<(), String> {
     schema::Sha256Digest::parse(expected_sha256)?;
-    let actual=executable_sha256(path)?;
-    if !sha256::constant_time_eq(actual.as_bytes(),expected_sha256.as_bytes()){return Err(format!("executable digest drift for {}",path.display()))}
+    let actual = executable_sha256(path)?;
+    if !sha256::constant_time_eq(actual.as_bytes(), expected_sha256.as_bytes()) {
+        return Err(format!("executable digest drift for {}", path.display()));
+    }
     Ok(())
 }
 
+pub fn open_verified_executable(path: &Path, expected_sha256: &str) -> Result<File, String> {
+    schema::Sha256Digest::parse(expected_sha256)?;
+    let (file, bytes) = open_verified_file(path, false)?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("inspect executable {}: {error}", path.display()))?;
+    if metadata.mode() & 0o111 == 0 {
+        return Err(format!(
+            "tool executable {} has no execute bit",
+            path.display()
+        ));
+    }
+    let actual = sha256::hex_digest(&bytes);
+    if !sha256::constant_time_eq(actual.as_bytes(), expected_sha256.as_bytes()) {
+        return Err(format!("executable digest drift for {}", path.display()));
+    }
+    relocate_file_above_stdio(file)
+}
+
+pub fn preflight_resources(
+    roots: &AuthorityRoots,
+    decisions: &[ResourceDecisionV1],
+) -> Result<(), String> {
+    validate_decisions(decisions)?;
+    let registry = load_registry_if_needed(roots, decisions)?;
+    validate_registry_for_decisions(registry.as_ref(), decisions)
+}
+
 fn validate_decisions(decisions: &[ResourceDecisionV1]) -> Result<(), String> {
-    let expected = BTreeSet::from(["port", "temp_dir", "build_dir", "database_schema", "log_dir", "cache_dir"]);
-    let actual = decisions.iter().map(|decision| decision.kind.as_str()).collect::<BTreeSet<_>>();
-    if decisions.len() != 6 || actual != expected { return Err("resource decisions must contain all six kinds exactly once".into()); }
+    let expected = BTreeSet::from([
+        "port",
+        "temp_dir",
+        "build_dir",
+        "database_schema",
+        "log_dir",
+        "cache_dir",
+    ]);
+    let actual = decisions
+        .iter()
+        .map(|decision| decision.kind.as_str())
+        .collect::<BTreeSet<_>>();
+    if decisions.len() != 6 || actual != expected {
+        return Err("resource decisions must contain all six kinds exactly once".into());
+    }
     let mut requested_names = BTreeSet::new();
     for decision in decisions {
         schema::validate_resource_name(&decision.name)?;
-        if decision.state == "requested" && !requested_names.insert((decision.kind.as_str(), decision.name.as_str())) {
+        if decision.state == "requested"
+            && !requested_names.insert((decision.kind.as_str(), decision.name.as_str()))
+        {
             return Err("requested resource names must be unique per kind".into());
         }
-        if decision.kind == "database_schema" && decision.state == "requested" && decision.provider_id.is_none() {
+        if decision.kind == "database_schema"
+            && decision.state == "requested"
+            && decision.provider_id.is_none()
+        {
             return Err("database_schema requires provider_id".into());
         }
         if decision.kind != "database_schema" && decision.provider_id.is_some() {
-            return Err(format!("{} cannot select an external provider", decision.kind));
+            return Err(format!(
+                "{} cannot select an external provider",
+                decision.kind
+            ));
         }
     }
     Ok(())
 }
 
-fn load_registry_if_needed(roots: &AuthorityRoots, decisions: &[ResourceDecisionV1]) -> Result<Option<ResourceProviderRegistryV1>, String> {
-    if !decisions.iter().any(|decision| decision.kind == "database_schema" && decision.state == "requested") { return Ok(None); }
+fn load_registry_if_needed(
+    roots: &AuthorityRoots,
+    decisions: &[ResourceDecisionV1],
+) -> Result<Option<ResourceProviderRegistryV1>, String> {
+    if !decisions
+        .iter()
+        .any(|decision| decision.kind == "database_schema" && decision.state == "requested")
+    {
+        return Ok(None);
+    }
     schema::read_jcs_file(&provider_registry_path(roots), None).map(Some)
 }
 
@@ -1721,15 +2128,25 @@ fn load_pinned_providers(
 }
 
 fn ensure_private_ancestors(path: &Path, trusted_root: &Path, euid: u32) -> Result<(), String> {
-    if !path.starts_with(trusted_root) { return Err("resource path escapes trusted data root".into()); }
-    let relative = path.strip_prefix(trusted_root).map_err(|_| "resource path escapes trusted root".to_string())?;
+    if !path.starts_with(trusted_root) {
+        return Err("resource path escapes trusted data root".into());
+    }
+    let relative = path
+        .strip_prefix(trusted_root)
+        .map_err(|_| "resource path escapes trusted root".to_string())?;
     let mut current = trusted_root.to_path_buf();
     authority::ensure_private_directory(&current, euid)?;
     for component in relative.components() {
         current.push(component);
         if !current.exists() {
-            fs::create_dir(&current).map_err(|error| format!("create private resource component {}: {error}", current.display()))?;
-            fs::set_permissions(&current, fs::Permissions::from_mode(0o700)).map_err(|error| format!("chmod private resource component: {error}"))?;
+            fs::create_dir(&current).map_err(|error| {
+                format!(
+                    "create private resource component {}: {error}",
+                    current.display()
+                )
+            })?;
+            fs::set_permissions(&current, fs::Permissions::from_mode(0o700))
+                .map_err(|error| format!("chmod private resource component: {error}"))?;
         }
         authority::ensure_private_directory(&current, euid)?;
     }
@@ -1739,7 +2156,10 @@ fn ensure_private_ancestors(path: &Path, trusted_root: &Path, euid: u32) -> Resu
 fn ensure_cloexec(fd: RawFd) -> Result<(), String> {
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
     if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } != 0 {
-        return Err(format!("set resource FD_CLOEXEC: {}", std::io::Error::last_os_error()));
+        return Err(format!(
+            "set resource FD_CLOEXEC: {}",
+            std::io::Error::last_os_error()
+        ));
     }
     Ok(())
 }
@@ -1752,27 +2172,85 @@ fn directory_env(kind: &str, value: &str) -> Result<Vec<EnvProjectionV1>, String
         "cache_dir" => &["DOCKS_CACHE_DIR"],
         _ => return Err("directory resource kind is invalid".into()),
     };
-    Ok(names.iter().map(|name| EnvProjectionV1 { name: (*name).into(), value: value.into() }).collect())
+    Ok(names
+        .iter()
+        .map(|name| EnvProjectionV1 {
+            name: (*name).into(),
+            value: value.into(),
+        })
+        .collect())
 }
 
 fn directory_evidence(path: &Path) -> Result<String, String> {
-    let metadata = fs::symlink_metadata(path).map_err(|error| format!("inspect resource directory {}: {error}", path.display()))?;
-    if !metadata.is_dir() || metadata.file_type().is_symlink() || metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o777 != 0o700 {
-        return Err(format!("resource directory {} is not EUID-owned mode-0700", path.display()));
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("inspect resource directory {}: {error}", path.display()))?;
+    if !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o777 != 0o700
+    {
+        return Err(format!(
+            "resource directory {} is not EUID-owned mode-0700",
+            path.display()
+        ));
     }
-    Ok(sha256::hex_digest(format!("session-relay/resource-directory/v1\0{}\0{}\0{}\0{}", path.display(), metadata.dev(), metadata.ino(), metadata.uid()).as_bytes()))
+    Ok(sha256::hex_digest(
+        format!(
+            "session-relay/resource-directory/v1\0{}\0{}\0{}\0{}",
+            path.display(),
+            metadata.dev(),
+            metadata.ino(),
+            metadata.uid()
+        )
+        .as_bytes(),
+    ))
 }
 
 fn builtin_evidence(kind: &str, allocation_id: &str, value: &str, extra: Option<&str>) -> String {
-    sha256::hex_digest(format!("session-relay/resource-builtin/v1\0{kind}\0{allocation_id}\0{value}\0{}", extra.unwrap_or("")).as_bytes())
+    sha256::hex_digest(
+        format!(
+            "session-relay/resource-builtin/v1\0{kind}\0{allocation_id}\0{value}\0{}",
+            extra.unwrap_or("")
+        )
+        .as_bytes(),
+    )
 }
 
-fn builtin_receipt(operation: &str, outcome: &str, allocation_id: &str, value: &str, evidence: &str, at: &str) -> ProviderReceiptV1 {
-    ProviderReceiptV1 { request_id: crate::store::uuid_v4(), allocation_id: allocation_id.into(), operation: operation.into(), outcome: outcome.into(), value: value.into(), provider_evidence_sha256: evidence.into(), at: at.into() }
+fn builtin_receipt(
+    operation: &str,
+    outcome: &str,
+    allocation_id: &str,
+    value: &str,
+    evidence: &str,
+    at: &str,
+) -> ProviderReceiptV1 {
+    ProviderReceiptV1 {
+        request_id: crate::store::uuid_v4(),
+        allocation_id: allocation_id.into(),
+        operation: operation.into(),
+        outcome: outcome.into(),
+        value: value.into(),
+        provider_evidence_sha256: evidence.into(),
+        at: at.into(),
+    }
 }
 
-fn provider_request(operation: &str, allocation_id: &str, session_id: &str, name: &str, prior: Option<&str>) -> ProviderRequestV1 {
-    ProviderRequestV1 { operation: operation.into(), request_id: crate::store::uuid_v4(), allocation_id: allocation_id.into(), session_id: session_id.into(), kind: "database_schema".into(), name: name.into(), prior_receipt_sha256: prior.map(str::to_string) }
+fn provider_request(
+    operation: &str,
+    allocation_id: &str,
+    session_id: &str,
+    name: &str,
+    prior: Option<&str>,
+) -> ProviderRequestV1 {
+    ProviderRequestV1 {
+        operation: operation.into(),
+        request_id: crate::store::uuid_v4(),
+        allocation_id: allocation_id.into(),
+        session_id: session_id.into(),
+        kind: "database_schema".into(),
+        name: name.into(),
+        prior_receipt_sha256: prior.map(str::to_string),
+    }
 }
 
 fn verify_provider_files(provider: &ResourceProviderRegistrationV1) -> Result<(), String> {
@@ -1809,9 +2287,7 @@ fn open_verified_file(path: &Path, private: bool) -> Result<(File, Vec<u8>), Str
             path.display()
         ));
     }
-    if private
-        && (metadata.uid() != unsafe { libc::geteuid() }
-            || metadata.mode() & 0o777 != 0o600)
+    if private && (metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o777 != 0o600)
     {
         return Err(format!(
             "{} is not an EUID-owned mode-0600 provider config",
@@ -1868,11 +2344,11 @@ fn open_verified_provider_files(
         ));
     }
     let config_digest = sha256::hex_digest(&config_bytes);
-    if !sha256::constant_time_eq(
-        config_digest.as_bytes(),
-        provider.config_sha256.as_bytes(),
-    ) {
-        return Err(format!("provider {} config digest drift", provider.provider_id));
+    if !sha256::constant_time_eq(config_digest.as_bytes(), provider.config_sha256.as_bytes()) {
+        return Err(format!(
+            "provider {} config digest drift",
+            provider.provider_id
+        ));
     }
     Ok(VerifiedProviderFiles {
         executable: relocate_file_above_stdio(executable)?,
@@ -1880,6 +2356,17 @@ fn open_verified_provider_files(
     })
 }
 
+#[cfg(not(target_os = "linux"))]
+fn invoke_provider_with_files(
+    provider: &ResourceProviderRegistrationV1,
+    request: ProviderRequestV1,
+    files: VerifiedProviderFiles,
+) -> Result<ProviderReceiptV1, String> {
+    let _ = (provider, request, files);
+    Err("external resource provider execution requires Linux process-tree containment".into())
+}
+
+#[cfg(target_os = "linux")]
 fn invoke_provider_with_files(
     provider: &ResourceProviderRegistrationV1,
     request: ProviderRequestV1,
@@ -1912,65 +2399,132 @@ fn invoke_provider_with_files(
                     return Err(std::io::Error::last_os_error());
                 }
             }
-            Ok(())
+            if libc::setpgid(0, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            install_provider_daemon_fence()
         });
     }
     let mut child = command
         .spawn()
         .map_err(|error| format!("spawn resource provider {}: {error}", provider.provider_id))?;
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| "provider stdin pipe missing".to_string())?;
+    let provider_group = child.id() as libc::pid_t;
+    let mut stdin = match child.stdin.take() {
+        Some(stdin) => stdin,
+        None => {
+            let _ = terminate_provider_group(&mut child, provider_group);
+            return Err("provider stdin pipe missing".into());
+        }
+    };
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            let _ = terminate_provider_group(&mut child, provider_group);
+            return Err("provider stdout pipe missing".into());
+        }
+    };
+    let stderr = match child.stderr.take() {
+        Some(stderr) => stderr,
+        None => {
+            let _ = terminate_provider_group(&mut child, provider_group);
+            return Err("provider stderr pipe missing".into());
+        }
+    };
+    let mut stdout = match ProviderOutput::new(stdout) {
+        Ok(stdout) => stdout,
+        Err(error) => {
+            let _ = terminate_provider_group(&mut child, provider_group);
+            return Err(error);
+        }
+    };
+    let mut stderr = match ProviderOutput::new(stderr) {
+        Ok(stderr) => stderr,
+        Err(error) => {
+            let _ = terminate_provider_group(&mut child, provider_group);
+            return Err(error);
+        }
+    };
     let request_bytes = schema::serialize_jcs_lf(&request);
-    stdin
-        .write_all(&request_bytes)
-        .map_err(|error| format!("write provider request: {error}"))?;
+    if let Err(error) = stdin.write_all(&request_bytes) {
+        drop(stdin);
+        let _ = terminate_provider_group(&mut child, provider_group);
+        return Err(format!("write provider request: {error}"));
+    }
     drop(stdin);
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "provider stdout pipe missing".to_string())?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| "provider stderr pipe missing".to_string())?;
-    let stdout_reader = thread::spawn(move || read_bounded(stdout));
-    let stderr_reader = thread::spawn(move || read_bounded(stderr));
+
     let deadline = Instant::now() + PROVIDER_TIMEOUT;
+    let mut status = None;
     let status = loop {
-        if let Some(status) = child
-            .try_wait()
-            .map_err(|error| format!("poll resource provider: {error}"))?
-        {
-            break status;
+        stdout.drain_available();
+        stderr.drain_available();
+        if status.is_none() {
+            match child.try_wait() {
+                Ok(observed) => status = observed,
+                Err(error) => {
+                    let _ = terminate_provider_group(&mut child, provider_group);
+                    return Err(format!("poll resource provider: {error}"));
+                }
+            }
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = stdout_reader.join();
-            let _ = stderr_reader.join();
-            return Err(format!("resource provider {} timed out", provider.provider_id));
+            let mut cleanup_errors = terminate_provider_group(&mut child, provider_group);
+            let drain_deadline = Instant::now() + PROVIDER_PIPE_DRAIN_TIMEOUT;
+            while (!stdout.is_closed() || !stderr.is_closed()) && Instant::now() < drain_deadline {
+                stdout.drain_available();
+                stderr.drain_available();
+                if !stdout.is_closed() || !stderr.is_closed() {
+                    thread::sleep(Duration::from_millis(5));
+                }
+            }
+            if !stdout.is_closed() {
+                cleanup_errors.push("provider stdout pipe remained open".into());
+            }
+            if !stderr.is_closed() {
+                cleanup_errors.push("provider stderr pipe remained open".into());
+            }
+            let detail = if cleanup_errors.is_empty() {
+                String::new()
+            } else {
+                format!("; cleanup: {}", cleanup_errors.join("; "))
+            };
+            return Err(format!(
+                "resource provider {} timed out{detail}",
+                provider.provider_id
+            ));
+        }
+        if stdout.is_closed() && stderr.is_closed() {
+            if let Some(status) = status {
+                match provider_group_exists(provider_group) {
+                    Ok(false) => break status,
+                    Ok(true) => {
+                        let cleanup_errors = terminate_provider_group(&mut child, provider_group);
+                        let detail = if cleanup_errors.is_empty() {
+                            String::new()
+                        } else {
+                            format!("; cleanup: {}", cleanup_errors.join("; "))
+                        };
+                        return Err(format!(
+                            "resource provider {} left descendants running{detail}",
+                            provider.provider_id
+                        ));
+                    }
+                    Err(error) => {
+                        let _ = terminate_provider_group(&mut child, provider_group);
+                        return Err(error);
+                    }
+                }
+            }
         }
         thread::sleep(Duration::from_millis(10));
     };
-    let stdout = stdout_reader
-        .join()
-        .map_err(|_| "provider stdout reader panicked".to_string())??;
-    let stderr = stderr_reader
-        .join()
-        .map_err(|_| "provider stderr reader panicked".to_string())??;
+    let stdout = stdout.finish()?;
+    let stderr = stderr.finish()?;
     if !status.success() {
         return Err(format!(
             "resource provider {} failed: {}",
             provider.provider_id,
             String::from_utf8_lossy(&stderr)
         ));
-    }
-    if stdout.len() > PROVIDER_OUTPUT_MAX as usize
-        || stderr.len() > PROVIDER_OUTPUT_MAX as usize
-    {
-        return Err("resource provider output exceeded 64 KiB".into());
     }
     let receipt = ProviderReceiptV1::from_jcs(schema::parse_jcs(&stdout, true)?)?;
     if receipt.request_id != request.request_id
@@ -1982,22 +2536,261 @@ fn invoke_provider_with_files(
     Ok(receipt)
 }
 
-fn read_bounded(reader: impl Read) -> Result<Vec<u8>, String> {
-    let mut bytes = Vec::new();
-    reader.take(PROVIDER_OUTPUT_MAX + 1).read_to_end(&mut bytes).map_err(|error| format!("read provider output: {error}"))?;
-    if bytes.len() as u64 > PROVIDER_OUTPUT_MAX { return Err("resource provider output exceeded 64 KiB".into()); }
-    Ok(bytes)
-}
+#[cfg(target_os = "linux")]
+fn install_provider_daemon_fence() -> std::io::Result<()> {
+    const BPF_LOAD_ABSOLUTE_WORD: u16 = 0x20;
+    const BPF_JUMP_IF_EQUAL: u16 = 0x15;
+    const BPF_JUMP_IF_BITS_SET: u16 = 0x45;
+    const BPF_RETURN: u16 = 0x06;
+    const SECCOMP_KILL_PROCESS: u32 = 0x8000_0000;
+    const SECCOMP_ALLOW: u32 = 0x7fff_0000;
+    const SECCOMP_ERRNO: u32 = 0x0005_0000;
+    const X32_SYSCALL_BIT: u32 = 0x4000_0000;
 
-fn validate_provider_receipt(receipt: &ProviderReceiptV1, operation: &str, outcome: &str, allocation_id: &str, expected_value: Option<&str>) -> Result<(), String> {
-    if receipt.operation != operation || receipt.outcome != outcome || receipt.allocation_id != allocation_id { return Err("resource provider returned an unexpected receipt variant".into()); }
-    if receipt.value.is_empty() || receipt.value.as_bytes().contains(&0) { return Err("resource provider returned an invalid value".into()); }
-    if expected_value.is_some_and(|value| value != receipt.value) { return Err("resource provider inspect value drifted".into()); }
+    let native_audit_arch = if cfg!(target_arch = "x86_64") {
+        0xc000_003e
+    } else if cfg!(target_arch = "aarch64") {
+        0xc000_00b7
+    } else {
+        return Err(std::io::Error::from_raw_os_error(libc::ENOTSUP));
+    };
+    let filters = [
+        libc::sock_filter {
+            code: BPF_LOAD_ABSOLUTE_WORD,
+            jt: 0,
+            jf: 0,
+            k: 4,
+        },
+        libc::sock_filter {
+            code: BPF_JUMP_IF_EQUAL,
+            jt: 1,
+            jf: 0,
+            k: native_audit_arch,
+        },
+        libc::sock_filter {
+            code: BPF_RETURN,
+            jt: 0,
+            jf: 0,
+            k: SECCOMP_KILL_PROCESS,
+        },
+        libc::sock_filter {
+            code: BPF_LOAD_ABSOLUTE_WORD,
+            jt: 0,
+            jf: 0,
+            k: 0,
+        },
+        libc::sock_filter {
+            code: BPF_JUMP_IF_BITS_SET,
+            jt: 0,
+            jf: 1,
+            k: X32_SYSCALL_BIT,
+        },
+        libc::sock_filter {
+            code: BPF_RETURN,
+            jt: 0,
+            jf: 0,
+            k: SECCOMP_KILL_PROCESS,
+        },
+        libc::sock_filter {
+            code: BPF_JUMP_IF_EQUAL,
+            jt: 0,
+            jf: 1,
+            k: libc::SYS_setsid as u32,
+        },
+        libc::sock_filter {
+            code: BPF_RETURN,
+            jt: 0,
+            jf: 0,
+            k: SECCOMP_ERRNO | libc::EPERM as u32,
+        },
+        libc::sock_filter {
+            code: BPF_JUMP_IF_EQUAL,
+            jt: 0,
+            jf: 1,
+            k: libc::SYS_setpgid as u32,
+        },
+        libc::sock_filter {
+            code: BPF_RETURN,
+            jt: 0,
+            jf: 0,
+            k: SECCOMP_ERRNO | libc::EPERM as u32,
+        },
+        libc::sock_filter {
+            code: BPF_RETURN,
+            jt: 0,
+            jf: 0,
+            k: SECCOMP_ALLOW,
+        },
+    ];
+    let program = libc::sock_fprog {
+        len: filters.len() as u16,
+        filter: filters.as_ptr().cast_mut(),
+    };
+    if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if unsafe {
+        libc::prctl(
+            libc::PR_SET_SECCOMP,
+            libc::SECCOMP_MODE_FILTER,
+            &program as *const libc::sock_fprog,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
     Ok(())
 }
 
-fn read_receipt(path:&Path,expected_sha256:&str)->Result<ProviderReceiptV1,String>{
-    read_secure_jcs(path,Some(expected_sha256))
+#[cfg(target_os = "linux")]
+fn signal_provider_group(group: libc::pid_t, signal: libc::c_int) -> Result<(), String> {
+    if unsafe { libc::kill(-group, signal) } == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        return Ok(());
+    }
+    Err(format!("signal provider process group: {error}"))
+}
+
+#[cfg(target_os = "linux")]
+fn provider_group_exists(group: libc::pid_t) -> Result<bool, String> {
+    if unsafe { libc::kill(-group, 0) } == 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::ESRCH) => Ok(false),
+        Some(libc::EPERM) => Ok(true),
+        _ => Err(format!("inspect provider process group: {error}")),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn terminate_provider_group(child: &mut Child, group: libc::pid_t) -> Vec<String> {
+    let mut errors = Vec::new();
+    if let Err(error) = signal_provider_group(group, libc::SIGTERM) {
+        errors.push(error);
+    }
+    let termination_deadline = Instant::now() + PROVIDER_TERMINATION_GRACE;
+    loop {
+        match provider_group_exists(group) {
+            Ok(false) => break,
+            Ok(true) if Instant::now() < termination_deadline => {
+                thread::sleep(Duration::from_millis(5));
+            }
+            Ok(true) => {
+                if let Err(error) = signal_provider_group(group, libc::SIGKILL) {
+                    errors.push(error);
+                }
+                break;
+            }
+            Err(error) => {
+                errors.push(error);
+                break;
+            }
+        }
+    }
+    if let Err(error) = child.wait() {
+        errors.push(format!("reap provider process: {error}"));
+    }
+    errors
+}
+
+#[cfg(target_os = "linux")]
+struct ProviderOutput<R> {
+    reader: Option<R>,
+    bytes: Vec<u8>,
+    error: Option<String>,
+}
+
+#[cfg(target_os = "linux")]
+impl<R: Read + AsRawFd> ProviderOutput<R> {
+    fn new(reader: R) -> Result<Self, String> {
+        let fd = reader.as_raw_fd();
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } != 0 {
+            return Err(format!(
+                "set provider output nonblocking: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(Self {
+            reader: Some(reader),
+            bytes: Vec::new(),
+            error: None,
+        })
+    }
+
+    fn drain_available(&mut self) {
+        let Some(reader) = self.reader.as_mut() else {
+            return;
+        };
+        let mut buffer = [0_u8; 4096];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => {
+                    self.reader = None;
+                    return;
+                }
+                Ok(count) => {
+                    let remaining =
+                        (PROVIDER_OUTPUT_MAX as usize + 1).saturating_sub(self.bytes.len());
+                    self.bytes
+                        .extend_from_slice(&buffer[..count.min(remaining)]);
+                    return;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return,
+                Err(error) => {
+                    self.error = Some(format!("read provider output: {error}"));
+                    self.reader = None;
+                    return;
+                }
+            }
+        }
+    }
+
+    fn is_closed(&self) -> bool {
+        self.reader.is_none()
+    }
+
+    fn finish(self) -> Result<Vec<u8>, String> {
+        if let Some(error) = self.error {
+            return Err(error);
+        }
+        if self.bytes.len() as u64 > PROVIDER_OUTPUT_MAX {
+            return Err("resource provider output exceeded 64 KiB".into());
+        }
+        Ok(self.bytes)
+    }
+}
+
+fn validate_provider_receipt(
+    receipt: &ProviderReceiptV1,
+    operation: &str,
+    outcome: &str,
+    allocation_id: &str,
+    expected_value: Option<&str>,
+) -> Result<(), String> {
+    if receipt.operation != operation
+        || receipt.outcome != outcome
+        || receipt.allocation_id != allocation_id
+    {
+        return Err("resource provider returned an unexpected receipt variant".into());
+    }
+    if receipt.value.is_empty() || receipt.value.as_bytes().contains(&0) {
+        return Err("resource provider returned an invalid value".into());
+    }
+    if expected_value.is_some_and(|value| value != receipt.value) {
+        return Err("resource provider inspect value drifted".into());
+    }
+    Ok(())
+}
+
+fn read_receipt(path: &Path, expected_sha256: &str) -> Result<ProviderReceiptV1, String> {
+    read_secure_jcs(path, Some(expected_sha256))
 }
 
 fn rollback_created_database(
@@ -2016,20 +2809,18 @@ fn rollback_created_database(
         Some(prior_receipt_sha256),
     );
     let receipt = invoke_provider(provider, request)?;
-    validate_provider_receipt(
-        &receipt,
-        "delete",
-        "released",
-        allocation_id,
-        Some(value),
-    )?;
+    validate_provider_receipt(&receipt, "delete", "released", allocation_id, Some(value))?;
     Ok(receipt)
 }
 
-fn combine_rollback_error(error:String,rollback:Result<(),String>)->String{
-    match rollback{Ok(())=>error,Err(rollback)=>format!("{error}; database allocation cleanup could not be proven: {rollback}")}
+fn combine_rollback_error(error: String, rollback: Result<(), String>) -> String {
+    match rollback {
+        Ok(()) => error,
+        Err(rollback) => {
+            format!("{error}; database allocation cleanup could not be proven: {rollback}")
+        }
+    }
 }
-
 
 fn read_secure_jcs<T: ClosedJcs>(path: &Path, expected_sha256: Option<&str>) -> Result<T, String> {
     let bytes = capability::read_secure_bytes(path)?;
@@ -2051,7 +2842,7 @@ fn require_existing_private_directory(path: &Path, euid: u32) -> Result<(), Stri
             return Err(format!(
                 "inspect existing private directory {}: {error}",
                 path.display()
-            ))
+            ));
         }
     }
     authority::ensure_private_directory(path, euid)
@@ -2137,12 +2928,8 @@ fn validate_inventory_receipts(
         )?;
         if allocation.provider_id == BUILTIN_PROVIDER {
             let evidence_matches = if allocation.kind == "port" {
-                let expected = builtin_evidence(
-                    "port",
-                    &allocation.allocation_id,
-                    &allocation.value,
-                    None,
-                );
+                let expected =
+                    builtin_evidence("port", &allocation.allocation_id, &allocation.value, None);
                 create.provider_evidence_sha256 == expected
                     && inspect.provider_evidence_sha256 == expected
             } else {
@@ -2334,38 +3121,74 @@ fn prove_recorded_port_released(_value: &str) -> Result<(), String> {
 }
 
 fn remove_private_tree(path: &Path, euid: u32) -> Result<(), String> {
-    let metadata = fs::symlink_metadata(path).map_err(|error| format!("inspect resource path {}: {error}", path.display()))?;
-    if !metadata.is_dir() || metadata.file_type().is_symlink() || metadata.uid() != euid { return Err(format!("resource path {} identity is not deletable", path.display())); }
-    for entry in fs::read_dir(path).map_err(|error| format!("read resource path {}: {error}", path.display()))? {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("inspect resource path {}: {error}", path.display()))?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() || metadata.uid() != euid {
+        return Err(format!(
+            "resource path {} identity is not deletable",
+            path.display()
+        ));
+    }
+    for entry in fs::read_dir(path)
+        .map_err(|error| format!("read resource path {}: {error}", path.display()))?
+    {
         let entry = entry.map_err(|error| format!("read resource entry: {error}"))?;
         let child = entry.path();
-        let metadata = fs::symlink_metadata(&child).map_err(|error| format!("inspect resource entry {}: {error}", child.display()))?;
-        if metadata.uid() != euid || metadata.file_type().is_symlink() { return Err(format!("resource entry {} is not safely removable", child.display())); }
-        if metadata.is_dir() { remove_private_tree(&child, euid)?; }
-        else if metadata.is_file() && metadata.nlink() == 1 { fs::remove_file(&child).map_err(|error| format!("remove resource file {}: {error}", child.display()))?; }
-        else { return Err(format!("resource entry {} has unsupported type or link count", child.display())); }
+        let metadata = fs::symlink_metadata(&child)
+            .map_err(|error| format!("inspect resource entry {}: {error}", child.display()))?;
+        if metadata.uid() != euid || metadata.file_type().is_symlink() {
+            return Err(format!(
+                "resource entry {} is not safely removable",
+                child.display()
+            ));
+        }
+        if metadata.is_dir() {
+            remove_private_tree(&child, euid)?;
+        } else if metadata.is_file() && metadata.nlink() == 1 {
+            fs::remove_file(&child)
+                .map_err(|error| format!("remove resource file {}: {error}", child.display()))?;
+        } else {
+            return Err(format!(
+                "resource entry {} has unsupported type or link count",
+                child.display()
+            ));
+        }
     }
-    fs::remove_dir(path).map_err(|error| format!("remove resource directory {}: {error}", path.display()))
+    fs::remove_dir(path)
+        .map_err(|error| format!("remove resource directory {}: {error}", path.display()))
 }
 
-fn string_array(value:&schema::JcsValue,name:&str)->Result<Vec<String>,String>{
-    match value{schema::JcsValue::Array(values)=>values.iter().map(|value|value.as_str().map(str::to_string)).collect(),_=>Err(format!("{name} must be an array"))}
+fn string_array(value: &schema::JcsValue, name: &str) -> Result<Vec<String>, String> {
+    match value {
+        schema::JcsValue::Array(values) => values
+            .iter()
+            .map(|value| value.as_str().map(str::to_string))
+            .collect(),
+        _ => Err(format!("{name} must be an array")),
+    }
 }
 
-fn strings_value(values:&[String])->schema::JcsValue{
-    schema::JcsValue::Array(values.iter().cloned().map(schema::JcsValue::String).collect())
+fn strings_value(values: &[String]) -> schema::JcsValue {
+    schema::JcsValue::Array(
+        values
+            .iter()
+            .cloned()
+            .map(schema::JcsValue::String)
+            .collect(),
+    )
 }
 
 fn append_option(arguments: &mut Vec<String>, flag: &str, value: Option<&str>) {
-    if let Some(value) = value { arguments.extend([flag.into(), value.into()]); }
+    if let Some(value) = value {
+        arguments.extend([flag.into(), value.into()]);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const REPOSITORY_ID: &str =
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const REPOSITORY_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const SESSION_ID: &str = "123e4567-e89b-42d3-a456-426614174000";
     const CREATED_AT: &str = "2026-07-22T00:00:00.000Z";
 
@@ -2425,8 +3248,7 @@ mod tests {
                 state: if is_requested { "requested" } else { "unused" }.into(),
                 provider_id: (kind == "database_schema" && is_requested)
                     .then(|| "test_provider".to_string()),
-                reason: (!is_requested)
-                    .then(|| "task_does_not_use_resource".to_string()),
+                reason: (!is_requested).then(|| "task_does_not_use_resource".to_string()),
             }
         })
         .collect()
@@ -2551,15 +3373,17 @@ sys.stdout.write(json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\
     fn invalid_registry_does_not_publish_resource_root_and_retry_is_possible() {
         let temp = TestRoot::new("invalid-registry");
         let (roots, receipts) = fixture_roots(&temp);
-        assert!(allocate_resources(
-            &roots,
-            REPOSITORY_ID,
-            SESSION_ID,
-            &decisions(&["database_schema"]),
-            &receipts,
-            CREATED_AT,
-        )
-        .is_err());
+        assert!(
+            allocate_resources(
+                &roots,
+                REPOSITORY_ID,
+                SESSION_ID,
+                &decisions(&["database_schema"]),
+                &receipts,
+                CREATED_AT,
+            )
+            .is_err()
+        );
         let resource_root = roots
             .data
             .join(REPOSITORY_ID)
@@ -2627,19 +3451,21 @@ sys.stdout.write(json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\
                 .iter()
                 .all(|allocation| allocation.state == "released")
         );
-        assert!(!roots
-            .data
-            .join(REPOSITORY_ID)
-            .join("resources")
-            .join(SESSION_ID)
-            .exists());
+        assert!(
+            !roots
+                .data
+                .join(REPOSITORY_ID)
+                .join("resources")
+                .join(SESSION_ID)
+                .exists()
+        );
     }
 
     #[test]
     fn deletion_intent_reconciles_crash_after_delete_before_receipt() {
         let temp = TestRoot::new("delete-intent-crash");
         let (roots, receipts) = fixture_roots(&temp);
-        let mut resources = allocate_resources(
+        let resources = allocate_resources(
             &roots,
             REPOSITORY_ID,
             SESSION_ID,
@@ -2650,12 +3476,7 @@ sys.stdout.write(json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\
         .unwrap();
         let allocation = resources.allocations[0].clone();
         resources
-            .persist_deletion_intent(
-                &allocation,
-                "release",
-                Some(&close_evidence()),
-                CREATED_AT,
-            )
+            .persist_deletion_intent(&allocation, "release", Some(&close_evidence()), CREATED_AT)
             .unwrap();
         remove_private_tree(Path::new(&allocation.value), roots.euid).unwrap();
         drop(resources);
@@ -2708,8 +3529,7 @@ sys.stdout.write(json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\
             true,
         );
         drop(resources);
-        let resources =
-            load_resources(&roots, REPOSITORY_ID, SESSION_ID, &receipts).unwrap();
+        let resources = load_resources(&roots, REPOSITORY_ID, SESSION_ID, &receipts).unwrap();
         let inspected = resources.inspect(&roots).unwrap();
         assert_eq!(inspected[0].provider_evidence_sha256, "b".repeat(64));
     }
@@ -2767,12 +3587,14 @@ sys.stdout.write(json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\
             )
             .unwrap();
         }
-        assert!(!roots
-            .data
-            .join(REPOSITORY_ID)
-            .join("resources")
-            .join(SESSION_ID)
-            .exists());
+        assert!(
+            !roots
+                .data
+                .join(REPOSITORY_ID)
+                .join("resources")
+                .join(SESSION_ID)
+                .exists()
+        );
     }
 
     #[test]
@@ -2813,15 +3635,17 @@ sys.stdout.write(json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\
             broker_close_sha256: "d".repeat(64),
             runtime_empty_sha256: evidence.runtime_empty_sha256,
         };
-        assert!(release_resources(
-            &roots,
-            REPOSITORY_ID,
-            SESSION_ID,
-            &receipts,
-            &drifted,
-            CREATED_AT,
-        )
-        .unwrap_err()
-        .contains("different close evidence"));
+        assert!(
+            release_resources(
+                &roots,
+                REPOSITORY_ID,
+                SESSION_ID,
+                &receipts,
+                &drifted,
+                CREATED_AT,
+            )
+            .unwrap_err()
+            .contains("different close evidence")
+        );
     }
 }

@@ -964,14 +964,13 @@ fn repository_gate_refuses_legacy_mode_before_fanout_mutation() {
     let roots = SystemAuthorityRootProvider.roots().unwrap();
     let authority = WorkspaceAuthority::new(roots.clone()).unwrap();
     let gate = RepositoryGate::acquire(&roots, &opened.identity).unwrap();
-    let repository_authority = authority.repository_dir(&opened.identity.repository_id).unwrap();
+    let repository_authority = authority
+        .repository_dir(&opened.identity.repository_id)
+        .unwrap();
     assert!(!repository_authority.exists());
     fs::create_dir(&repository_authority).unwrap();
     let error = gate
-        .refuse_legacy_if_managed(
-            &roots,
-            Path::new(&opened.identity.common_dir_realpath),
-        )
+        .refuse_legacy_if_managed(&roots, &opened.identity)
         .unwrap_err();
     assert!(error.contains("managed workspace mode"), "{error}");
     assert!(git(&repo, &["branch", "--list", "relay/fanout-*"]).is_empty());
@@ -1013,7 +1012,11 @@ fn repository_identity_accepts_reported_sha1_and_sha256_oid_widths() {
         let opened = OpenedRepository::open(&repo).unwrap();
         let head = opened.head().unwrap();
         assert_eq!(head.as_str().len(), if format == "sha1" { 40 } else { 64 });
-        assert!(opened.validate_oid(&"a".repeat(if format == "sha1" { 64 } else { 40 })).is_err());
+        assert!(
+            opened
+                .validate_oid(&"a".repeat(if format == "sha1" { 64 } else { 40 }))
+                .is_err()
+        );
         fs::remove_dir_all(home).ok();
     }
 }

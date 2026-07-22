@@ -1489,8 +1489,12 @@ pub fn run(raw: Vec<String>) -> ! {
     if read_only && full_access {
         die("--read-only and --full-access are mutually exclusive");
     }
-    crate::workspace::refuse_unsupported_managed_mutation(&dir, read_only || args.has("dry"), "spawn")
-        .unwrap_or_else(|error| die(&error));
+    crate::workspace::refuse_unsupported_managed_mutation(
+        &dir,
+        read_only || args.has("dry"),
+        "spawn",
+    )
+    .unwrap_or_else(|error| die(&error));
     let timeout_secs: u64 = args
         .flag("timeout")
         .map(|v| {

@@ -7,7 +7,7 @@ fn main() {
     else {
         return;
     };
-    let _ = relay::store::drain_with_guard(
+    let _ = relay::lifecycle::drain_with_guard(
         &mut guard,
         "22222222-2222-4222-8222-222222222222",
     );

@@ -33,7 +33,7 @@ fn acquire_legacy_gate(
     let roots = SystemAuthorityRootProvider.roots()?;
     WorkspaceAuthority::new(roots.clone())?;
     let gate = RepositoryGate::acquire(&roots, identity.workspace_identity())?;
-    gate.refuse_legacy_if_managed(&roots, Path::new(&identity.common_dir))?;
+    gate.refuse_legacy_if_managed(&roots, identity.workspace_identity())?;
     Ok((gate, roots))
 }
 
