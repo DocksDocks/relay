@@ -5557,6 +5557,7 @@ fn wait_supervisor_bootstrap_ready(mut read_end: File, child: &mut Child) -> Res
                 .read_to_end(&mut bytes)
                 .map_err(|error| format!("read custody supervisor bootstrap readiness: {error}"))?;
             if bytes != [0x01] {
+                let _ = child.kill();
                 let status = child
                     .wait()
                     .map_err(|error| format!("wait for failed custody supervisor: {error}"))?;

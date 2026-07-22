@@ -63,6 +63,7 @@
       "plugins/session-relay/rust/src/workspace.rs::start_custody_runtime",
       "plugins/session-relay/rust/src/workspace.rs::start_git_broker",
       "plugins/session-relay/rust/src/workspace.rs::wait_pipe_record",
+      "plugins/session-relay/rust/src/workspace.rs::wait_supervisor_bootstrap_ready",
       "plugins/session-relay/rust/src/workspace/git.rs::apply_wip",
       "plugins/session-relay/rust/src/workspace/git.rs::create_pax_archive",
       "plugins/session-relay/rust/src/workspace/platform/linux.rs::prove_runtime_closure",
@@ -2783,6 +2784,14 @@
       "id": "signal:plugins/session-relay/rust/src/workspace.rs:wait_pipe_record:child_kill:1",
       "file": "plugins/session-relay/rust/src/workspace.rs",
       "function": "wait_pipe_record",
+      "category": "signal",
+      "operation": "child_kill",
+      "anchor": ".kill()"
+    },
+    {
+      "id": "signal:plugins/session-relay/rust/src/workspace.rs:wait_supervisor_bootstrap_ready:child_kill:1",
+      "file": "plugins/session-relay/rust/src/workspace.rs",
+      "function": "wait_supervisor_bootstrap_ready",
       "category": "signal",
       "operation": "child_kill",
       "anchor": ".kill()"

@@ -1598,6 +1598,16 @@ fn add_system_loader_file(paths: &mut Vec<RuntimePath>, path: &Path) -> Result<(
     add_runtime_path(paths, &canonical, LANDLOCK_ACCESS_FS_READ_FILE)
 }
 
+fn is_loader_virtual_address(line: &str) -> bool {
+    let Some(address) = line
+        .strip_prefix("(0x")
+        .and_then(|line| line.strip_suffix(')'))
+    else {
+        return false;
+    };
+    !address.is_empty() && address.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 fn prove_runtime_closure(
     executable: &Path,
     cwd: &Path,
@@ -1650,7 +1660,8 @@ fn prove_runtime_closure(
     }
     for line in listing.lines() {
         let line = line.trim();
-        if line.is_empty() || line.starts_with("linux-vdso.so.") {
+        if line.is_empty() || line.starts_with("linux-vdso.so.") || is_loader_virtual_address(line)
+        {
             continue;
         }
         let path = if let Some((_, resolved)) = line.split_once("=>") {
@@ -2469,6 +2480,15 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn loader_virtual_address_requires_an_exact_hex_record() {
+        assert!(is_loader_virtual_address("(0x0000ff3d2e660000)"));
+        assert!(!is_loader_virtual_address("0x0000ff3d2e660000"));
+        assert!(!is_loader_virtual_address("(0x)"));
+        assert!(!is_loader_virtual_address("(0xnot-hex)"));
+        assert!(!is_loader_virtual_address("/lib/ld-linux-aarch64.so.1"));
+    }
 
     #[test]
     fn tool_code_stays_stopped_until_activation_is_acknowledged() {
