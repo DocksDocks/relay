@@ -1006,12 +1006,12 @@ function testNativeProducerWorkflow() {
   assert.equal(byName.get('prove Linux managed-workspace custody').if, "runner.os == 'Linux'");
   assert.match(
     byName.get('prove Linux managed-workspace custody').run,
-    /\/proc\/self\/cgroup[\s\S]*\/sys\/fs\/cgroup\$\{CURRENT_CGROUP%\/\}[\s\S]*SESSION_RELAY_TEST_CGROUP_ROOT=[\s\S]*workspace_lease_process[\s\S]*linux_cgroup_pidfd_guardian_kills_hostile_descendants[\s\S]*--exact --nocapture/,
+    /\/proc\/self\/cgroup[\s\S]*\/sys\/fs\/cgroup\$\{CURRENT_CGROUP%\/\}[\s\S]*SESSION_RELAY_TEST_BIN="\$RUNNER_TEMP\/session-relay\/\$TARGET\/\$ASSET_NAME"[\s\S]*SESSION_RELAY_TEST_CGROUP_ROOT=[\s\S]*workspace_lease_process[\s\S]*linux_cgroup_pidfd_guardian_kills_hostile_descendants[\s\S]*--exact --nocapture/,
   );
   assert.equal(byName.get('prove macOS managed-workspace admission STOP').if, "runner.os == 'macOS'");
   assert.match(
     byName.get('prove macOS managed-workspace admission STOP').run,
-    /diskutil info -plist "\$PWD" \| plutil -extract FilesystemType raw -o - -[\s\S]*workspace_lease_process[\s\S]*macos_process_group_recursive_guardian_kills_hostile_descendants[\s\S]*--exact --nocapture/,
+    /df -P \. \| awk 'END \{ print \$1 \}'[\s\S]*diskutil info -plist "\$filesystem_device"[\s\S]*PlistBuddy -c 'Print :FilesystemType'[\s\S]*test "\$filesystem_type" = apfs[\s\S]*workspace_lease_process[\s\S]*macos_process_group_recursive_guardian_kills_hostile_descendants[\s\S]*--exact --nocapture/,
   );
   assert.equal(byName.get('smoke explicit fresh Linux workspace binary').if, "runner.os == 'Linux'");
   assert.match(
