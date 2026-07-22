@@ -4,6 +4,7 @@
 //   relay hook [codex] [--event prompt]   SessionStart/UserPromptSubmit hook (register + drain inbox)
 //   relay discover|list|register|send|inbox|peek|attach|wake|doctor   CLI / attach / doorbell / health
 //   relay watch …                  poll mailboxes, push into live Codex threads via app-server
+//   relay workspace …              managed workspace authority (nine closed verbs)
 //   relay __spawn-log-writer <id>  hidden bounded stderr pump for detached spawn
 //   relay __appserver-spawn-pump    hidden bounded app-server first-turn pump
 //   relay __lifecycle-watchdog …    hidden detached supervisor owner
@@ -29,6 +30,7 @@ fn main() {
         Some("spawn") => relay::spawn::run(argv.clone()),
         Some("handback") => relay::fanout::run_handback(argv.clone()),
         Some("collect") => relay::fanout::run_collect(argv.clone()),
+        Some("workspace") => relay::workspace::run(argv[1..].to_vec()),
         Some("__spawn-log-writer") => {
             let Some(id) = argv.get(1) else {
                 die("usage: relay __spawn-log-writer <uuid>");
@@ -67,7 +69,7 @@ fn main() {
             }
         }
         _ => die(
-            "usage: relay bus | channel | hook [codex] [--event prompt] | discover [--within min] [--tool t] | list | register <name> --id <uuid> [--dir <path>] [--server <sock>] | send <to> [--] <msg> | inbox <who> | peek <who> | attach <who> [--exec] | wake <who> [--model m] [--effort e] [--service-tier default|fast] [msg] | doctor [--id <session>] | watch <who>...|--all [--server <sock>] [--auto-turn] [--once] | spawn <dir> [--fanout|--worktree --from <session>] [--service-tier default|fast] [options] -- <task> | handback --from <session> --status completed|failed [--note <text>] | collect <session> --from <parent>",
+            "usage: relay bus | channel | hook [codex] [--event prompt] | discover [--within min] [--tool t] | list | register <name> --id <uuid> [--dir <path>] [--server <sock>] | send <to> [--] <msg> | inbox <who> | peek <who> | attach <who> [--exec] | wake <who> [--model m] [--effort e] [--service-tier default|fast] [msg] | doctor [--id <session>] | watch <who>...|--all [--server <sock>] [--auto-turn] [--once] | spawn <dir> [--fanout|--worktree --from <session>] [--service-tier default|fast] [options] -- <task> | handback --from <session> --status completed|failed [--note <text>] | collect <session> --from <parent> | workspace preserve|start|list|inspect|handback|integrate|recover|finish|abort ...",
         ),
     }
 }

@@ -12,3 +12,4 @@ pub mod spawn;
 pub mod store;
 pub mod supervisor;
 pub mod watch;
+pub mod workspace;

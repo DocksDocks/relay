@@ -150,6 +150,50 @@ pub(crate) fn hex_digest(input: &[u8]) -> String {
         })
 }
 
+pub(crate) fn digest(input: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(input);
+    hasher.digest()
+}
+
+pub(crate) fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    let mut difference = left.len() ^ right.len();
+    let common = left.len().min(right.len());
+    for index in 0..common {
+        difference |= usize::from(left[index] ^ right[index]);
+    }
+    for byte in &left[common..] {
+        difference |= usize::from(*byte);
+    }
+    for byte in &right[common..] {
+        difference |= usize::from(*byte);
+    }
+    difference == 0
+}
+
+pub(crate) fn hmac(key: &[u8], message: &[u8]) -> [u8; 32] {
+    let mut key_block = [0_u8; 64];
+    if key.len() > key_block.len() {
+        key_block[..32].copy_from_slice(&digest(key));
+    } else {
+        key_block[..key.len()].copy_from_slice(key);
+    }
+    let mut inner_pad = [0x36_u8; 64];
+    let mut outer_pad = [0x5c_u8; 64];
+    for index in 0..64 {
+        inner_pad[index] ^= key_block[index];
+        outer_pad[index] ^= key_block[index];
+    }
+    let mut inner = Sha256::new();
+    inner.update(&inner_pad);
+    inner.update(message);
+    let inner_digest = inner.digest();
+    let mut outer = Sha256::new();
+    outer.update(&outer_pad);
+    outer.update(&inner_digest);
+    outer.digest()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Sha256, hex_digest};
