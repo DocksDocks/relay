@@ -157,6 +157,56 @@ function binaryFor(target) {
   return bytes;
 }
 
+function nativeProducerJobs() {
+  const descriptors = [
+    ['x86_64-unknown-linux-musl', 'ubuntu-24.04', 'Linux'],
+    ['aarch64-unknown-linux-musl', 'ubuntu-24.04-arm', 'Linux'],
+    ['x86_64-apple-darwin', 'macos-15-intel', 'macOS'],
+    ['aarch64-apple-darwin', 'macos-15', 'macOS'],
+  ];
+  const stepNames = [
+    'build locked native release',
+    'prove Linux managed-workspace custody',
+    'prove macOS managed-workspace admission STOP',
+    'smoke explicit fresh Linux workspace binary',
+    'attest native release binary',
+    'upload stable executable and canonical attestation',
+  ];
+  return descriptors.map(([target, runner, runnerOs], jobIndex) => ({
+    id: 7000 + jobIndex,
+    run_id: RUN_ID,
+    run_attempt: RUN_ATTEMPT,
+    head_sha: COMMIT,
+    name: `build ${target} on ${runner}`,
+    status: 'completed',
+    conclusion: 'success',
+    runner_id: 7100 + jobIndex,
+    runner_name: `GitHub Actions ${jobIndex + 1}`,
+    runner_group_id: 0,
+    runner_group_name: 'GitHub Actions',
+    labels: [runner],
+    steps: stepNames.map((name, stepIndex) => ({
+      name,
+      number: stepIndex + 1,
+      status: 'completed',
+      conclusion:
+        name === 'prove Linux managed-workspace custody'
+          ? runnerOs === 'Linux'
+            ? 'success'
+            : 'skipped'
+          : name === 'prove macOS managed-workspace admission STOP'
+            ? runnerOs === 'macOS'
+              ? 'success'
+              : 'skipped'
+            : name === 'smoke explicit fresh Linux workspace binary'
+              ? runnerOs === 'Linux'
+                ? 'success'
+                : 'skipped'
+              : 'success',
+    })),
+  }));
+}
+
 function artifactFixture({ mutateArchive } = {}) {
   const archives = new Map();
   const artifacts = [];
@@ -201,7 +251,7 @@ function artifactFixture({ mutateArchive } = {}) {
   archives.set(databaseId, checksumArchive);
   artifacts.push(artifactRecord(databaseId, 'session-relay-checksums', checksumArchive));
   if (mutateArchive) mutateArchive({ archives, artifacts });
-  return { archives, artifacts };
+  return { archives, artifacts, jobs: nativeProducerJobs() };
 }
 
 function artifactRecord(id, name, archive) {
@@ -242,6 +292,8 @@ function preflightAdapter(fixture) {
         return { id: WORKFLOW_ID, path: '.github/workflows/build-binaries.yml', state: 'active' };
       if (endpoint.includes('/contents/.github/workflows/build-binaries.yml?ref='))
         return { type: 'file', path: '.github/workflows/build-binaries.yml', sha: WORKFLOW_BLOB };
+      if (endpoint.endsWith(`/actions/runs/${RUN_ID}/jobs?filter=latest&per_page=100`))
+        return { total_count: fixture.jobs.length, jobs: fixture.jobs };
       if (endpoint.endsWith(`/actions/runs/${RUN_ID}/artifacts?per_page=100`))
         return { total_count: fixture.artifacts.length, artifacts: fixture.artifacts };
       assert.fail(`unexpected API endpoint ${endpoint}`);
@@ -890,6 +942,163 @@ function testArtifactAdversaries(temp) {
       ),
     /empty|workspace|owned/i,
   );
+}
+
+function testNativeProducerWorkflow() {
+  const workflow = parseYaml(fs.readFileSync('.github/workflows/build-binaries.yml', 'utf8'));
+  const build = workflow.jobs.build;
+  assert.equal(build.needs, 'identity');
+  assert.equal(build['runs-on'], '${{ matrix.runner }}');
+  assert.deepEqual(
+    build.strategy.matrix.include.map(({ runner, runner_os, runner_arch, target, asset }) => ({
+      runner,
+      runner_os,
+      runner_arch,
+      target,
+      asset,
+    })),
+    [
+      {
+        runner: 'ubuntu-24.04',
+        runner_os: 'Linux',
+        runner_arch: 'X64',
+        target: 'x86_64-unknown-linux-musl',
+        asset: 'session-relay-x86_64-unknown-linux-musl',
+      },
+      {
+        runner: 'ubuntu-24.04-arm',
+        runner_os: 'Linux',
+        runner_arch: 'ARM64',
+        target: 'aarch64-unknown-linux-musl',
+        asset: 'session-relay-aarch64-unknown-linux-musl',
+      },
+      {
+        runner: 'macos-15-intel',
+        runner_os: 'macOS',
+        runner_arch: 'X64',
+        target: 'x86_64-apple-darwin',
+        asset: 'session-relay-x86_64-apple-darwin',
+      },
+      {
+        runner: 'macos-15',
+        runner_os: 'macOS',
+        runner_arch: 'ARM64',
+        target: 'aarch64-apple-darwin',
+        asset: 'session-relay-aarch64-apple-darwin',
+      },
+    ],
+  );
+  const names = build.steps.map((step) => step.name ?? step.uses);
+  const required = [
+    'build locked native release',
+    'prove Linux managed-workspace custody',
+    'prove macOS managed-workspace admission STOP',
+    'smoke explicit fresh Linux workspace binary',
+    'attest native release binary',
+    'upload stable executable and canonical attestation',
+  ];
+  assert.deepEqual(
+    required.map((name) => names.indexOf(name)),
+    [...required.keys()].map((offset) => names.indexOf(required[0]) + offset),
+    'native producer evidence steps must be present, contiguous, and ordered',
+  );
+  const byName = new Map(build.steps.map((step) => [step.name, step]));
+  assert.equal(byName.get('prove Linux managed-workspace custody').if, "runner.os == 'Linux'");
+  assert.match(
+    byName.get('prove Linux managed-workspace custody').run,
+    /SESSION_RELAY_TEST_CGROUP_ROOT=[\s\S]*workspace_lease_process[\s\S]*linux_cgroup_pidfd_guardian_kills_hostile_descendants[\s\S]*--exact --nocapture/,
+  );
+  assert.equal(byName.get('prove macOS managed-workspace admission STOP').if, "runner.os == 'macOS'");
+  assert.match(
+    byName.get('prove macOS managed-workspace admission STOP').run,
+    /stat -f %T[\s\S]*workspace_lease_process[\s\S]*macos_process_group_recursive_guardian_kills_hostile_descendants[\s\S]*--exact --nocapture/,
+  );
+  assert.equal(byName.get('smoke explicit fresh Linux workspace binary').if, "runner.os == 'Linux'");
+  assert.match(
+    byName.get('smoke explicit fresh Linux workspace binary').run,
+    /--case single-session-compat --bin "\$bin"[\s\S]*--case docs-contract --bin "\$bin"/,
+  );
+  assert.deepEqual(workflow.jobs.aggregate.needs, ['identity', 'build']);
+  assert.deepEqual(workflow.jobs.publish.needs, ['identity', 'aggregate']);
+}
+
+function testNativeProducerEvidence(temp) {
+  let adversary = 0;
+  const expectJobsReject = (label, mutate, pattern) => {
+    const fixture = artifactFixture();
+    mutate(fixture.jobs);
+    expectReject(
+      label,
+      () => runPreflight(temp, fixture),
+      pattern,
+    );
+    adversary += 1;
+  };
+
+  expectJobsReject(
+    'missing native job',
+    (jobs) => jobs.pop(),
+    /native job|exactly once/i,
+  );
+  expectJobsReject(
+    'cross-built native job',
+    (jobs) => {
+      jobs[0].labels = ['ubuntu-24.04-arm'];
+    },
+    /did not run|runner/i,
+  );
+  expectJobsReject(
+    'skipped Linux custody',
+    (jobs) => {
+      jobs[0].steps.find(({ name }) => name === 'prove Linux managed-workspace custody').conclusion = 'skipped';
+    },
+    /custody|conclusion/i,
+  );
+  expectJobsReject(
+    'failed macOS negative admission',
+    (jobs) => {
+      jobs[2].steps.find(({ name }) => name === 'prove macOS managed-workspace admission STOP').conclusion =
+        'failure';
+    },
+    /admission STOP|conclusion/i,
+  );
+  expectJobsReject(
+    'macOS support substitution',
+    (jobs) => {
+      jobs[2].steps.find(({ name }) => name === 'prove macOS managed-workspace admission STOP').name =
+        'prove macOS managed-workspace custody';
+    },
+    /admission STOP|exactly once/i,
+  );
+  expectJobsReject(
+    'self-hosted runner substitution',
+    (jobs) => {
+      jobs[0].runner_group_id = 5;
+      jobs[0].runner_group_name = 'default';
+    },
+    /runner_group/i,
+  );
+  expectJobsReject(
+    'skipped fresh-binary smoke',
+    (jobs) => {
+      jobs[1].steps.find(({ name }) => name === 'smoke explicit fresh Linux workspace binary').conclusion =
+        'skipped';
+    },
+    /smoke|conclusion/i,
+  );
+  expectJobsReject(
+    'reordered attestation before evidence',
+    (jobs) => {
+      const steps = jobs[0].steps;
+      const attestation = steps.splice(
+        steps.findIndex(({ name }) => name === 'attest native release binary'),
+        1,
+      )[0];
+      steps.splice(1, 0, attestation);
+    },
+    /reordered/i,
+  );
+  assert.equal(adversary, 8);
 }
 
 function writeReceipt(file, value) {
@@ -1761,6 +1970,8 @@ function main() {
     const preparation = testPreparationHandlers(temp, preflight, sourceCi);
     testCompletionBinding(temp, preparation);
     testArtifactAdversaries(temp);
+    testNativeProducerEvidence(temp);
+    testNativeProducerWorkflow();
     testPrepareFixtureUsesFullCi(temp);
     testLiveSourceCiAndPrepareDryRun();
     console.log('release evidence contract: ok');
