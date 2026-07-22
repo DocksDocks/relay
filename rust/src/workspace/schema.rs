@@ -1,7 +1,9 @@
 use crate::sha256;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
+use std::fs::{self,OpenOptions};
+use std::io::Read;
+use std::os::unix::fs::{MetadataExt,OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
 
 pub const SCHEMA_V1: &str = "1";
@@ -79,7 +81,10 @@ pub fn serialize_jcs_lf<T: ClosedJcs>(value: &T) -> Vec<u8> {
 }
 
 pub fn read_jcs_file<T: ClosedJcs>(path: &Path, expected_sha256: Option<&str>) -> Result<T, String> {
-    let bytes = fs::read(path).map_err(|error| format!("read {}: {error}", path.display()))?;
+    let mut file=OpenOptions::new().read(true).custom_flags(libc::O_CLOEXEC|libc::O_NOFOLLOW).open(path).map_err(|error|format!("securely open {}: {error}",path.display()))?;
+    let metadata=file.metadata().map_err(|error|format!("inspect {}: {error}",path.display()))?;
+    if !metadata.is_file()||metadata.uid()!=unsafe{libc::geteuid()}||metadata.nlink()!=1||metadata.mode()&0o7777!=0o600{return Err(format!("{} must be an EUID-owned, single-link, mode-0600 regular file",path.display()))}
+    let mut bytes=Vec::new();file.read_to_end(&mut bytes).map_err(|error|format!("read {}: {error}",path.display()))?;
     if let Some(expected) = expected_sha256 {
         Sha256Digest::parse(expected)?;
         if !sha256::constant_time_eq(sha256::hex_digest(&bytes).as_bytes(), expected.as_bytes()) {
@@ -378,11 +383,110 @@ pub struct PathClaimRequestV1 { pub path:String,pub path_type:String,pub mode:St
 impl PathClaimRequestV1 { pub fn validate(&self)->Result<(),String>{RelPath::parse(&self.path)?;if !matches!(self.path_type.as_str(),"file"|"directory"){return Err("claim path_type must be file|directory".into())}if self.mode!="exclusive"{return Err("claim mode must be exclusive".into())}Ok(())} }
 
 pub fn validate_non_overlapping_claims(claims:&[PathClaimRequestV1])->Result<(),String>{
- for c in claims{c.validate()?;} let mut sorted:Vec<_>=claims.iter().map(|c|c.path.as_str()).collect();sorted.sort_unstable();
- for pair in sorted.windows(2){if pair[0]==pair[1]||pair[1].strip_prefix(pair[0]).is_some_and(|r|r.starts_with('/')){return Err(format!("overlapping path claims: {} and {}",pair[0],pair[1]))}}
+ for claim in claims{claim.validate()?;}
+ let mut sorted:Vec<(String,&str)>=claims.iter().map(|claim|(claim.path.chars().flat_map(char::to_lowercase).collect(),claim.path.as_str())).collect();
+ sorted.sort_by(|left,right|left.0.cmp(&right.0));
+ for pair in sorted.windows(2){if pair[0].0==pair[1].0||pair[1].0.strip_prefix(&pair[0].0).is_some_and(|rest|rest.starts_with('/')){return Err(format!("overlapping path claims: {} and {}",pair[0].1,pair[1].1))}}
  Ok(())
 }
 
+
+fn string_array(value:&JcsValue,name:&str)->Result<Vec<String>,String>{match value{JcsValue::Array(values)=>values.iter().map(|v|v.as_str().map(str::to_string)).collect(),_=>Err(format!("{name} must be an array of strings"))}}
+fn optional_string(value:&JcsValue,name:&str)->Result<Option<String>,String>{match value{JcsValue::Null=>Ok(None),JcsValue::String(v)=>Ok(Some(v.clone())),_=>Err(format!("{name} has invalid nullability"))}}
+
+#[derive(Clone,Debug,Eq,PartialEq)]
+pub struct SourceSnapshotV1{pub head_oid:String,pub index_sha256:Option<String>,pub status_sha256:String,pub tracked_untracked_inventory_sha256:String}
+impl SourceSnapshotV1{
+ fn from_value(value:JcsValue)->Result<Self,String>{let o=value.object()?;require_keys(&o,&["head_oid","index_sha256","status_sha256","tracked_untracked_inventory_sha256"])?;let index_sha256=optional_string(&o["index_sha256"],"index_sha256")?;if let Some(v)=&index_sha256{Sha256Digest::parse(v)?;}for key in ["status_sha256","tracked_untracked_inventory_sha256"]{Sha256Digest::parse(&get_string(&o,key)?)?;}Ok(Self{head_oid:get_string(&o,"head_oid")?,index_sha256,status_sha256:get_string(&o,"status_sha256")?,tracked_untracked_inventory_sha256:get_string(&o,"tracked_untracked_inventory_sha256")?})}
+ fn value(&self)->JcsValue{object([("head_oid",JcsValue::String(self.head_oid.clone())),("index_sha256",self.index_sha256.clone().map(JcsValue::String).unwrap_or(JcsValue::Null)),("status_sha256",JcsValue::String(self.status_sha256.clone())),("tracked_untracked_inventory_sha256",JcsValue::String(self.tracked_untracked_inventory_sha256.clone()))])}
+}
+
+#[derive(Clone,Debug,Eq,PartialEq)]
+pub enum WipPayloadV1{
+ Commit{temporary_index_sha256:String,tree_oid:String,preserved_commit:String,preserve_ref:String},
+ Artifact{binary_diff:String,untracked_inventory:String,untracked_archive:String,archive_format:String,entries:Vec<String>},
+}
+impl WipPayloadV1{
+ fn from_value(value:JcsValue)->Result<Self,String>{let o=value.object()?;let kind=get_string(&o,"kind")?;match kind.as_str(){
+  "commit"=>{require_keys(&o,&["kind","temporary_index_sha256","tree_oid","preserved_commit","preserve_ref"])?;Sha256Digest::parse(&get_string(&o,"temporary_index_sha256")?)?;let preserve_ref=get_string(&o,"preserve_ref")?;if !preserve_ref.starts_with("refs/docks/preserve/"){return Err("preserve ref is outside refs/docks/preserve".into())}Ok(Self::Commit{temporary_index_sha256:get_string(&o,"temporary_index_sha256")?,tree_oid:get_string(&o,"tree_oid")?,preserved_commit:get_string(&o,"preserved_commit")?,preserve_ref})}
+  "artifact"=>{require_keys(&o,&["kind","binary_diff","untracked_inventory","untracked_archive","archive_format","entries"])?;if get_string(&o,"archive_format")?!="pax"{return Err("artifact archive format must be pax".into())}for key in ["binary_diff","untracked_inventory","untracked_archive"]{AbsPath::parse(&get_string(&o,key)?)?;}let entries=string_array(&o["entries"],"entries")?;let mut sorted=entries.clone();sorted.sort();sorted.dedup();if sorted!=entries{return Err("artifact entries must be sorted and unique".into())}for entry in &entries{RelPath::parse(entry)?;}Ok(Self::Artifact{binary_diff:get_string(&o,"binary_diff")?,untracked_inventory:get_string(&o,"untracked_inventory")?,untracked_archive:get_string(&o,"untracked_archive")?,archive_format:"pax".into(),entries})}
+  _=>Err("WIP payload kind must be commit|artifact".into())
+ }}
+ fn value(&self)->JcsValue{match self{
+  Self::Commit{temporary_index_sha256,tree_oid,preserved_commit,preserve_ref}=>object([("kind",JcsValue::String("commit".into())),("preserve_ref",JcsValue::String(preserve_ref.clone())),("preserved_commit",JcsValue::String(preserved_commit.clone())),("temporary_index_sha256",JcsValue::String(temporary_index_sha256.clone())),("tree_oid",JcsValue::String(tree_oid.clone()))]),
+  Self::Artifact{binary_diff,untracked_inventory,untracked_archive,archive_format,entries}=>object([("archive_format",JcsValue::String(archive_format.clone())),("binary_diff",JcsValue::String(binary_diff.clone())),("entries",JcsValue::Array(entries.iter().cloned().map(JcsValue::String).collect())),("kind",JcsValue::String("artifact".into())),("untracked_archive",JcsValue::String(untracked_archive.clone())),("untracked_inventory",JcsValue::String(untracked_inventory.clone()))])
+ }}
+}
+
+#[derive(Clone,Debug,Eq,PartialEq)]
+pub struct WipReceiptV1{pub receipt_id:String,pub request_sha256:String,pub repository:RepositoryIdentityV1,pub source_root:String,pub base_commit:String,pub mode:String,pub before:SourceSnapshotV1,pub after:SourceSnapshotV1,pub payload:WipPayloadV1,pub created_at:String}
+impl ClosedJcs for WipReceiptV1{
+ fn from_jcs(value:JcsValue)->Result<Self,String>{
+  let mut o=value.object()?;require_keys(&o,&["schema","receipt_id","request_sha256","repository","source_root","base_commit","mode","before","after","payload","created_at"])?;
+  if get_string(&o,"schema")?!=SCHEMA_V1{return Err("WipReceiptV1 schema mismatch".into())}
+  LowerUuidV4::parse(&get_string(&o,"receipt_id")?)?;Sha256Digest::parse(&get_string(&o,"request_sha256")?)?;AbsPath::parse(&get_string(&o,"source_root")?)?;Timestamp::parse(&get_string(&o,"created_at")?)?;
+  let before=SourceSnapshotV1::from_value(o.remove("before").unwrap())?;let after=SourceSnapshotV1::from_value(o.remove("after").unwrap())?;if before!=after{return Err("WIP source before/after snapshots differ".into())}
+  let repository=RepositoryIdentityV1::from_jcs(o.remove("repository").unwrap())?;let payload=WipPayloadV1::from_value(o.remove("payload").unwrap())?;let base_commit=get_string(&o,"base_commit")?;
+  GitOid::parse(&base_commit,repository.object_format)?;GitOid::parse(&before.head_oid,repository.object_format)?;
+  if let WipPayloadV1::Commit{tree_oid,preserved_commit,..}=&payload{GitOid::parse(tree_oid,repository.object_format)?;GitOid::parse(preserved_commit,repository.object_format)?;}
+  let mode=get_string(&o,"mode")?;let mode_matches=matches!((&mode,&payload),(m,WipPayloadV1::Commit{..}) if m=="commit")||matches!((&mode,&payload),(m,WipPayloadV1::Artifact{..}) if m=="artifact");if !mode_matches{return Err("WIP mode and payload kind differ".into())}
+  Ok(Self{receipt_id:get_string(&o,"receipt_id")?,request_sha256:get_string(&o,"request_sha256")?,repository,source_root:get_string(&o,"source_root")?,base_commit,mode,before,after,payload,created_at:get_string(&o,"created_at")?})
+ }
+ fn to_jcs(&self)->JcsValue{object([("after",self.after.value()),("base_commit",JcsValue::String(self.base_commit.clone())),("before",self.before.value()),("created_at",JcsValue::String(self.created_at.clone())),("mode",JcsValue::String(self.mode.clone())),("payload",self.payload.value()),("receipt_id",JcsValue::String(self.receipt_id.clone())),("repository",self.repository.to_jcs()),("request_sha256",JcsValue::String(self.request_sha256.clone())),("schema",JcsValue::String(SCHEMA_V1.into())),("source_root",JcsValue::String(self.source_root.clone()))])}
+}
+
+#[derive(Clone,Debug,Eq,PartialEq)]
+pub struct ToolLaunchV1{pub kind:String,pub executable_path:String,pub executable_sha256:String,pub model:Option<String>,pub effort:Option<String>,pub service_tier:Option<String>}
+impl ToolLaunchV1{
+ fn from_value(value:JcsValue)->Result<Self,String>{let o=value.object()?;require_keys(&o,&["kind","executable_path","executable_sha256","model","effort","service_tier"])?;let kind=get_string(&o,"kind")?;if !matches!(kind.as_str(),"claude"|"codex"|"omp"){return Err("tool kind must be claude|codex|omp".into())}AbsPath::parse(&get_string(&o,"executable_path")?)?;Sha256Digest::parse(&get_string(&o,"executable_sha256")?)?;let service_tier=optional_string(&o["service_tier"],"service_tier")?;if service_tier.as_deref().is_some_and(|v|!matches!(v,"default"|"fast")){return Err("service_tier must be null|default|fast".into())}Ok(Self{kind,executable_path:get_string(&o,"executable_path")?,executable_sha256:get_string(&o,"executable_sha256")?,model:optional_string(&o["model"],"model")?,effort:optional_string(&o["effort"],"effort")?,service_tier})}
+ fn value(&self)->JcsValue{object([("effort",self.effort.clone().map(JcsValue::String).unwrap_or(JcsValue::Null)),("executable_path",JcsValue::String(self.executable_path.clone())),("executable_sha256",JcsValue::String(self.executable_sha256.clone())),("kind",JcsValue::String(self.kind.clone())),("model",self.model.clone().map(JcsValue::String).unwrap_or(JcsValue::Null)),("service_tier",self.service_tier.clone().map(JcsValue::String).unwrap_or(JcsValue::Null))])}
+}
+
+#[derive(Clone,Debug,Eq,PartialEq)]
+pub struct ResourceDecisionV1{pub kind:String,pub name:String,pub state:String,pub provider_id:Option<String>,pub reason:Option<String>}
+impl ResourceDecisionV1{
+ fn from_value(value:JcsValue)->Result<Self,String>{let o=value.object()?;let state=get_string(&o,"state")?;let kind=get_string(&o,"kind")?;if !matches!(kind.as_str(),"port"|"temp_dir"|"build_dir"|"database_schema"|"log_dir"|"cache_dir"){return Err("unknown resource kind".into())}let name=get_string(&o,"name")?;if name.is_empty()||name.len()>32||!name.bytes().enumerate().all(|(i,b)|if i==0{b.is_ascii_lowercase()}else{b.is_ascii_lowercase()||b.is_ascii_digit()||b==b'_'}){return Err("resource name is invalid".into())}match state.as_str(){"requested"=>{require_keys(&o,&["kind","name","state","provider_id"])?;Ok(Self{kind,name,state,provider_id:optional_string(&o["provider_id"],"provider_id")?,reason:None})},"unused"=>{require_keys(&o,&["kind","name","state","reason"])?;if get_string(&o,"reason")?!="task_does_not_use_resource"{return Err("unused resource reason is not closed".into())}Ok(Self{kind,name,state,provider_id:None,reason:Some("task_does_not_use_resource".into())})},_=>Err("resource state must be requested|unused".into())}}
+ fn value(&self)->JcsValue{if self.state=="requested"{object([("kind",JcsValue::String(self.kind.clone())),("name",JcsValue::String(self.name.clone())),("provider_id",self.provider_id.clone().map(JcsValue::String).unwrap_or(JcsValue::Null)),("state",JcsValue::String(self.state.clone()))])}else{object([("kind",JcsValue::String(self.kind.clone())),("name",JcsValue::String(self.name.clone())),("reason",JcsValue::String("task_does_not_use_resource".into())),("state",JcsValue::String(self.state.clone()))])}}
+}
+
+fn claim_from_value(value:JcsValue)->Result<PathClaimRequestV1,String>{let o=value.object()?;require_keys(&o,&["path","path_type","mode"])?;let claim=PathClaimRequestV1{path:get_string(&o,"path")?,path_type:get_string(&o,"path_type")?,mode:get_string(&o,"mode")?};claim.validate()?;Ok(claim)}
+fn claim_value(claim:&PathClaimRequestV1)->JcsValue{object([("mode",JcsValue::String(claim.mode.clone())),("path",JcsValue::String(claim.path.clone())),("path_type",JcsValue::String(claim.path_type.clone()))])}
+
+#[derive(Clone,Debug,Eq,PartialEq)]
+pub struct WorkspaceStartRequestV1{pub request_id:String,pub repository_path:String,pub integration_root:String,pub base_commit:String,pub task_slug:String,pub task:String,pub tool:ToolLaunchV1,pub wip_receipt_path:String,pub wip_receipt_sha256:String,pub owned_paths:Vec<PathClaimRequestV1>,pub coordinator_owned_paths:Vec<PathClaimRequestV1>,pub coordinator_owned_overrides:Vec<JcsValue>,pub resources:Vec<ResourceDecisionV1>,pub created_at:String}
+impl ClosedJcs for WorkspaceStartRequestV1{
+ fn from_jcs(value:JcsValue)->Result<Self,String>{
+  let o=value.object()?;
+  require_keys(&o,&["schema","request_id","repository_path","integration_root","base_commit","task_slug","task","tool","wip_receipt_path","wip_receipt_sha256","owned_paths","coordinator_owned_paths","coordinator_owned_overrides","resources","created_at"])?;
+  if get_string(&o,"schema")?!=SCHEMA_V1{return Err("WorkspaceStartRequestV1 schema mismatch".into())}
+  LowerUuidV4::parse(&get_string(&o,"request_id")?)?;
+  for key in ["repository_path","integration_root","wip_receipt_path"]{AbsPath::parse(&get_string(&o,key)?)?;}
+  TaskSlug::parse(&get_string(&o,"task_slug")?)?;Sha256Digest::parse(&get_string(&o,"wip_receipt_sha256")?)?;Timestamp::parse(&get_string(&o,"created_at")?)?;
+  let owned_paths=match &o["owned_paths"]{JcsValue::Array(values)=>values.iter().cloned().map(claim_from_value).collect::<Result<Vec<_>,_>>()?,_=>return Err("owned_paths must be array".into())};
+  let coordinator_owned_paths=match &o["coordinator_owned_paths"]{JcsValue::Array(values)=>values.iter().cloned().map(claim_from_value).collect::<Result<Vec<_>,_>>()?,_=>return Err("coordinator_owned_paths must be array".into())};
+  validate_non_overlapping_claims(&owned_paths)?;validate_non_overlapping_claims(&coordinator_owned_paths)?;
+  let coordinator_owned_overrides=match &o["coordinator_owned_overrides"]{JcsValue::Array(values)=>values.clone(),_=>return Err("coordinator_owned_overrides must be array".into())};
+  for override_value in &coordinator_owned_overrides{let override_object=match override_value{JcsValue::Object(object)=>object,_=>return Err("CoordinatorOwnedOverrideV1 must be an object".into())};require_keys(override_object,&["path","reason"])?;RelPath::parse(get_string(override_object,"path")?.as_str())?;let reason=get_string(override_object,"reason")?;if reason.is_empty()||reason.contains('\0'){return Err("coordinator-owned override reason is invalid".into())}}
+  let resources=match &o["resources"]{JcsValue::Array(values)=>values.iter().cloned().map(ResourceDecisionV1::from_value).collect::<Result<Vec<_>,_>>()?,_=>return Err("resources must be array".into())};
+  let kinds:BTreeSet<_>=resources.iter().map(|resource|resource.kind.as_str()).collect();if resources.len()!=6||kinds!=BTreeSet::from(["port","temp_dir","build_dir","database_schema","log_dir","cache_dir"]){return Err("start request requires exactly one decision for all six resource kinds".into())}
+  Ok(Self{request_id:get_string(&o,"request_id")?,repository_path:get_string(&o,"repository_path")?,integration_root:get_string(&o,"integration_root")?,base_commit:get_string(&o,"base_commit")?,task_slug:get_string(&o,"task_slug")?,task:get_string(&o,"task")?,tool:ToolLaunchV1::from_value(o["tool"].clone())?,wip_receipt_path:get_string(&o,"wip_receipt_path")?,wip_receipt_sha256:get_string(&o,"wip_receipt_sha256")?,owned_paths,coordinator_owned_paths,coordinator_owned_overrides,resources,created_at:get_string(&o,"created_at")?})
+ }
+ fn to_jcs(&self)->JcsValue{object([("base_commit",JcsValue::String(self.base_commit.clone())),("coordinator_owned_overrides",JcsValue::Array(self.coordinator_owned_overrides.clone())),("coordinator_owned_paths",JcsValue::Array(self.coordinator_owned_paths.iter().map(claim_value).collect())),("created_at",JcsValue::String(self.created_at.clone())),("integration_root",JcsValue::String(self.integration_root.clone())),("owned_paths",JcsValue::Array(self.owned_paths.iter().map(claim_value).collect())),("repository_path",JcsValue::String(self.repository_path.clone())),("request_id",JcsValue::String(self.request_id.clone())),("resources",JcsValue::Array(self.resources.iter().map(ResourceDecisionV1::value).collect())),("schema",JcsValue::String(SCHEMA_V1.into())),("task",JcsValue::String(self.task.clone())),("task_slug",JcsValue::String(self.task_slug.clone())),("tool",self.tool.value()),("wip_receipt_path",JcsValue::String(self.wip_receipt_path.clone())),("wip_receipt_sha256",JcsValue::String(self.wip_receipt_sha256.clone()))])}
+}
+
+#[derive(Clone,Debug,Eq,PartialEq)]
+pub struct WorktreeIdentityV1{pub identity_sha256:String,pub root_realpath:String,pub root_dev:String,pub root_ino:String,pub root_owner_euid:String,pub private_git_dir_realpath:String,pub private_git_dir_dev:String,pub private_git_dir_ino:String,pub branch_ref:String}
+impl WorktreeIdentityV1{
+ pub fn value(&self)->JcsValue{object([("branch_ref",JcsValue::String(self.branch_ref.clone())),("identity_sha256",JcsValue::String(self.identity_sha256.clone())),("private_git_dir_dev",JcsValue::String(self.private_git_dir_dev.clone())),("private_git_dir_ino",JcsValue::String(self.private_git_dir_ino.clone())),("private_git_dir_realpath",JcsValue::String(self.private_git_dir_realpath.clone())),("root_dev",JcsValue::String(self.root_dev.clone())),("root_ino",JcsValue::String(self.root_ino.clone())),("root_owner_euid",JcsValue::String(self.root_owner_euid.clone())),("root_realpath",JcsValue::String(self.root_realpath.clone())),("schema",JcsValue::String(SCHEMA_V1.into()))])}
+ pub fn from_value(value:JcsValue)->Result<Self,String>{let o=value.object()?;require_keys(&o,&["schema","identity_sha256","root_realpath","root_dev","root_ino","root_owner_euid","private_git_dir_realpath","private_git_dir_dev","private_git_dir_ino","branch_ref"])?;if get_string(&o,"schema")?!=SCHEMA_V1{return Err("WorktreeIdentityV1 schema mismatch".into())}Sha256Digest::parse(&get_string(&o,"identity_sha256")?)?;for key in ["root_realpath","private_git_dir_realpath"]{AbsPath::parse(&get_string(&o,key)?)?;}for key in ["root_dev","root_ino","root_owner_euid","private_git_dir_dev","private_git_dir_ino"]{Decimal::parse(&get_string(&o,key)?)?;}Ok(Self{identity_sha256:get_string(&o,"identity_sha256")?,root_realpath:get_string(&o,"root_realpath")?,root_dev:get_string(&o,"root_dev")?,root_ino:get_string(&o,"root_ino")?,root_owner_euid:get_string(&o,"root_owner_euid")?,private_git_dir_realpath:get_string(&o,"private_git_dir_realpath")?,private_git_dir_dev:get_string(&o,"private_git_dir_dev")?,private_git_dir_ino:get_string(&o,"private_git_dir_ino")?,branch_ref:get_string(&o,"branch_ref")?})}
+}
+
+#[derive(Clone,Debug,Eq,PartialEq)]
+pub struct WorkspaceStartResultV1{pub session_id:String,pub repository_id:String,pub worktree_root:String,pub branch_ref:String,pub coordinator_capability_file:String,pub coordinator_generation:String,pub bootstrap:String}
+impl ClosedJcs for WorkspaceStartResultV1{
+ fn from_jcs(value:JcsValue)->Result<Self,String>{let o=value.object()?;require_keys(&o,&["schema","session_id","repository_id","worktree_root","branch_ref","coordinator_capability_file","coordinator_generation","bootstrap"])?;let session_id=get_string(&o,"session_id")?;LowerUuidV4::parse(&session_id)?;let bootstrap=get_string(&o,"bootstrap")?;if !matches!(bootstrap.as_str(),"created"|"existing"){return Err("bootstrap outcome invalid".into())}Ok(Self{session_id,repository_id:get_string(&o,"repository_id")?,worktree_root:get_string(&o,"worktree_root")?,branch_ref:get_string(&o,"branch_ref")?,coordinator_capability_file:get_string(&o,"coordinator_capability_file")?,coordinator_generation:get_string(&o,"coordinator_generation")?,bootstrap})}
+ fn to_jcs(&self)->JcsValue{object([("bootstrap",JcsValue::String(self.bootstrap.clone())),("branch_ref",JcsValue::String(self.branch_ref.clone())),("coordinator_capability_file",JcsValue::String(self.coordinator_capability_file.clone())),("coordinator_generation",JcsValue::String(self.coordinator_generation.clone())),("repository_id",JcsValue::String(self.repository_id.clone())),("schema",JcsValue::String(SCHEMA_V1.into())),("session_id",JcsValue::String(self.session_id.clone())),("worktree_root",JcsValue::String(self.worktree_root.clone()))])}
+}
 #[cfg(test)]
 mod tests {
  use super::*;

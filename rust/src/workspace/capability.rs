@@ -1,8 +1,9 @@
 use super::schema::{
-    COORDINATOR_ACTIONS, CapabilityRecordV1, CoordinatorCapabilityV1, Decimal, LowerUuidV4,
-    Sha256Digest, Timestamp, WORKER_ACTIONS,
+    self, COORDINATOR_ACTIONS, CapabilityRecordV1, ClosedJcs, CoordinatorCapabilityV1, Decimal,
+    JcsValue, LowerUuidV4, Sha256Digest, Timestamp, WORKER_ACTIONS,
 };
 use crate::sha256;
+use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::Read;
 use std::os::unix::fs::OpenOptionsExt;
@@ -19,6 +20,52 @@ pub struct WorkerCapabilityV1 {
     pub broker_socket: String,
     pub issued_at: String,
     pub expires_at: String,
+}
+
+impl ClosedJcs for WorkerCapabilityV1 {
+    fn from_jcs(value: JcsValue) -> Result<Self, String> {
+        let object = value.object()?;
+        let keys = [
+            "schema", "capability_id", "repository_id", "session_id", "generation", "actions",
+            "secret_b64url", "broker_socket", "issued_at", "expires_at",
+        ];
+        if object.len() != keys.len() || keys.iter().any(|key| !object.contains_key(*key)) {
+            return Err("WorkerCapabilityV1 keys differ from the closed schema".to_string());
+        }
+        let string = |key: &str| object[key].as_str().map(str::to_string);
+        if string("schema")? != schema::SCHEMA_V1 { return Err("WorkerCapabilityV1 schema mismatch".to_string()); }
+        LowerUuidV4::parse(&string("capability_id")?)?;
+        LowerUuidV4::parse(&string("session_id")?)?;
+        Sha256Digest::parse(&string("repository_id")?)?;
+        Decimal::parse(&string("generation")?)?;
+        Timestamp::parse(&string("issued_at")?)?;
+        Timestamp::parse(&string("expires_at")?)?;
+        let actions = match &object["actions"] {
+            JcsValue::Array(values) => values.iter().map(|value| value.as_str().map(str::to_string)).collect::<Result<Vec<_>, _>>()?,
+            _ => return Err("worker actions must be an array".to_string()),
+        };
+        if actions != WORKER_ACTIONS.map(str::to_string) { return Err("worker actions differ from the closed set".to_string()); }
+        let secret_b64url = string("secret_b64url")?;
+        decode_base64url(&secret_b64url)?;
+        let broker_socket = string("broker_socket")?;
+        if !Path::new(&broker_socket).is_absolute() { return Err("worker broker socket is not absolute".to_string()); }
+        Ok(Self { capability_id:string("capability_id")?, repository_id:string("repository_id")?, session_id:string("session_id")?, generation:string("generation")?, actions, secret_b64url, broker_socket, issued_at:string("issued_at")?, expires_at:string("expires_at")? })
+    }
+
+    fn to_jcs(&self) -> JcsValue {
+        JcsValue::Object(BTreeMap::from([
+            ("actions".into(), JcsValue::Array(self.actions.iter().cloned().map(JcsValue::String).collect())),
+            ("broker_socket".into(), JcsValue::String(self.broker_socket.clone())),
+            ("capability_id".into(), JcsValue::String(self.capability_id.clone())),
+            ("expires_at".into(), JcsValue::String(self.expires_at.clone())),
+            ("generation".into(), JcsValue::String(self.generation.clone())),
+            ("issued_at".into(), JcsValue::String(self.issued_at.clone())),
+            ("repository_id".into(), JcsValue::String(self.repository_id.clone())),
+            ("schema".into(), JcsValue::String(schema::SCHEMA_V1.into())),
+            ("secret_b64url".into(), JcsValue::String(self.secret_b64url.clone())),
+            ("session_id".into(), JcsValue::String(self.session_id.clone())),
+        ]))
+    }
 }
 
 pub fn mint_coordinator(

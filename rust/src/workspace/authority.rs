@@ -220,6 +220,13 @@ impl WorkspaceAuthority {
     }
 }
 
+#[derive(Clone,Debug,Eq,PartialEq)]
+pub struct LeaseOwnerV1 { pub session_id:String,pub acquired_at:String }
+impl ClosedJcs for LeaseOwnerV1 {
+    fn from_jcs(value:JcsValue)->Result<Self,String>{let object=value.object()?;let keys=["schema","session_id","acquired_at"];if object.len()!=keys.len()||keys.iter().any(|key|!object.contains_key(*key)){return Err("LeaseOwnerV1 keys differ".into())}let session_id=object["session_id"].as_str()?.to_string();schema::LowerUuidV4::parse(&session_id)?;let acquired_at=object["acquired_at"].as_str()?.to_string();schema::Timestamp::parse(&acquired_at)?;Ok(Self{session_id,acquired_at})}
+    fn to_jcs(&self)->JcsValue{JcsValue::Object(BTreeMap::from([("acquired_at".into(),JcsValue::String(self.acquired_at.clone())),("schema".into(),JcsValue::String(schema::SCHEMA_V1.into())),("session_id".into(),JcsValue::String(self.session_id.clone()))]))}
+}
+
 pub struct WorkspaceLease { file: File, path: PathBuf }
 impl WorkspaceLease {
     pub fn acquire(path: &Path) -> Result<Self, String> {
@@ -240,6 +247,32 @@ impl WorkspaceLease {
         }
         Ok(Self { file, path: path.to_path_buf() })
     }
+    pub fn acquire_owned(path:&Path,owner_path:&Path,session_id:&str,acquired_at:&str)->Result<Self,String>{
+        schema::LowerUuidV4::parse(session_id)?;
+        schema::Timestamp::parse(acquired_at)?;
+        match Self::acquire(path) {
+            Ok(lease) => {
+                atomic_replace_jcs(owner_path,&LeaseOwnerV1{session_id:session_id.into(),acquired_at:acquired_at.into()},0o600)?;
+                Ok(lease)
+            }
+            Err(error) if error=="workspace lease is already held" => {
+                let deadline=std::time::Instant::now()+std::time::Duration::from_secs(3);
+                loop {
+                    if let Ok(bytes)=read_secure_bytes(owner_path){
+                        if let Ok(value)=schema::parse_jcs(&bytes,true){
+                            if let Ok(owner)=LeaseOwnerV1::from_jcs(value){
+                                return Err(format!("Workspace already owned by session {}. Open a separate worktree or continue in read-only mode.",owner.session_id));
+                            }
+                        }
+                    }
+                    if std::time::Instant::now()>=deadline{return Err("workspace lease is held but exact owner evidence is not durably readable; refusing recovery".into())}
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+            Err(error)=>Err(error),
+        }
+    }
+    pub fn duplicate(&self)->Result<File,String>{self.file.try_clone().map_err(|error|format!("duplicate workspace lease: {error}"))}
     pub fn as_raw_fd(&self) -> RawFd { self.file.as_raw_fd() }
     pub fn path(&self) -> &Path { &self.path }
 }
@@ -265,7 +298,15 @@ fn atomic_write(path:&Path,bytes:&[u8],mode:u32,replace:bool)->Result<(),String>
 
 pub fn ensure_private_directory(path:&Path,euid:u32)->Result<(),String>{
  if !path.is_absolute(){return Err(format!("private directory {} is not absolute",path.display()))}
- if !path.exists(){fs::create_dir_all(path).map_err(|e|format!("create {}: {e}",path.display()))?;fs::set_permissions(path,fs::Permissions::from_mode(0o700)).map_err(|e|format!("chmod {}: {e}",path.display()))?;}
+ let mut current=PathBuf::from("/");
+ for component in path.components().skip(1){
+  current.push(component.as_os_str());
+  match fs::symlink_metadata(&current){
+   Ok(metadata)=>{if metadata.file_type().is_symlink()||!metadata.is_dir(){return Err(format!("private directory component {} is not a real directory",current.display()))}}
+   Err(error) if error.kind()==std::io::ErrorKind::NotFound=>{fs::create_dir(&current).map_err(|e|format!("create {}: {e}",current.display()))?;fs::set_permissions(&current,fs::Permissions::from_mode(0o700)).map_err(|e|format!("chmod {}: {e}",current.display()))?;}
+   Err(error)=>return Err(format!("inspect private directory component {}: {error}",current.display())),
+  }
+ }
  let file=OpenOptions::new().read(true).custom_flags(libc::O_CLOEXEC|libc::O_NOFOLLOW|libc::O_DIRECTORY).open(path).map_err(|e|format!("securely open directory {}: {e}",path.display()))?;let metadata=file.metadata().map_err(|e|format!("fstat {}: {e}",path.display()))?;if !metadata.is_dir()||metadata.uid()!=euid||metadata.mode()&0o777!=0o700{return Err(format!("{} is not an EUID-owned mode-0700 directory",path.display()))}Ok(())
 }
 fn create_private_directory(path:&Path,euid:u32)->Result<(),String>{fs::create_dir(path).map_err(|e|format!("create private directory {}: {e}",path.display()))?;fs::set_permissions(path,fs::Permissions::from_mode(0o700)).map_err(|e|format!("chmod {}: {e}",path.display()))?;ensure_private_directory(path,euid)}
