@@ -2205,27 +2205,45 @@ fn cleanup_failed_launch(
     let kill = write_all_fd(kill_fd, b"1");
     let empty = wait_recursive_empty(leaf, EMPTY_DEADLINE);
     let reap = if let Some(pidfd) = pidfd {
-        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-        let rc = unsafe {
-            libc::waitid(
-                P_PIDFD,
-                pidfd.as_raw_fd() as libc::id_t,
-                &mut info,
-                libc::WEXITED,
-            )
+        let mut pollfd = libc::pollfd {
+            fd: pidfd.as_raw_fd(),
+            events: libc::POLLIN | libc::POLLHUP,
+            revents: 0,
         };
-        if rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD) {
-            Ok(())
-        } else {
+        let ready = unsafe { libc::poll(&mut pollfd, 1, 0) };
+        if ready < 0 {
             Err(format!(
-                "waitid failed launch root: {}",
+                "poll failed launch root pidfd: {}",
                 std::io::Error::last_os_error()
             ))
+        } else if ready == 0 || pollfd.revents & (libc::POLLIN | libc::POLLHUP) == 0 {
+            Err("failed launch root remained live after cgroup kill".to_string())
+        } else {
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            let rc = unsafe {
+                libc::waitid(
+                    P_PIDFD,
+                    pidfd.as_raw_fd() as libc::id_t,
+                    &mut info,
+                    libc::WEXITED,
+                )
+            };
+            if rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "waitid failed launch root: {}",
+                    std::io::Error::last_os_error()
+                ))
+            }
         }
     } else {
         let mut status = 0;
-        if unsafe { libc::waitpid(pid, &mut status, 0) } == pid {
+        let reaped = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        if reaped == pid {
             Ok(())
+        } else if reaped == 0 {
+            Err("failed launch root remained live after cgroup kill".to_string())
         } else {
             Err(format!(
                 "waitpid failed launch root: {}",

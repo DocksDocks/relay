@@ -1869,6 +1869,14 @@
       "anchor": "libc::write("
     },
     {
+      "id": "platform:plugins/session-relay/rust/src/workspace/platform/linux.rs:cleanup_failed_launch:libc_poll:1",
+      "file": "plugins/session-relay/rust/src/workspace/platform/linux.rs",
+      "function": "cleanup_failed_launch",
+      "category": "platform",
+      "operation": "libc_poll",
+      "anchor": "libc::poll("
+    },
+    {
       "id": "platform:plugins/session-relay/rust/src/workspace/platform/linux.rs:cleanup_failed_launch:libc_waitid:1",
       "file": "plugins/session-relay/rust/src/workspace/platform/linux.rs",
       "function": "cleanup_failed_launch",
