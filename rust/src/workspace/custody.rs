@@ -271,7 +271,8 @@ expected_peer: PeerIdentity,
 peer_pidfd: OwnedFd,
 tx_seq: u64,
 rx_seq: u64,
-missed_heartbeats: u8, }
+missed_heartbeats: u8,
+pending_heartbeat_seq: Option<u64>, }
 
 impl ControlEndpoint {
     #[cfg(target_os = "linux")]
@@ -331,6 +332,7 @@ impl ControlEndpoint {
             tx_seq: 0,
             rx_seq: 0,
             missed_heartbeats: 0,
+            pending_heartbeat_seq: None,
         })
     }
 
@@ -403,31 +405,69 @@ impl ControlEndpoint {
     evidence_required: bool,) -> Result<ControlPayload, String> { if command.is_heartbeat() || expected_ack.is_heartbeat() {
         return Err("heartbeat must use heartbeat()".to_string());
     }
+    while self.pending_heartbeat_seq.is_some() {
+        self.heartbeat()?;
+    }
     let seq = self.send(command, payload, &[])?;
     let received = self.receive(HEARTBEAT_FENCE_AFTER, 0)?;
     if received.packet.kind != expected_ack {
         return Err(format!("custody command {} received {}, expected {}", command.as_str(), received.packet.kind.as_str(), expected_ack.as_str()));
     }
-    validate_ack(&received.packet.payload, seq, evidence_required)?;
-    Ok(received.packet.payload) }
+    match validate_ack(&received.packet.payload, seq, evidence_required)? {
+        AckStatus::Ok => Ok(received.packet.payload),
+        AckStatus::Fault {
+            code,
+            evidence_sha256,
+        } => Err(format!(
+            "custody command {} received fault ACK {code} ({evidence_sha256})",
+            command.as_str()
+        )),
+    } }
 
     #[cfg(target_os = "linux")]
-    pub fn heartbeat(&mut self) -> Result<(), String> { let seq = self.send(PacketKind::Heartbeat, ControlPayload::new(), &[])?;
-    match self.receive(HEARTBEAT_INTERVAL, 0) {
-        Ok(received) if received.packet.kind == PacketKind::HeartbeatAck
-            && validate_ack(&received.packet.payload, seq, false).is_ok() => {
+    pub fn heartbeat(&mut self) -> Result<(), String> {
+        let seq = match self.pending_heartbeat_seq {
+            Some(seq) => seq,
+            None => {
+                let seq = self.send(
+                    PacketKind::Heartbeat,
+                    ControlPayload::new(),
+                    &[],
+                )?;
+                self.pending_heartbeat_seq = Some(seq);
+                seq
+            }
+        };
+        match self.receive(HEARTBEAT_INTERVAL, 0) {
+            Ok(received)
+                if received.packet.kind == PacketKind::HeartbeatAck
+                    && matches!(
+                        validate_ack(&received.packet.payload, seq, false),
+                        Ok(AckStatus::Ok)
+                    ) =>
+            {
                 self.missed_heartbeats = 0;
+                self.pending_heartbeat_seq = None;
                 Ok(())
             }
-        Ok(_) | Err(_) => {
-            self.missed_heartbeats = self.missed_heartbeats.saturating_add(1);
-            if self.missed_heartbeats >= 3 {
-                Err("custody heartbeat fenced after three missed ACK deadlines".to_string())
-            } else {
-                Err("custody heartbeat ACK deadline missed".to_string())
+            Err(error)
+                if error.starts_with("custody control deadline elapsed after ") =>
+            {
+                self.missed_heartbeats =
+                    self.missed_heartbeats.saturating_add(1);
+                if self.missed_heartbeats >= 3 {
+                    Err(
+                        "custody heartbeat fenced after three missed ACK deadlines"
+                            .to_string(),
+                    )
+                } else {
+                    Ok(())
+                }
             }
+            Ok(_) => Err("custody heartbeat ACK is invalid".to_string()),
+            Err(error) => Err(error),
         }
-    } }
+    }
 
     #[cfg(target_os = "linux")]
     pub fn acknowledge(&mut self,
@@ -441,6 +481,21 @@ impl ControlEndpoint {
         payload.insert("evidence_sha256".to_string(), PayloadValue::String(evidence.to_string()));
     }
     self.send(kind, payload, &[]) }
+
+    #[cfg(target_os = "linux")]
+    pub fn acknowledge_fault(
+        &mut self,
+        received: &ControlPacket,
+        kind: PacketKind,
+        code: &str,
+        evidence_sha256: &str,
+    ) -> Result<u64, String> {
+        self.send(
+            kind,
+            fault_ack_payload(received.seq, code, evidence_sha256)?,
+            &[],
+        )
+    }
 
     pub fn peer_identity(&self) -> &PeerIdentity { &self.expected_peer }
 }
@@ -466,6 +521,73 @@ pub enum CustodyPhase {
 pub struct CustodyController {
     endpoint: ControlEndpoint,
     phase: CustodyPhase,
+}
+
+#[cfg(target_os = "linux")]
+fn decode_worker_prepared(
+    packet: ReceivedPacket,
+) -> Result<ReceivedWorkerRoot, String> {
+    if packet.packet.kind != PacketKind::WorkerPrepared
+        || packet.packet.payload.len() != 4
+    {
+        return Err(
+            "custodian did not send exact WORKER_PREPARED".to_string(),
+        );
+    }
+    let string = |key: &str| {
+        packet.packet.payload.get(key).and_then(|value| match value {
+            PayloadValue::String(value) => Some(value.clone()),
+            _ => None,
+        })
+    };
+    let evidence = string("evidence_sha256")
+        .ok_or_else(|| "WORKER_PREPARED has no evidence digest".to_string())?;
+    validate_sha256(&evidence)?;
+    let pid = match packet.packet.payload.get("pid") {
+        Some(PayloadValue::Unsigned(pid))
+            if *pid > 0 && *pid <= libc::pid_t::MAX as u64 =>
+        {
+            *pid as libc::pid_t
+        }
+        _ => return Err("WORKER_PREPARED PID is invalid".to_string()),
+    };
+    let start_token = string("start_token")
+        .ok_or_else(|| "WORKER_PREPARED start token is missing".to_string())?;
+    let cgroup_membership = string("cgroup_membership").ok_or_else(|| {
+        "WORKER_PREPARED cgroup membership is missing".to_string()
+    })?;
+    if !cgroup_membership.starts_with('/') {
+        return Err(
+            "WORKER_PREPARED cgroup membership is not absolute".to_string(),
+        );
+    }
+    let expected_evidence =
+        worker_prepared_evidence(pid, &start_token, &cgroup_membership)?;
+    if !constant_time_eq(evidence.as_bytes(), expected_evidence.as_bytes()) {
+        return Err(
+            "WORKER_PREPARED evidence does not bind its identity".to_string(),
+        );
+    }
+    let [pidfd]: [OwnedFd; 1] = packet
+        .fds
+        .try_into()
+        .map_err(|_| "WORKER_PREPARED requires exactly one pidfd".to_string())?;
+    crate::workspace::platform::linux::validate_pidfd_identity(
+        pidfd.as_raw_fd(),
+        pid,
+        &start_token,
+    )?;
+    Ok(ReceivedWorkerRoot {
+        pid,
+        pidfd,
+        start_token,
+        cgroup_membership,
+        evidence_sha256: evidence,
+    })
+}
+
+fn custody_fault_evidence(code: &str, error: &str) -> String {
+    hex_digest(format!("custody-fault-v1\0{code}\0{error}").as_bytes())
 }
 
 impl CustodyController {
@@ -497,7 +619,17 @@ impl CustodyController {
         ) {
             return Err("BOOTSTRAP did not receive a custodian READY ACK".to_string());
         }
-        validate_ack(&ready.packet.payload, seq, true)?;
+        match validate_ack(&ready.packet.payload, seq, true)? {
+            AckStatus::Ok => {}
+            AckStatus::Fault {
+                code,
+                evidence_sha256,
+            } => {
+                return Err(format!(
+                    "BOOTSTRAP received fault ACK {code} ({evidence_sha256})"
+                ));
+            }
+        }
         self.phase = CustodyPhase::Ready;
         Ok(ready.packet.payload)
     }
@@ -505,81 +637,33 @@ impl CustodyController {
     #[cfg(target_os = "linux")]
     pub fn worker_prepared(&mut self) -> Result<ReceivedWorkerRoot, String> {
         self.require_phase(CustodyPhase::Ready)?;
-        let packet = self
-            .endpoint
-            .receive(HEARTBEAT_FENCE_AFTER, 1)?;
-        if packet.packet.kind != PacketKind::WorkerPrepared
-            || packet.packet.payload.len() != 4
-        {
-            return Err(
-                "custodian did not send exact WORKER_PREPARED".to_string(),
-            );
-        }
-        let string = |key: &str| {
-            packet.packet.payload.get(key).and_then(|value| match value {
-                PayloadValue::String(value) => Some(value.clone()),
-                _ => None,
-            })
-        };
-        let evidence = string("evidence_sha256")
-            .ok_or_else(|| "WORKER_PREPARED has no evidence digest".to_string())?;
-        validate_sha256(&evidence)?;
-        let pid = match packet.packet.payload.get("pid") {
-            Some(PayloadValue::Unsigned(pid))
-                if *pid > 0 && *pid <= libc::pid_t::MAX as u64 =>
-            {
-                *pid as libc::pid_t
+        let packet = self.endpoint.receive(HEARTBEAT_FENCE_AFTER, 1)?;
+        let command = packet.packet.clone();
+        let root = match decode_worker_prepared(packet) {
+            Ok(root) => root,
+            Err(error) => {
+                let evidence =
+                    custody_fault_evidence("worker_prepared_invalid", &error);
+                return match self.endpoint.acknowledge_fault(
+                    &command,
+                    PacketKind::WorkerPrepared,
+                    "worker_prepared_invalid",
+                    &evidence,
+                ) {
+                    Ok(_) => Err(error),
+                    Err(ack_error) => Err(format!(
+                        "{error}; send authenticated fault ACK: {ack_error}"
+                    )),
+                };
             }
-            _ => return Err("WORKER_PREPARED PID is invalid".to_string()),
         };
-        let start_token = string("start_token")
-            .ok_or_else(|| "WORKER_PREPARED start token is missing".to_string())?;
-        let cgroup_membership = string("cgroup_membership").ok_or_else(|| {
-            "WORKER_PREPARED cgroup membership is missing".to_string()
-        })?;
-        if !cgroup_membership.starts_with('/') {
-            return Err(
-                "WORKER_PREPARED cgroup membership is not absolute".to_string(),
-            );
-        }
-        let expected_evidence = hex_digest(
-            format!(
-                "worker-prepared-v1\0pid{}\0start_token{}\0sandbox=1\0{}",
-                pid, start_token, cgroup_membership
-            )
-            .as_bytes(),
-        );
-        if !constant_time_eq(
-            evidence.as_bytes(),
-            expected_evidence.as_bytes(),
-        ) {
-            return Err(
-                "WORKER_PREPARED evidence does not bind its identity"
-                    .to_string(),
-            );
-        }
-        let [pidfd]: [OwnedFd; 1] = packet
-            .fds
-            .try_into()
-            .map_err(|_| "WORKER_PREPARED requires exactly one pidfd".to_string())?;
-        crate::workspace::platform::linux::validate_pidfd_identity(
-            pidfd.as_raw_fd(),
-            pid,
-            &start_token,
-        )?;
         self.endpoint.acknowledge(
-            &packet.packet,
+            &command,
             PacketKind::WorkerPrepared,
-            Some(&evidence),
+            Some(&root.evidence_sha256),
         )?;
         self.phase = CustodyPhase::Prepared;
-        Ok(ReceivedWorkerRoot {
-            pid,
-            pidfd,
-            start_token,
-            cgroup_membership,
-            evidence_sha256: evidence,
-        })
+        Ok(root)
     }
 
     #[cfg(target_os = "linux")]
@@ -626,9 +710,21 @@ impl CustodyController {
         if empty.packet.kind != PacketKind::Empty
             || empty.packet.payload != evidence_payload(evidence_sha256)?
         {
-            return Err(
-                "QUIESCED custody did not provide exact EMPTY evidence".to_string(),
-            );
+            let error =
+                "QUIESCED custody did not provide exact EMPTY evidence";
+            let fault_evidence =
+                custody_fault_evidence("empty_invalid", error);
+            return match self.endpoint.acknowledge_fault(
+                &empty.packet,
+                PacketKind::Empty,
+                "empty_invalid",
+                &fault_evidence,
+            ) {
+                Ok(_) => Err(error.to_string()),
+                Err(ack_error) => Err(format!(
+                    "{error}; send authenticated fault ACK: {ack_error}"
+                )),
+            };
         }
         self.endpoint.acknowledge(
             &empty.packet,
@@ -756,7 +852,16 @@ impl CustodianServer {
                 continue;
             }
             if packet.packet.kind == PacketKind::Fault {
-                return Err("peer sent authenticated FAULT".to_string());
+                let (code, evidence) =
+                    validate_fault_payload(&packet.packet.payload)?;
+                self.endpoint.acknowledge(
+                    &packet.packet,
+                    PacketKind::Fault,
+                    Some(&evidence),
+                )?;
+                return Err(format!(
+                    "peer sent authenticated FAULT {code} ({evidence})"
+                ));
             }
             if !admitted.contains(&packet.packet.kind) {
                 return Err(format!(
@@ -783,11 +888,21 @@ impl CustodianServer {
                 response.as_str(),
             ));
         }
-        validate_ack(
+        match validate_ack(
             &packet.packet.payload,
             command_seq,
             evidence_sha256.is_some(),
-        )?;
+        )? {
+            AckStatus::Ok => {}
+            AckStatus::Fault {
+                code,
+                evidence_sha256,
+            } => {
+                return Err(format!(
+                    "custodian returned fault ACK {code} ({evidence_sha256})"
+                ));
+            }
+        }
         if let Some(expected) = evidence_sha256 {
             if packet.packet.payload.get("evidence_sha256")
                 != Some(&PayloadValue::String(expected.to_string()))
@@ -807,6 +922,23 @@ impl CustodianServer {
     ) -> Result<(), String> {
         self.endpoint
             .acknowledge(command, response, Some(evidence_sha256))?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn acknowledge_fault(
+        &mut self,
+        command: &ControlPacket,
+        response: PacketKind,
+        code: &str,
+        evidence_sha256: &str,
+    ) -> Result<(), String> {
+        self.endpoint.acknowledge_fault(
+            command,
+            response,
+            code,
+            evidence_sha256,
+        )?;
         Ok(())
     }
 
@@ -959,6 +1091,26 @@ Ok(BTreeMap::from([
 pub fn evidence_payload(evidence_sha256: &str) -> Result<ControlPayload, String> { validate_sha256(evidence_sha256)?;
 Ok(BTreeMap::from([("evidence_sha256".to_string(), PayloadValue::String(evidence_sha256.to_string()))])) }
 
+pub fn worker_prepared_evidence(
+    pid: libc::pid_t,
+    start_token: &str,
+    cgroup_membership: &str,
+) -> Result<String, String> {
+    if pid <= 0
+        || start_token.is_empty()
+        || !start_token.bytes().all(|byte| byte.is_ascii_digit())
+        || !cgroup_membership.starts_with('/')
+    {
+        return Err("WORKER_PREPARED identity is invalid".to_string());
+    }
+    Ok(hex_digest(
+        format!(
+            "worker-prepared-v1\0{pid}\0{start_token}\0{cgroup_membership}\0sandbox=1"
+        )
+        .as_bytes(),
+    ))
+}
+
 pub fn create_control_key_memfd() -> Result<(OwnedFd, [u8; 32]), String> { #[cfg(not(target_os = "linux"))]
 { return Err(crate::workspace::platform::macos::STOP_REASON.to_string()); }
 #[cfg(target_os = "linux")]
@@ -1031,14 +1183,125 @@ fn validate_sha256(value: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_ack(payload: &ControlPayload, ack_seq: u64, evidence_required: bool) -> Result<(), String> {
-    let allowed = if evidence_required { 3 } else { 2 };
-    if payload.len() != allowed
-        || payload.get("ack_seq") != Some(&PayloadValue::Unsigned(ack_seq))
-        || payload.get("status") != Some(&PayloadValue::String("ok".to_string()))
-        || (evidence_required && !matches!(payload.get("evidence_sha256"), Some(PayloadValue::String(value)) if validate_sha256(value).is_ok()))
-    { return Err("custody ACK is not exact".to_string()); }
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum AckStatus {
+    Ok,
+    Fault {
+        code: String,
+        evidence_sha256: String,
+    },
+}
+
+fn validate_fault_code(code: &str) -> Result<(), String> {
+    if code.is_empty()
+        || !code.bytes().all(|byte| {
+            byte.is_ascii_lowercase()
+                || byte.is_ascii_digit()
+                || byte == b'_'
+        })
+    {
+        return Err(
+            "custody fault code must be nonempty lowercase ASCII".to_string(),
+        );
+    }
     Ok(())
+}
+
+fn validate_fault_payload(
+    payload: &ControlPayload,
+) -> Result<(String, String), String> {
+    if payload.len() != 2 {
+        return Err("custody FAULT payload is not exact".to_string());
+    }
+    let code = match payload.get("code") {
+        Some(PayloadValue::String(code)) => code.clone(),
+        _ => return Err("custody FAULT code is missing".to_string()),
+    };
+    validate_fault_code(&code)?;
+    let evidence_sha256 = match payload.get("evidence_sha256") {
+        Some(PayloadValue::String(evidence_sha256)) => {
+            evidence_sha256.clone()
+        }
+        _ => return Err("custody FAULT evidence is missing".to_string()),
+    };
+    validate_sha256(&evidence_sha256)?;
+    Ok((code, evidence_sha256))
+}
+
+fn fault_ack_payload(
+    ack_seq: u64,
+    code: &str,
+    evidence_sha256: &str,
+) -> Result<ControlPayload, String> {
+    validate_fault_code(code)?;
+    validate_sha256(evidence_sha256)?;
+    Ok(BTreeMap::from([
+        ("ack_seq".to_string(), PayloadValue::Unsigned(ack_seq)),
+        (
+            "code".to_string(),
+            PayloadValue::String(code.to_string()),
+        ),
+        (
+            "evidence_sha256".to_string(),
+            PayloadValue::String(evidence_sha256.to_string()),
+        ),
+        (
+            "status".to_string(),
+            PayloadValue::String("fault".to_string()),
+        ),
+    ]))
+}
+
+fn validate_ack(
+    payload: &ControlPayload,
+    ack_seq: u64,
+    evidence_required: bool,
+) -> Result<AckStatus, String> {
+    if payload.get("ack_seq") != Some(&PayloadValue::Unsigned(ack_seq)) {
+        return Err("custody ACK is not exact".to_string());
+    }
+    match payload.get("status") {
+        Some(PayloadValue::String(status)) if status == "ok" => {
+            let allowed = if evidence_required { 3 } else { 2 };
+            if payload.len() != allowed
+                || (evidence_required
+                    && !matches!(
+                        payload.get("evidence_sha256"),
+                        Some(PayloadValue::String(value))
+                            if validate_sha256(value).is_ok()
+                    ))
+            {
+                return Err("custody ACK is not exact".to_string());
+            }
+            Ok(AckStatus::Ok)
+        }
+        Some(PayloadValue::String(status)) if status == "fault" => {
+            if payload.len() != 4 {
+                return Err("custody fault ACK is not exact".to_string());
+            }
+            let code = match payload.get("code") {
+                Some(PayloadValue::String(code)) => code.clone(),
+                _ => return Err("custody fault ACK code is missing".to_string()),
+            };
+            validate_fault_code(&code)?;
+            let evidence_sha256 = match payload.get("evidence_sha256") {
+                Some(PayloadValue::String(evidence_sha256)) => {
+                    evidence_sha256.clone()
+                }
+                _ => {
+                    return Err(
+                        "custody fault ACK evidence is missing".to_string(),
+                    );
+                }
+            };
+            validate_sha256(&evidence_sha256)?;
+            Ok(AckStatus::Fault {
+                code,
+                evidence_sha256,
+            })
+        }
+        _ => Err("custody ACK is not exact".to_string()),
+    }
 }
 
 fn encode_payload(payload: &ControlPayload, out: &mut String) -> Result<(), String> {
@@ -1257,5 +1520,310 @@ fn wait_readable(fd: RawFd, timeout: Duration) -> Result<(), String> {
         if rc == 0 { return Err(format!("custody control deadline elapsed after {} ms", started.elapsed().as_millis())); }
         let error = std::io::Error::last_os_error();
         if error.kind() != std::io::ErrorKind::Interrupted { return Err(format!("poll custody control: {error}")); }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    fn current_peer() -> PeerIdentity {
+        let pid = unsafe { libc::getpid() };
+        PeerIdentity {
+            pid,
+            euid: unsafe { libc::geteuid() },
+            gid: unsafe { libc::getegid() },
+            start_token: crate::workspace::platform::linux::process_start_token(pid)
+                .unwrap(),
+        }
+    }
+
+    #[test]
+    fn heartbeat_fences_only_after_three_missed_deadlines() {
+        let (controller_fd, _silent_peer) = ControlEndpoint::pair().unwrap();
+        let endpoint = ControlEndpoint::new(
+            controller_fd,
+            [0x42; 32],
+            "00000000-0000-4000-8000-000000000001".to_string(),
+            1,
+            Sender::Guardian,
+            current_peer(),
+        )
+        .unwrap();
+        let mut controller = CustodyController {
+            endpoint,
+            phase: CustodyPhase::Active,
+        };
+
+        assert!(controller.heartbeat().is_ok());
+        assert_eq!(controller.phase(), CustodyPhase::Active);
+        assert!(controller.heartbeat().is_ok());
+        assert_eq!(controller.phase(), CustodyPhase::Active);
+        assert!(controller.heartbeat().is_err());
+        assert_eq!(controller.phase(), CustodyPhase::Faulted);
+    }
+
+    #[test]
+    fn late_heartbeat_ack_satisfies_the_outstanding_deadline() {
+        let peer = current_peer();
+        let (guardian_fd, supervisor_fd) = ControlEndpoint::pair().unwrap();
+        let key = [0x29; 32];
+        let session_id =
+            "00000000-0000-4000-8000-000000000001".to_string();
+        let guardian_endpoint = ControlEndpoint::new(
+            guardian_fd,
+            key,
+            session_id.clone(),
+            1,
+            Sender::Guardian,
+            peer.clone(),
+        )
+        .unwrap();
+        let mut supervisor_endpoint = ControlEndpoint::new(
+            supervisor_fd,
+            key,
+            session_id,
+            1,
+            Sender::Supervisor,
+            peer,
+        )
+        .unwrap();
+        let responder = std::thread::spawn(move || {
+            let heartbeat = supervisor_endpoint
+                .receive(Duration::from_secs(1), 0)
+                .unwrap();
+            assert_eq!(heartbeat.packet.kind, PacketKind::Heartbeat);
+            std::thread::sleep(Duration::from_millis(300));
+            supervisor_endpoint
+                .acknowledge(
+                    &heartbeat.packet,
+                    PacketKind::HeartbeatAck,
+                    None,
+                )
+                .unwrap();
+        });
+        let mut controller = CustodyController {
+            endpoint: guardian_endpoint,
+            phase: CustodyPhase::Active,
+        };
+
+        assert!(controller.heartbeat().is_ok());
+        assert!(controller.heartbeat().is_ok());
+        assert_eq!(controller.phase(), CustodyPhase::Active);
+        responder.join().unwrap();
+    }
+
+    #[test]
+    fn lifecycle_command_drains_outstanding_heartbeat_ack() {
+        let peer = current_peer();
+        let (guardian_fd, supervisor_fd) = ControlEndpoint::pair().unwrap();
+        let key = [0x39; 32];
+        let session_id =
+            "00000000-0000-4000-8000-000000000001".to_string();
+        let guardian_endpoint = ControlEndpoint::new(
+            guardian_fd,
+            key,
+            session_id.clone(),
+            1,
+            Sender::Guardian,
+            peer.clone(),
+        )
+        .unwrap();
+        let mut supervisor_endpoint = ControlEndpoint::new(
+            supervisor_fd,
+            key,
+            session_id,
+            1,
+            Sender::Supervisor,
+            peer,
+        )
+        .unwrap();
+        let evidence = "b".repeat(64);
+        let response_evidence = evidence.clone();
+        let responder = std::thread::spawn(move || {
+            let heartbeat = supervisor_endpoint
+                .receive(Duration::from_secs(1), 0)
+                .unwrap();
+            assert_eq!(heartbeat.packet.kind, PacketKind::Heartbeat);
+            std::thread::sleep(Duration::from_millis(300));
+            supervisor_endpoint
+                .acknowledge(
+                    &heartbeat.packet,
+                    PacketKind::HeartbeatAck,
+                    None,
+                )
+                .unwrap();
+            let quiesce = supervisor_endpoint
+                .receive(Duration::from_secs(1), 0)
+                .unwrap();
+            assert_eq!(quiesce.packet.kind, PacketKind::Quiesce);
+            supervisor_endpoint
+                .acknowledge(
+                    &quiesce.packet,
+                    PacketKind::Quiesced,
+                    Some(&response_evidence),
+                )
+                .unwrap();
+        });
+        let mut controller = CustodyController {
+            endpoint: guardian_endpoint,
+            phase: CustodyPhase::Active,
+        };
+
+        assert!(controller.heartbeat().is_ok());
+        let response = controller.quiesce().unwrap();
+        assert_eq!(
+            response.get("evidence_sha256"),
+            Some(&PayloadValue::String(evidence))
+        );
+        assert_eq!(controller.phase(), CustodyPhase::Quiesced);
+        responder.join().unwrap();
+    }
+
+    #[test]
+    fn worker_prepared_uses_one_shared_preimage() {
+        let peer = current_peer();
+        let pid = peer.pid;
+        let start_token = peer.start_token.clone();
+        let membership = "/session";
+        let evidence =
+            worker_prepared_evidence(pid, &start_token, membership).unwrap();
+        let (guardian_fd, supervisor_fd) = ControlEndpoint::pair().unwrap();
+        let key = [0x63; 32];
+        let session_id =
+            "00000000-0000-4000-8000-000000000001".to_string();
+        let guardian_endpoint = ControlEndpoint::new(
+            guardian_fd,
+            key,
+            session_id.clone(),
+            1,
+            Sender::Guardian,
+            peer.clone(),
+        )
+        .unwrap();
+        let supervisor_endpoint = ControlEndpoint::new(
+            supervisor_fd,
+            key,
+            session_id,
+            1,
+            Sender::Supervisor,
+            peer,
+        )
+        .unwrap();
+        let expected_evidence = evidence.clone();
+        let sender = std::thread::spawn(move || {
+            let pidfd =
+                crate::workspace::platform::linux::pidfd_open(pid).unwrap();
+            let mut server = CustodianServer::new(supervisor_endpoint);
+            let seq = server
+                .send_worker_prepared(
+                    pid,
+                    pidfd.as_raw_fd(),
+                    &start_token,
+                    membership,
+                    &expected_evidence,
+                )
+                .unwrap();
+            server
+                .wait_ack(
+                    PacketKind::WorkerPrepared,
+                    seq,
+                    Some(&expected_evidence),
+                )
+                .unwrap();
+        });
+        let mut controller = CustodyController {
+            endpoint: guardian_endpoint,
+            phase: CustodyPhase::Ready,
+        };
+        let root = controller.worker_prepared().unwrap();
+        assert_eq!(root.evidence_sha256, evidence);
+        sender.join().unwrap();
+    }
+
+    #[test]
+    fn fault_ack_is_exact_and_authenticated_by_packet_mac() {
+        let evidence = "a".repeat(64);
+        let payload =
+            fault_ack_payload(7, "activation_failed", &evidence).unwrap();
+        let key = [0x5a; 32];
+        let mut packet = ControlPacket {
+            session_id: "00000000-0000-4000-8000-000000000001".to_string(),
+            generation: 1,
+            sender: Sender::Supervisor,
+            seq: 1,
+            kind: PacketKind::Activated,
+            payload,
+            mac: [0; 32],
+        };
+        packet.mac = hmac(&key, &packet.unsigned_bytes().unwrap());
+        let decoded = ControlPacket::decode(
+            &packet.encode().unwrap(),
+            &key,
+        )
+        .unwrap();
+        assert_eq!(
+            validate_ack(&decoded.payload, 7, true).unwrap(),
+            AckStatus::Fault {
+                code: "activation_failed".to_string(),
+                evidence_sha256: evidence,
+            }
+        );
+    }
+
+    #[test]
+    fn bootstrap_fault_ack_is_rejected_without_phase_progress() {
+        let peer = current_peer();
+        let (guardian_fd, supervisor_fd) = ControlEndpoint::pair().unwrap();
+        let key = [0x71; 32];
+        let session_id =
+            "00000000-0000-4000-8000-000000000001".to_string();
+        let guardian_endpoint = ControlEndpoint::new(
+            guardian_fd,
+            key,
+            session_id.clone(),
+            1,
+            Sender::Guardian,
+            peer.clone(),
+        )
+        .unwrap();
+        let mut supervisor_endpoint = ControlEndpoint::new(
+            supervisor_fd,
+            key,
+            session_id,
+            1,
+            Sender::Supervisor,
+            peer,
+        )
+        .unwrap();
+        let responder = std::thread::spawn(move || {
+            let command = supervisor_endpoint
+                .receive(Duration::from_secs(1), 4)
+                .unwrap();
+            let evidence =
+                custody_fault_evidence("bootstrap_invalid", "bad bootstrap");
+            supervisor_endpoint
+                .acknowledge_fault(
+                    &command.packet,
+                    PacketKind::SupervisorReady,
+                    "bootstrap_invalid",
+                    &evidence,
+                )
+                .unwrap();
+        });
+        let files = [
+            File::open("/dev/null").unwrap(),
+            File::open("/dev/null").unwrap(),
+            File::open("/dev/null").unwrap(),
+            File::open("/dev/null").unwrap(),
+        ];
+        let fds = files.each_ref().map(AsRawFd::as_raw_fd);
+        let mut controller = CustodyController::new(guardian_endpoint);
+        let error = controller
+            .bootstrap(ControlPayload::new(), &fds)
+            .unwrap_err();
+        assert!(error.contains("BOOTSTRAP received fault ACK"));
+        assert_eq!(controller.phase(), CustodyPhase::Bootstrapping);
+        responder.join().unwrap();
     }
 }

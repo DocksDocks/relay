@@ -78,10 +78,7 @@ pub fn run_workspace_guardian_bootstrap(
     let bootstrap_fds =
         cgroup.duplicate_bootstrap_fds(lease.as_raw_fd())?;
     let raw = bootstrap_fds.each_ref().map(AsRawFd::as_raw_fd);
-    let payload = BTreeMap::from([(
-        "leaf".to_string(),
-        PayloadValue::String(cgroup.membership().to_string()),
-    )]);
+    let payload = guardian_bootstrap_payload(cgroup.membership());
     let ready = controller.bootstrap(payload, &raw)?;
     let (root, prepared_evidence_sha256, activated) =
         run_workspace_guardian_activation(controller, cgroup)?;
@@ -91,6 +88,14 @@ pub fn run_workspace_guardian_bootstrap(
         root,
         activated,
     })
+}
+
+#[cfg(target_os = "linux")]
+fn guardian_bootstrap_payload(membership: &str) -> ControlPayload {
+    BTreeMap::from([(
+        "cgroup_membership".to_string(),
+        PayloadValue::String(membership.to_string()),
+    )])
 }
 
 #[cfg(target_os = "linux")]
@@ -122,23 +127,55 @@ pub fn run_workspace_supervisor_entrypoint(
     fault_sink: &mut dyn FnMut(&str),
 ) -> Result<WorkerTreeCustody, String> {
     let bootstrap = server.next_command(PacketKind::Bootstrap, 4)?;
+    let bootstrap_packet = bootstrap.packet.clone();
     if bootstrap.packet.payload.len() != 1 {
-        return Err("BOOTSTRAP payload keys are not exact".to_string());
+        return Err(admitted_fault(
+            server,
+            &bootstrap_packet,
+            PacketKind::SupervisorReady,
+            "bootstrap_invalid",
+            "BOOTSTRAP payload keys are not exact",
+        ));
     }
     let membership = match bootstrap.packet.payload.get("cgroup_membership") {
         Some(PayloadValue::String(value)) if value.starts_with('/') => {
             value.clone()
         }
         _ => {
-            return Err(
-                "BOOTSTRAP has no exact cgroup_membership".to_string(),
-            );
+            return Err(admitted_fault(
+                server,
+                &bootstrap_packet,
+                PacketKind::SupervisorReady,
+                "bootstrap_invalid",
+                "BOOTSTRAP has no exact cgroup_membership",
+            ));
         }
     };
-    let bootstrap_packet = bootstrap.packet.clone();
-    let fds = DelegatedCgroup::receive_bootstrap(bootstrap)?;
+    let fds = match DelegatedCgroup::receive_bootstrap(bootstrap) {
+        Ok(fds) => fds,
+        Err(error) => {
+            return Err(admitted_fault(
+                server,
+                &bootstrap_packet,
+                PacketKind::SupervisorReady,
+                "bootstrap_invalid",
+                &error,
+            ));
+        }
+    };
     let (lease, cgroup) =
-        DelegatedCgroup::from_bootstrap(fds, &membership)?;
+        match DelegatedCgroup::from_bootstrap(fds, &membership) {
+            Ok(custody) => custody,
+            Err(error) => {
+                return Err(admitted_fault(
+                    server,
+                    &bootstrap_packet,
+                    PacketKind::SupervisorReady,
+                    "bootstrap_invalid",
+                    &error,
+                ));
+            }
+        };
     let ready_evidence = hex_digest(
         format!("supervisor-ready-v1\0{membership}").as_bytes(),
     );
@@ -187,44 +224,56 @@ pub fn run_workspace_supervisor_entrypoint(
         }
     };
     if !activate.packet.payload.is_empty() {
-        let error = prepared.abort("ACTIVATE payload must be empty");
-        retain_bootstrap_fault(lease, cgroup, error, fault_sink);
-    }
-    if let Err(error) = cgroup.verify_pre_activation(&prepared.identity) {
+        let error = admitted_fault(
+            server,
+            &activate.packet,
+            PacketKind::Activated,
+            "activation_failed",
+            "ACTIVATE payload must be empty",
+        );
         let error = prepared.abort(error);
         retain_bootstrap_fault(lease, cgroup, error, fault_sink);
     }
-    let (process, activation) = match prepared.activate() {
-        Ok(activated) => activated,
-        Err(error) => retain_bootstrap_fault(lease, cgroup, error, fault_sink),
-    };
-    if let Err(error) = server.acknowledge(
-        &activate.packet,
-        PacketKind::Activated,
-        &activation.evidence_sha256,
-    ) {
-        let lifecycle = WorkerTreeBridge {
-            session_id: bootstrap_packet.session_id,
-            generation: bootstrap_packet.generation.to_string(),
-            backend: "linux_cgroup_v2_pidfd".to_string(),
-            prepared_evidence_sha256: prepared_evidence.evidence_sha256,
-            activated_evidence_sha256: activation.evidence_sha256.clone(),
-            empty_evidence_sha256: None,
-        };
-        let custody = WorkerTreeCustody {
-            cgroup,
-            lease,
-            process,
-            activation,
-            lifecycle,
-        };
-        fence_and_retain_worker_tree_after_peer_loss(custody, |empty| {
-            let detail = empty
-                .map(|evidence| evidence.evidence_sha256.as_str())
-                .unwrap_or("empty proof unavailable");
-            fault_sink(&format!("{error}; {detail}"));
-        });
+    if let Err(error) = cgroup.verify_pre_activation(&prepared.identity) {
+        let error = admitted_fault(
+            server,
+            &activate.packet,
+            PacketKind::Activated,
+            "activation_failed",
+            &error,
+        );
+        let error = prepared.abort(error);
+        retain_bootstrap_fault(lease, cgroup, error, fault_sink);
     }
+    let verified = match prepared.verify_activation() {
+        Ok(verified) => verified,
+        Err(error) => {
+            let error = admitted_fault(
+                server,
+                &activate.packet,
+                PacketKind::Activated,
+                "activation_failed",
+                &error,
+            );
+            retain_bootstrap_fault(lease, cgroup, error, fault_sink);
+        }
+    };
+    let (process, activation) = match verified.release_after_ack(|evidence| {
+        server.acknowledge(
+            &activate.packet,
+            PacketKind::Activated,
+            &evidence.evidence_sha256,
+        )
+    }) {
+        Ok(activated) => activated,
+        Err(error) => {
+            let evidence =
+                custody_fault_evidence("activation_release_failed", &error);
+            let _ =
+                server.send_fault("activation_release_failed", &evidence);
+            retain_bootstrap_fault(lease, cgroup, error, fault_sink);
+        }
+    };
     let lifecycle = WorkerTreeBridge {
         session_id: bootstrap_packet.session_id,
         generation: bootstrap_packet.generation.to_string(),
@@ -241,6 +290,33 @@ pub fn run_workspace_supervisor_entrypoint(
         activation,
         lifecycle,
     })
+}
+
+#[cfg(target_os = "linux")]
+fn custody_fault_evidence(code: &str, error: &str) -> String {
+    hex_digest(format!("custody-fault-v1\0{code}\0{error}").as_bytes())
+}
+
+#[cfg(target_os = "linux")]
+fn admitted_fault(
+    server: &mut CustodianServer,
+    command: &crate::workspace::custody::ControlPacket,
+    response: PacketKind,
+    code: &str,
+    error: &str,
+) -> String {
+    let evidence = custody_fault_evidence(code, error);
+    match server.acknowledge_fault(
+        command,
+        response,
+        code,
+        &evidence,
+    ) {
+        Ok(()) => error.to_string(),
+        Err(ack_error) => {
+            format!("{error}; send authenticated fault ACK: {ack_error}")
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -279,11 +355,19 @@ pub fn run_workspace_supervisor_release_protocol(
         Err(error) => retain_runtime_fault(custody, error, fault_sink),
     };
     if !termination.packet.payload.is_empty() {
-        retain_runtime_fault(
-            custody,
+        let response = if termination.packet.kind == PacketKind::Quiesce {
+            PacketKind::Quiesced
+        } else {
+            PacketKind::Empty
+        };
+        let error = admitted_fault(
+            server,
+            &termination.packet,
+            response,
+            "termination_failed",
             "termination command payload must be empty",
-            fault_sink,
         );
+        retain_runtime_fault(custody, error, fault_sink);
     }
     let empty = if termination.packet.kind == PacketKind::Quiesce {
         let empty = match custody
@@ -291,7 +375,16 @@ pub fn run_workspace_supervisor_release_protocol(
             .wait_root_and_empty(&custody.process)
         {
             Ok(empty) => empty,
-            Err(error) => retain_runtime_fault(custody, error, fault_sink),
+            Err(error) => {
+                let error = admitted_fault(
+                    server,
+                    &termination.packet,
+                    PacketKind::Quiesced,
+                    "quiesce_failed",
+                    &error,
+                );
+                retain_runtime_fault(custody, error, fault_sink);
+            }
         };
         if let Err(error) = server.acknowledge(
             &termination.packet,
@@ -318,7 +411,16 @@ pub fn run_workspace_supervisor_release_protocol(
             .kill_and_wait_empty(&custody.process)
         {
             Ok(empty) => empty,
-            Err(error) => retain_runtime_fault(custody, error, fault_sink),
+            Err(error) => {
+                let error = admitted_fault(
+                    server,
+                    &termination.packet,
+                    PacketKind::Empty,
+                    "terminate_failed",
+                    &error,
+                );
+                retain_runtime_fault(custody, error, fault_sink);
+            }
         };
         if let Err(error) = server.acknowledge(
             &termination.packet,
@@ -340,11 +442,14 @@ pub fn run_workspace_supervisor_release_protocol(
         Err(error) => retain_runtime_fault(custody, error, fault_sink),
     };
     if !prepare.packet.payload.is_empty() {
-        retain_runtime_fault(
-            custody,
+        let error = admitted_fault(
+            server,
+            &prepare.packet,
+            PacketKind::ReleasePrepared,
+            "prepare_release_failed",
             "PREPARE_RELEASE payload must be empty",
-            fault_sink,
         );
+        retain_runtime_fault(custody, error, fault_sink);
     }
     let release_evidence = hex_digest(
         format!(
@@ -366,11 +471,14 @@ pub fn run_workspace_supervisor_release_protocol(
         Err(error) => retain_runtime_fault(custody, error, fault_sink),
     };
     if !close.packet.payload.is_empty() {
-        retain_runtime_fault(
-            custody,
+        let error = admitted_fault(
+            server,
+            &close.packet,
+            PacketKind::LeaseClosed,
+            "close_lease_failed",
             "CLOSE_LEASE payload must be empty",
-            fault_sink,
         );
+        retain_runtime_fault(custody, error, fault_sink);
     }
     let lease_close = custody.lease.close();
     if let Err(error) = server.acknowledge(
@@ -396,9 +504,14 @@ pub fn run_workspace_supervisor_release_protocol(
             evidence.clone()
         }
         _ => {
-            return Err(
-                "CLOSED_COMMITTED evidence payload is not exact".to_string(),
+            let error = admitted_fault(
+                server,
+                &committed.packet,
+                PacketKind::ClosedCommitted,
+                "closed_commit_failed",
+                "CLOSED_COMMITTED evidence payload is not exact",
             );
+            return Err(error);
         }
     };
     server.acknowledge(
@@ -430,19 +543,25 @@ fn retain_runtime_fault(
 
 
 #[cfg(target_os = "linux")]
-pub fn launch_worker_tree_bridge(
+pub fn launch_worker_tree_bridge<F>(
     session_id: &str,
     generation: u64,
     lease: LeaseReference,
     cgroup: DelegatedCgroup,
     launch: &WorkerLaunch,
-) -> Result<WorkerTreeCustody, String> {
+    acknowledge_activated: F,
+) -> Result<WorkerTreeCustody, String>
+where
+    F: FnOnce(&ActivatedEvidence) -> Result<(), String>,
+{
     let prepared = cgroup.launch_worker(launch)?;
     if let Err(error) = cgroup.verify_pre_activation(&prepared.identity) {
         return Err(prepared.abort(error));
     }
     let prepared_evidence = prepared.prepared_evidence.clone();
-    let (process, activation) = prepared.activate()?;
+    let verified = prepared.verify_activation()?;
+    let (process, activation) =
+        verified.release_after_ack(acknowledge_activated)?;
     let lifecycle = WorkerTreeBridge {
         session_id: session_id.to_string(),
         generation: generation.to_string(),
@@ -2334,4 +2453,95 @@ fn decode_hex(encoded: &str) -> Result<Vec<u8>, String> {
                 .map_err(|_| "supervisor byte frame is not hex".to_string())
         })
         .collect()
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod workspace_custody_tests {
+    use super::*;
+
+    #[test]
+    fn guardian_bootstrap_uses_exact_membership_key() {
+        let payload = guardian_bootstrap_payload("/session");
+        assert_eq!(
+            payload.get("cgroup_membership"),
+            Some(&PayloadValue::String("/session".to_string()))
+        );
+        assert_eq!(payload.len(), 1);
+    }
+
+    #[test]
+    fn admitted_activation_failure_sends_authenticated_fault_ack() {
+        use crate::workspace::custody::{
+            ControlEndpoint, PeerIdentity, Sender,
+        };
+
+        let pid = unsafe { libc::getpid() };
+        let peer = PeerIdentity {
+            pid,
+            euid: unsafe { libc::geteuid() },
+            gid: unsafe { libc::getegid() },
+            start_token:
+                crate::workspace::platform::linux::process_start_token(pid)
+                    .unwrap(),
+        };
+        let (guardian_fd, supervisor_fd) = ControlEndpoint::pair().unwrap();
+        let key = [0x31; 32];
+        let session_id =
+            "00000000-0000-4000-8000-000000000001".to_string();
+        let mut guardian = ControlEndpoint::new(
+            guardian_fd,
+            key,
+            session_id.clone(),
+            1,
+            Sender::Guardian,
+            peer.clone(),
+        )
+        .unwrap();
+        let supervisor = ControlEndpoint::new(
+            supervisor_fd,
+            key,
+            session_id,
+            1,
+            Sender::Supervisor,
+            peer,
+        )
+        .unwrap();
+        let receiver = std::thread::spawn(move || {
+            let command_seq = guardian
+                .send(PacketKind::Activate, ControlPayload::new(), &[])
+                .unwrap();
+            let received = guardian
+                .receive(Duration::from_secs(1), 0)
+                .unwrap();
+            (command_seq, received)
+        });
+        let mut server = CustodianServer::new(supervisor);
+        let command = server
+            .next_command(PacketKind::Activate, 0)
+            .unwrap();
+        let error = admitted_fault(
+            &mut server,
+            &command.packet,
+            PacketKind::Activated,
+            "activation_failed",
+            "verification failed",
+        );
+        assert_eq!(error, "verification failed");
+
+        let (command_seq, received) = receiver.join().unwrap();
+        assert_eq!(received.packet.kind, PacketKind::Activated);
+        assert_eq!(
+            received.packet.payload.get("ack_seq"),
+            Some(&PayloadValue::Unsigned(command_seq))
+        );
+        assert_eq!(
+            received.packet.payload.get("status"),
+            Some(&PayloadValue::String("fault".to_string()))
+        );
+        assert_eq!(
+            received.packet.payload.get("code"),
+            Some(&PayloadValue::String("activation_failed".to_string()))
+        );
+        assert_eq!(received.packet.payload.len(), 4);
+    }
 }

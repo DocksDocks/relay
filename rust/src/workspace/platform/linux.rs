@@ -1,6 +1,7 @@
 use crate::sha256::hex_digest;
 use crate::workspace::custody::{
-    ControlEndpoint, LeaseReference, PacketKind, PayloadValue, ReceivedPacket,
+    worker_prepared_evidence, ControlEndpoint, LeaseReference, PacketKind,
+    PayloadValue, ReceivedPacket,
 };
 use std::collections::BTreeMap;
 use std::ffi::{CString, OsStr};
@@ -91,6 +92,14 @@ expected_executable_ino: u64,
 membership: String,
 failure_kill: OwnedFd,
 failure_leaf: PathBuf, }
+
+#[derive(Debug)]
+pub struct VerifiedWorker {
+    identity: ProcessIdentity,
+    evidence: ActivatedEvidence,
+    failure_kill: OwnedFd,
+    failure_leaf: PathBuf,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PreparedEvidence {
@@ -432,14 +441,11 @@ impl DelegatedCgroup {
         start_token: start_token.clone(),
         cgroup_membership: self.membership.clone(),
         sandbox_prepared: true,
-        evidence_sha256: hex_digest(
-            format!(
-                "worker-prepared-v1\0{pid}\0{start_token}\0{}\0sandbox=1",
-                self.membership
-
-            )
-            .as_bytes(),
-        ),
+        evidence_sha256: worker_prepared_evidence(
+            pid,
+            &start_token,
+            &self.membership,
+        )?,
     };
     Ok(PreparedWorker {
         identity: ProcessIdentity { pid, pidfd, start_token },
@@ -504,9 +510,9 @@ impl PreparedWorker {
         self.activation_failure(error.into())
     }
 
-    pub fn activate(
+    pub fn verify_activation(
         mut self,
-    ) -> Result<(ProcessIdentity, ActivatedEvidence), String> {
+    ) -> Result<VerifiedWorker, String> {
         prove_exact_membership(self.identity.pid, &self.membership)
             .map_err(|error| self.activation_failure(error))?;
         write_all_fd(
@@ -536,6 +542,8 @@ impl PreparedWorker {
                 std::io::Error::from_raw_os_error(errno)
             )));
         }
+        wait_for_traced_exec_stop(self.identity.pid)
+            .map_err(|error| self.activation_failure(error))?;
         let current_start = process_start_token(self.identity.pid)
             .map_err(|error| self.activation_failure(error))?;
         if current_start != self.identity.start_token {
@@ -576,9 +584,13 @@ impl PreparedWorker {
             executable_ino: executable.ino(),
             evidence_sha256,
         };
-        Ok((self.identity, evidence))
+        Ok(VerifiedWorker {
+            identity: self.identity,
+            evidence,
+            failure_kill: self.failure_kill,
+            failure_leaf: self.failure_leaf,
+        })
     }
-
     fn activation_failure(&self, error: String) -> String {
         cleanup_failed_launch(
             self.failure_kill.as_raw_fd(),
@@ -590,15 +602,97 @@ impl PreparedWorker {
     }
 }
 
-pub fn process_start_token(pid: libc::pid_t) -> Result<String, String> { if pid <= 0 { return Err("process PID must be positive".to_string()); }
-let stat = fs::read_to_string(format!("/proc/{pid}/stat")).map_err(|e| format!("read /proc/{pid}/stat: {e}"))?;
-let end = stat.rfind(") ").ok_or_else(|| format!("malformed /proc/{pid}/stat"))?;
-let fields = stat[end + 2..].split_ascii_whitespace().collect::<Vec<_>>();
-let token = fields.get(19).ok_or_else(|| format!("/proc/{pid}/stat has no start token"))?;
-if token.is_empty() || !token.bytes().all(|b| b.is_ascii_digit()) || token.starts_with('0') {
-    return Err(format!("/proc/{pid}/stat start token is not canonical"));
+impl VerifiedWorker {
+    pub fn release_after_ack<F>(
+        self,
+        acknowledge: F,
+    ) -> Result<(ProcessIdentity, ActivatedEvidence), String>
+    where
+        F: FnOnce(&ActivatedEvidence) -> Result<(), String>,
+    {
+        if let Err(error) = acknowledge(&self.evidence) {
+            return Err(self.activation_failure(error));
+        }
+        let rc = unsafe {
+            libc::ptrace(
+                libc::PTRACE_DETACH,
+                self.identity.pid,
+                std::ptr::null_mut::<libc::c_void>(),
+                std::ptr::null_mut::<libc::c_void>(),
+            )
+        };
+        if rc != 0 {
+            return Err(self.activation_failure(format!(
+                "release traced activation barrier: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        Ok((self.identity, self.evidence))
+    }
+
+    pub fn abort(self, error: impl Into<String>) -> String {
+        self.activation_failure(error.into())
+    }
+
+    fn activation_failure(&self, error: String) -> String {
+        let _ = unsafe {
+            libc::ptrace(
+                libc::PTRACE_DETACH,
+                self.identity.pid,
+                std::ptr::null_mut::<libc::c_void>(),
+                libc::SIGKILL as usize as *mut libc::c_void,
+            )
+        };
+        cleanup_failed_launch(
+            self.failure_kill.as_raw_fd(),
+            &self.failure_leaf,
+            self.identity.pid,
+            Some(&self.identity.pidfd),
+            error,
+        )
+    }
 }
-Ok((*token).to_string()) }
+
+
+struct ProcessStat {
+    state: char,
+    start_token: String,
+}
+
+fn process_stat(pid: libc::pid_t) -> Result<ProcessStat, String> {
+    if pid <= 0 {
+        return Err("process PID must be positive".to_string());
+    }
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat"))
+        .map_err(|error| format!("read /proc/{pid}/stat: {error}"))?;
+    let end = stat
+        .rfind(") ")
+        .ok_or_else(|| format!("malformed /proc/{pid}/stat"))?;
+    let fields = stat[end + 2..].split_ascii_whitespace().collect::<Vec<_>>();
+    let state = fields
+        .first()
+        .and_then(|value| value.chars().next())
+        .ok_or_else(|| format!("/proc/{pid}/stat has no process state"))?;
+    let start_token = fields
+        .get(19)
+        .ok_or_else(|| format!("/proc/{pid}/stat has no start token"))?;
+    if start_token.is_empty()
+        || !start_token.bytes().all(|byte| byte.is_ascii_digit())
+        || start_token.starts_with('0')
+    {
+        return Err(format!(
+            "/proc/{pid}/stat start token is not canonical"
+        ));
+    }
+    Ok(ProcessStat {
+        state,
+        start_token: (*start_token).to_string(),
+    })
+}
+
+pub fn process_start_token(pid: libc::pid_t) -> Result<String, String> {
+    Ok(process_stat(pid)?.start_token)
+}
 
 pub fn validate_pidfd_identity(
     pidfd: RawFd,
@@ -628,20 +722,8 @@ pub fn validate_pidfd_identity(
     if process_start_token(expected_pid)? != expected_start_token {
         return Err("received pidfd process start token changed".to_string());
     }
-    let live = unsafe {
-        libc::syscall(
-            libc::SYS_pidfd_send_signal,
-            pidfd,
-            0,
-            std::ptr::null::<libc::siginfo_t>(),
-            0,
-        )
-    };
-    if live != 0 {
-        return Err(format!(
-            "received pidfd process is not live: {}",
-            std::io::Error::last_os_error()
-        ));
+    if !pidfd_raw_is_live(pidfd, expected_pid, expected_start_token)? {
+        return Err("received pidfd process is not live".to_string());
     }
     Ok(())
 }
@@ -651,12 +733,55 @@ if fd < 0 { return Err(format!("pidfd_open({pid}): {}", std::io::Error::last_os_
 set_cloexec(fd)?;
 Ok(unsafe { OwnedFd::from_raw_fd(fd) }) }
 
-pub fn pidfd_is_live(identity: &ProcessIdentity) -> Result<bool, String> { let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-let rc = unsafe { libc::waitid(P_PIDFD, identity.pidfd.as_raw_fd() as libc::id_t, &mut info, libc::WEXITED | libc::WNOHANG | libc::WNOWAIT) };
-if rc == 0 { return Ok(unsafe { info.si_pid() } == 0); }
-let error = std::io::Error::last_os_error();
-if error.raw_os_error() == Some(libc::ECHILD) { return Ok(process_start_token(identity.pid).ok().as_deref() == Some(identity.start_token.as_str())); }
-Err(format!("waitid(P_PIDFD): {error}")) }
+fn pidfd_raw_is_live(
+    pidfd: RawFd,
+    pid: libc::pid_t,
+    start_token: &str,
+) -> Result<bool, String> {
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let rc = unsafe {
+        libc::waitid(
+            P_PIDFD,
+            pidfd as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if rc == 0 {
+        return Ok(unsafe { info.si_pid() } == 0);
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ECHILD) {
+        let stat = match process_stat(pid) {
+            Ok(stat) => stat,
+            Err(_) => return Ok(false),
+        };
+        if stat.start_token != start_token
+            || matches!(stat.state, 'Z' | 'X' | 'x')
+        {
+            return Ok(false);
+        }
+        let live = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                pidfd,
+                0,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            )
+        };
+        return Ok(live == 0);
+    }
+    Err(format!("waitid(P_PIDFD): {error}"))
+}
+
+pub fn pidfd_is_live(identity: &ProcessIdentity) -> Result<bool, String> {
+    pidfd_raw_is_live(
+        identity.pidfd.as_raw_fd(),
+        identity.pid,
+        &identity.start_token,
+    )
+}
 
 pub fn signal_pidfd(identity: &ProcessIdentity, signal: i32) -> Result<(), String> { let rc = unsafe { libc::syscall(libc::SYS_pidfd_send_signal, identity.pidfd.as_raw_fd(), signal, std::ptr::null::<libc::siginfo_t>(), 0) };
 if rc != 0 { return Err(format!("pidfd_send_signal: {}", std::io::Error::last_os_error())); }
@@ -863,6 +988,44 @@ unsafe fn clone_or_fork_into_cgroup(cgroup_fd: RawFd) -> Result<ForkResult, Stri
     Ok(ForkResult { pid, pidfd: -1, used_fallback: true })
 }
 
+fn wait_for_traced_exec_stop(pid: libc::pid_t) -> Result<(), String> {
+    let mut status = 0;
+    loop {
+        let rc = unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED) };
+        if rc == pid {
+            break;
+        }
+        if rc < 0
+            && std::io::Error::last_os_error().kind()
+                == std::io::ErrorKind::Interrupted
+        {
+            continue;
+        }
+        return Err(format!(
+            "wait for traced worker exec: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    if !libc::WIFSTOPPED(status) || libc::WSTOPSIG(status) != libc::SIGTRAP {
+        return Err("worker did not stop at traced exec barrier".to_string());
+    }
+    if unsafe {
+        libc::ptrace(
+            libc::PTRACE_SETOPTIONS,
+            pid,
+            std::ptr::null_mut::<libc::c_void>(),
+            libc::PTRACE_O_EXITKILL as usize as *mut libc::c_void,
+        )
+    } != 0
+    {
+        return Err(format!(
+            "arm traced worker exit-kill: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
 fn child_prepare_and_exec(
     argv: &[CString], env: &[CString], cwd: &CString, policy: &LandlockPolicy, resource_fds: &[RawFd],
     activation_fd: RawFd, prepared_fd: RawFd, exec_fd: RawFd,
@@ -886,9 +1049,24 @@ fn child_prepare_and_exec(
     let mut activation = 0_u8;
     if unsafe { libc::read(activation_fd, (&mut activation as *mut u8).cast(), 1) } != 1 || activation != 0x01 { return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "activation barrier closed or ambiguous")); }
     unsafe { libc::close(activation_fd); }
-    let mut argv_ptrs = argv.iter().map(|v| v.as_ptr()).collect::<Vec<_>>(); argv_ptrs.push(std::ptr::null());
-    let mut env_ptrs = env.iter().map(|v| v.as_ptr()).collect::<Vec<_>>(); env_ptrs.push(std::ptr::null());
-    unsafe { libc::execve(argv[0].as_ptr(), argv_ptrs.as_ptr(), env_ptrs.as_ptr()); }
+    if unsafe {
+        libc::ptrace(
+            libc::PTRACE_TRACEME,
+            0,
+            std::ptr::null_mut::<libc::c_void>(),
+            std::ptr::null_mut::<libc::c_void>(),
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut argv_ptrs = argv.iter().map(|v| v.as_ptr()).collect::<Vec<_>>();
+    argv_ptrs.push(std::ptr::null());
+    let mut env_ptrs = env.iter().map(|v| v.as_ptr()).collect::<Vec<_>>();
+    env_ptrs.push(std::ptr::null());
+    unsafe {
+        libc::execve(argv[0].as_ptr(), argv_ptrs.as_ptr(), env_ptrs.as_ptr());
+    }
     Err(std::io::Error::last_os_error())
 }
 
@@ -1144,3 +1322,195 @@ fn c_env(environment: &BTreeMap<String, String>) -> Result<Vec<CString>, String>
 }
 fn fstat_mode(fd: RawFd) -> Result<libc::mode_t, String> { let mut stat: libc::stat = unsafe { std::mem::zeroed() }; if unsafe { libc::fstat(fd, &mut stat) } != 0 { return Err(format!("fstat custody FD: {}", std::io::Error::last_os_error())); } Ok(stat.st_mode) }
 fn fstat_metadata(fd: RawFd) -> Result<(u64, u64), String> { let mut stat: libc::stat = unsafe { std::mem::zeroed() }; if unsafe { libc::fstat(fd, &mut stat) } != 0 { return Err(format!("fstat lease probe: {}", std::io::Error::last_os_error())); } Ok((stat.st_dev, stat.st_ino)) }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn tool_code_stays_stopped_until_activation_is_acknowledged() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let workspace = std::env::temp_dir().join(format!(
+            "session-relay-activation-{}-{suffix}",
+            unsafe { libc::getpid() }
+        ));
+        fs::create_dir(&workspace).unwrap();
+        let marker = workspace.join("tool-ran");
+        let command = format!("printf activated > {}", marker.display());
+        let argv = c_argv(
+            Path::new("/bin/sh"),
+            &["-c".to_string(), command],
+        )
+        .unwrap();
+        let env = c_env(&BTreeMap::new()).unwrap();
+        let cwd = c_path(&workspace).unwrap();
+        let policy = LandlockPolicy {
+            workspace: workspace.clone(),
+            readable: Vec::new(),
+            writable_resources: Vec::new(),
+        };
+        let (activation_read, activation_write) = pipe_cloexec().unwrap();
+        let (prepared_read, prepared_write) = pipe_cloexec().unwrap();
+        let (exec_read, exec_write) = pipe_cloexec().unwrap();
+
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            drop(activation_write);
+            drop(prepared_read);
+            drop(exec_read);
+            let result = child_prepare_and_exec(
+                &argv,
+                &env,
+                &cwd,
+                &policy,
+                &[],
+                activation_read.as_raw_fd(),
+                prepared_write.as_raw_fd(),
+                exec_write.as_raw_fd(),
+            );
+            let errno = result
+                .err()
+                .and_then(|error| error.raw_os_error())
+                .unwrap_or(libc::EPERM);
+            unsafe {
+                libc::write(
+                    exec_write.as_raw_fd(),
+                    errno.to_ne_bytes().as_ptr().cast(),
+                    std::mem::size_of::<i32>(),
+                );
+                libc::_exit(127);
+            }
+        }
+
+        drop(activation_read);
+        drop(prepared_write);
+        drop(exec_write);
+        assert_eq!(
+            read_one_with_deadline(prepared_read.as_raw_fd(), PREPARED_DEADLINE)
+                .unwrap(),
+            0x01
+        );
+        write_all_fd(activation_write.as_raw_fd(), &[0x01]).unwrap();
+        drop(activation_write);
+        let mut exec_status = [0_u8; 4];
+        assert_eq!(
+            read_with_deadline(
+                exec_read.as_raw_fd(),
+                &mut exec_status,
+                PREPARED_DEADLINE,
+            )
+            .unwrap(),
+            0
+        );
+
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED) }, pid);
+        let stopped_before_ack = libc::WIFSTOPPED(status);
+        let ran_before_ack = marker.exists();
+        if stopped_before_ack {
+            assert_eq!(
+                unsafe {
+                    libc::ptrace(
+                        libc::PTRACE_DETACH,
+                        pid,
+                        std::ptr::null_mut::<libc::c_void>(),
+                        std::ptr::null_mut::<libc::c_void>(),
+                    )
+                },
+                0
+            );
+            assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        }
+
+        let ran_after_ack = marker.exists();
+        let _ = fs::remove_file(&marker);
+        fs::remove_dir(&workspace).unwrap();
+        assert!(stopped_before_ack, "worker was not stopped at traced exec");
+        assert!(!ran_before_ack, "tool code ran before ACTIVATED acknowledgment");
+        assert!(ran_after_ack, "tool code did not run after activation acknowledgment");
+    }
+
+    #[test]
+    fn pidfd_echild_rejects_a_zombie_root() {
+        let (pid_read, pid_write) = pipe_cloexec().unwrap();
+        let (release_read, release_write) = pipe_cloexec().unwrap();
+        let intermediary = unsafe { libc::fork() };
+        assert!(intermediary >= 0);
+        if intermediary == 0 {
+            drop(pid_read);
+            drop(release_write);
+            let child = unsafe { libc::fork() };
+            if child == 0 {
+                unsafe { libc::_exit(0) };
+            }
+            write_all_fd(
+                pid_write.as_raw_fd(),
+                &child.to_ne_bytes(),
+            )
+            .unwrap();
+            drop(pid_write);
+            let _ = read_one_with_deadline(
+                release_read.as_raw_fd(),
+                PREPARED_DEADLINE,
+            );
+            let mut status = 0;
+            unsafe {
+                libc::waitpid(child, &mut status, 0);
+                libc::_exit(0);
+            }
+        }
+
+        drop(pid_write);
+        drop(release_read);
+        let mut pid_bytes = [0_u8; std::mem::size_of::<libc::pid_t>()];
+        assert_eq!(
+            read_with_deadline(
+                pid_read.as_raw_fd(),
+                &mut pid_bytes,
+                PREPARED_DEADLINE,
+            )
+            .unwrap(),
+            pid_bytes.len()
+        );
+        let pid = libc::pid_t::from_ne_bytes(pid_bytes);
+        let deadline = Instant::now() + PREPARED_DEADLINE;
+        let start_token = loop {
+            let stat = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+            let end = stat.rfind(") ").unwrap();
+            if stat[end + 2..].starts_with('Z') {
+                break process_start_token(pid).unwrap();
+            }
+            assert!(Instant::now() < deadline, "child did not become a zombie");
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        let identity = ProcessIdentity {
+            pid,
+            pidfd: pidfd_open(pid).unwrap(),
+            start_token,
+        };
+        let accepted_prepared_identity = validate_pidfd_identity(
+            identity.pidfd.as_raw_fd(),
+            identity.pid,
+            &identity.start_token,
+        );
+        let live = pidfd_is_live(&identity).unwrap();
+
+        write_all_fd(release_write.as_raw_fd(), &[0x01]).unwrap();
+        drop(release_write);
+        let mut status = 0;
+        assert_eq!(
+            unsafe { libc::waitpid(intermediary, &mut status, 0) },
+            intermediary
+        );
+        assert!(
+            accepted_prepared_identity.is_err(),
+            "WORKER_PREPARED accepted a zombie pidfd identity"
+        );
+        assert!(!live, "zombie root was accepted by start-token liveness");
+    }
+}
