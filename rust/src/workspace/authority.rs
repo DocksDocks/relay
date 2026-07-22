@@ -6,7 +6,9 @@ use super::schema::{
 };
 use crate::sha256;
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::{CStr, CString, OsStr};
+#[cfg(target_os = "linux")]
+use std::ffi::CString;
+use std::ffi::{CStr, OsStr};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::os::fd::{AsRawFd, RawFd};

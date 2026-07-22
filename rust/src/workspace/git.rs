@@ -684,6 +684,10 @@ fn safe_artifact_symlink(path: &str, target: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn portable_permission_mode(mode: impl Into<u32>) -> u32 {
+    mode.into() & 0o7777
+}
+
 fn walk_artifact_source(
     directory: &File,
     relative: &Path,
@@ -767,7 +771,7 @@ fn walk_artifact_source(
             members.push(ArtifactMember::Regular {
                 path,
                 digest: sha256::hex_digest(&bytes),
-                mode: opened.st_mode & 0o7777,
+                mode: portable_permission_mode(opened.st_mode),
                 file,
                 stat: opened,
             });
@@ -789,7 +793,7 @@ fn walk_artifact_source(
             members.push(ArtifactMember::Symlink {
                 path,
                 target,
-                mode: observed.st_mode & 0o7777,
+                mode: portable_permission_mode(observed.st_mode),
             });
         } else {
             members.push(ArtifactMember::Unsupported { path });

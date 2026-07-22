@@ -25,7 +25,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -3177,10 +3177,17 @@ fn prepare_cleanup_evidence(
     cleanup_fault(session_dir, session_id, "before_empty")?;
     wait_for_durable_file(&broker_close_path, "broker close proof")?;
     if !empty_path.exists() {
-        if dead_custody_identities(session_dir, session_id)?.is_some() {
-            recover_dead_custody_empty(session_dir, session_id)?;
-        } else {
-            runtime_exchange(session_dir, "terminate", None)?;
+        #[cfg(not(target_os = "linux"))]
+        {
+            return Err(platform::MACOS_STOP_REASON.into());
+        }
+        #[cfg(target_os = "linux")]
+        {
+            if dead_custody_identities(session_dir, session_id)?.is_some() {
+                recover_dead_custody_empty(session_dir, session_id)?;
+            } else {
+                runtime_exchange(session_dir, "terminate", None)?;
+            }
         }
     }
     wait_for_durable_file(&empty_path, "custody EMPTY proof")?;
@@ -3722,6 +3729,7 @@ fn verify_intermediate_retained_abort(
     )
 }
 
+#[cfg(target_os = "linux")]
 fn process_identity_gone(pid: libc::pid_t, start_token: &str) -> Result<bool, String> {
     let proc_path = PathBuf::from(format!("/proc/{pid}"));
     if !proc_path.exists() {
@@ -3752,6 +3760,7 @@ fn process_identity_gone(pid: libc::pid_t, start_token: &str) -> Result<bool, St
     }
 }
 
+#[cfg(target_os = "linux")]
 fn closed_custody_identities(
     session_dir: &Path,
     session_id: &str,
@@ -3800,6 +3809,7 @@ fn closed_custody_identities(
     ])
 }
 
+#[cfg(target_os = "linux")]
 fn dead_custody_identities(
     session_dir: &Path,
     session_id: &str,
@@ -3816,6 +3826,7 @@ fn dead_custody_identities(
     Ok(Some(identities))
 }
 
+#[cfg(target_os = "linux")]
 fn recover_dead_custody_empty(session_dir: &Path, session_id: &str) -> Result<String, String> {
     if dead_custody_identities(session_dir, session_id)?.is_none() {
         return Err(
@@ -3841,6 +3852,7 @@ fn recover_dead_custody_empty(session_dir: &Path, session_id: &str) -> Result<St
     )
 }
 
+#[cfg(target_os = "linux")]
 fn close_dead_custody_leases(session_dir: &Path, session_id: &str) -> Result<String, String> {
     let identities = dead_custody_identities(session_dir, session_id)?.ok_or_else(|| {
         "custody lease close requires proof that both custodians died".to_string()
@@ -3904,7 +3916,7 @@ fn remove_stale_custody_socket(socket: &Path) -> Result<(), String> {
         }
     };
     if metadata.file_type().is_symlink()
-        || metadata.mode() & libc::S_IFMT != libc::S_IFSOCK
+        || !metadata.file_type().is_socket()
         || metadata.uid() != unsafe { libc::geteuid() }
     {
         return Err("refuse to remove unproven stale custody command socket".into());
@@ -3918,6 +3930,7 @@ fn remove_stale_custody_socket(socket: &Path) -> Result<(), String> {
         .map_err(|error| format!("remove stale custody command socket directory: {error}"))
 }
 
+#[cfg(target_os = "linux")]
 fn reconcile_closed_custody(
     roots: &AuthorityRoots,
     repository: &git::OpenedRepository,
@@ -3992,6 +4005,9 @@ fn closed_cleanup_replay(
         return Err("cleanup receipt belongs to a different coordinator request".into());
     }
     let receipt_sha256 = sha256::hex_digest(&capability::read_secure_bytes(&receipt_path)?);
+    #[cfg(not(target_os = "linux"))]
+    return Err(platform::MACOS_STOP_REASON.into());
+    #[cfg(target_os = "linux")]
     reconcile_closed_custody(roots, repository, session_dir, session_id, &receipt_sha256)?;
     Ok(Some(receipt))
 }
@@ -4236,10 +4252,17 @@ fn finalize_closed(
     cleanup_fault(session_dir, &session_id, "before_lease_close")?;
     let lease_close_path = session_dir.join("custody-lease-closed-v1.json");
     if !lease_close_path.exists() {
-        if dead_custody_identities(session_dir, &session_id)?.is_some() {
-            close_dead_custody_leases(session_dir, &session_id)?;
-        } else {
-            runtime_exchange(session_dir, "close_lease", None)?;
+        #[cfg(not(target_os = "linux"))]
+        {
+            return Err(platform::MACOS_STOP_REASON.into());
+        }
+        #[cfg(target_os = "linux")]
+        {
+            if dead_custody_identities(session_dir, &session_id)?.is_some() {
+                close_dead_custody_leases(session_dir, &session_id)?;
+            } else {
+                runtime_exchange(session_dir, "close_lease", None)?;
+            }
         }
     }
     wait_for_durable_file(&lease_close_path, "custody lease close proof")?;
@@ -4307,6 +4330,9 @@ fn finalize_closed(
     if intent_object["request_id"].as_str()? != request_id {
         return Err("cleanup intent request changed before Closed reconciliation".into());
     }
+    #[cfg(not(target_os = "linux"))]
+    return Err(platform::MACOS_STOP_REASON.into());
+    #[cfg(target_os = "linux")]
     reconcile_closed_custody(roots, repository, session_dir, &session_id, &receipt_sha256)?;
     Ok(receipt)
 }
@@ -4358,10 +4384,17 @@ fn retain_abort_and_close(
     revoke_worker_if_needed(roots, repository, session_dir, manifest, created_at)?;
     let session_id = manifest.object()?["session_id"].as_str()?;
     if !session_dir.join("custody-empty-v1.json").exists() {
-        if dead_custody_identities(session_dir, session_id)?.is_some() {
-            recover_dead_custody_empty(session_dir, session_id)?;
-        } else {
-            runtime_exchange(session_dir, "terminate", None)?;
+        #[cfg(not(target_os = "linux"))]
+        {
+            return Err(platform::MACOS_STOP_REASON.into());
+        }
+        #[cfg(target_os = "linux")]
+        {
+            if dead_custody_identities(session_dir, session_id)?.is_some() {
+                recover_dead_custody_empty(session_dir, session_id)?;
+            } else {
+                runtime_exchange(session_dir, "terminate", None)?;
+            }
         }
     }
     wait_for_durable_file(
@@ -5448,7 +5481,6 @@ fn start_git_broker(context: GitBrokerStartContext<'_>) -> Result<(), String> {
     ))
 }
 
-#[cfg(target_os = "linux")]
 fn set_spawn_inheritance(fds: &[RawFd], inheritable: bool) -> Result<Vec<(RawFd, i32)>, String> {
     let mut prior = Vec::with_capacity(fds.len());
     for fd in fds {
@@ -5477,7 +5509,6 @@ fn set_spawn_inheritance(fds: &[RawFd], inheritable: bool) -> Result<Vec<(RawFd,
     Ok(prior)
 }
 
-#[cfg(target_os = "linux")]
 fn restore_spawn_inheritance(prior: &[(RawFd, i32)]) -> Result<(), String> {
     let mut error = None;
     for (fd, flags) in prior.iter().copied() {
@@ -5736,7 +5767,6 @@ fn start_custody_runtime(context: CustodyRuntimeStartContext<'_>) -> Result<Stri
     }
 }
 
-#[cfg(target_os = "linux")]
 fn parse_fd_list(value: &str) -> Result<Vec<RawFd>, String> {
     if value.is_empty() || value == "none" {
         return Ok(Vec::new());
@@ -5770,7 +5800,6 @@ fn runtime_key(session_dir: &Path) -> Result<[u8; 32], String> {
         .map_err(|_| "runtime control key is not exactly 32 bytes".to_string())
 }
 
-#[cfg(target_os = "linux")]
 fn persist_runtime_record(
     session_dir: &Path,
     name: &str,
@@ -8596,6 +8625,12 @@ fn run_broker_client(raw: &[String]) -> Result<i32, String> {
 }
 pub fn run(raw: Vec<String>) -> ! {
     if raw.first().map(String::as_str) == Some("__guardian") {
+        #[cfg(not(target_os = "linux"))]
+        {
+            eprintln!("{}", platform::MACOS_STOP_REASON);
+            std::process::exit(1)
+        }
+        #[cfg(target_os = "linux")]
         match run_guardian(&raw[1..]) {
             Ok(()) => std::process::exit(0),
             Err(error) => {
@@ -8605,6 +8640,12 @@ pub fn run(raw: Vec<String>) -> ! {
         }
     }
     if raw.first().map(String::as_str) == Some("__custody-supervisor") {
+        #[cfg(not(target_os = "linux"))]
+        {
+            eprintln!("{}", platform::MACOS_STOP_REASON);
+            std::process::exit(1)
+        }
+        #[cfg(target_os = "linux")]
         match run_custody_supervisor(&raw[1..]) {
             Ok(()) => std::process::exit(0),
             Err(error) => {

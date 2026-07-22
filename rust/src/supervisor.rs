@@ -25,7 +25,9 @@ use crate::workspace::platform::linux::{
     ActivatedEvidence, DelegatedCgroup, EmptyEvidence, ProcessIdentity, VerifiedWorkerLaunch,
     WorkerLaunch,
 };
-use std::collections::{BTreeMap, HashMap};
+#[cfg(target_os = "linux")]
+use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, IsTerminal, Read, Write};

@@ -270,7 +270,7 @@ fn open_private_marker_directory(
 fn open_marker_at(
     directory: &File,
     flags: libc::c_int,
-    mode: libc::mode_t,
+    mode: libc::c_uint,
 ) -> Result<File, std::io::Error> {
     let name = std::ffi::CString::new("workspace-admission-v1.json").unwrap();
     let fd = unsafe {

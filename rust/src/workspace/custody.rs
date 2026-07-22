@@ -1,10 +1,16 @@
 use crate::sha256::{constant_time_eq, hex_digest, hmac};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
+#[cfg(target_os = "linux")]
 use std::fs::File;
+#[cfg(target_os = "linux")]
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::time::{Duration, Instant};
+#[cfg(target_os = "linux")]
+use std::os::fd::FromRawFd;
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::time::Duration;
+#[cfg(target_os = "linux")]
+use std::time::Instant;
 use tinyjson::JsonValue;
 
 pub const CONTROL_FRAME_MAX: usize = 16 * 1024;
