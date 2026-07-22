@@ -176,8 +176,7 @@ impl WorkspaceAuthority {
             fsync_directory(&stage.join("sessions"))?;
             fsync_directory(&stage.join("journal"))?;
             fsync_directory(&stage)?;
-            rename_noreplace(&stage, &target)?;
-            fsync_directory(&repositories)?;
+            publish_bootstrap(&stage,&target,&repositories,&deterministic)?;
             Ok(BootstrapResult { capability, capability_file: deterministic, bootstrap: BootstrapOutcome::Created })
         })();
         if result.is_err() && stage.exists() { fs::remove_dir_all(&stage).ok(); }
@@ -293,7 +292,7 @@ pub fn atomic_create_jcs<T:ClosedJcs>(path:&Path,value:&T,mode:u32)->Result<(),S
 pub fn atomic_replace_jcs<T:ClosedJcs>(path:&Path,value:&T,mode:u32)->Result<(),String>{atomic_write(path,&schema::serialize_jcs_lf(value),mode,true)}
 fn atomic_write(path:&Path,bytes:&[u8],mode:u32,replace:bool)->Result<(),String>{
  let parent=path.parent().ok_or_else(||"record path has no parent".to_string())?;let temp=parent.join(format!(".tmp-{}",crate::store::uuid_v4()));let mut file=OpenOptions::new().create_new(true).write(true).mode(mode).custom_flags(libc::O_CLOEXEC|libc::O_NOFOLLOW).open(&temp).map_err(|e|format!("create {}: {e}",temp.display()))?;file.write_all(bytes).and_then(|_|file.sync_all()).map_err(|e|format!("persist {}: {e}",temp.display()))?;drop(file);
- let result=if replace{fs::rename(&temp,path).map_err(|e|format!("replace {}: {e}",path.display()))}else{rename_noreplace(&temp,path)};if result.is_err(){fs::remove_file(&temp).ok();return result}fsync_directory(parent)
+ let result=if replace{fs::rename(&temp,path).map_err(|e|format!("replace {}: {e}",path.display()))}else{rename_noreplace(&temp,path).map_err(|e|format!("create-once publish {}: {e}",path.display()))};if result.is_err(){fs::remove_file(&temp).ok();return result}fsync_directory(parent)
 }
 
 pub fn ensure_private_directory(path:&Path,euid:u32)->Result<(),String>{
@@ -312,11 +311,18 @@ pub fn ensure_private_directory(path:&Path,euid:u32)->Result<(),String>{
 fn create_private_directory(path:&Path,euid:u32)->Result<(),String>{fs::create_dir(path).map_err(|e|format!("create private directory {}: {e}",path.display()))?;fs::set_permissions(path,fs::Permissions::from_mode(0o700)).map_err(|e|format!("chmod {}: {e}",path.display()))?;ensure_private_directory(path,euid)}
 fn verify_regular(file:&File,path:&Path,mode:u32,euid:u32)->Result<(),String>{let m=file.metadata().map_err(|e|format!("fstat {}: {e}",path.display()))?;if !m.is_file()||m.uid()!=euid||m.nlink()!=1||m.mode()&0o777!=mode{return Err(format!("{} is not an EUID-owned single-link mode-{mode:o} file",path.display()))}Ok(())}
 fn fsync_directory(path:&Path)->Result<(),String>{let file=OpenOptions::new().read(true).custom_flags(libc::O_CLOEXEC|libc::O_NOFOLLOW|libc::O_DIRECTORY).open(path).map_err(|e|format!("open directory {} for fsync: {e}",path.display()))?;file.sync_all().map_err(|e|format!("fsync directory {}: {e}",path.display()))}
-fn rename_noreplace(source:&Path,target:&Path)->Result<(),String>{
+fn publish_bootstrap(stage:&Path,target:&Path,repositories:&Path,deterministic:&Path)->Result<(),String>{
+ match rename_noreplace(stage,target){
+  Ok(())=>fsync_directory(repositories),
+  Err(error) if error.kind()==std::io::ErrorKind::AlreadyExists=>{fs::remove_dir_all(stage).map_err(|cleanup|format!("remove losing bootstrap staging directory {}: {cleanup}",stage.display()))?;Err(format!("workspace authority already exists; retry with --coordinator-capability-file {}",deterministic.display()))},
+  Err(error)=>Err(format!("create-once publish {}: {error}",target.display())),
+ }
+}
+fn rename_noreplace(source:&Path,target:&Path)->Result<(),std::io::Error>{
  #[cfg(target_os="linux")]
- {let s=CString::new(source.as_os_str().as_bytes()).map_err(|_|"source path contains NUL".to_string())?;let t=CString::new(target.as_os_str().as_bytes()).map_err(|_|"target path contains NUL".to_string())?;let result=unsafe{libc::syscall(libc::SYS_renameat2,libc::AT_FDCWD,s.as_ptr(),libc::AT_FDCWD,t.as_ptr(),libc::RENAME_NOREPLACE)};if result==0{return Ok(())}return Err(format!("create-once publish {}: {}",target.display(),std::io::Error::last_os_error()))}
+ {let s=CString::new(source.as_os_str().as_bytes()).map_err(|_|std::io::Error::new(std::io::ErrorKind::InvalidInput,"source path contains NUL"))?;let t=CString::new(target.as_os_str().as_bytes()).map_err(|_|std::io::Error::new(std::io::ErrorKind::InvalidInput,"target path contains NUL"))?;let result=unsafe{libc::syscall(libc::SYS_renameat2,libc::AT_FDCWD,s.as_ptr(),libc::AT_FDCWD,t.as_ptr(),libc::RENAME_NOREPLACE)};if result==0{return Ok(())}Err(std::io::Error::last_os_error())}
  #[cfg(not(target_os="linux"))]
- {if target.exists(){return Err(format!("create-once publish {}: already exists",target.display()))}fs::rename(source,target).map_err(|e|format!("create-once publish {}: {e}",target.display()))}
+ {if target.exists(){return Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists,"target exists"))}fs::rename(source,target)}
 }
 
 pub fn repository_id(euid:u32,dev:u64,ino:u64)->String{sha256::hex_digest(format!("session-relay/repository/v1\0{euid}\0{dev}\0{ino}").as_bytes())}
@@ -414,4 +420,18 @@ fn coordinator_default(name:&str,relative:&str,is_directory:bool)->bool{
  ((lower.contains("manifest")||lower.contains("catalog")||lower=="marketplace.json")&&matches!(Path::new(&lower).extension().and_then(OsStr::to_str),Some("json"|"toml"|"yaml"|"yml")))
 }
 
-#[cfg(test)] mod tests{use super::*;#[test]fn repository_id_is_domain_separated(){assert_eq!(repository_id(1,2,3).len(),64);assert_ne!(repository_id(1,2,3),repository_id(1,2,4));}#[test]fn timestamp_shape(){assert!(schema::Timestamp::parse(&now_timestamp().unwrap()).is_ok());}}
+#[cfg(test)]
+mod tests{
+ use super::*;
+ #[test]fn repository_id_is_domain_separated(){assert_eq!(repository_id(1,2,3).len(),64);assert_ne!(repository_id(1,2,3),repository_id(1,2,4));}
+ #[test]fn timestamp_shape(){assert!(schema::Timestamp::parse(&now_timestamp().unwrap()).is_ok());}
+ #[test]fn bootstrap_publish_race_loser_gets_deterministic_guidance(){
+  let root=std::env::temp_dir().join(format!("session-relay-bootstrap-{}",crate::store::uuid_v4()));fs::create_dir(&root).unwrap();
+  let stage=root.join("stage");let target=root.join("target");fs::create_dir(&stage).unwrap();fs::create_dir(&target).unwrap();
+  let capability=target.join("coordinator-capabilities/00000000000000000001.json");
+  let error=publish_bootstrap(&stage,&target,&root,&capability).unwrap_err();
+  assert_eq!(error,format!("workspace authority already exists; retry with --coordinator-capability-file {}",capability.display()));
+  assert!(!stage.exists());
+  fs::remove_dir_all(root).unwrap();
+ }
+}

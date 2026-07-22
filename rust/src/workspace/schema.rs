@@ -280,7 +280,7 @@ string_primitive!(LowerUuidV4, |v: &str| {
     let b=v.as_bytes(); b.len()==36 && [8,13,18,23].into_iter().all(|i| b[i]==b'-') && b[14]==b'4' && matches!(b[19],b'8'|b'9'|b'a'|b'b') && b.iter().enumerate().all(|(i,c)| [8,13,18,23].contains(&i) || c.is_ascii_digit() || matches!(c,b'a'..=b'f'))
 }, "value is not a lowercase UUID v4");
 string_primitive!(Sha256Digest, |v: &str| v.len()==64 && v.bytes().all(|b| b.is_ascii_digit() || matches!(b,b'a'..=b'f')), "value is not a lowercase SHA-256");
-string_primitive!(Decimal, |v: &str| v=="0" || (!v.starts_with('0') && v.bytes().all(|b| b.is_ascii_digit())), "value is not canonical unsigned decimal");
+string_primitive!(Decimal, |v: &str| v=="0" || (!v.is_empty() && !v.starts_with('0') && v.bytes().all(|b| b.is_ascii_digit())), "value is not canonical unsigned decimal");
 string_primitive!(Timestamp, valid_timestamp, "value is not an exact millisecond UTC timestamp");
 string_primitive!(TaskSlug, |v: &str| !v.is_empty() && v.len()<=48 && v.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b==b'-') && !v.starts_with('-') && !v.ends_with('-') && !v.contains("--"), "task slug is invalid");
 
@@ -574,4 +574,6 @@ mod tests {
  use super::*;
  #[test] fn canonical_roundtrip_and_duplicate_refusal(){let v=parse_jcs(b"{\"a\":[true,null,1],\"z\":\"x\"}\n",true).unwrap();assert_eq!(serialize_jcs(&v),"{\"a\":[true,null,1],\"z\":\"x\"}");assert!(parse_jcs(b"{\"a\":1,\"a\":2}\n",true).is_err());}
  #[test] fn primitives_are_closed(){assert!(LowerUuidV4::parse("11111111-1111-4111-8111-111111111111").is_ok());assert!(LowerUuidV4::parse("11111111-1111-4111-7111-111111111111").is_err());assert!(RelPath::parse("a/b").is_ok());assert!(RelPath::parse("a/../b").is_err());}
+ #[test] fn decimal_requires_at_least_one_digit(){assert!(Decimal::parse("").is_err());assert!(Decimal::parse("0").is_ok());assert!(Decimal::parse("1").is_ok());assert!(Decimal::parse("01").is_err());}
+ #[test] fn case_alias_claims_remain_mutually_exclusive(){let claims=[PathClaimRequestV1{path:"Foo".into(),path_type:"directory".into(),mode:"exclusive".into()},PathClaimRequestV1{path:"foo/bar".into(),path_type:"file".into(),mode:"exclusive".into()}];assert!(validate_non_overlapping_claims(&claims).is_err());}
 }

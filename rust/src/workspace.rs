@@ -14,8 +14,8 @@ use schema::{AbsPath, ClosedJcs, JcsValue, LowerUuidV4, Sha256Digest, WorkspaceS
 use std::collections::BTreeMap;
 use std::fs::{self,File,OpenOptions};
 use std::io::{Read,Write};
-use std::os::fd::{FromRawFd,RawFd};
-use std::os::unix::fs::{OpenOptionsExt,PermissionsExt};
+use std::os::fd::{AsRawFd,FromRawFd,RawFd};
+use std::os::unix::fs::{MetadataExt,OpenOptionsExt,PermissionsExt};
 use std::os::unix::net::{UnixListener,UnixStream};
 use std::path::{Path,PathBuf};
 use std::process::{Command,Stdio};
@@ -100,11 +100,16 @@ impl ClosedJcs for WorkspaceManifestRecord {
   let state=WorkspaceState::parse(object["state"].as_str()?)?;
   let early=matches!(state,WorkspaceState::Reserved|WorkspaceState::Provisioning);
   if early != matches!(object["worktree_identity"],JcsValue::Null){return Err("workspace identity nullability differs from state".into())}
-  let applied_null=matches!(object["applied_wip_commit"],JcsValue::Null)||matches!(object["worker_base_commit"],JcsValue::Null);
-  if early!=applied_null{return Err("applied WIP nullability differs from state".into())}
+  validate_manifest_wip_nullability(early,&object["applied_wip_commit"],&object["worker_base_commit"])?;
   Ok(Self(value))
  }
  fn to_jcs(&self)->JcsValue{self.0.clone()}
+}
+
+fn validate_manifest_wip_nullability(early:bool,applied:&JcsValue,worker_base:&JcsValue)->Result<(),String>{
+ let applied_null=matches!(applied,JcsValue::Null);let worker_null=matches!(worker_base,JcsValue::Null);
+ if applied_null!=worker_null||early!=applied_null{return Err("applied WIP nullability differs from state".into())}
+ Ok(())
 }
 
 struct CanonicalRecord(JcsValue);
@@ -194,7 +199,7 @@ pub fn start_workspace_with_roots_and_verified_executable(roots:&AuthorityRoots,
   let sessions=repository_dir.join("sessions");let session_dir=sessions.join(&request.request_id);
   if session_dir.exists(){return Err("workspace session already exists; use inspect or explicit recovery".into())}
   reject_overlapping_session_claims(&sessions,&request)?;
-  fs::create_dir(&session_dir).map_err(|e|format!("create workspace session: {e}"))?;fs::set_permissions(&session_dir,fs::Permissions::from_mode(0o700)).map_err(|e|format!("chmod workspace session: {e}"))?;for name in ["journal","worker-capabilities","broker-replays","resources"]{fs::create_dir(session_dir.join(name)).map_err(|e|format!("create workspace {name}: {e}"))?;fs::set_permissions(session_dir.join(name),fs::Permissions::from_mode(0o700)).map_err(|e|format!("chmod workspace {name}: {e}"))?}
+  fs::create_dir(&session_dir).map_err(|e|format!("create workspace session: {e}"))?;fs::set_permissions(&session_dir,fs::Permissions::from_mode(0o700)).map_err(|e|format!("chmod workspace session: {e}"))?;for name in ["journal","worker-capabilities","broker-replays","broker-intents","broker-plans","resources"]{fs::create_dir(session_dir.join(name)).map_err(|e|format!("create workspace {name}: {e}"))?;fs::set_permissions(session_dir.join(name),fs::Permissions::from_mode(0o700)).map_err(|e|format!("chmod workspace {name}: {e}"))?}
   let worktree_root=roots.data.join(&repository.identity.repository_id).join(format!("{}-{}",&request.request_id,&request.task_slug));authority::ensure_private_directory(worktree_root.parent().unwrap(),roots.euid)?;
   let branch_ref=format!("refs/heads/docks/{}/{}",&request.request_id,&request.task_slug);
   let manifest=manifest_for(&request,&repository,&worktree_root,&branch_ref,WorkspaceState::Reserved,None,None,None,None,&now,"0",None);
@@ -251,7 +256,28 @@ fn reject_overlapping_session_claims(sessions:&Path,request:&WorkspaceStartReque
 }
 
 fn create_git_shim(worktree:&Path,capability_file:&Path,relay_executable:&Path)->Result<PathBuf,String>{
- let private=git::actual_private_git_dir(worktree)?;let bin=private.join("session-relay/bin");authority::ensure_private_directory(&bin,unsafe{libc::geteuid()})?;let shim=bin.join("git");let quote=|value:&Path|value.to_string_lossy().replace('\'',"'\"'\"'");let body=format!("#!/bin/sh\nexec '{}' workspace __broker-client --worker-capability-file '{}' -- \"$@\"\n",quote(relay_executable),quote(capability_file));write_private_bytes(&shim,body.as_bytes())?;fs::set_permissions(&shim,fs::Permissions::from_mode(0o500)).map_err(|e|format!("chmod Git shim: {e}"))?;Ok(shim)
+ let private=git::actual_private_git_dir(worktree)?;
+ let private_fd=OpenOptions::new().read(true).custom_flags(libc::O_CLOEXEC|libc::O_NOFOLLOW|libc::O_DIRECTORY).open(&private).map_err(|e|format!("securely open private Git directory for shim: {e}"))?;
+ let session_relay=open_or_create_private_dir_at(&private_fd,"session-relay")?;
+ let bin=open_or_create_private_dir_at(&session_relay,"bin")?;
+ let quote=|value:&Path|value.to_string_lossy().replace('\'',"'\"'\"'");
+ let body=format!("#!/bin/sh\nexec '{}' workspace __broker-client --worker-capability-file '{}' -- \"$@\"\n",quote(relay_executable),quote(capability_file));
+ let name=std::ffi::CString::new("git").unwrap();let fd=unsafe{libc::openat(bin.as_raw_fd(),name.as_ptr(),libc::O_WRONLY|libc::O_CREAT|libc::O_EXCL|libc::O_CLOEXEC|libc::O_NOFOLLOW,0o500)};
+ if fd<0{return Err(format!("create Git shim: {}",std::io::Error::last_os_error()))}
+ let mut shim_file=unsafe{File::from_raw_fd(fd)};let metadata=shim_file.metadata().map_err(|e|format!("fstat Git shim: {e}"))?;if !metadata.is_file()||metadata.uid()!=unsafe{libc::geteuid()}||metadata.nlink()!=1||metadata.mode()&0o777!=0o500{return Err("Git shim is not an EUID-owned single-link mode-0500 regular file".into())}
+ shim_file.write_all(body.as_bytes()).and_then(|_|shim_file.sync_all()).map_err(|e|format!("persist Git shim: {e}"))?;bin.sync_all().map_err(|e|format!("fsync Git shim directory: {e}"))?;
+ Ok(private.join("session-relay/bin/git"))
+}
+
+fn open_or_create_private_dir_at(parent:&File,name:&str)->Result<File,String>{
+ let name=std::ffi::CString::new(name).map_err(|_|"private directory component contains NUL".to_string())?;
+ let created=unsafe{libc::mkdirat(parent.as_raw_fd(),name.as_ptr(),0o700)};
+ if created!=0{let error=std::io::Error::last_os_error();if error.kind()!=std::io::ErrorKind::AlreadyExists{return Err(format!("create private directory component: {error}"))}}
+ let fd=unsafe{libc::openat(parent.as_raw_fd(),name.as_ptr(),libc::O_RDONLY|libc::O_CLOEXEC|libc::O_NOFOLLOW|libc::O_DIRECTORY,0)};
+ if fd<0{return Err(format!("securely open private directory component: {}",std::io::Error::last_os_error()))}
+ let file=unsafe{File::from_raw_fd(fd)};let metadata=file.metadata().map_err(|e|format!("fstat private directory component: {e}"))?;if !metadata.is_dir()||metadata.uid()!=unsafe{libc::geteuid()}||metadata.mode()&0o777!=0o700{return Err("Git shim directory is not an EUID-owned mode-0700 real directory".into())}
+ if created==0{parent.sync_all().map_err(|e|format!("fsync parent after Git shim directory creation: {e}"))?}
+ Ok(file)
 }
 
 pub fn list_workspaces(repository_path:&Path,capability_file:&Path)->Result<JcsValue,String>{
@@ -337,7 +363,7 @@ fn run_broker(raw:&[String])->Result<(),String>{
  if resource_fds.iter().any(|fd|*fd==lease_fd){return Err("broker lease FD collides with a held resource FD".into())}
  resources::validate_held_resource_fds(&session_dir.join("resources"),&resource_fds)?;
  let _lease=unsafe{File::from_raw_fd(lease_fd)};let _held_resources=resource_fds.into_iter().map(|fd|unsafe{File::from_raw_fd(fd)}).collect::<Vec<_>>();
- let capability:WorkerCapabilityV1=schema::read_jcs_file(&capability_file,None)?;let record:schema::CapabilityRecordV1=schema::read_jcs_file(&session_dir.join("worker-capability-record-v1.json"),None)?;let socket=PathBuf::from(&capability.broker_socket);if socket.exists(){return Err("broker socket already exists; refusing replacement".into())}let listener=UnixListener::bind(&socket).map_err(|e|format!("bind Git broker {}: {e}",socket.display()))?;fs::set_permissions(&socket,fs::Permissions::from_mode(0o600)).map_err(|e|format!("chmod Git broker socket: {e}"))?;
+ let capability:WorkerCapabilityV1=schema::read_jcs_file(&capability_file,None)?;let record:schema::CapabilityRecordV1=schema::read_jcs_file(&session_dir.join("worker-capability-record-v1.json"),None)?;for name in ["broker-replays","broker-intents","broker-plans"]{authority::ensure_private_directory(&session_dir.join(name),roots.euid)?}let socket=PathBuf::from(&capability.broker_socket);if socket.exists(){return Err("broker socket already exists; refusing replacement".into())}let listener=UnixListener::bind(&socket).map_err(|e|format!("bind Git broker {}: {e}",socket.display()))?;fs::set_permissions(&socket,fs::Permissions::from_mode(0o600)).map_err(|e|format!("chmod Git broker socket: {e}"))?;
  for connection in listener.incoming(){let mut stream=match connection{Ok(stream)=>stream,Err(error)=>return Err(format!("accept Git broker connection: {error}"))};let response=match read_broker_request(&mut stream).and_then(|envelope|handle_broker_request(&roots,&session_dir,&worktree,&branch_ref,&capability,&record,envelope)){Ok(response)=>response,Err(error)=>broker_response("00000000-0000-4000-8000-000000000000","error",1,"",&error,JcsValue::Null)};let mut bytes=schema::serialize_jcs(&response).into_bytes();bytes.push(b'\n');stream.write_all(&bytes).map_err(|e|format!("write Git broker response: {e}"))?;}
  Ok(())
 }
@@ -350,37 +376,121 @@ fn handle_broker_request(roots:&AuthorityRoots,session_dir:&Path,worktree:&Path,
  capability::authenticate_worker(capability,record,&capability.repository_id,&capability.session_id,capability.generation.parse().map_err(|_|"broker generation overflow".to_string())?,operation,&authority::now_timestamp()?)?;
  let replay=session_dir.join("broker-replays").join(format!("{request_id}.json"));let replay_digest=session_dir.join("broker-replays").join(format!("{request_id}.sha256"));if replay.exists(){let existing=capability::read_secure_bytes(&replay_digest)?;if existing!=format!("{supplied_digest}\n").as_bytes(){return Err("changed broker request replay is refused".into())}return schema::parse_jcs(&capability::read_secure_bytes(&replay)?,true)}
  let argv=match &object["argv"]{JcsValue::Array(values)=>values.iter().map(|value|value.as_str().map(str::to_string)).collect::<Result<Vec<_>,_>>()?,_=>return Err("broker argv must be an array".into())};let cwd=PathBuf::from(object["cwd"].as_str()?);if fs::canonicalize(&cwd).map_err(|e|format!("canonicalize broker cwd: {e}"))?!=worktree{return Err("broker cwd differs from the exact workspace root".into())}
- let repository=git::OpenedRepository::open(worktree)?;let gate=repository_gate::RepositoryGate::acquire(roots,&repository.identity)?;let response=match operation{"git_index"=>broker_git_index(&repository,worktree,branch_ref,session_dir,&request_id,&argv),"git_commit"=>broker_git_commit(&repository,worktree,branch_ref,session_dir,&request_id,&argv),"handback"=>broker_handback(&repository,worktree,branch_ref,session_dir,&request_id,&argv),_=>unreachable!()}?;drop(gate);
+ let repository=git::OpenedRepository::open(worktree)?;let (manifest,_)=manifest_claims(session_dir)?;validate_broker_repository_binding(capability,&manifest,&repository,worktree,branch_ref)?;let gate=repository_gate::RepositoryGate::acquire(roots,&repository.identity)?;let response=match operation{"git_index"=>broker_git_index(&repository,worktree,branch_ref,session_dir,&request_id,&supplied_digest,&argv),"git_commit"=>broker_git_commit(&repository,worktree,branch_ref,session_dir,&request_id,&supplied_digest,&argv),"handback"=>broker_handback(&repository,worktree,branch_ref,session_dir,&request_id,&supplied_digest,&argv),_=>unreachable!()}?;drop(gate);
  let response_record=CanonicalRecord(response.clone());authority::atomic_create_jcs(&replay,&response_record,0o600)?;write_private_bytes(&replay_digest,format!("{supplied_digest}\n").as_bytes())?;Ok(response)
 }
 
 fn manifest_claims(session_dir:&Path)->Result<(WorkspaceManifestRecord,Vec<schema::PathClaimRequestV1>),String>{let path=session_dir.join("manifest-v1.json");let manifest:WorkspaceManifestRecord=schema::read_jcs_file(&path,None)?;let object=match &manifest.0{JcsValue::Object(object)=>object,_=>unreachable!()};let claims=match &object["owned_paths"]{JcsValue::Array(values)=>values.iter().map(|value|{let object=value.clone().object()?;Ok(schema::PathClaimRequestV1{path:object["path"].as_str()?.into(),path_type:object["path_type"].as_str()?.into(),mode:object["mode"].as_str()?.into()})}).collect::<Result<Vec<_>,String>>()?,_=>return Err("manifest owned_paths is not an array".into())};Ok((manifest,claims))}
 
-fn broker_git_index(_repository:&git::OpenedRepository,worktree:&Path,branch_ref:&str,session_dir:&Path,request_id:&str,argv:&[String])->Result<JcsValue,String>{
+fn validate_broker_identity_values(capability_repository_id:&str,actual_repository:&schema::RepositoryIdentityV1,expected_repository:&schema::RepositoryIdentityV1,actual_worktree:&schema::WorktreeIdentityV1,expected_worktree:&schema::WorktreeIdentityV1)->Result<(),String>{
+ if capability_repository_id!=actual_repository.repository_id||expected_repository!=actual_repository{return Err("broker repository identity differs from capability or manifest".into())}
+ if actual_worktree!=expected_worktree{return Err("broker worktree or private Git identity differs from manifest".into())}
+ Ok(())
+}
+fn validate_broker_repository_binding(capability:&WorkerCapabilityV1,manifest:&WorkspaceManifestRecord,repository:&git::OpenedRepository,worktree:&Path,branch_ref:&str)->Result<(),String>{
+ let object=match &manifest.0{JcsValue::Object(object)=>object,_=>unreachable!()};
+ let expected_repository=schema::RepositoryIdentityV1::from_jcs(object["repository"].clone())?;
+ let expected_worktree=schema::WorktreeIdentityV1::from_value(object["worktree_identity"].clone())?;
+ let actual_worktree=git::worktree_identity(worktree,branch_ref)?;
+ validate_broker_identity_values(&capability.repository_id,&repository.identity,&expected_repository,&actual_worktree,&expected_worktree)
+}
+
+#[derive(Clone,Debug,Eq,PartialEq)]
+struct BrokerIndexCommand{git_args:Vec<String>,paths:Vec<String>}
+fn parse_broker_index_argv(argv:&[String])->Result<BrokerIndexCommand,String>{
+ let (mut git_args,rest)=match argv{
+  [operation,rest @ ..] if operation=="add"=>(vec!["add".into()],rest),
+  [operation,cached,rest @ ..] if operation=="rm"&&cached=="--cached"=>(vec!["rm".into(),"--cached".into()],rest),
+  [operation,staged,rest @ ..] if operation=="restore"&&staged=="--staged"=>(vec!["restore".into(),"--staged".into()],rest),
+  _=>return Err("Git broker permits exactly add, rm --cached, or restore --staged".into()),
+ };
+ let paths=if rest.first().is_some_and(|arg|arg=="--"){&rest[1..]}else{rest};
+ if paths.is_empty()||paths.iter().any(|arg|arg.starts_with('-')){return Err("Git broker index operation has invalid path grammar".into())}
+ for path in paths{schema::RelPath::parse(path)?;if path.starts_with(':')||path.bytes().any(|byte|matches!(byte,b'*'|b'?'|b'['|b']'|b'\\')){return Err("Git broker requires literal relative path arguments".into())}}
+ git_args.push("--".into());git_args.extend(paths.iter().cloned());
+ Ok(BrokerIndexCommand{git_args,paths:paths.to_vec()})
+}
+
+fn broker_intent<F>(session_dir:&Path,request_id:&str,request_sha256:&str,operation:&str,argv:&[String],build_details:F)->Result<(JcsValue,bool),String>
+where F:FnOnce()->Result<JcsValue,String>{
+ let path=session_dir.join("broker-intents").join(format!("{request_id}.json"));
+ let expected_argv=JcsValue::Array(argv.iter().cloned().map(JcsValue::String).collect());
+ if path.exists(){
+  let record=schema::parse_jcs(&capability::read_secure_bytes(&path)?,true)?;let object=closed_object(&record,&["schema","request_id","request_sha256","operation","argv","details"],"GitBrokerIntentV1")?;
+  if object["schema"].as_str()!=Ok(schema::SCHEMA_V1)||object["request_id"].as_str()!=Ok(request_id)||object["request_sha256"].as_str()!=Ok(request_sha256)||object["operation"].as_str()!=Ok(operation)||object["argv"]!=expected_argv{return Err("changed broker request conflicts with durable mutation intent".into())}
+  return Ok((object["details"].clone(),true))
+ }
+ let details=build_details()?;let record=CanonicalRecord(JcsValue::Object(BTreeMap::from([("argv".into(),expected_argv),("details".into(),details.clone()),("operation".into(),JcsValue::String(operation.into())),("request_id".into(),JcsValue::String(request_id.into())),("request_sha256".into(),JcsValue::String(request_sha256.into())),("schema".into(),JcsValue::String(schema::SCHEMA_V1.into()))])));
+ authority::atomic_create_jcs(&path,&record,0o600)?;Ok((details,false))
+}
+
+fn read_optional_git_file(path:&Path)->Result<Option<Vec<u8>>,String>{
+ let mut file=match OpenOptions::new().read(true).custom_flags(libc::O_CLOEXEC|libc::O_NOFOLLOW).open(path){Ok(file)=>file,Err(error) if error.kind()==std::io::ErrorKind::NotFound=>return Ok(None),Err(error)=>return Err(format!("securely open Git file {}: {error}",path.display()))};
+ let metadata=file.metadata().map_err(|e|format!("fstat Git file {}: {e}",path.display()))?;if !metadata.is_file()||metadata.uid()!=unsafe{libc::geteuid()}||metadata.nlink()!=1{return Err(format!("Git file {} is not an EUID-owned single-link regular file",path.display()))}
+ let mut bytes=Vec::new();file.read_to_end(&mut bytes).map_err(|e|format!("read Git file {}: {e}",path.display()))?;Ok(Some(bytes))
+}
+fn optional_digest(bytes:&Option<Vec<u8>>)->JcsValue{bytes.as_ref().map(|bytes|JcsValue::String(sha256::hex_digest(bytes))).unwrap_or(JcsValue::Null)}
+fn digest_matches(value:&JcsValue,bytes:&Option<Vec<u8>>)->Result<bool,String>{match (value,bytes){(JcsValue::Null,None)=>Ok(true),(JcsValue::String(expected),Some(bytes))=>{Sha256Digest::parse(expected)?;Ok(sha256::hex_digest(bytes)==*expected)},(JcsValue::Null,Some(_))|(JcsValue::String(_),None)=>Ok(false),_=>Err("broker intent index digest has invalid nullability".into())}}
+
+fn prepare_index_plan(worktree:&Path,plan:&Path,index_before:&Option<Vec<u8>>,command:&BrokerIndexCommand)->Result<String,String>{
+ if let Some(bytes)=index_before{write_private_bytes(plan,bytes)?}else{
+  let output=Command::new("git").args(["read-tree","HEAD"]).env("GIT_INDEX_FILE",plan).current_dir(worktree).stdin(Stdio::null()).output().map_err(|e|format!("prepare empty Git index plan: {e}"))?;if !output.status.success(){return Err(format!("prepare empty Git index plan failed: {}",String::from_utf8_lossy(&output.stderr).trim()))}
+ }
+ let args=command.git_args.iter().map(String::as_str).collect::<Vec<_>>();let output=Command::new("git").args(&args).env("GIT_INDEX_FILE",plan).current_dir(worktree).stdin(Stdio::null()).output().map_err(|e|format!("prepare Git index mutation: {e}"))?;if !output.status.success(){fs::remove_file(plan).ok();return Err(format!("Git index operation failed before publication: {}",String::from_utf8_lossy(&output.stderr).trim()))}
+ fs::set_permissions(plan,fs::Permissions::from_mode(0o600)).map_err(|e|format!("chmod Git index plan: {e}"))?;let file=OpenOptions::new().read(true).custom_flags(libc::O_CLOEXEC|libc::O_NOFOLLOW).open(plan).map_err(|e|format!("open Git index plan: {e}"))?;file.sync_all().map_err(|e|format!("fsync Git index plan: {e}"))?;let bytes=read_optional_git_file(plan)?.ok_or_else(||"Git index plan disappeared".to_string())?;Ok(sha256::hex_digest(&bytes))
+}
+
+fn publish_index_plan(index:&Path,plan:&Path,before:&JcsValue,planned_sha256:&str)->Result<(),String>{
+ let current=read_optional_git_file(index)?;if current.as_ref().is_some_and(|bytes|sha256::hex_digest(bytes)==planned_sha256){return Ok(())}if !digest_matches(before,&current)?{return Err("Git index differs from both durable intent precondition and planned result; refusing ambiguous replay".into())}
+ let planned=read_optional_git_file(plan)?.ok_or_else(||"durable Git index plan is missing".to_string())?;if sha256::hex_digest(&planned)!=planned_sha256{return Err("durable Git index plan digest differs from intent".into())}
+ let parent=index.parent().ok_or_else(||"Git index has no parent".to_string())?;let staging=parent.join(format!(".session-relay-index-{}",crate::store::uuid_v4()));write_private_bytes(&staging,&planned)?;
+ let still_current=read_optional_git_file(index)?;if !digest_matches(before,&still_current)?{fs::remove_file(&staging).ok();return Err("Git index changed while publishing durable broker intent".into())}
+ fs::rename(&staging,index).map_err(|e|format!("publish planned Git index: {e}"))?;let directory=OpenOptions::new().read(true).custom_flags(libc::O_CLOEXEC|libc::O_NOFOLLOW|libc::O_DIRECTORY).open(parent).map_err(|e|format!("open Git index directory for fsync: {e}"))?;directory.sync_all().map_err(|e|format!("fsync Git index directory: {e}"))?;
+ let published=read_optional_git_file(index)?.ok_or_else(||"published Git index disappeared".to_string())?;if sha256::hex_digest(&published)!=planned_sha256{return Err("published Git index differs from durable plan".into())}Ok(())
+}
+
+fn broker_git_index(_repository:&git::OpenedRepository,worktree:&Path,branch_ref:&str,session_dir:&Path,request_id:&str,request_sha256:&str,argv:&[String])->Result<JcsValue,String>{
  let (_,claims)=manifest_claims(session_dir)?;
- let operation=argv.first().map(String::as_str).ok_or_else(||"Git broker index operation is missing".to_string())?;if !matches!(operation,"add"|"rm"|"mv"){return Err("Git broker permits only add|rm|mv index operations".into())}
- if argv.iter().skip(1).any(|arg|arg.starts_with('-')&&arg!="--"){return Err("Git broker index flags are outside the closed set".into())}
- let literal_paths=argv.iter().skip(1).filter(|arg|arg.as_str()!="--").collect::<Vec<_>>();if literal_paths.is_empty()||(operation=="mv"&&literal_paths.len()!=2){return Err("Git broker index operation has invalid path arity".into())}
- for path in &literal_paths{schema::RelPath::parse(path)?;if path.starts_with(':')||path.bytes().any(|byte|matches!(byte,b'*'|b'?'|b'['|b']'|b'\\')){return Err("Git broker requires literal relative path arguments".into())}let exact_file=claims.iter().any(|claim|claim.path_type=="file"&&claim.path.eq_ignore_ascii_case(path));if exact_file&&worktree.join(path).is_dir(){return Err("file claim cannot address a directory pathspec".into())}}
- let paths=literal_paths.iter().map(|path|git::NameStatusChange{status:"A".into(),source:None,destination:(**path).clone()}).collect::<Vec<_>>();git::validate_changed_paths(&paths,&claims)?;
+ let command=parse_broker_index_argv(argv)?;
+ for path in &command.paths{let exact_file=claims.iter().any(|claim|claim.path_type=="file"&&claim.path==*path);if exact_file&&worktree.join(path).is_dir(){return Err("file claim cannot address a directory pathspec".into())}}
+ let paths=command.paths.iter().map(|path|git::NameStatusChange{status:"A".into(),source:None,destination:path.clone()}).collect::<Vec<_>>();git::validate_changed_paths(&paths,&claims)?;
  if git::run_git_text(worktree,&["symbolic-ref","-q","HEAD"])?!=branch_ref{return Err("workspace branch changed before broker index mutation".into())}
- let mut args=vec![operation,"--"];args.extend(literal_paths.iter().map(|path|path.as_str()));let output=git::run_git(worktree,&args)?;
- if !output.status.success(){return Ok(broker_response(request_id,"error",output.status.code().unwrap_or(1),&String::from_utf8_lossy(&output.stdout),&String::from_utf8_lossy(&output.stderr),JcsValue::Null))}
+ let index=PathBuf::from(git::run_git_text(worktree,&["rev-parse","--path-format=absolute","--git-path","index"])?);let plan=session_dir.join("broker-plans").join(format!("{request_id}.index"));
+ let (details,_)=broker_intent(session_dir,request_id,request_sha256,"git_index",argv,||{
+  let before=read_optional_git_file(&index)?;let planned_sha256=prepare_index_plan(worktree,&plan,&before,&command)?;
+  Ok(JcsValue::Object(BTreeMap::from([("planned_index_sha256".into(),JcsValue::String(planned_sha256)),("pre_index_sha256".into(),optional_digest(&before))])))
+ })?;
+ let details=closed_object(&details,&["pre_index_sha256","planned_index_sha256"],"GitIndexIntentV1")?;let planned_sha256=details["planned_index_sha256"].as_str()?;Sha256Digest::parse(planned_sha256)?;
+ publish_index_plan(&index,&plan,&details["pre_index_sha256"],planned_sha256)?;
  let changed=git::parse_name_status_z(&git::run_git_bytes(worktree,&["diff","--cached","--name-status","-z","--find-renames","--find-copies"])? )?;git::validate_changed_paths(&changed,&claims)?;
  Ok(broker_response(request_id,"ok",0,"","",JcsValue::Null))
 }
 
-fn broker_git_commit(repository:&git::OpenedRepository,worktree:&Path,branch_ref:&str,session_dir:&Path,request_id:&str,argv:&[String])->Result<JcsValue,String>{
+fn validate_planned_commit(worktree:&Path,commit:&str,pre_head:&str,tree:&str,timestamp:&str,message:&str)->Result<(),String>{
+ if git::run_git_text(worktree,&["rev-parse","--verify",&format!("{commit}^")])?!=pre_head||git::run_git_text(worktree,&["rev-parse","--verify",&format!("{commit}^{{tree}}")])?!=tree{return Err("advanced broker branch does not match the durable commit intent".into())}
+ for (format,expected) in [("%an","Session Relay"),("%ae","session-relay@localhost"),("%cn","Session Relay"),("%ce","session-relay@localhost")]{if git::run_git_text(worktree,&["show","-s",&format!("--format={format}"),commit])?!=expected{return Err("advanced broker commit identity differs from durable intent".into())}}
+ let expected_time=format!("{}+00:00",&timestamp[..19]);for format in ["%aI","%cI"]{if git::run_git_text(worktree,&["show","-s",&format!("--format={format}"),commit])?!=expected_time{return Err("advanced broker commit timestamp differs from durable intent".into())}}
+ if git::run_git_text(worktree,&["show","-s","--format=%B",commit])?!=message.trim_end_matches(['\r','\n']){return Err("advanced broker commit message differs from durable intent".into())}Ok(())
+}
+
+fn broker_git_commit(repository:&git::OpenedRepository,worktree:&Path,branch_ref:&str,session_dir:&Path,request_id:&str,request_sha256:&str,argv:&[String])->Result<JcsValue,String>{
  let (_,claims)=manifest_claims(session_dir)?;
  if argv.len()!=3||argv[0]!="commit"||argv[1]!="-m"{return Err("Git broker commit grammar is exactly commit -m <message>".into())}
  let changed=git::parse_name_status_z(&git::run_git_bytes(worktree,&["diff","--cached","--name-status","-z","--find-renames","--find-copies"])? )?;
  if changed.is_empty(){return Err("Git broker refuses an empty worker commit".into())}
  git::validate_changed_paths(&changed,&claims)?;
- let commit=git::create_worker_commit(repository,worktree,branch_ref,&argv[2],&authority::now_timestamp()?)?;
+ if git::run_git_text(worktree,&["symbolic-ref","-q","HEAD"])?!=branch_ref{return Err("workspace branch changed before broker commit".into())}
+ let (details,_)=broker_intent(session_dir,request_id,request_sha256,"git_commit",argv,||{
+  let pre_head=git::run_git_text(worktree,&["rev-parse","--verify","HEAD"])?;let tree=git::run_git_text(worktree,&["write-tree"])?;let timestamp=authority::now_timestamp()?;
+  Ok(JcsValue::Object(BTreeMap::from([("message".into(),JcsValue::String(argv[2].clone())),("pre_head".into(),JcsValue::String(pre_head)),("timestamp".into(),JcsValue::String(timestamp)),("tree".into(),JcsValue::String(tree))])))
+ })?;
+ let details=closed_object(&details,&["message","pre_head","timestamp","tree"],"GitCommitIntentV1")?;let pre_head=details["pre_head"].as_str()?;let tree=details["tree"].as_str()?;let timestamp=details["timestamp"].as_str()?;let message=details["message"].as_str()?;schema::Timestamp::parse(timestamp)?;repository.validate_oid(pre_head)?;repository.validate_oid(tree)?;
+ if git::run_git_text(worktree,&["write-tree"])?!=tree{return Err("Git index tree changed after durable commit intent".into())}
+ let head=git::run_git_text(worktree,&["rev-parse","--verify","HEAD"])?;let commit=if head==pre_head{git::create_worker_commit(repository,worktree,branch_ref,message,timestamp)?}else{validate_planned_commit(worktree,&head,pre_head,tree,timestamp,message)?;head};
  Ok(broker_response(request_id,"ok",0,&format!("{commit}\n"),"",JcsValue::Null))
 }
 
-fn broker_handback(repository:&git::OpenedRepository,worktree:&Path,branch_ref:&str,session_dir:&Path,request_id:&str,argv:&[String])->Result<JcsValue,String>{
+fn broker_handback(repository:&git::OpenedRepository,worktree:&Path,branch_ref:&str,session_dir:&Path,request_id:&str,request_sha256:&str,argv:&[String])->Result<JcsValue,String>{
  if argv.len()!=2{return Err("broker handback requires request path and digest".into())}
  let request_path=Path::new(&argv[0]);let bytes=capability::read_secure_bytes(request_path).map_err(|e|format!("read handback request: {e}"))?;let request=schema::parse_jcs(&bytes,true)?;
  let request_object=closed_object(&request,&["schema","request_id","session_id","expected_head","created_at"],"HandbackRequestV1")?;
@@ -394,7 +504,9 @@ fn broker_handback(repository:&git::OpenedRepository,worktree:&Path,branch_ref:&
  let commits=git::run_git_text(worktree,&["rev-list","--reverse",&format!("{base}..{head}")])?.lines().map(str::to_string).filter(|value|!value.is_empty()).collect::<Vec<_>>();
  for commit in &commits{let parents=git::run_git_text(worktree,&["rev-list","--parents","-n","1",commit])?;if parents.split_whitespace().count()!=2{return Err("handback produced history is not linear and merge-free".into())}}
  let receipt=JcsValue::Object(BTreeMap::from([("created_at".into(),JcsValue::String(request_object["created_at"].as_str()?.into())),("head_oid".into(),JcsValue::String(head)),("outcome".into(),JcsValue::String("validated".into())),("produced_commits".into(),JcsValue::Array(commits.into_iter().map(JcsValue::String).collect())),("request_id".into(),JcsValue::String(request_object["request_id"].as_str()?.into())),("schema".into(),JcsValue::String(schema::SCHEMA_V1.into())),("session_id".into(),JcsValue::String(request_object["session_id"].as_str()?.into()))]));
- authority::atomic_create_jcs(&session_dir.join("handback-receipt-v1.json"),&CanonicalRecord(receipt.clone()),0o600)?;
+ let receipt_path=session_dir.join("handback-receipt-v1.json");let (_,existing_intent)=broker_intent(session_dir,request_id,request_sha256,"handback",argv,||Ok(JcsValue::Object(BTreeMap::new())))?;
+ if receipt_path.exists(){if !existing_intent{return Err("handback receipt predates its durable broker intent".into())}let existing=schema::parse_jcs(&capability::read_secure_bytes(&receipt_path)?,true)?;if existing!=receipt{return Err("handback receipt differs from durable replay result".into())}return Ok(broker_response(request_id,"ok",0,"","",existing))}
+ authority::atomic_create_jcs(&receipt_path,&CanonicalRecord(receipt.clone()),0o600)?;
  Ok(broker_response(request_id,"ok",0,"","",receipt))
 }
 
@@ -404,7 +516,7 @@ fn broker_response(request_id:&str,status:&str,exit_code:i32,stdout:&str,stderr:
 
 fn run_broker_client(raw:&[String])->Result<i32,String>{
  let divider=raw.iter().position(|arg|arg=="--").ok_or_else(||"broker client requires -- before Git arguments".to_string())?;let flags=Flags::parse(&raw[..divider],&["--worker-capability-file"])?;let capability_file=flags.absolute("--worker-capability-file")?;let argv=raw[divider+1..].to_vec();
- let operation=match argv.first().map(String::as_str){Some("add"|"rm"|"mv")=>"git_index",Some("commit")=>"git_commit",Some(other)=>return Err(format!("Git operation {other} is refused by the closed broker")),None=>return Err("Git broker requires an operation".into())};
+ let operation=match argv.first().map(String::as_str){Some("add"|"rm"|"restore")=>{parse_broker_index_argv(&argv)?;"git_index"},Some("commit")=>"git_commit",Some(other)=>return Err(format!("Git operation {other} is refused by the closed broker")),None=>return Err("Git broker requires an operation".into())};
  let capability:WorkerCapabilityV1=schema::read_jcs_file(&capability_file,None)?;let response=broker_exchange(&capability,operation,argv,std::env::current_dir().map_err(|e|format!("resolve broker client cwd: {e}"))?)?;let object=match response{JcsValue::Object(object)=>object,_=>return Err("broker response is not an object".into())};
  print!("{}",object["stdout"].as_str()?);eprint!("{}",object["stderr"].as_str()?);object["exit_code"].as_str()?.parse().map_err(|_|"broker exit code is invalid".to_string())
 }
@@ -419,4 +531,51 @@ pub fn run(raw: Vec<String>) -> ! {
  match result { Ok(output)=>{print!("{output}");std::process::exit(0)},Err(error)=>{eprintln!("{error}");std::process::exit(1)} }
 }
 
-#[cfg(test)] mod tests { use super::*; #[test] fn exact_router_is_closed(){let args=vec!["preserve".into(),"--request-file".into(),"/tmp/request.json".into(),"--request-sha256".into(),"a".repeat(64)];assert!(matches!(parse_command(&args),Ok(WorkspaceCommand::Preserve{..})));let mut bad=args;bad.extend(["--extra".into(),"x".into()]);assert!(parse_command(&bad).is_err());} }
+#[cfg(test)]
+mod tests {
+ use super::*;
+ #[test] fn exact_router_is_closed(){let args=vec!["preserve".into(),"--request-file".into(),"/tmp/request.json".into(),"--request-sha256".into(),"a".repeat(64)];assert!(matches!(parse_command(&args),Ok(WorkspaceCommand::Preserve{..})));let mut bad=args;bad.extend(["--extra".into(),"x".into()]);assert!(parse_command(&bad).is_err());}
+ #[test] fn manifest_wip_fields_are_state_coupled(){
+  let oid=JcsValue::String("a".repeat(40));
+  assert!(validate_manifest_wip_nullability(true,&JcsValue::Null,&JcsValue::Null).is_ok());
+  assert!(validate_manifest_wip_nullability(false,&oid,&oid).is_ok());
+  assert!(validate_manifest_wip_nullability(true,&JcsValue::Null,&oid).is_err());
+  assert!(validate_manifest_wip_nullability(true,&oid,&JcsValue::Null).is_err());
+  assert!(validate_manifest_wip_nullability(false,&JcsValue::Null,&JcsValue::Null).is_err());
+ }
+ #[test] fn broker_index_grammar_is_exact(){
+  let strings=|values:&[&str]|values.iter().map(|value|value.to_string()).collect::<Vec<_>>();
+  assert_eq!(parse_broker_index_argv(&strings(&["add","--","src/a.rs"])).unwrap().git_args,strings(&["add","--","src/a.rs"]));
+  assert_eq!(parse_broker_index_argv(&strings(&["rm","--cached","src/a.rs"])).unwrap().git_args,strings(&["rm","--cached","--","src/a.rs"]));
+  assert_eq!(parse_broker_index_argv(&strings(&["restore","--staged","--","src/a.rs"])).unwrap().git_args,strings(&["restore","--staged","--","src/a.rs"]));
+  for refused in [strings(&["mv","a","b"]),strings(&["rm","a"]),strings(&["restore","a"]),strings(&["add","-A"])]{assert!(parse_broker_index_argv(&refused).is_err())}
+ }
+ #[test] fn broker_identity_binds_repository_and_private_git_inode(){
+  use schema::{ObjectFormat,RepositoryIdentityV1,WorktreeIdentityV1};
+  let repository=RepositoryIdentityV1{repository_id:"a".repeat(64),common_dir_realpath:"/repo/.git".into(),common_dir_dev:"1".into(),common_dir_ino:"2".into(),common_dir_owner_euid:"3".into(),euid:"3".into(),object_format:ObjectFormat::Sha1};
+  let worktree=WorktreeIdentityV1{identity_sha256:"b".repeat(64),root_realpath:"/repo/w".into(),root_dev:"4".into(),root_ino:"5".into(),root_owner_euid:"3".into(),private_git_dir_realpath:"/repo/.git/worktrees/w".into(),private_git_dir_dev:"1".into(),private_git_dir_ino:"6".into(),branch_ref:"refs/heads/docks/x/task".into()};
+  assert!(validate_broker_identity_values(&repository.repository_id,&repository,&repository,&worktree,&worktree).is_ok());
+  let mut replaced=worktree.clone();replaced.private_git_dir_ino="7".into();assert!(validate_broker_identity_values(&repository.repository_id,&repository,&repository,&replaced,&worktree).is_err());
+  assert!(validate_broker_identity_values(&"c".repeat(64),&repository,&repository,&worktree,&worktree).is_err());
+ }
+ #[test] fn durable_broker_intent_precedes_and_authenticates_replay(){
+  let root=std::env::temp_dir().join(format!("session-relay-intent-{}",crate::store::uuid_v4()));authority::ensure_private_directory(&root.join("broker-intents"),unsafe{libc::geteuid()}).unwrap();
+  let request_id="11111111-1111-4111-8111-111111111111";let argv=vec!["commit".into(),"-m".into(),"message".into()];let details=JcsValue::Object(BTreeMap::from([("pre_head".into(),JcsValue::String("a".repeat(40)))]));
+  let (created,existing)=broker_intent(&root,request_id,&"b".repeat(64),"git_commit",&argv,||Ok(details.clone())).unwrap();assert_eq!(created,details);assert!(!existing);assert!(root.join("broker-intents").join(format!("{request_id}.json")).exists());
+  let (replayed,existing)=broker_intent(&root,request_id,&"b".repeat(64),"git_commit",&argv,||panic!("durable replay must not rebuild intent")).unwrap();assert_eq!(replayed,details);assert!(existing);
+  assert!(broker_intent(&root,request_id,&"c".repeat(64),"git_commit",&argv,||Ok(JcsValue::Null)).is_err());
+  fs::remove_dir_all(root).unwrap();
+ }
+ #[test] fn durable_index_plan_reconciles_pre_and_post_mutation_states(){
+  let root=std::env::temp_dir().join(format!("session-relay-index-plan-{}",crate::store::uuid_v4()));fs::create_dir(&root).unwrap();let index=root.join("index");let plan=root.join("plan");fs::write(&index,b"before").unwrap();fs::write(&plan,b"planned").unwrap();
+  let before=JcsValue::String(sha256::hex_digest(b"before"));let planned=sha256::hex_digest(b"planned");publish_index_plan(&index,&plan,&before,&planned).unwrap();assert_eq!(fs::read(&index).unwrap(),b"planned");
+  publish_index_plan(&index,&plan,&before,&planned).unwrap();fs::write(&index,b"unrelated").unwrap();assert!(publish_index_plan(&index,&plan,&before,&planned).is_err());fs::remove_dir_all(root).unwrap();
+ }
+ #[test] fn git_shim_is_create_new_no_follow_and_fsynced_at_final_mode(){
+  use std::os::unix::fs::symlink;
+  let root=std::env::temp_dir().join(format!("session-relay-shim-{}",crate::store::uuid_v4()));fs::create_dir(&root).unwrap();let output=Command::new("git").args(["init","-q"]).current_dir(&root).output().unwrap();assert!(output.status.success());
+  let capability=root.join("capability.json");let shim=create_git_shim(&root,&capability,Path::new("/bin/true")).unwrap();let metadata=fs::symlink_metadata(&shim).unwrap();assert!(metadata.is_file());assert_eq!(metadata.mode()&0o777,0o500);assert_eq!(metadata.nlink(),1);
+  fs::remove_file(&shim).unwrap();let outside=root.join("outside");fs::write(&outside,b"unchanged").unwrap();symlink(&outside,&shim).unwrap();assert!(create_git_shim(&root,&capability,Path::new("/bin/true")).is_err());assert_eq!(fs::read(&outside).unwrap(),b"unchanged");
+  fs::remove_dir_all(root).unwrap();
+ }
+}

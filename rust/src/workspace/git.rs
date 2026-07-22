@@ -93,8 +93,8 @@ fn preserve_commit(repository:&OpenedRepository,request:&PreserveRequestV1,outpu
 }
 
 fn preserve_artifact(repository:&OpenedRepository,request:&PreserveRequestV1,output:&Path)->Result<WipPayloadV1,String>{
- let binary_diff=output.join("tracked-full-index.binary");let diff=run_git_bytes(&repository.root,&["diff","--binary","--full-index",&request.base_commit,"--"])?;write_private(&binary_diff,&diff)?;
- if fs::read(&binary_diff).map_err(|e|format!("read back tracked artifact: {e}"))?!=diff{return Err("tracked artifact read-back differs".into())}
+ let binary_diff_staging=output.join("tracked-full-index.binary");let diff=run_git_bytes(&repository.root,&["diff","--binary","--full-index",&request.base_commit,"--"])?;write_private(&binary_diff_staging,&diff)?;
+ if fs::read(&binary_diff_staging).map_err(|e|format!("read back tracked artifact: {e}"))?!=diff{return Err("tracked artifact read-back differs".into())}
  let inventory_bytes=run_git_bytes(&repository.root,&["ls-files","-z","--others","--exclude-standard"])?;
  let mut entries=Vec::new();
  for bytes in inventory_bytes.split(|byte|*byte==0).filter(|entry|!entry.is_empty()){
@@ -108,10 +108,14 @@ fn preserve_artifact(repository:&OpenedRepository,request:&PreserveRequestV1,out
  entries.sort();if entries.windows(2).any(|pair|pair[0]==pair[1]){return Err("artifact inventory contains duplicate paths".into())}
  let mut inventory=Vec::new();for entry in &entries{inventory.extend_from_slice(entry.as_bytes());inventory.push(0)}
  if inventory!=inventory_bytes{return Err("artifact inventory is not raw-byte ordered".into())}
- let untracked_inventory=output.join("untracked.inventory");write_private(&untracked_inventory,&inventory)?;
- if fs::read(&untracked_inventory).map_err(|e|format!("read back artifact inventory: {e}"))?!=inventory{return Err("artifact inventory read-back differs".into())}
- let untracked_archive=output.join("untracked.pax");create_pax_archive(&repository.root,&untracked_archive,&inventory)?;
- let archive_file=OpenOptions::new().read(true).custom_flags(libc::O_CLOEXEC|libc::O_NOFOLLOW).open(&untracked_archive).map_err(|e|format!("reopen PAX archive: {e}"))?;archive_file.sync_all().map_err(|e|format!("sync PAX archive: {e}"))?;let metadata=archive_file.metadata().map_err(|e|format!("inspect PAX archive: {e}"))?;if !metadata.is_file()||metadata.uid()!=unsafe{libc::geteuid()}||metadata.nlink()!=1||metadata.mode()&0o777!=0o600{return Err("PAX archive is not an EUID-owned single-link mode-0600 regular file".into())}
+ let untracked_inventory_staging=output.join("untracked.inventory");write_private(&untracked_inventory_staging,&inventory)?;
+ if fs::read(&untracked_inventory_staging).map_err(|e|format!("read back artifact inventory: {e}"))?!=inventory{return Err("artifact inventory read-back differs".into())}
+ let untracked_archive_staging=output.join("untracked.pax");create_pax_archive(&repository.root,&untracked_archive_staging,&inventory)?;
+ let archive_file=OpenOptions::new().read(true).custom_flags(libc::O_CLOEXEC|libc::O_NOFOLLOW).open(&untracked_archive_staging).map_err(|e|format!("reopen PAX archive: {e}"))?;archive_file.sync_all().map_err(|e|format!("sync PAX archive: {e}"))?;let metadata=archive_file.metadata().map_err(|e|format!("inspect PAX archive: {e}"))?;if !metadata.is_file()||metadata.uid()!=unsafe{libc::geteuid()}||metadata.nlink()!=1||metadata.mode()&0o777!=0o600{return Err("PAX archive is not an EUID-owned single-link mode-0600 regular file".into())}
+ let archive=fs::read(&untracked_archive_staging).map_err(|e|format!("read PAX archive: {e}"))?;
+ let binary_diff=publish_content_addressed(&binary_diff_staging,&diff,"tracked-full-index.binary")?;
+ let untracked_inventory=publish_content_addressed(&untracked_inventory_staging,&inventory,"untracked.inventory")?;
+ let untracked_archive=publish_content_addressed(&untracked_archive_staging,&archive,"untracked.pax")?;
  Ok(WipPayloadV1::Artifact{binary_diff:binary_diff.to_string_lossy().into_owned(),untracked_inventory:untracked_inventory.to_string_lossy().into_owned(),untracked_archive:untracked_archive.to_string_lossy().into_owned(),archive_format:"pax".into(),entries})
 }
 
@@ -123,6 +127,23 @@ fn create_pax_archive(root:&Path,archive:&Path,inventory:&[u8])->Result<(),Strin
 }
 
 fn write_private(path:&Path,bytes:&[u8])->Result<(),String>{let mut file=OpenOptions::new().create_new(true).write(true).mode(0o600).custom_flags(libc::O_CLOEXEC|libc::O_NOFOLLOW).open(path).map_err(|e|format!("create {}: {e}",path.display()))?;file.write_all(bytes).and_then(|_|file.sync_all()).map_err(|e|format!("persist {}: {e}",path.display()))}
+
+fn publish_content_addressed(staging:&Path,bytes:&[u8],label:&str)->Result<PathBuf,String>{
+ let digest=sha256::hex_digest(bytes);let target=staging.parent().ok_or_else(||"artifact staging path has no parent".to_string())?.join(format!("{digest}.{label}"));
+ fs::rename(staging,&target).map_err(|e|format!("publish content-addressed artifact {}: {e}",target.display()))?;
+ let directory=OpenOptions::new().read(true).custom_flags(libc::O_CLOEXEC|libc::O_NOFOLLOW|libc::O_DIRECTORY).open(target.parent().unwrap()).map_err(|e|format!("open artifact directory for fsync: {e}"))?;directory.sync_all().map_err(|e|format!("fsync artifact directory: {e}"))?;
+ Ok(target)
+}
+
+fn read_content_addressed(path:&Path,label:&str)->Result<Vec<u8>,String>{
+ let file_name=path.file_name().and_then(|name|name.to_str()).ok_or_else(||format!("content-addressed {label} path is not UTF-8"))?;
+ let digest=file_name.strip_suffix(&format!(".{label}")).ok_or_else(||format!("{label} path is not content-addressed"))?;schema::Sha256Digest::parse(digest)?;
+ let mut file=OpenOptions::new().read(true).custom_flags(libc::O_CLOEXEC|libc::O_NOFOLLOW).open(path).map_err(|e|format!("securely open {label}: {e}"))?;
+ let metadata=file.metadata().map_err(|e|format!("fstat {label}: {e}"))?;if !metadata.is_file()||metadata.uid()!=unsafe{libc::geteuid()}||metadata.nlink()!=1||metadata.mode()&0o777!=0o600{return Err(format!("{label} is not an EUID-owned single-link mode-0600 regular file"))}
+ let mut bytes=Vec::new();use std::io::Read;file.read_to_end(&mut bytes).map_err(|e|format!("read {label}: {e}"))?;
+ if sha256::hex_digest(&bytes)!=digest{return Err(format!("{label} content digest differs from its receipt-bound name"))}
+ Ok(bytes)
+}
 
 fn git_env(cwd:&Path,args:&[&str],environment:&[(&str,&str)])->Result<String,String>{let output=Command::new("git").args(args).envs(environment.iter().copied()).current_dir(cwd).stdin(Stdio::null()).output().map_err(|e|format!("run git {}: {e}",args.join(" ")))?;if !output.status.success(){return Err(format!("git {} failed: {}",args.join(" "),String::from_utf8_lossy(&output.stderr).trim()))}String::from_utf8(output.stdout).map(|v|v.trim().to_string()).map_err(|_|"Git output was not UTF-8".into())}
 fn fixed_commit_tree(repository:&OpenedRepository,tree:&str,parent:&str,timestamp:&str,message:&str)->Result<String,String>{let environment=[("GIT_AUTHOR_NAME","Session Relay"),("GIT_AUTHOR_EMAIL","session-relay@localhost"),("GIT_AUTHOR_DATE",timestamp),("GIT_COMMITTER_NAME","Session Relay"),("GIT_COMMITTER_EMAIL","session-relay@localhost"),("GIT_COMMITTER_DATE",timestamp)];git_env(&repository.root,&["commit-tree",tree,"-p",parent,"-m",message],&environment)}
@@ -159,9 +180,12 @@ pub fn apply_wip(repository:&OpenedRepository,worktree:&Path,branch_ref:&str,bas
    run_git_text(worktree,&["read-tree","--reset","-u",tree_oid])?;
   }
   WipPayloadV1::Artifact{binary_diff,untracked_inventory,untracked_archive,entries,..}=>{
-   let inventory=fs::read(untracked_inventory).map_err(|e|format!("read artifact inventory: {e}"))?;let parsed=inventory.split(|byte|*byte==0).filter(|value|!value.is_empty()).map(|value|std::str::from_utf8(value).map(str::to_string).map_err(|_|"artifact inventory is not UTF-8".to_string())).collect::<Result<Vec<_>,_>>()?;if &parsed!=entries{return Err("artifact inventory differs from receipt entries".into())}
-   let output=Command::new("git").args(["apply","--index","--binary"]).arg(binary_diff).current_dir(worktree).stdin(Stdio::null()).output().map_err(|e|format!("apply tracked artifact: {e}"))?;if !output.status.success(){return Err(format!("apply tracked artifact failed: {}",String::from_utf8_lossy(&output.stderr).trim()))}
+   let diff=read_content_addressed(Path::new(binary_diff),"tracked-full-index.binary")?;
+   let inventory=read_content_addressed(Path::new(untracked_inventory),"untracked.inventory")?;
+   let _archive=read_content_addressed(Path::new(untracked_archive),"untracked.pax")?;
+   let parsed=inventory.split(|byte|*byte==0).filter(|value|!value.is_empty()).map(|value|std::str::from_utf8(value).map(str::to_string).map_err(|_|"artifact inventory is not UTF-8".to_string())).collect::<Result<Vec<_>,_>>()?;if &parsed!=entries{return Err("artifact inventory differs from receipt entries".into())}
    let listed=Command::new("tar").args(["-tf",untracked_archive]).stdin(Stdio::null()).output().map_err(|e|format!("list artifact archive: {e}"))?;if !listed.status.success(){return Err("artifact archive cannot be listed".into())}let archive_entries=String::from_utf8(listed.stdout).map_err(|_|"artifact archive member is not UTF-8".to_string())?.lines().map(|line|line.trim_end_matches('/').to_string()).filter(|line|!line.is_empty()).collect::<Vec<_>>();if archive_entries!=*entries{return Err("artifact archive membership differs from receipt".into())}
+   if !diff.is_empty(){let output=Command::new("git").args(["apply","--index","--binary"]).arg(binary_diff).current_dir(worktree).stdin(Stdio::null()).output().map_err(|e|format!("apply tracked artifact: {e}"))?;if !output.status.success(){return Err(format!("apply tracked artifact failed: {}",String::from_utf8_lossy(&output.stderr).trim()))}}
    let output=Command::new("tar").args(["--extract","--no-same-owner","--no-same-permissions","--keep-old-files","-f",untracked_archive]).current_dir(worktree).stdin(Stdio::null()).output().map_err(|e|format!("extract artifact: {e}"))?;if !output.status.success(){return Err(format!("artifact extraction failed: {}",String::from_utf8_lossy(&output.stderr).trim()))}
    if !entries.is_empty(){let mut args=vec!["add","--"];args.extend(entries.iter().map(String::as_str));run_git_text(worktree,&args)?;}
   }
@@ -181,7 +205,7 @@ pub fn parse_name_status_z(bytes:&[u8])->Result<Vec<NameStatusChange>,String>{
 }
 
 pub fn validate_changed_paths(changes:&[NameStatusChange],claims:&[PathClaimRequestV1])->Result<(),String>{
- let owns=|path:&str|claims.iter().any(|claim|path.eq_ignore_ascii_case(&claim.path)||(claim.path_type=="directory"&&path.to_ascii_lowercase().strip_prefix(&format!("{}/",claim.path.to_ascii_lowercase())).is_some()));
+ let owns=|path:&str|claims.iter().any(|claim|path==claim.path||(claim.path_type=="directory"&&path.strip_prefix(&claim.path).is_some_and(|suffix|suffix.starts_with('/'))));
  for change in changes{if !owns(&change.destination)||change.source.as_deref().is_some_and(|source|!owns(source)){return Err(format!("changed path is outside admitted claims: {:?}",change))}}
  Ok(())
 }
@@ -213,5 +237,31 @@ mod tests{
    command(&repository.root,&["worktree","unlock",worktree.to_str().unwrap()]);command(&repository.root,&["worktree","remove",worktree.to_str().unwrap()]);
   }
   fs::remove_dir_all(root).unwrap();
+ }
+ #[test]
+ fn changed_path_authorization_is_exact_case(){
+  let file_claim=PathClaimRequestV1{path:"src/Foo.rs".into(),path_type:"file".into(),mode:"exclusive".into()};
+  let directory_claim=PathClaimRequestV1{path:"Assets".into(),path_type:"directory".into(),mode:"exclusive".into()};
+  assert!(validate_changed_paths(&[NameStatusChange{status:"M".into(),source:None,destination:"src/Foo.rs".into()}],&[file_claim.clone()]).is_ok());
+  assert!(validate_changed_paths(&[NameStatusChange{status:"M".into(),source:None,destination:"src/foo.rs".into()}],&[file_claim]).is_err());
+  assert!(validate_changed_paths(&[NameStatusChange{status:"M".into(),source:None,destination:"Assets/logo.svg".into()}],&[directory_claim.clone()]).is_ok());
+  assert!(validate_changed_paths(&[NameStatusChange{status:"M".into(),source:None,destination:"assets/logo.svg".into()}],&[directory_claim]).is_err());
+ }
+ #[test]
+ fn artifact_bytes_are_receipt_bound_and_empty_diff_is_supported(){
+  let root=std::env::temp_dir().join(format!("session-relay-artifact-{}",crate::store::uuid_v4()));fs::create_dir(&root).unwrap();let repository_root=root.join("repository");fs::create_dir(&repository_root).unwrap();
+  command(&repository_root,&["init","-q"]);command(&repository_root,&["config","user.name","Test"]);command(&repository_root,&["config","user.email","test@example.invalid"]);fs::write(repository_root.join("tracked.txt"),"base\n").unwrap();command(&repository_root,&["add","tracked.txt"]);command(&repository_root,&["commit","-qm","base"]);let base=command(&repository_root,&["rev-parse","HEAD"]);
+  fs::write(repository_root.join("only-untracked.txt"),"payload\n").unwrap();let repository=OpenedRepository::open(&repository_root).unwrap();let preserve_root=root.join("preserved");let data_root=root.join("data");authority::ensure_private_directory(&data_root,unsafe{libc::geteuid()}).unwrap();
+  let make_request=||{let request_id=crate::store::uuid_v4();PreserveRequestV1{request_id,repository_path:repository.root.to_string_lossy().into_owned(),base_commit:base.clone(),mode:"artifact".into(),label:"smoke".into(),created_at:"2026-07-22T00:00:00.000Z".into()}};
+  let tampered_request=make_request();let tampered=preserve(&repository,&tampered_request,&"a".repeat(64),&preserve_root).unwrap();
+  let WipPayloadV1::Artifact{binary_diff,untracked_inventory,untracked_archive,..}=&tampered.receipt.payload else{panic!("artifact payload")};
+  for (index,path) in [binary_diff,untracked_inventory,untracked_archive].into_iter().enumerate(){
+   let original=fs::read(path).unwrap();fs::write(path,b"different valid-looking bytes\n").unwrap();let session_id=crate::store::uuid_v4();let tampered_worktree=data_root.join(format!("tampered-{index}"));let tampered_branch=format!("refs/heads/docks/{session_id}/smoke");provision_worktree(&repository,&tampered_worktree,&tampered_branch,&session_id,"smoke",&base).unwrap();
+   assert!(apply_wip(&repository,&tampered_worktree,&tampered_branch,&base,&tampered.receipt,"2026-07-22T00:00:00.000Z").is_err());assert_eq!(command(&tampered_worktree,&["rev-parse","HEAD"]),base);assert!(!tampered_worktree.join("only-untracked.txt").exists());
+   command(&repository.root,&["worktree","unlock",tampered_worktree.to_str().unwrap()]);command(&repository.root,&["worktree","remove",tampered_worktree.to_str().unwrap()]);fs::write(path,original).unwrap();
+  }
+  let clean_request=make_request();let clean=preserve(&repository,&clean_request,&"b".repeat(64),&preserve_root).unwrap();let clean_worktree=data_root.join("clean");let clean_branch=format!("refs/heads/docks/{}/smoke",clean_request.request_id);provision_worktree(&repository,&clean_worktree,&clean_branch,&clean_request.request_id,"smoke",&base).unwrap();
+  let applied=apply_wip(&repository,&clean_worktree,&clean_branch,&base,&clean.receipt,"2026-07-22T00:00:00.000Z").unwrap();assert_ne!(applied,base);assert_eq!(fs::read_to_string(clean_worktree.join("only-untracked.txt")).unwrap(),"payload\n");
+  command(&repository.root,&["worktree","unlock",clean_worktree.to_str().unwrap()]);command(&repository.root,&["worktree","remove",clean_worktree.to_str().unwrap()]);fs::remove_dir_all(root).unwrap();
  }
 }
