@@ -101,6 +101,8 @@ Managed writing is supported only by the Linux `linux_cgroup_v2_pidfd` backend o
 
 The macOS STOP is exact: managed writing is stopped, and the inactive `macos_pgroup_libproc` backend returns `process groups are escapable, kqueue is PID observation rather than durable containment, and no documented public primitive provides crash-durable descendant membership plus atomic kill/empty proof`. A macOS build, APFS check, process scan, or passing negative-admission test is not custody evidence and must not be attested or advertised as managed-workspace support.
 
+This STOP does not remove ordinary macOS Relay support or its x86-64 and arm64 release artifacts. Each GitHub-hosted native macOS release leg must run the exact negative-admission test against its fresh binary before attestation and upload. That runner evidence is sufficient to prove fail-closed managed-workspace refusal for an ordinary macOS artifact; it does not claim macOS custody, a successful macOS managed workspace, or testing on a physical Mac.
+
 Other operating systems; containers or overlay filesystems; NFS, SMB, FUSE, network, cloud, or removable filesystems; cross-UID/shared-service workspaces; and remote workers are unsupported.
 
 ## Precedents, not compatibility claims

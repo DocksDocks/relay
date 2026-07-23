@@ -226,20 +226,19 @@ export function createFixture({ bin: configuredBin, home }) {
     if (child.exitCode !== null || child.signalCode !== null) return child;
     const record = { child, processGroup };
     tracked.set(child, record);
-    const forget = () => tracked.delete(child);
-    child.once('close', forget);
+    if (!processGroup) child.once('close', () => tracked.delete(child));
     return child;
   }
 
   async function terminate(record) {
     const { child, processGroup } = record;
-    if (child.exitCode !== null || child.signalCode !== null) return;
-    const pids = processTreePids(child.pid);
-    if (processGroup && Number.isInteger(child.pid)) signalPids([-child.pid], 'SIGTERM');
-    else signalPids(pids, 'SIGTERM');
-    let remaining = await waitForTreeExit(pids, CLOSE_GRACE_MS);
+    const childClosed = child.exitCode !== null || child.signalCode !== null;
+    if (childClosed && !processGroup) return;
+    const pids = childClosed ? [] : processTreePids(child.pid);
+    const targets = [...new Set(processGroup && Number.isInteger(child.pid) ? [...pids, -child.pid] : pids)];
+    signalPids(targets, 'SIGTERM');
+    let remaining = await waitForTreeExit(targets, CLOSE_GRACE_MS);
     if (remaining.length > 0) {
-      if (processGroup && Number.isInteger(child.pid)) signalPids([-child.pid], 'SIGKILL');
       signalPids(remaining, 'SIGKILL');
       remaining = await waitForTreeExit(remaining, CLOSE_KILL_MS);
     }

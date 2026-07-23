@@ -1154,6 +1154,9 @@ fn conflicting_commits_settle_once_needs_user_action() {
         replay_error.contains("IntegrationBlocked") || replay_error.contains("expected state"),
         "conflict replay was not closed: {replay_error}"
     );
+    let second_cleanup =
+        abort_started_workspace(&repo, &roots, second, "integration conflict test cleanup");
+    assert!(second_cleanup.lease_released);
     let first_cleanup = finish_started_workspace(&repo, &roots, first);
     assert!(first_cleanup.lease_released);
 }

@@ -6,7 +6,7 @@ allowed-tools: Bash, Read
 metadata:
   pattern: tool-wrapper
   updated: "2026-07-22"
-  content_hash: "603ed7aefc35718ccc483cb6f55a47e39798b16652f60759aee0a8366ecf51d7"
+  content_hash: "a808ce07853fcae779f0feb44299eeac361dfa7432d5e9a6ce56edd8daa262b9"
 ---
 
 # Session relay
@@ -39,7 +39,7 @@ The installed plugin's compatibility launcher resolves a non-empty `SESSION_RELA
 
 The launcher has no embedded relay binary and never compiles, builds, or downloads one at startup. For a missing CLI, run `docks-kit sync` and then `docks-kit toolchain ensure session-relay`; do not install a compiler. For a broken override, correct it or `unset SESSION_RELAY_BIN`.
 
-Official prebuilts support Linux and macOS on x86-64 or arm64. Other operating systems and architectures are unsupported; use a supported host because retrying the launcher cannot add platform support.
+Official prebuilts support ordinary Relay on Linux and macOS on x86-64 or arm64. Managed writing is a separate Linux/ext4-only capability: shipped macOS binaries must prove its exact negative admission on GitHub-hosted native macOS runners, which is refusal evidence rather than macOS workspace success or a requirement for a physical Mac. Other operating systems and architectures are unsupported; use a supported host because retrying the launcher cannot add platform support.
 
 ## Pick the transport deliberately
 
@@ -443,7 +443,7 @@ session-relay spawn <dir> --tool claude|codex --model <model> --effort <effort> 
   (Claude OAuth / ChatGPT login) — heavier than a wake; spawn deliberately, never
   in loops.
 
-For managed writing, use only the exact nine `session-relay workspace` commands after reading the Linux-only admission, macOS STOP, actors, recovery, integration, and unmanaged-process limits in [`references/workspace.md`](references/workspace.md); this is neither legacy fan-out nor Docks plan-review evidence.
+For managed writing, use only the exact nine `session-relay workspace` commands after reading the Linux-only admission, exact macOS STOP, ordinary macOS release boundary, actors, recovery, integration, and unmanaged-process limits in [`references/workspace.md`](references/workspace.md); this is neither legacy fan-out nor Docks plan-review evidence.
 
 ## Bounded worktree fan-out
 
