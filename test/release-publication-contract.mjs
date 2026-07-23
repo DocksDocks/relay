@@ -144,7 +144,7 @@ function proof(directory) {
     tag_commit: SOURCE,
     evidence_commit: '6'.repeat(40),
     shipped_commit: '2'.repeat(40),
-    promoted_commit: '2'.repeat(40),
+    promoted_commit: '3'.repeat(40),
     candidate,
     candidate_sha256: sha256(Buffer.from(canonicalize(candidate))),
     plans: {

@@ -28,12 +28,13 @@ import {
 
 const OLD_MAIN = '1'.repeat(40);
 const TAG_COMMIT = '2'.repeat(40);
+const SHIPPED_COMMIT = 'd'.repeat(40);
 const PROMOTED_COMMIT = '3'.repeat(40);
 const LOCK_COMMIT = '4'.repeat(40);
 const RESTORE_COMMIT = '5'.repeat(40);
 const REAPPLY_COMMIT = '6'.repeat(40);
 const REPAIR_IMPLEMENTATION_COMMIT = 'e'.repeat(40);
-const PUBLIC_REVIEWED_COMMIT = 'c3b542220d5a24a98ca05383bbe28afc2319b7e2';
+const PUBLIC_REVIEWED_COMMIT = '6c07f9bc02ef7a0a26b8ffb539c16c42a87a3172';
 const PUBLIC_RELEASE_COMMIT = '7'.repeat(40);
 const PUBLIC_PLAN_COMMIT = '8'.repeat(40);
 const DIGEST = (letter) => letter.repeat(64);
@@ -45,9 +46,12 @@ const hash = (value) =>
 const HOST_ASSET_DIGEST = '5'.repeat(64);
 const RELEASE_VERSION = '0.13.0';
 const RELEASE_TAG = 'session-relay--v0.13.0';
+const PUBLIC_VERSION = '0.10.2';
+const PUBLIC_TAG = 'cli-v0.10.2';
 const DOCKS_PLAN_PATH = 'docs/plans/active/session-relay-linux-workspace-recertification.md';
 const DOCKS_FINISHED_PLAN_PATH = 'docs/plans/finished/2026-07-23-session-relay-linux-workspace-recertification.md';
 const PUBLIC_PLAN_PATH = 'docs/plans/active/session-relay-cli-0.13.0-release-preparation.md';
+const PUBLIC_FINISHED_PLAN_PATH = 'docs/plans/finished/2026-07-23-session-relay-cli-0.13.0-production-release.md';
 const ORDINARY_ASSET_NAMES = Object.freeze([
   'session-relay-aarch64-apple-darwin',
   'session-relay-aarch64-unknown-linux-musl',
@@ -156,7 +160,7 @@ const proofValue = {
   source_commit: TAG_COMMIT,
   tag_commit: TAG_COMMIT,
   evidence_commit: '8'.repeat(40),
-  shipped_commit: PROMOTED_COMMIT,
+  shipped_commit: SHIPPED_COMMIT,
   promoted_commit: PROMOTED_COMMIT,
   candidate,
   candidate_sha256: hash(candidate),
@@ -172,12 +176,12 @@ const proofValue = {
   source_ancestry: {
     source_commit: TAG_COMMIT,
     evidence_commit: '8'.repeat(40),
-    shipped_commit: PROMOTED_COMMIT,
+    shipped_commit: SHIPPED_COMMIT,
     verified: true,
   },
   non_plan_tree_equivalence: {
     source_commit: TAG_COMMIT,
-    shipped_commit: PROMOTED_COMMIT,
+    shipped_commit: SHIPPED_COMMIT,
     excluded_paths: [DOCKS_PLAN_PATH, DOCKS_FINISHED_PLAN_PATH],
     verified: true,
   },
@@ -268,8 +272,8 @@ const publicRequestValue = {
   schema: 1,
   type: 'PublicReleaseRequestV1',
   repository_id: 'DocksDocks/public',
-  tag: 'cli-v0.9.0',
-  version: '0.9.0',
+  tag: PUBLIC_TAG,
+  version: PUBLIC_VERSION,
   companion_base_commit: PUBLIC_REVIEWED_COMMIT,
   session_relay: {
     repository_id: 'DocksDocks/docks',
@@ -286,8 +290,8 @@ const publicReleaseValue = {
   type: 'PublicReleaseReceiptV1',
   request_sha256: hash(publicRequestValue),
   repository_id: 'DocksDocks/public',
-  tag: 'cli-v0.9.0',
-  version: '0.9.0',
+  tag: PUBLIC_TAG,
+  version: PUBLIC_VERSION,
   release_commit: PUBLIC_RELEASE_COMMIT,
   companion_base_commit: PUBLIC_REVIEWED_COMMIT,
   ancestry_verified: true,
@@ -312,7 +316,7 @@ const publicReleaseValue = {
   pinned_assets: publicationAssetPins,
   public_plan: {
     commit: PUBLIC_PLAN_COMMIT,
-    path: 'docs/plans/finished/2026-07-18-session-relay-cli-production-release.md',
+    path: PUBLIC_FINISHED_PLAN_PATH,
     completion_receipt_sha256: DIGEST('c'),
   },
   created_at: '2026-07-17T21:00:00.000Z',
@@ -328,7 +332,7 @@ function options(output = '/receipts/promotion.json', extra = {}) {
       'public-release-sha256': publicRelease.digest,
       'source-proof': '/receipts/proof.json',
       'source-proof-sha256': proof.digest,
-      'docks-kit-release': 'cli-v0.9.0',
+      'docks-kit-release': PUBLIC_TAG,
       'expected-origin-main': OLD_MAIN,
       'receipt-out': output,
       ...extra,
@@ -404,6 +408,7 @@ function makeAdapter({
     'plugins/session-relay/bin/relay': BLOB('6'),
     'plugins/session-relay/new-in-0.13': BLOB('7'),
   };
+  if (initialMain === PROMOTED_COMMIT) state.currentBlobs = { ...promotedBlobs };
   const beforeRaw = { ...state.currentBlobs };
   const paths = [...new Set([...Object.keys(beforeRaw), ...Object.keys(promotedBlobs)])].sort();
   const fill = (map) => Object.fromEntries(paths.map((item) => [item, map[item] ?? null]));
@@ -445,7 +450,7 @@ function makeAdapter({
         [TAG_COMMIT, PROMOTED_COMMIT].includes(ancestorCommit),
         'reviewed promotion commit must be the ancestor',
       );
-      assert.equal(descendantCommit, OLD_MAIN, 'expected origin/main must be the descendant');
+      assert.equal(descendantCommit, initialMain, 'expected origin/main must match the fixture head');
       return ancestry;
     },
     isPublicAncestor: (ancestorCommit, descendantCommit) => {
@@ -454,10 +459,10 @@ function makeAdapter({
       return publicAncestry;
     },
     validatePrepushRepair: ({ baseCommit, repairCommit }) => {
-      assert.equal(baseCommit, OLD_MAIN);
+      assert.equal(baseCommit, initialMain);
       assert.equal(repairCommit, REPAIR_IMPLEMENTATION_COMMIT);
       return {
-        base_commit: OLD_MAIN,
+        base_commit: initialMain,
         commit: REPAIR_IMPLEMENTATION_COMMIT,
         paths: [
           'plugins/session-relay/test/release-promotion-contract.mjs',
@@ -504,6 +509,8 @@ function makeAdapter({
       state.calls.push({ operation: 'main', commit, expected });
       if (state.rejectMutation === 'main') throw new Error('main CAS rejected');
       assert.equal(state.refs.get('refs/heads/main'), expected, 'main update must be leased to the expected head');
+      assert.equal(commit, PROMOTED_COMMIT, 'main update must consume the reviewed promoted implementation');
+      assert.notEqual(commit, SHIPPED_COMMIT, 'main update must not roll back to the shipped archive');
       state.refs.set('refs/heads/main', commit);
       state.currentBlobs = { ...promotedBlobs };
       state.counts.main += 1;
@@ -564,7 +571,7 @@ function makeAdapter({
         publicReleaseCommit,
       });
       assert.equal(docksKitRepository, 'DocksDocks/public');
-      assert.equal(docksKitRelease, 'cli-v0.9.0');
+      assert.equal(docksKitRelease, PUBLIC_TAG);
       assert.equal(sourceCommit, TAG_COMMIT);
       assert.equal(publicReleaseCommit, PUBLIC_RELEASE_COMMIT);
       state.counts.prepush += 1;
@@ -834,7 +841,7 @@ function makePublicReleaseAdapter(
   if (removeAsset !== null) releaseAssets = releaseAssets.filter(({ name }) => name !== removeAsset);
   const release = {
     id: 901,
-    tag_name: 'cli-v0.9.0',
+    tag_name: PUBLIC_TAG,
     draft: false,
     prerelease: false,
     assets: releaseAssets,
@@ -843,7 +850,7 @@ function makePublicReleaseAdapter(
     id: 801,
     run_attempt: 1,
     head_sha: PUBLIC_RELEASE_COMMIT,
-    head_branch: 'cli-v0.9.0',
+    head_branch: PUBLIC_TAG,
     path: '.github/workflows/release-cli.yml',
     event: 'push',
     status: 'completed',
@@ -895,7 +902,7 @@ function verifyPublicBoundary(
   {
     output = 'public-release.json',
     completionDigest = adapter.completionDigest,
-    finishedPlanPath = 'docs/plans/finished/2026-07-18-session-relay-cli-production-release.md',
+    finishedPlanPath = PUBLIC_FINISHED_PLAN_PATH,
   } = {},
 ) {
   return captureDigest(() =>
@@ -1052,13 +1059,13 @@ function verifyPublicBoundary(
       [
         'wrong finished-plan slug',
         makePublicReleaseAdapter(boundary.request),
-        { finishedPlanPath: 'docs/plans/finished/2026-07-18-other-release.md' },
+        { finishedPlanPath: 'docs/plans/finished/2026-07-23-session-relay-cli-0.13.1-production-release.md' },
         /finished-plan|production-release|path/i,
       ],
       [
         'wrong finished-plan date',
         makePublicReleaseAdapter(boundary.request),
-        { finishedPlanPath: 'docs/plans/finished/2026-07-17-session-relay-cli-production-release.md' },
+        { finishedPlanPath: 'docs/plans/finished/not-a-date-session-relay-cli-0.13.0-production-release.md' },
         /finished-plan|production-release|path/i,
       ],
     ];
@@ -1110,6 +1117,8 @@ for (const [label, mutate] of [
   const result = run(adapter);
   assert.equal(result.receipt.outcome, 'success');
   assert.equal(result.receipt.retryable, false);
+  assert.equal(result.receipt.promoted_commit, PROMOTED_COMMIT);
+  assert.equal(state.refs.get('refs/heads/main'), PROMOTED_COMMIT);
   const wrongPublicTag = structuredClone(result.receipt);
   wrongPublicTag.public_tag_commit = 'e'.repeat(40);
   assert.throws(() => validatePromotionReceipt(wrongPublicTag), /public release|docks-kit/i);
@@ -1186,6 +1195,24 @@ for (const [label, mutate] of [
       .filter(({ operation }) => operation === 'append')
       .every((call, index, calls) => (index === 0 ? call.prior === null : call.prior !== calls[index - 1].prior)),
   );
+}
+
+{
+  const { adapter, state } = makeAdapter({ initialMain: PROMOTED_COMMIT });
+  const result = run(adapter, '/receipts/already-promoted.json', {
+    'expected-origin-main': PROMOTED_COMMIT,
+  });
+  assert.equal(result.receipt.outcome, 'success');
+  assert.equal(state.refs.get('refs/heads/main'), PROMOTED_COMMIT);
+  assert.equal(state.counts.main, 0, 'promotion must not replay an already-applied origin/main update');
+  assert.deepEqual(phases(state), [
+    '0:0:initialized',
+    '0:1:locked',
+    '0:2:prepush_passed',
+    '0:3:main_pushed',
+    '0:4:live_passed',
+    '0:5:terminal_success',
+  ]);
 }
 
 for (const phase of ['initialized', 'locked', 'prepush_passed', 'main_pushed', 'live_passed', 'terminal_success']) {
@@ -2020,9 +2047,9 @@ for (const releaseAbsent of [false, true]) {
       '--public-release-sha256',
       hash(publicReleaseBytes),
       '--docks-kit-release',
-      'cli-v0.9.0',
+      PUBLIC_TAG,
       '--expected-origin-main',
-      OLD_MAIN,
+      PROMOTED_COMMIT,
       '--receipt-out',
       receiptPath,
       RELEASE_VERSION,
@@ -2160,9 +2187,9 @@ await assert.rejects(
     '--public-release-sha256',
     DIGEST('3'),
     '--docks-kit-release',
-    'cli-v0.9.0',
+    PUBLIC_TAG,
     '--expected-origin-main',
-    OLD_MAIN,
+    PROMOTED_COMMIT,
     '--receipt-out',
     '/promotion.json',
     '--repair-prepush',

@@ -37,8 +37,9 @@ const RUN_ATTEMPT = 2;
 const REPOSITORY_DATABASE_ID = 98765;
 const WORKFLOW_ID = 4567;
 const PUBLIC_PLAN_PATH = 'docs/plans/active/session-relay-cli-0.13.0-release-preparation.md';
-const PUBLIC_COMMIT = '34567890abcdef1234567890abcdef1234567890';
-const PUBLIC_SOURCE_COMMIT = '234567890abcdef1234567890abcdef123456789';
+const PUBLIC_COMMIT = '6c07f9bc02ef7a0a26b8ffb539c16c42a87a3172';
+const PUBLIC_SOURCE_COMMIT = '3ce9db40c9da62bd396a34665ad0a98ca126394f';
+const PUBLIC_VALIDATION_REF = 'refs/heads/preflight/session-relay-cli-0.13.0-6c07f9bc02ef';
 const TARGETS = [
   ['x86_64-unknown-linux-musl', 'Linux', 'X64'],
   ['aarch64-unknown-linux-musl', 'Linux', 'ARM64'],
@@ -1223,23 +1224,54 @@ function capturePublicRed(temp) {
 }
 
 function publicDraftReviewFixture() {
-  const source = fs.readFileSync('docs/plans/active/session-relay-linux-workspace-recertification.md', 'utf8');
-  const extract = (label) => {
-    const match = source.match(new RegExp(`^${label}: (\\{.*\\})$`, 'm'));
-    assert.ok(match, `a real ${label} is available as the public review template`);
-    return JSON.parse(match[1]);
-  };
-  const templateReceipt = extract('Review-receipt');
+  const activePath = 'docs/plans/active/session-relay-linux-workspace-publication.md';
+  let templatePath = activePath;
+  if (!fs.existsSync(templatePath)) {
+    const finishedMatches = fs
+      .readdirSync('docs/plans/finished')
+      .filter((name) => /^\d{4}-\d{2}-\d{2}-session-relay-linux-workspace-publication\.md$/.test(name));
+    assert.equal(
+      finishedMatches.length,
+      1,
+      'exactly one finished publication plan is available as the review template',
+    );
+    templatePath = path.join('docs/plans/finished', finishedMatches[0]);
+  }
+  const source = fs.readFileSync(templatePath, 'utf8');
+  const match = source.match(/^Review-receipt: (\{.*\})$/m);
+  assert.ok(match, 'a real Review-receipt is available as the public review template');
+  const templateReceipt = JSON.parse(match[1]);
   const inputSha256 = '1'.repeat(64);
   const replacements = new Map([
     [templateReceipt.input_sha256, inputSha256],
     [templateReceipt.reviewed_commit, PUBLIC_COMMIT],
-    ['docs/plans/active/session-relay-linux-workspace-recertification.md', PUBLIC_PLAN_PATH],
+    [activePath, PUBLIC_PLAN_PATH],
   ]);
   const receipt = replaceReceiptIdentity(templateReceipt, replacements);
-  const state = replaceReceiptIdentity(extract('Review-orchestration-state'), replacements);
-  state.series_sha256 = sha256(Buffer.from(jcs(receipt.series)));
-  delete state.state_sha256;
+  const request = receipt.series.rounds[0].request;
+  assert.equal(receipt.series.rounds.length, 1, 'public review template must contain one full round');
+  assert.equal(request.lifecycle_intent, 'none', 'public review template must be non-executing');
+  const state = {
+    apply_state: 'none',
+    current_input_sha256: receipt.series.current_input_sha256,
+    initial_input_sha256: receipt.series.initial_input_sha256,
+    lifecycle_intent: request.lifecycle_intent,
+    orchestration_attempt: 1,
+    phase: 'draft',
+    plan_path: PUBLIC_PLAN_PATH,
+    request_ids: [request.request_id],
+    retry_authorization: null,
+    round_index: 1,
+    schema: 2,
+    series_id: request.orchestration_series_id,
+    series_sha256: sha256(Buffer.from(jcs(receipt.series))),
+    status: 'passed',
+    stop_reason: null,
+    terminal_evidence_sha256: null,
+    terminated_from_state: null,
+    terminated_from_state_sha256: null,
+    transitioned_from_state_sha256: null,
+  };
   state.state_sha256 = sha256(Buffer.from(jcs(state)));
   receipt.settled_orchestration_state_sha256 = state.state_sha256;
   return { receipt, state };
@@ -1294,7 +1326,7 @@ function preparationAdapter({
     },
     inspectPublic(input) {
       assert.equal(input.remote, 'https://github.com/DocksDocks/public.git');
-      assert.equal(input.ref, `refs/heads/preflight/session-relay-cli-0.13.0-${PUBLIC_COMMIT.slice(0, 12)}`);
+      assert.equal(input.ref, PUBLIC_VALIDATION_REF);
       assert.equal(input.commit, PUBLIC_COMMIT);
       assert.equal(input.planPath, PUBLIC_PLAN_PATH);
       assert.equal(input.redCommit, publicRed.pre_production_commit);
@@ -1334,9 +1366,9 @@ function preparationAdapter({
           '--public-remote',
           'https://github.com/DocksDocks/public.git',
           '--public-ref',
-          'refs/heads/preflight/session-relay-cli-0.13.0-34567890abcd',
+          PUBLIC_VALIDATION_REF,
           '--public-commit',
-          '34567890abcdef1234567890abcdef1234567890',
+          PUBLIC_COMMIT,
           '--detached-clone',
         ]);
       }
@@ -1400,8 +1432,8 @@ function testPreparationHandlers(temp, preflight, sourceCi) {
     '',
     '- Companion repository ID: DocksDocks/public',
     '- Companion plan: `/home/vagrant/projects/public/docs/plans/active/session-relay-cli-0.13.0-release-preparation.md`.',
-    '- Companion validation ref: refs/heads/preflight/session-relay-cli-0.13.0-34567890abcd',
-    '- Companion implementation commit: 34567890abcdef1234567890abcdef1234567890',
+    `- Companion validation ref: ${PUBLIC_VALIDATION_REF}`,
+    `- Companion implementation commit: ${PUBLIC_COMMIT}`,
     `- Companion plan input SHA-256: ${companionReview.input_sha256}`,
     `- Companion execution base commit: ${'5'.repeat(40)}`,
     `- Companion review receipt SHA-256: ${companionReviewDigest}`,
@@ -1437,6 +1469,10 @@ function testPreparationHandlers(temp, preflight, sourceCi) {
   });
   const candidate = checkPrepared(options, adapter);
   assert.equal(candidate.receipt.source_commit, COMMIT);
+  assert.equal(candidate.receipt.companion.repository_id, 'DocksDocks/public');
+  assert.equal(candidate.receipt.companion.validation_ref, PUBLIC_VALIDATION_REF);
+  assert.equal(candidate.receipt.companion.commit, PUBLIC_COMMIT);
+  assert.equal(candidate.receipt.companion.plan_path, PUBLIC_PLAN_PATH);
   assert.deepEqual(
     candidate.receipt.checks.map(({ id }) => id),
     ['A1', 'A2', 'A3', 'A4', 'A5', 'A6'],
@@ -1455,7 +1491,7 @@ function testPreparationHandlers(temp, preflight, sourceCi) {
           '--public-remote',
           'https://github.com/DocksDocks/public.git',
           '--public-ref',
-          `refs/heads/preflight/session-relay-cli-0.13.0-${PUBLIC_COMMIT.slice(0, 12)}`,
+          PUBLIC_VALIDATION_REF,
           '--public-commit',
           PUBLIC_COMMIT,
           '--detached-clone',
@@ -1651,6 +1687,14 @@ function testCompletionBinding(temp, preparation) {
   const evidenceCommit = '234567890abcdef1234567890abcdef123456789';
   const shippedCommit = '567890abcdef1234567890abcdef123456789012';
   const currentHead = '67890abcdef1234567890abcdef1234567890123';
+  const promotedChangedPaths = [
+    'docs/plans/active/session-relay-linux-workspace-publication.md',
+    'plugins/session-relay/test/release-evidence-contract.mjs',
+    'plugins/session-relay/test/release-promotion-contract.mjs',
+    'plugins/session-relay/test/release-publication-contract.mjs',
+    'scripts/lib/session-relay-release-preparation.mjs',
+    'scripts/lib/session-relay-release-promotion.mjs',
+  ];
   const evidencePlan = preparation.plan
     .replace('status: ongoing', 'status: in_review')
     .replace('review_status: null', 'review_status: null');
@@ -1677,16 +1721,18 @@ function testCompletionBinding(temp, preparation) {
     return file;
   };
   const adapter = ({
-    ancestry = true,
+    brokenAncestry = null,
     equivalent = true,
     sourceEvidenceClean = true,
     evidenceShippedClean = true,
+    promotedPaths = promotedChangedPaths,
     evidenceBody = evidencePlan,
     shippedBody = finishedBody,
     shippedPlanMatches = true,
     dirty = false,
     finishedDate = '2026-07-17',
     sourceBody = preparation.sourcePlan,
+    calls = null,
   } = {}) => ({
     repoRoot: root,
     git(args) {
@@ -1709,19 +1755,48 @@ function testCompletionBinding(temp, preparation) {
       }
       if (args[0] === 'status') return dirty ? ' M docs/plans/finished/substituted.md' : '';
       if (args[0] === 'merge-base' && args[1] === '--is-ancestor') {
-        if (!ancestry) throw new Error('unrelated');
+        const link = [
+          ['source-evidence', COMMIT, evidenceCommit],
+          ['evidence-shipped', evidenceCommit, shippedCommit],
+          ['shipped-promoted', shippedCommit, currentHead],
+        ].find(([, ancestor, descendant]) => args[2] === ancestor && args[3] === descendant);
+        assert.ok(link, `unexpected completion ancestry call: ${joined}`);
+        calls?.ancestry.push(link[0]);
+        if (brokenAncestry === link[0]) throw new Error(`${link[0]} is unrelated`);
         return '';
       }
       if (args[0] === 'diff' && args[1] === '--name-only') {
-        if (args[2] === COMMIT && args[3] === evidenceCommit)
+        if (args[2] === COMMIT && args[3] === evidenceCommit) {
+          assert.deepEqual(args, ['diff', '--name-only', COMMIT, evidenceCommit, '--no-renames', '--', '.']);
           return sourceEvidenceClean
             ? 'docs/plans/active/session-relay-linux-workspace-recertification.md'
             : 'docs/plans/active/session-relay-linux-workspace-recertification.md\nscripts/transient.mjs';
-        if (args[2] === evidenceCommit && args[3] === shippedCommit)
+        }
+        if (args[2] === evidenceCommit && args[3] === shippedCommit) {
+          assert.deepEqual(args, ['diff', '--name-only', evidenceCommit, shippedCommit, '--no-renames', '--', '.']);
           return evidenceShippedClean
             ? `docs/plans/active/session-relay-linux-workspace-recertification.md\ndocs/plans/finished/${finishedDate}-session-relay-linux-workspace-recertification.md`
             : `docs/plans/active/session-relay-linux-workspace-recertification.md\ndocs/plans/finished/${finishedDate}-session-relay-linux-workspace-recertification.md\nscripts/transient.mjs`;
-        return equivalent ? '' : 'scripts/substituted.mjs';
+        }
+        if (args[2] === shippedCommit && args[3] === currentHead) {
+          assert.deepEqual(args, ['diff', '--name-only', shippedCommit, currentHead, '--no-renames', '--', '.']);
+          calls?.promotedDiffs.push([...args]);
+          return promotedPaths.join('\n');
+        }
+        if (args[2] === COMMIT && args[3] === shippedCommit) {
+          assert.deepEqual(args, [
+            'diff',
+            '--name-only',
+            COMMIT,
+            shippedCommit,
+            '--no-renames',
+            '--',
+            '.',
+            ':(exclude)docs/plans/active/session-relay-linux-workspace-recertification.md',
+            `:(exclude)docs/plans/finished/${finishedDate}-session-relay-linux-workspace-recertification.md`,
+          ]);
+          return equivalent ? '' : 'scripts/substituted.mjs';
+        }
       }
       assert.fail(`unexpected completion git call: ${joined}`);
     },
@@ -1741,13 +1816,14 @@ function testCompletionBinding(temp, preparation) {
 
   const finished = makePlan('2026-07-17');
   const proofOut = path.join(temp, 'source-proof.json');
+  const successfulCalls = { ancestry: [], promotedDiffs: [] };
   const result = bindCompletion(
     new Map([
       ['finished-plan', finished],
       ['embedded-candidate-sha256', sha256(fs.readFileSync(preparation.candidateOut))],
       ['receipt-out', proofOut],
     ]),
-    adapter(),
+    adapter({ calls: successfulCalls }),
   );
   validateSourcePreparationProof(result.receipt);
   const loaded = validateProof(
@@ -1757,7 +1833,33 @@ function testCompletionBinding(temp, preparation) {
     ]),
   );
   assert.equal(loaded.value.evidence_commit, evidenceCommit);
-  assert.equal(loaded.value.promoted_commit, shippedCommit);
+  assert.equal(loaded.value.shipped_commit, shippedCommit);
+  assert.equal(
+    loaded.value.promoted_commit,
+    currentHead,
+    'completion binder must record the distinct current clean HEAD as promoted_commit',
+  );
+  assert.notEqual(loaded.value.promoted_commit, loaded.value.shipped_commit);
+  assert.deepEqual(loaded.value.source_ancestry, {
+    source_commit: COMMIT,
+    evidence_commit: evidenceCommit,
+    shipped_commit: shippedCommit,
+    verified: true,
+  });
+  assert.deepEqual(loaded.value.non_plan_tree_equivalence, {
+    source_commit: COMMIT,
+    shipped_commit: shippedCommit,
+    excluded_paths: [
+      'docs/plans/active/session-relay-linux-workspace-recertification.md',
+      'docs/plans/finished/2026-07-17-session-relay-linux-workspace-recertification.md',
+    ],
+    verified: true,
+  });
+  assert.equal(loaded.value.public_reviewed_commit, PUBLIC_COMMIT);
+  assert.deepEqual(successfulCalls.ancestry, ['source-evidence', 'evidence-shipped', 'shipped-promoted']);
+  assert.deepEqual(successfulCalls.promotedDiffs, [
+    ['diff', '--name-only', shippedCommit, currentHead, '--no-renames', '--', '.'],
+  ]);
   assert.deepEqual(result.receipt.candidate, preparation.candidate.receipt);
 
   // Model a candidate sealed before the raw-byte binder repair: its recorded
@@ -1918,19 +2020,25 @@ function testCompletionBinding(temp, preparation) {
       ),
     /completion|unknown|missing/i,
   );
-  expectReject(
-    'broken completion ancestry',
-    () =>
-      bindCompletion(
-        new Map([
-          ['finished-plan', makePlan('2026-07-19')],
-          ['embedded-candidate-sha256', sha256(fs.readFileSync(preparation.candidateOut))],
-          ['receipt-out', path.join(temp, 'ancestry-proof.json')],
-        ]),
-        adapter({ finishedDate: '2026-07-19', ancestry: false }),
-      ),
-    /ancestor|ancestry/i,
-  );
+  for (const [brokenAncestry, finishedDate, label] of [
+    ['source-evidence', '2026-07-19', 'broken source-to-evidence ancestry'],
+    ['evidence-shipped', '2026-07-25', 'broken evidence-to-shipped ancestry'],
+    ['shipped-promoted', '2026-07-26', 'stale promoted HEAD ancestry'],
+  ]) {
+    expectReject(
+      label,
+      () =>
+        bindCompletion(
+          new Map([
+            ['finished-plan', makePlan(finishedDate)],
+            ['embedded-candidate-sha256', sha256(fs.readFileSync(preparation.candidateOut))],
+            ['receipt-out', path.join(temp, `${brokenAncestry}-ancestry-proof.json`)],
+          ]),
+          adapter({ finishedDate, brokenAncestry }),
+        ),
+      /ancestor|ancestry|stale|promoted/i,
+    );
+  }
   expectReject(
     'non-plan tree substitution',
     () =>
@@ -1996,6 +2104,31 @@ function testCompletionBinding(temp, preparation) {
       ),
     /evidence|shipped|lifecycle|outside/i,
   );
+  for (const [label, finishedDate, promotedPaths] of [
+    ['missing shipped-to-promoted contract path', '2026-07-27', promotedChangedPaths.slice(1)],
+    ['extra shipped-to-promoted contract path', '2026-07-28', [...promotedChangedPaths, 'scripts/transient.mjs']],
+    [
+      'substituted shipped-to-promoted contract path',
+      '2026-07-29',
+      promotedChangedPaths.map((item) =>
+        item === 'scripts/lib/session-relay-release-promotion.mjs' ? 'scripts/substituted.mjs' : item,
+      ),
+    ],
+  ]) {
+    expectReject(
+      label,
+      () =>
+        bindCompletion(
+          new Map([
+            ['finished-plan', makePlan(finishedDate)],
+            ['embedded-candidate-sha256', sha256(fs.readFileSync(preparation.candidateOut))],
+            ['receipt-out', path.join(temp, `promoted-paths-${finishedDate}.json`)],
+          ]),
+          adapter({ finishedDate, promotedPaths }),
+        ),
+      /shipped|promoted|path|allow|exact/i,
+    );
+  }
 }
 
 function testPrepareFixtureUsesFullCi(temp) {
