@@ -1241,13 +1241,35 @@ function publicDraftReviewFixture() {
   const match = source.match(/^Review-receipt: (\{.*\})$/m);
   assert.ok(match, 'a real Review-receipt is available as the public review template');
   const templateReceipt = JSON.parse(match[1]);
+  const templateRequest = templateReceipt.series.rounds[0].request;
+  const runtimePolicy = {
+    schema: 6,
+    role: 'primary',
+    fallback: 'none',
+    max_rounds: 2,
+    candidates: [
+      { ...templateRequest.author, ...(templateRequest.author.tool === 'codex' ? { service_tier: 'default' } : {}) },
+    ],
+    provenance: {
+      role: 'skill_default',
+      fallback: 'skill_default',
+      max_rounds: 'skill_default',
+      candidates: 'runtime_global',
+    },
+  };
+  const runtimePolicySha256 = sha256(Buffer.from(jcs(runtimePolicy)));
   const inputSha256 = '1'.repeat(64);
   const replacements = new Map([
     [templateReceipt.input_sha256, inputSha256],
     [templateReceipt.reviewed_commit, PUBLIC_COMMIT],
+    [templateReceipt.policy_sha256, runtimePolicySha256],
     [activePath, PUBLIC_PLAN_PATH],
   ]);
-  const receipt = replaceReceiptIdentity(templateReceipt, replacements);
+  const receipt = replaceReceiptPolicy(
+    replaceReceiptIdentity(templateReceipt, replacements),
+    templateReceipt.policy_sha256,
+    runtimePolicy,
+  );
   const request = receipt.series.rounds[0].request;
   assert.equal(receipt.series.rounds.length, 1, 'public review template must contain one full round');
   assert.equal(request.lifecycle_intent, 'none', 'public review template must be non-executing');
@@ -1663,6 +1685,20 @@ function testPreparationHandlers(temp, preflight, sourceCi) {
     /execution-base|ancestor|ancestry|source/i,
   );
   return { candidate, candidateOut, plan, sourcePlan };
+}
+
+function replaceReceiptPolicy(value, templatePolicySha256, runtimePolicy) {
+  if (Array.isArray(value)) return value.map((item) => replaceReceiptPolicy(item, templatePolicySha256, runtimePolicy));
+  if (value !== null && typeof value === 'object') {
+    if (sha256(Buffer.from(jcs(value))) === templatePolicySha256) return structuredClone(runtimePolicy);
+    return Object.fromEntries(
+      Object.entries(value).map(([key, item]) => [
+        key,
+        replaceReceiptPolicy(item, templatePolicySha256, runtimePolicy),
+      ]),
+    );
+  }
+  return value;
 }
 
 function replaceReceiptIdentity(value, replacements) {
