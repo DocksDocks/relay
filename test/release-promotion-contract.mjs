@@ -10,7 +10,9 @@ import {
   LOCK_REF,
   PRERELEASE_BODY,
   SessionRelayReleaseError,
+  TAG,
   TRANSACTION_REF,
+  VERSION,
 } from '../../../scripts/lib/session-relay-release-core.mjs';
 import { validateSourcePreparationProof } from '../../../scripts/lib/session-relay-release-preparation.mjs';
 import * as releasePromotion from '../../../scripts/lib/session-relay-release-promotion.mjs';
@@ -41,16 +43,28 @@ const hash = (value) =>
     .update(Buffer.isBuffer(value) || typeof value === 'string' ? value : canonicalize(value))
     .digest('hex');
 const HOST_ASSET_DIGEST = '5'.repeat(64);
+const RELEASE_VERSION = '0.13.0';
+const RELEASE_TAG = 'session-relay--v0.13.0';
+const DOCKS_PLAN_PATH = 'docs/plans/active/session-relay-linux-workspace-recertification.md';
+const DOCKS_FINISHED_PLAN_PATH = 'docs/plans/finished/2026-07-23-session-relay-linux-workspace-recertification.md';
+const PUBLIC_PLAN_PATH = 'docs/plans/active/session-relay-cli-0.13.0-release-preparation.md';
+const ORDINARY_ASSET_NAMES = Object.freeze([
+  'session-relay-aarch64-apple-darwin',
+  'session-relay-aarch64-unknown-linux-musl',
+  'session-relay-x86_64-apple-darwin',
+  'session-relay-x86_64-unknown-linux-musl',
+]);
+const PUBLICATION_ASSET_NAMES = Object.freeze(['SHA256SUMS', ...ORDINARY_ASSET_NAMES]);
 
 const candidate = {
   schema: 1,
   type: 'SourcePreparationCandidateV1',
   repository_id: 'DocksDocks/docks',
-  version: '0.12.0',
+  version: RELEASE_VERSION,
   source_commit: TAG_COMMIT,
   execution_base_commit: OLD_MAIN,
   plan: {
-    path: 'docs/plans/active/session-relay-prebuilt-cli-distribution.md',
+    path: DOCKS_PLAN_PATH,
     source_blob_sha256: DIGEST('1'),
   },
   docks_red: {
@@ -60,15 +74,15 @@ const candidate = {
   },
   companion: {
     repository_id: 'DocksDocks/public',
-    validation_ref: 'refs/heads/preflight/session-relay-0.12.0',
+    validation_ref: `refs/heads/preflight/session-relay-cli-0.13.0-${PUBLIC_REVIEWED_COMMIT.slice(0, 12)}`,
     commit: PUBLIC_REVIEWED_COMMIT,
-    plan_path: 'docs/plans/active/session-relay-cli-installation.md',
+    plan_path: PUBLIC_PLAN_PATH,
     input_sha256: DIGEST('3'),
     execution_base_commit: BLOB('b'),
     review_receipt_sha256: DIGEST('4'),
     red_receipt_sha256: DIGEST('5'),
     status: 'blocked',
-    blocked_reason: 'Awaiting the four independently hashed `session-relay--v0.12.0` production asset digests.',
+    blocked_reason: 'Awaiting the four independently hashed `session-relay--v0.13.0` production asset digests.',
   },
   preflight: {
     sha256: DIGEST('6'),
@@ -84,16 +98,50 @@ const candidate = {
     run_database_id: 71,
     run_attempt: 1,
   },
-  checks: Array.from({ length: 6 }, (_, index) => ({
-    id: `A${index + 1}`,
-    steps: [
-      {
-        argv: ['node', `check-${index + 1}.mjs`],
-        exit_code: 0,
-        stdout_sha256: DIGEST('8'),
-        stderr_sha256: DIGEST('9'),
-      },
+  checks: [
+    ['A1', [['node', 'plugins/session-relay/test/release-evidence-contract.mjs']]],
+    ['A2', [['node', 'plugins/session-relay/test/release-publication-contract.mjs']]],
+    ['A3', [['node', 'plugins/session-relay/test/release-promotion-contract.mjs']]],
+    ['A4', [['node', 'plugins/session-relay/test/distribution-contract.mjs']]],
+    [
+      'A5',
+      [
+        [
+          'node',
+          'plugins/session-relay/test/companion-distribution-contract.mjs',
+          '--public-remote',
+          'https://github.com/DocksDocks/public.git',
+          '--public-ref',
+          `refs/heads/preflight/session-relay-cli-0.13.0-${PUBLIC_REVIEWED_COMMIT.slice(0, 12)}`,
+          '--public-commit',
+          PUBLIC_REVIEWED_COMMIT,
+          '--detached-clone',
+        ],
+      ],
     ],
+    [
+      'A6',
+      [
+        [
+          'cargo',
+          '+1.85.0',
+          'build',
+          '--manifest-path',
+          'plugins/session-relay/rust/Cargo.toml',
+          '--release',
+          '--locked',
+        ],
+        ['sh', '-c', 'test "$(plugins/session-relay/rust/target/release/relay --version)" = "session-relay 0.13.0"'],
+      ],
+    ],
+  ].map(([id, commands]) => ({
+    id,
+    steps: commands.map((argv) => ({
+      argv,
+      exit_code: 0,
+      stdout_sha256: DIGEST('8'),
+      stderr_sha256: DIGEST('9'),
+    })),
     exit_code: 0,
     stdout_sha256: DIGEST('a'),
     stderr_sha256: DIGEST('b'),
@@ -104,7 +152,7 @@ const proofValue = {
   schema: 1,
   type: 'SourcePreparationProofV1',
   repository_id: 'DocksDocks/docks',
-  version: '0.12.0',
+  version: RELEASE_VERSION,
   source_commit: TAG_COMMIT,
   tag_commit: TAG_COMMIT,
   evidence_commit: '8'.repeat(40),
@@ -113,11 +161,11 @@ const proofValue = {
   candidate,
   candidate_sha256: hash(candidate),
   plans: {
-    source_path: 'docs/plans/active/session-relay-prebuilt-cli-distribution.md',
+    source_path: DOCKS_PLAN_PATH,
     source_sha256: DIGEST('c'),
-    evidence_path: 'docs/plans/active/session-relay-prebuilt-cli-distribution.md',
+    evidence_path: DOCKS_PLAN_PATH,
     evidence_sha256: DIGEST('d'),
-    finished_path: 'docs/plans/finished/2026-07-17-session-relay-prebuilt-cli-distribution.md',
+    finished_path: DOCKS_FINISHED_PLAN_PATH,
     finished_sha256: DIGEST('e'),
   },
   completion_review_sha256: DIGEST('f'),
@@ -130,10 +178,7 @@ const proofValue = {
   non_plan_tree_equivalence: {
     source_commit: TAG_COMMIT,
     shipped_commit: PROMOTED_COMMIT,
-    excluded_paths: [
-      'docs/plans/active/session-relay-prebuilt-cli-distribution.md',
-      'docs/plans/finished/2026-07-17-session-relay-prebuilt-cli-distribution.md',
-    ],
+    excluded_paths: [DOCKS_PLAN_PATH, DOCKS_FINISHED_PLAN_PATH],
     verified: true,
   },
   public_repository_id: 'DocksDocks/public',
@@ -141,16 +186,27 @@ const proofValue = {
   review_status: 'passed',
   bound_at: '2026-07-17T19:30:00.000Z',
 };
+assert.equal(VERSION, RELEASE_VERSION, 'Session Relay production version must be 0.13.0');
+assert.equal(TAG, RELEASE_TAG, 'Session Relay production tag must be session-relay--v0.13.0');
+assert.match(
+  candidate.companion.validation_ref,
+  /^refs\/heads\/preflight\/session-relay-cli-0\.13\.0-[0-9a-f]{12}$/,
+  'public validation ref must use the immutable 0.13.0 preflight grammar',
+);
+assert.equal(
+  candidate.companion.validation_ref.slice(-12),
+  candidate.companion.commit.slice(0, 12),
+  'public validation ref suffix must bind the first 12 hex of the immutable public commit',
+);
 validateSourcePreparationProof(proofValue);
 const proof = { digest: hash(proofValue), value: proofValue };
 
-const assets = [
-  'SHA256SUMS',
-  'session-relay-aarch64-apple-darwin',
-  'session-relay-aarch64-unknown-linux-musl',
-  'session-relay-x86_64-apple-darwin',
-  'session-relay-x86_64-unknown-linux-musl',
-].map((name, index) => ({ name, database_id: 100 + index, size: 1000 + index, digest: String(index + 1).repeat(64) }));
+const assets = PUBLICATION_ASSET_NAMES.map((name, index) => ({
+  name,
+  database_id: 100 + index,
+  size: 1000 + index,
+  digest: String(index + 1).repeat(64),
+}));
 
 const publication = {
   digest: DIGEST('b'),
@@ -158,9 +214,9 @@ const publication = {
     schema: 1,
     type: 'SessionRelayPublicationReceiptV1',
     repository_id: 'DocksDocks/docks',
-    version: '0.12.0',
+    version: RELEASE_VERSION,
     source_proof_sha256: proof.digest,
-    tag: 'session-relay--v0.12.0',
+    tag: RELEASE_TAG,
     tag_commit: TAG_COMMIT,
     workflow: {
       file: '.github/workflows/build-binaries.yml',
@@ -187,6 +243,16 @@ const PUBLIC_ASSET_TARGETS = [
   'x86_64-apple-darwin',
   'aarch64-apple-darwin',
 ];
+assert.deepEqual(
+  assets.map(({ name }) => name),
+  PUBLICATION_ASSET_NAMES,
+  'promotion fixture must retain SHA256SUMS and exactly four ordinary native assets',
+);
+assert.deepEqual(
+  PUBLIC_ASSET_TARGETS.map((target) => `session-relay-${target}`).sort(),
+  [...ORDINARY_ASSET_NAMES].sort(),
+  'promotion must retain exact digest pins for both Linux and both Darwin targets',
+);
 const PUBLIC_RELEASE_ASSET_NAMES = [
   'SHA256SUMS',
   'docks-kit-darwin-arm64',
@@ -207,8 +273,8 @@ const publicRequestValue = {
   companion_base_commit: PUBLIC_REVIEWED_COMMIT,
   session_relay: {
     repository_id: 'DocksDocks/docks',
-    tag: 'session-relay--v0.12.0',
-    version: '0.12.0',
+    tag: RELEASE_TAG,
+    version: RELEASE_VERSION,
     tag_commit: TAG_COMMIT,
     publication_receipt_sha256: publication.digest,
   },
@@ -280,9 +346,9 @@ function smoke(kind) {
     ordering_log_sha256: DIGEST('1'),
     installed_binary_sha256: HOST_ASSET_DIGEST,
     session_relay_asset_name: 'session-relay-x86_64-unknown-linux-musl',
-    installed_version: 'session-relay 0.12.0',
+    installed_version: `session-relay ${RELEASE_VERSION}`,
     launcher_sha256: DIGEST('a'),
-    launcher_version: 'session-relay 0.12.0',
+    launcher_version: `session-relay ${RELEASE_VERSION}`,
     docks_kit_target_commit: PUBLIC_RELEASE_COMMIT,
     docks_kit_asset: { name: 'docks-kit-linux-x64', database_id: 501, size: 2000, digest: DIGEST('9') },
     docks_kit_release_database_id: 601,
@@ -336,7 +402,7 @@ function makeAdapter({
   const promotedBlobs = {
     '.claude-plugin/marketplace.json': BLOB('5'),
     'plugins/session-relay/bin/relay': BLOB('6'),
-    'plugins/session-relay/new-in-0.12': BLOB('7'),
+    'plugins/session-relay/new-in-0.13': BLOB('7'),
   };
   const beforeRaw = { ...state.currentBlobs };
   const paths = [...new Set([...Object.keys(beforeRaw), ...Object.keys(promotedBlobs)])].sort();
@@ -445,7 +511,7 @@ function makeAdapter({
     },
     releaseState: () => ({
       repository_id: 'DocksDocks/docks',
-      tag: 'session-relay--v0.12.0',
+      tag: RELEASE_TAG,
       commit: state.tagAbsent ? null : TAG_COMMIT,
       release_database_id: state.releaseAbsent ? null : 91,
       prerelease: state.releaseAbsent ? null : !state.releaseStable,
@@ -1010,6 +1076,33 @@ function verifyPublicBoundary(
   } finally {
     fs.rmSync(directory, { recursive: true, force: true });
   }
+}
+
+for (const [label, mutate] of [
+  ['missing-darwin', (records) => records.filter(({ name }) => name !== 'session-relay-aarch64-apple-darwin')],
+  [
+    'substituted-darwin',
+    (records) =>
+      records.map((record) =>
+        record.name === 'session-relay-x86_64-apple-darwin'
+          ? { ...record, name: 'session-relay-x86_64-apple-darwin-workspace-supported' }
+          : record,
+      ),
+  ],
+]) {
+  const { adapter, state } = makeAdapter();
+  state.releaseAssets = mutate(state.releaseAssets);
+  assert.throws(
+    () => run(adapter, `/receipts/${label}.json`),
+    /authoritative release.*asset|wrong closed asset set|release assets changed/i,
+    `promotion must reject ${label} ordinary asset state`,
+  );
+  assert.deepEqual(state.calls, [], `${label} rejection must precede release mutation`);
+  assert.deepEqual(
+    state.counts,
+    { lock: 0, prepush: 0, main: 0, live: 0, restore: 0, reapply: 0, append: 0 },
+    `${label} rejection must precede state-machine mutation`,
+  );
 }
 
 {
@@ -1932,7 +2025,7 @@ for (const releaseAbsent of [false, true]) {
       OLD_MAIN,
       '--receipt-out',
       receiptPath,
-      '0.12.0',
+      RELEASE_VERSION,
     ];
     await assert.rejects(
       dispatchSessionRelayRelease(['--promote-reviewed', ...common]),
@@ -2039,12 +2132,12 @@ for (const releaseAbsent of [false, true]) {
 }
 
 await assert.rejects(
-  dispatchSessionRelayRelease(['--emit-public-request', '--plugin', 'session-relay', '0.12.0']),
+  dispatchSessionRelayRelease(['--emit-public-request', '--plugin', 'session-relay', RELEASE_VERSION]),
   /missing required option: --publication/i,
   'emit-public-request CLI mode must be recognized',
 );
 await assert.rejects(
-  dispatchSessionRelayRelease(['--verify-public-release', '--plugin', 'session-relay', '0.12.0']),
+  dispatchSessionRelayRelease(['--verify-public-release', '--plugin', 'session-relay', RELEASE_VERSION]),
   /missing required option: --request/i,
   'verify-public-release CLI mode must be recognized',
 );
@@ -2053,7 +2146,7 @@ await assert.rejects(
     '--promote-reviewed',
     '--plugin',
     'session-relay',
-    '0.12.0',
+    RELEASE_VERSION,
     '--source-proof',
     '/proof.json',
     '--source-proof-sha256',

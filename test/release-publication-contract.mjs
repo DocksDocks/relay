@@ -21,6 +21,18 @@ import {
 import { finalizeReviewed, publishReviewed } from '../../../scripts/lib/session-relay-release-publication.mjs';
 
 const SOURCE = '1'.repeat(40);
+const EXPECTED_VERSION = '0.13.0';
+const EXPECTED_TAG = 'session-relay--v0.13.0';
+const DOCKS_PLAN_PATH = 'docs/plans/active/session-relay-linux-workspace-recertification.md';
+const DOCKS_FINISHED_PLAN_PATH = 'docs/plans/finished/2026-07-23-session-relay-linux-workspace-recertification.md';
+const PUBLIC_PLAN_PATH = 'docs/plans/active/session-relay-cli-0.13.0-release-preparation.md';
+const ORDINARY_ASSETS = Object.freeze([
+  'session-relay-aarch64-apple-darwin',
+  'session-relay-aarch64-unknown-linux-musl',
+  'session-relay-x86_64-apple-darwin',
+  'session-relay-x86_64-unknown-linux-musl',
+]);
+const EXPECTED_ASSETS = Object.freeze([...ORDINARY_ASSETS, 'SHA256SUMS']);
 const WORKFLOW_PATH = '.github/workflows/build-binaries.yml';
 const POLL_LIMIT = 12;
 const acceptPromotionReceipt = (receipt) => receipt;
@@ -40,11 +52,11 @@ function proof(directory) {
     schema: 1,
     type: 'SourcePreparationCandidateV1',
     repository_id: REPOSITORY_ID,
-    version: VERSION,
+    version: EXPECTED_VERSION,
     source_commit: SOURCE,
     execution_base_commit: 'b'.repeat(40),
     plan: {
-      path: 'docs/plans/active/session-relay-prebuilt-cli-distribution.md',
+      path: DOCKS_PLAN_PATH,
       source_blob_sha256: hash,
     },
     docks_red: {
@@ -54,15 +66,15 @@ function proof(directory) {
     },
     companion: {
       repository_id: 'DocksDocks/public',
-      validation_ref: 'refs/heads/preflight/session-relay-test',
+      validation_ref: `refs/heads/preflight/session-relay-cli-0.13.0-${'a'.repeat(12)}`,
       commit: 'a'.repeat(40),
-      plan_path: 'docs/plans/active/session-relay-cli-installation.md',
+      plan_path: PUBLIC_PLAN_PATH,
       input_sha256: hash,
       execution_base_commit: 'd'.repeat(40),
       review_receipt_sha256: hash,
       red_receipt_sha256: hash,
       status: 'blocked',
-      blocked_reason: 'Awaiting the four independently hashed `session-relay--v0.12.0` production asset digests.',
+      blocked_reason: 'Awaiting the four independently hashed `session-relay--v0.13.0` production asset digests.',
     },
     preflight: {
       sha256: hash,
@@ -78,9 +90,45 @@ function proof(directory) {
       run_database_id: 102,
       run_attempt: 1,
     },
-    checks: Array.from({ length: 6 }, (_, index) => ({
-      id: `A${index + 1}`,
-      steps: [{ argv: ['node', `A${index + 1}`], exit_code: 0, stdout_sha256: hash, stderr_sha256: hash }],
+    checks: [
+      ['A1', [['node', 'plugins/session-relay/test/release-evidence-contract.mjs']]],
+      ['A2', [['node', 'plugins/session-relay/test/release-publication-contract.mjs']]],
+      ['A3', [['node', 'plugins/session-relay/test/release-promotion-contract.mjs']]],
+      ['A4', [['node', 'plugins/session-relay/test/distribution-contract.mjs']]],
+      [
+        'A5',
+        [
+          [
+            'node',
+            'plugins/session-relay/test/companion-distribution-contract.mjs',
+            '--public-remote',
+            'https://github.com/DocksDocks/public.git',
+            '--public-ref',
+            `refs/heads/preflight/session-relay-cli-0.13.0-${'a'.repeat(12)}`,
+            '--public-commit',
+            'a'.repeat(40),
+            '--detached-clone',
+          ],
+        ],
+      ],
+      [
+        'A6',
+        [
+          [
+            'cargo',
+            '+1.85.0',
+            'build',
+            '--manifest-path',
+            'plugins/session-relay/rust/Cargo.toml',
+            '--release',
+            '--locked',
+          ],
+          ['sh', '-c', 'test "$(plugins/session-relay/rust/target/release/relay --version)" = "session-relay 0.13.0"'],
+        ],
+      ],
+    ].map(([id, commands]) => ({
+      id,
+      steps: commands.map((argv) => ({ argv, exit_code: 0, stdout_sha256: hash, stderr_sha256: hash })),
       exit_code: 0,
       stdout_sha256: hash,
       stderr_sha256: hash,
@@ -91,7 +139,7 @@ function proof(directory) {
     schema: 1,
     type: 'SourcePreparationProofV1',
     repository_id: REPOSITORY_ID,
-    version: VERSION,
+    version: EXPECTED_VERSION,
     source_commit: SOURCE,
     tag_commit: SOURCE,
     evidence_commit: '6'.repeat(40),
@@ -100,11 +148,11 @@ function proof(directory) {
     candidate,
     candidate_sha256: sha256(Buffer.from(canonicalize(candidate))),
     plans: {
-      source_path: 'docs/plans/active/session-relay-prebuilt-cli-distribution.md',
+      source_path: DOCKS_PLAN_PATH,
       source_sha256: '7'.repeat(64),
-      evidence_path: 'docs/plans/active/session-relay-prebuilt-cli-distribution.md',
+      evidence_path: DOCKS_PLAN_PATH,
       evidence_sha256: '8'.repeat(64),
-      finished_path: 'docs/plans/finished/2026-07-17-session-relay-prebuilt-cli-distribution.md',
+      finished_path: DOCKS_FINISHED_PLAN_PATH,
       finished_sha256: '9'.repeat(64),
     },
     completion_review_sha256: '5'.repeat(64),
@@ -117,10 +165,7 @@ function proof(directory) {
     non_plan_tree_equivalence: {
       source_commit: SOURCE,
       shipped_commit: '2'.repeat(40),
-      excluded_paths: [
-        'docs/plans/active/session-relay-prebuilt-cli-distribution.md',
-        'docs/plans/finished/2026-07-17-session-relay-prebuilt-cli-distribution.md',
-      ],
+      excluded_paths: [DOCKS_PLAN_PATH, DOCKS_FINISHED_PLAN_PATH],
       verified: true,
     },
     public_repository_id: 'DocksDocks/public',
@@ -143,7 +188,7 @@ function run(id = 701, event = 'push') {
     id,
     run_attempt: 3,
     head_sha: SOURCE,
-    head_branch: TAG,
+    head_branch: EXPECTED_TAG,
     path: WORKFLOW_PATH,
     event,
     status: 'completed',
@@ -155,7 +200,7 @@ function run(id = 701, event = 'push') {
 }
 
 function runAssetRecords() {
-  return [...ASSETS].sort().map((name, index) => {
+  return [...EXPECTED_ASSETS].sort().map((name, index) => {
     const bytes = Buffer.from(`same-run:${name}`);
     return { name, size: bytes.length, digest: sha256(bytes), path: `/bound-run/${index}-${name}` };
   });
@@ -175,7 +220,7 @@ function runAttestationRecords(workflowRun, assets, mode = workflowRun.event ===
         asset_name: asset.name,
         inputs: {
           expected_commit: workflowRun.event === 'push' ? '' : SOURCE,
-          expected_tag: workflowRun.event === 'push' ? '' : TAG,
+          expected_tag: workflowRun.event === 'push' ? '' : EXPECTED_TAG,
           mode,
         },
         runner_arch: runners[target][0],
@@ -184,7 +229,7 @@ function runAttestationRecords(workflowRun, assets, mode = workflowRun.event ===
         sha256: asset.digest,
         source_commit: SOURCE,
         target,
-        version_stdout: `session-relay ${VERSION}`,
+        version_stdout: `session-relay ${EXPECTED_VERSION}`,
         workflow_run_attempt: workflowRun.run_attempt,
         workflow_run_id: workflowRun.id,
       };
@@ -529,7 +574,7 @@ function runPublicationWorkflow(
   const binDirectory = path.join(directory, 'bin');
   fs.mkdirSync(releaseDirectory);
   fs.mkdirSync(binDirectory);
-  const files = ASSETS.map((name, index) => {
+  const files = EXPECTED_ASSETS.map((name, index) => {
     const file = path.join(releaseDirectory, name);
     fs.writeFileSync(file, Buffer.from(`${name}:${index}\n`));
     return file;
@@ -542,10 +587,10 @@ function runPublicationWorkflow(
       ? null
       : {
           id: 88,
-          tag_name: TAG,
+          tag_name: EXPECTED_TAG,
           draft: false,
           prerelease: true,
-          name: `Session Relay ${VERSION}`,
+          name: `Session Relay ${EXPECTED_VERSION}`,
           body: PRERELEASE_BODY,
           assets: assetOverrides(structuredClone(present)),
           ...releaseOverrides,
@@ -575,8 +620,8 @@ function runPublicationWorkflow(
       GITHUB_REPOSITORY: REPOSITORY_ID,
       PATH: `${binDirectory}:${process.env.PATH}`,
       RUNNER_TEMP: directory,
-      TAG,
-      VERSION,
+      TAG: EXPECTED_TAG,
+      VERSION: EXPECTED_VERSION,
     },
   });
   return {
@@ -594,6 +639,16 @@ function assertWorkflowFailure(run, message) {
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'session-relay-publication-contract-'));
 try {
+  assert.equal(VERSION, EXPECTED_VERSION, 'Session Relay production version must be 0.13.0');
+  assert.equal(TAG, EXPECTED_TAG, 'Session Relay production tag must be session-relay--v0.13.0');
+  assert.match(PRERELEASE_BODY, /Session Relay 0\.13\.0/, 'prerelease body must announce Session Relay 0.13.0');
+  assert.match(STABLE_BODY, /Session Relay 0\.13\.0/, 'stable body must announce Session Relay 0.13.0');
+  assert.deepEqual(ASSETS, EXPECTED_ASSETS, 'publication must bind SHA256SUMS and exactly four ordinary native assets');
+  assert.deepEqual(
+    ASSETS.filter((name) => name !== 'SHA256SUMS'),
+    ORDINARY_ASSETS,
+    'publication ordinary asset order and four target pins are frozen',
+  );
   {
     const cli = spawnSync(
       process.execPath,
@@ -832,6 +887,35 @@ try {
     assert.deepEqual(fake.state.pushed, [SOURCE]);
     assert.equal(fake.state.dispatched.length, 0);
     assert.equal(fake.state.sleeps, POLL_LIMIT - 1);
+  }
+
+  for (const [label, mutate] of [
+    ['missing-darwin', (records) => records.filter(({ name }) => name !== 'session-relay-aarch64-apple-darwin')],
+    [
+      'substituted-darwin',
+      (records) =>
+        records.map((record) =>
+          record.name === 'session-relay-x86_64-apple-darwin'
+            ? { ...record, name: 'session-relay-x86_64-apple-darwin-workspace-supported' }
+            : record,
+        ),
+    ],
+  ]) {
+    const directory = fs.mkdtempSync(path.join(root, `${label}-ordinary-asset-`));
+    const completeAssets = runAssetRecords();
+    const fake = fakeAdapter({
+      release: null,
+      runAssets: mutate(completeAssets),
+      attestations: runAttestationRecords(run(), completeAssets),
+    });
+    const sourceProof = proof(directory);
+    const publicationOptions = optionsFor(directory, sourceProof);
+    expectConflict(
+      () => publishReviewed(publicationOptions, fake.adapter),
+      /bound workflow run asset set is incomplete|asset set.*conflict/i,
+    );
+    assertNoPublicationMutation(fake.state);
+    assert.equal(fs.existsSync(publicationOptions.get('receipt-out')), false);
   }
 
   {

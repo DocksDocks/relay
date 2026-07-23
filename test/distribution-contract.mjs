@@ -15,7 +15,11 @@ const HELPER = path.join(REPO, 'scripts/capture-tdd-red.mjs');
 const LAUNCHER = path.join(REPO, 'plugins/session-relay/bin/relay');
 const RELEASE = path.join(REPO, 'scripts/release.mjs');
 const WORKFLOW = path.join(REPO, '.github/workflows/build-binaries.yml');
-const SHA = /^[0-9a-f]{64}$/;
+const COMPANION = path.join(REPO, 'plugins/session-relay/test/companion-distribution-contract.mjs');
+const DOCKS_PLAN = 'docs/plans/active/session-relay-linux-workspace-recertification.md';
+const RELEASE_VERSION = '0.13.0';
+const RELEASE_TAG = `session-relay--v${RELEASE_VERSION}`;
+const PUBLIC_REF = /^refs\/heads\/preflight\/session-relay-cli-0\.13\.0-[0-9a-f]{12}$/;
 const COMMIT = /^[0-9a-f]{40}$/;
 const ASSETS = [
   'session-relay-aarch64-apple-darwin',
@@ -333,7 +337,7 @@ function testLauncher() {
     fs.mkdirSync(path.join(home, '.local/bin'), { recursive: true });
     const record = path.join(root, 'record.json');
     const stubBody = (name) =>
-      `require('node:fs').writeFileSync(process.env.RELAY_RECORD, JSON.stringify({name:${JSON.stringify(name)},argv:process.argv.slice(2)}));process.stdout.write(${JSON.stringify(`${name} 0.12.0\n`)});`;
+      `require('node:fs').writeFileSync(process.env.RELAY_RECORD, JSON.stringify({name:${JSON.stringify(name)},argv:process.argv.slice(2)}));process.stdout.write(${JSON.stringify(`${name} ${RELEASE_VERSION}\n`)});`;
     const explicit = path.join(envDir, 'explicit');
     makeExecutable(explicit, stubBody('explicit'));
     makeExecutable(path.join(pathDir, 'session-relay'), stubBody('path'));
@@ -346,7 +350,7 @@ function testLauncher() {
 
     let result = launcherRun({ ...common, SESSION_RELAY_BIN: explicit }, ['send', 'agent', '--', 'a b', '--flag']);
     assert.equal(result.status, 0, result.stderr);
-    assert.equal(result.stdout, 'explicit 0.12.0\n');
+    assert.equal(result.stdout, `explicit ${RELEASE_VERSION}\n`);
     assert.deepEqual(JSON.parse(fs.readFileSync(record, 'utf8')), {
       name: 'explicit',
       argv: ['send', 'agent', '--', 'a b', '--flag'],
@@ -391,7 +395,7 @@ check('only the launcher remains tracked in the plugin bin directory', () => {
   ]);
 });
 
-check('Cargo and plugin manifests expose one synchronized version', () => {
+check('Cargo and plugin manifests expose exact synchronized release version', () => {
   const cargo = fs
     .readFileSync(path.join(REPO, 'plugins/session-relay/rust/Cargo.toml'), 'utf8')
     .match(/^version\s*=\s*"([^"]+)"/m)?.[1];
@@ -402,10 +406,110 @@ check('Cargo and plugin manifests expose one synchronized version', () => {
   const market = JSON.parse(fs.readFileSync(path.join(REPO, '.claude-plugin/marketplace.json'))).plugins.find(
     ({ name }) => name === 'session-relay',
   ).version;
-  assert.equal(cargo, claude);
-  assert.equal(codex, claude);
-  assert.equal(market, claude);
+  assert.equal(cargo, RELEASE_VERSION);
+  assert.equal(claude, RELEASE_VERSION);
+  assert.equal(codex, RELEASE_VERSION);
+  assert.equal(market, RELEASE_VERSION);
 });
+
+function assertNativeWorkflowBoundary(document) {
+  const build = document.jobs.build;
+  assert.equal(build.needs, 'identity');
+  assert.equal(build['runs-on'], '${{ matrix.runner }}');
+  exactKeys(build.strategy.matrix, ['include'], 'native matrix is closed');
+  for (const leg of build.strategy.matrix.include)
+    exactKeys(leg, ['runner', 'runner_os', 'runner_arch', 'target', 'asset'], 'native matrix leg is closed');
+  assert.deepEqual(build.strategy.matrix.include, [
+    {
+      runner: 'ubuntu-24.04',
+      runner_os: 'Linux',
+      runner_arch: 'X64',
+      target: 'x86_64-unknown-linux-musl',
+      asset: 'session-relay-x86_64-unknown-linux-musl',
+    },
+    {
+      runner: 'ubuntu-24.04-arm',
+      runner_os: 'Linux',
+      runner_arch: 'ARM64',
+      target: 'aarch64-unknown-linux-musl',
+      asset: 'session-relay-aarch64-unknown-linux-musl',
+    },
+    {
+      runner: 'macos-15-intel',
+      runner_os: 'macOS',
+      runner_arch: 'X64',
+      target: 'x86_64-apple-darwin',
+      asset: 'session-relay-x86_64-apple-darwin',
+    },
+    {
+      runner: 'macos-15',
+      runner_os: 'macOS',
+      runner_arch: 'ARM64',
+      target: 'aarch64-apple-darwin',
+      asset: 'session-relay-aarch64-apple-darwin',
+    },
+  ]);
+
+  const names = build.steps.map((step) => step.name ?? step.uses);
+  const evidenceSteps = [
+    'build locked native release',
+    'prove Linux managed-workspace custody',
+    'prove macOS managed-workspace admission STOP',
+    'smoke explicit fresh Linux workspace binary',
+    'attest native release binary',
+    'upload stable executable and canonical attestation',
+  ];
+  const firstEvidence = names.indexOf(evidenceSteps[0]);
+  assert.notEqual(firstEvidence, -1, 'native evidence steps are absent');
+  assert.deepEqual(
+    evidenceSteps.map((name) => names.indexOf(name)),
+    evidenceSteps.map((_, index) => firstEvidence + index),
+    'native custody, refusal, smoke, and attestation steps must remain contiguous and ordered',
+  );
+  const byName = new Map(build.steps.map((step) => [step.name, step]));
+  const linuxCustody = byName.get('prove Linux managed-workspace custody');
+  assert.equal(linuxCustody.if, "runner.os == 'Linux'");
+  assert.match(
+    linuxCustody.run,
+    /SESSION_RELAY_TEST_BIN="\$RUNNER_TEMP\/session-relay\/\$TARGET\/\$ASSET_NAME"[\s\S]*workspace_lease_process[\s\S]*linux_cgroup_pidfd_guardian_kills_hostile_descendants[\s\S]*--exact --nocapture/,
+  );
+  const linuxSmoke = byName.get('smoke explicit fresh Linux workspace binary');
+  assert.equal(linuxSmoke.if, "runner.os == 'Linux'");
+  assert.match(
+    linuxSmoke.run,
+    /bin="\$RUNNER_TEMP\/session-relay\/\$TARGET\/\$ASSET_NAME"[\s\S]*--case single-session-compat --bin "\$bin"[\s\S]*--case docs-contract --bin "\$bin"/,
+  );
+  const macosRefusal = byName.get('prove macOS managed-workspace admission STOP');
+  assert.equal(macosRefusal.if, "runner.os == 'macOS'");
+  assert.match(
+    macosRefusal.run,
+    /test "\$filesystem_type" = apfs[\s\S]*workspace_lease_process[\s\S]*macos_process_group_recursive_guardian_kills_hostile_descendants[\s\S]*--exact --nocapture/,
+  );
+  assert.doesNotMatch(macosRefusal.name, /custody|support/i);
+
+  const upload = byName.get('upload stable executable and canonical attestation');
+  assert.match(upload.with.path, /\$\{\{ matrix\.asset \}\}/);
+  assert.match(upload.with.path, /attestation-\$\{\{ matrix\.target \}\}\.json/);
+  assert.deepEqual(document.jobs.aggregate.needs, ['identity', 'build']);
+  const aggregate = document.jobs.aggregate.steps.find(
+    ({ name }) => name === 'validate closed attestations and generate SHA256SUMS',
+  );
+  assert.ok(aggregate, 'aggregate attestation closure is absent');
+  assert.match(aggregate.run, /const attestationName = `attestation-\$\{target\}\.json`;/);
+  assert.match(aggregate.run, /expectedFiles\.push\(assetName, attestationName\)/);
+  for (const target of build.strategy.matrix.include.map(({ target }) => target)) {
+    assert.match(
+      aggregate.run,
+      new RegExp(`['"]${target}['"]\\s*:`),
+      `aggregate does not declare attestation row ${target}`,
+    );
+  }
+  const checksumRows = aggregate.run
+    .match(/sha256sum \\\n([\s\S]*?)> SHA256SUMS/)?.[1]
+    ?.match(/session-relay-[a-z0-9_-]+/g);
+  assert.deepEqual(checksumRows, ASSETS, 'checksum manifest must contain exactly the four ordinary native assets');
+  assert.match(aggregate.run, /test "\$\(wc -l < SHA256SUMS\)" -eq 4/);
+}
 
 function workflowContract() {
   const document = parseYaml(fs.readFileSync(WORKFLOW, 'utf8'));
@@ -426,21 +530,30 @@ function workflowContract() {
   assert.equal(publishing.length, 1, 'only one publisher may receive contents: write');
   for (const job of jobs.filter((job) => !publishing.includes(job)))
     assert.notEqual(job.permissions?.contents, 'write');
-  const serialized = JSON.stringify(document);
-  for (const asset of ASSETS) assert.ok(serialized.includes(asset), `workflow does not name ${asset}`);
-  for (const [runner, target] of [
-    ['ubuntu-24.04', 'x86_64-unknown-linux-musl'],
-    ['ubuntu-24.04-arm', 'aarch64-unknown-linux-musl'],
-    ['macos-15-intel', 'x86_64-apple-darwin'],
-    ['macos-15', 'aarch64-apple-darwin'],
-  ]) {
-    assert.ok(serialized.includes(runner) && serialized.includes(target), `missing native ${runner}/${target} leg`);
-  }
-  assert.match(serialized, /--version/);
-  assert.match(serialized, /SHA256SUMS/);
-  assert.match(serialized, /attest/i);
-  assert.match(serialized, /prerelease/i);
-  assert.match(serialized, /validate-only/);
+  assertNativeWorkflowBoundary(document);
+
+  const supportSubstitution = structuredClone(document);
+  supportSubstitution.jobs.build.steps.find(
+    ({ name }) => name === 'prove macOS managed-workspace admission STOP',
+  ).name = 'prove macOS managed-workspace custody';
+  assert.throws(
+    () => assertNativeWorkflowBoundary(supportSubstitution),
+    /contiguous|ordered|absent/,
+    'macOS support substitution was accepted',
+  );
+  const missingDarwin = structuredClone(document);
+  missingDarwin.jobs.build.strategy.matrix.include = missingDarwin.jobs.build.strategy.matrix.include.filter(
+    ({ target }) => target !== 'aarch64-apple-darwin',
+  );
+  assert.throws(() => assertNativeWorkflowBoundary(missingDarwin), /deep-equal/, 'missing Darwin asset was accepted');
+  const substitutedDarwin = structuredClone(document);
+  substitutedDarwin.jobs.build.strategy.matrix.include[2].asset = 'session-relay-x86_64-unknown-linux-musl';
+  assert.throws(
+    () => assertNativeWorkflowBoundary(substitutedDarwin),
+    /deep-equal/,
+    'substituted Darwin asset was accepted',
+  );
+
   for (const match of fs.readFileSync(WORKFLOW, 'utf8').matchAll(/uses:\s*([^\s#]+)/g)) {
     assert.match(match[1], /@[0-9a-f]{40}$/i, `action is not pinned by full commit: ${match[1]}`);
   }
@@ -515,7 +628,7 @@ function runReleaseFixture(root, mode, scenario, expectedOutcome, releaseArgs) {
     source_commit: '1'.repeat(40),
     promoted_commit: '2'.repeat(40),
     expected_origin_main: '3'.repeat(40),
-    tag: 'session-relay--v0.12.0',
+    tag: RELEASE_TAG,
     assets: [...ASSETS, 'SHA256SUMS'].map((name, index) => ({
       name,
       digest: String(index + 4)
@@ -581,7 +694,7 @@ function releaseContracts() {
         '--publish-reviewed',
         '--plugin',
         'session-relay',
-        '0.12.0',
+        RELEASE_VERSION,
         '--source-proof',
         ...pair('source-proof', 'a'),
         '--receipt-out',
@@ -605,8 +718,8 @@ function releaseContracts() {
         `--${mode}`,
         '--plugin',
         'session-relay',
-        '0.12.0',
-        ...(resume ? ['--transaction-ref', 'refs/heads/transactions/session-relay-0.12.0'] : []),
+        RELEASE_VERSION,
+        ...(resume ? ['--transaction-ref', `refs/heads/transactions/session-relay-${RELEASE_VERSION}`] : []),
         '--source-proof',
         ...pair('source-proof', 'a'),
         '--publication',
@@ -636,9 +749,9 @@ function releaseContracts() {
         '--resume-promotion',
         '--plugin',
         'session-relay',
-        '0.12.0',
+        RELEASE_VERSION,
         '--transaction-ref',
-        'refs/heads/transactions/session-relay-0.12.0',
+        `refs/heads/transactions/session-relay-${RELEASE_VERSION}`,
         '--source-proof',
         ...pair('source-proof', 'a'),
         '--publication',
@@ -683,7 +796,7 @@ function releaseContracts() {
         '--finalize-reviewed',
         '--plugin',
         'session-relay',
-        '0.12.0',
+        RELEASE_VERSION,
         '--source-proof',
         ...pair('source-proof', 'a'),
         '--publication',
@@ -704,16 +817,16 @@ function releaseContracts() {
     }
 
     const preparation = [
-      ['prepare', ['--prepare', '--plugin', 'session-relay', '0.12.0']],
+      ['prepare', ['--prepare', '--plugin', 'session-relay', RELEASE_VERSION]],
       [
         'materialize-tdd-red',
         [
           '--materialize-tdd-red',
           '--plugin',
           'session-relay',
-          '0.12.0',
+          RELEASE_VERSION,
           '--plan',
-          'docs/plans/active/session-relay-prebuilt-cli-distribution.md',
+          DOCKS_PLAN,
           '--docks-red-out',
           outPath('docks-red'),
           '--public-red-out',
@@ -722,14 +835,7 @@ function releaseContracts() {
       ],
       [
         'verify-embedded-preparation',
-        [
-          '--verify-embedded-preparation',
-          '--plugin',
-          'session-relay',
-          '0.12.0',
-          '--plan',
-          'docs/plans/active/session-relay-prebuilt-cli-distribution.md',
-        ],
+        ['--verify-embedded-preparation', '--plugin', 'session-relay', RELEASE_VERSION, '--plan', DOCKS_PLAN],
       ],
       [
         'verify-source-ci',
@@ -737,7 +843,7 @@ function releaseContracts() {
           '--verify-source-ci',
           '--plugin',
           'session-relay',
-          '0.12.0',
+          RELEASE_VERSION,
           '--run-id',
           '12345',
           '--expected-commit',
@@ -752,7 +858,7 @@ function releaseContracts() {
           '--check-prepared',
           '--plugin',
           'session-relay',
-          '0.12.0',
+          RELEASE_VERSION,
           '--source-commit',
           '1'.repeat(40),
           '--docks-red',
@@ -773,7 +879,7 @@ function releaseContracts() {
           '--bind-completion',
           '--plugin',
           'session-relay',
-          '0.12.0',
+          RELEASE_VERSION,
           '--finished-plan',
           inPath('finished-plan'),
           '--embedded-candidate-sha256',
@@ -813,7 +919,7 @@ function releaseContracts() {
       '--prepare',
       '--plugin',
       'session-relay',
-      '0.12.0',
+      RELEASE_VERSION,
       '--dry-run',
     ]);
     assert.equal(
@@ -831,7 +937,7 @@ function releaseContracts() {
       '--publish-reviewed',
       '--plugin',
       'session-relay',
-      '0.12.0',
+      RELEASE_VERSION,
       '--source-proof',
       ...pair('source-proof', 'a'),
       '--receipt-out',
@@ -847,7 +953,7 @@ function releaseContracts() {
           '--publish-reviewed',
           '--plugin',
           'session-relay',
-          '0.12.0',
+          RELEASE_VERSION,
           '--source-proof-sha256',
           'a'.repeat(64),
           '--receipt-out',
@@ -874,7 +980,7 @@ function releaseContracts() {
     const positionalRelay = runReleaseFixture(fixtureRoot.root, 'grammar', 'session-relay-positional', 'conflict', [
       '--plugin',
       'session-relay',
-      '0.12.0',
+      RELEASE_VERSION,
     ]);
     assert.deepEqual(positionalRelay.mutations, []);
   } finally {
@@ -889,87 +995,23 @@ check(
 function verifyCompanion() {
   if (!cli.publicRemote) return;
   assert.equal(cli.publicRemote, 'https://github.com/DocksDocks/public.git');
-  assert.match(cli.publicRef, /^refs\/heads\/preflight\/session-relay-cli-0\.9\.0-[0-9a-f]{12}$/);
-  const directory = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'session-relay-public-contract-')));
-  const identity = fs.statSync(directory);
-  try {
-    git(directory, ['init', '-q']);
-    git(directory, ['remote', 'add', 'origin', cli.publicRemote]);
-    git(directory, ['fetch', '--no-tags', 'origin', `${cli.publicRef}:refs/remotes/origin/preflight`]);
-    assert.equal(git(directory, ['rev-parse', 'refs/remotes/origin/preflight^{commit}']), cli.publicCommit);
-    git(directory, ['checkout', '--detach', '-q', cli.publicCommit]);
-    assert.equal(git(directory, ['rev-parse', 'HEAD']), cli.publicCommit);
-    assert.equal(git(directory, ['status', '--porcelain=v1']), '');
-    assert.equal(git(directory, ['remote', 'get-url', 'origin']), cli.publicRemote);
-    const planCandidates = [
-      'docs/plans/active/session-relay-cli-installation.md',
-      'docs/plans/finished/session-relay-cli-installation.md',
-    ].map((relative) => path.join(directory, relative));
-    const planPath = planCandidates.find(fs.existsSync);
-    assert.ok(planPath, 'companion plan is absent');
-    const plan = fs.readFileSync(planPath, 'utf8');
-    const executionBase = plan.match(/^execution_base_commit:\s*([0-9a-f]{40})$/m)?.[1];
-    assert.ok(executionBase, 'companion execution base is absent');
-    const reviewBytes = plan.match(/^Review-receipt:\s*(\{.*\})$/m)?.[1];
-    assert.ok(reviewBytes, 'companion review receipt is absent');
-    const review = JSON.parse(reviewBytes);
-    assert.equal(review.outcome, 'passed');
-    assert.match(plan, /^status:\s*blocked$/m);
-    const blockedReason = 'Awaiting the four independently hashed `session-relay--v0.12.0` production asset digests.';
-    assert.match(
-      plan,
-      new RegExp(`^- .*blocked reason: ${blockedReason.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'mi'),
-    );
-    const receiptBytes = plan.match(/^- (?:Public|Companion) TDD-red receipt JCS bytes: (\{.*\})$/m)?.[1];
-    const receiptHash = plan.match(/^- (?:Public|Companion) TDD-red receipt SHA-256: ([0-9a-f]{64})$/m)?.[1];
-    assert.ok(receiptBytes && receiptHash, 'companion TDD-red receipt is absent');
-    assert.equal(canonicalize(JSON.parse(receiptBytes)), receiptBytes);
-    assert.equal(sha256(receiptBytes), receiptHash);
-    const receipt = JSON.parse(receiptBytes);
-    assert.equal(receipt.type, 'TddRedReceiptV1');
-    assert.equal(receipt.repository_id, 'DocksDocks/public');
-    assert.ok(receipt.test_paths.length > 0);
-    for (const test of receipt.test_paths)
-      assert.equal(git(directory, ['rev-parse', `${receipt.pre_production_commit}:${test.path}`]), test.blob_id);
-    assert.equal(git(directory, ['merge-base', '--is-ancestor', receipt.pre_production_commit, cli.publicCommit]), '');
-    const docksPlan = fs.readFileSync(
-      path.join(REPO, 'docs/plans/active/session-relay-prebuilt-cli-distribution.md'),
-      'utf8',
-    );
-    const docksField = (name) =>
-      docksPlan.match(new RegExp(`^- ${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}: (.+)$`, 'm'))?.[1];
-    assert.equal(docksField('Companion repository ID'), 'DocksDocks/public');
-    assert.equal(docksField('Companion validation ref'), cli.publicRef);
-    assert.equal(docksField('Companion implementation commit'), cli.publicCommit);
-    assert.equal(docksField('Companion plan input SHA-256'), review.input_sha256);
-    assert.equal(docksField('Companion execution-base commit'), executionBase);
-    assert.equal(docksField('Companion review receipt SHA-256'), sha256(reviewBytes));
-    assert.equal(docksField('Companion TDD-red receipt JCS bytes'), receiptBytes);
-    assert.equal(docksField('Companion TDD-red receipt SHA-256'), receiptHash);
-    assert.equal(docksField('Companion status'), 'blocked');
-    assert.equal(docksField('Companion blocked reason'), blockedReason);
-    const toolchain = JSON.parse(fs.readFileSync(path.join(directory, 'SoT/toolchain.json'), 'utf8'));
-    const relay = toolchain['session-relay'] ?? toolchain.tools?.['session-relay'];
-    assert.equal(relay.repository, 'DocksDocks/docks');
-    assert.equal(relay.tag, 'session-relay--v0.12.0');
-    assert.equal(relay.version, '0.12.0');
-    assert.equal(relay.install_path, '~/.local/bin/session-relay');
-    exactKeys(
-      relay.assets,
-      ['x86_64-unknown-linux-musl', 'aarch64-unknown-linux-musl', 'x86_64-apple-darwin', 'aarch64-apple-darwin'],
-      'companion asset pins are closed',
-    );
-    for (const digest of Object.values(relay.assets)) assert.match(digest, SHA);
-  } finally {
-    const current = fs.statSync(directory);
-    assert.equal(
-      `${current.dev}:${current.ino}`,
-      `${identity.dev}:${identity.ino}`,
-      'companion clone identity changed before cleanup',
-    );
-    fs.rmSync(directory, { recursive: true, force: true });
-    assert.equal(fs.existsSync(directory), false);
-  }
+  assert.match(cli.publicRef, PUBLIC_REF);
+  assert.equal(
+    cli.publicRef,
+    `refs/heads/preflight/session-relay-cli-${RELEASE_VERSION}-${cli.publicCommit.slice(0, 12)}`,
+    'companion validation ref must be derived from the exact public commit',
+  );
+  const result = run(process.execPath, [
+    COMPANION,
+    '--public-remote',
+    cli.publicRemote,
+    '--public-ref',
+    cli.publicRef,
+    '--public-commit',
+    cli.publicCommit,
+    '--detached-clone',
+  ]);
+  assert.equal(result.status, 0, result.stderr || result.stdout);
 }
 check('companion validation ref is a clean detached, receipt-bound installer contract', verifyCompanion);
 
