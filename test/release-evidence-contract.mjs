@@ -1723,14 +1723,49 @@ function testCompletionBinding(temp, preparation) {
   const evidenceCommit = '234567890abcdef1234567890abcdef123456789';
   const shippedCommit = '567890abcdef1234567890abcdef123456789012';
   const currentHead = '67890abcdef1234567890abcdef1234567890123';
+  const authorizedBaseCommit = '25592c6550069e300a7a0148d3cd3c21880da8e7';
   const promotedChangedPaths = [
+    '.claude-plugin/marketplace.json',
+    '.codex/agents/plan-manager.toml',
+    '.codex/agents/plan-reviewer.toml',
+    'AGENTS.md',
+    'README.md',
+    'docs/plans/AGENTS.md',
     'docs/plans/active/session-relay-linux-workspace-publication.md',
+    'docs/scaffold/templates/codex-plan-manager.toml.template',
+    'docs/scaffold/templates/codex-plan-reviewer.toml.template',
+    'docs/scaffold/templates/root-AGENTS.md.template',
+    'plugins/docks/.claude-plugin/plugin.json',
+    'plugins/docks/.codex-plugin/plugin.json',
+    'plugins/docks/README.md',
+    'plugins/docks/agents/plan-manager.md',
+    'plugins/docks/agents/plan-reviewer.md',
+    'plugins/docks/skills/AGENTS.md',
+    'plugins/docks/skills/productivity/plan-creator/SKILL.md',
+    'plugins/docks/skills/productivity/plan-manager/SKILL.md',
+    'plugins/docks/skills/productivity/plan-repairer/SKILL.md',
+    'plugins/docks/skills/productivity/plan-reviewer/SKILL.md',
+    'plugins/docks/skills/productivity/plan-reviewer/scripts/review-policy.mjs',
+    'plugins/docks/skills/productivity/plan-workspace/SKILL.md',
+    'plugins/docks/skills/productivity/plan-workspace/references/codex-agent-templates.md',
+    'plugins/docks/skills/productivity/plan-workspace/references/plans-agents-md-template.md',
     'plugins/session-relay/test/release-evidence-contract.mjs',
     'plugins/session-relay/test/release-promotion-contract.mjs',
     'plugins/session-relay/test/release-publication-contract.mjs',
+    'scripts/agents/score.mjs',
     'scripts/lib/session-relay-release-preparation.mjs',
     'scripts/lib/session-relay-release-promotion.mjs',
+    'scripts/tests/plan-review-convergence-repair.mjs',
+    'scripts/tests/plan-review-policy-regressions.mjs',
+    'scripts/tests/plan-review-policy.mjs',
+    'scripts/tests/plan-skill-phases.mjs',
   ];
+  const amendmentChangedPaths = [
+    'docs/plans/active/session-relay-linux-workspace-publication.md',
+    'plugins/session-relay/test/release-evidence-contract.mjs',
+    'scripts/lib/session-relay-release-preparation.mjs',
+  ];
+  assert.equal(promotedChangedPaths.length, 34);
   const evidencePlan = preparation.plan
     .replace('status: ongoing', 'status: in_review')
     .replace('review_status: null', 'review_status: null');
@@ -1762,6 +1797,7 @@ function testCompletionBinding(temp, preparation) {
     sourceEvidenceClean = true,
     evidenceShippedClean = true,
     promotedPaths = promotedChangedPaths,
+    basePaths = amendmentChangedPaths,
     evidenceBody = evidencePlan,
     shippedBody = finishedBody,
     shippedPlanMatches = true,
@@ -1795,6 +1831,7 @@ function testCompletionBinding(temp, preparation) {
           ['source-evidence', COMMIT, evidenceCommit],
           ['evidence-shipped', evidenceCommit, shippedCommit],
           ['shipped-promoted', shippedCommit, currentHead],
+          ['authorized-base-promoted', authorizedBaseCommit, currentHead],
         ].find(([, ancestor, descendant]) => args[2] === ancestor && args[3] === descendant);
         assert.ok(link, `unexpected completion ancestry call: ${joined}`);
         calls?.ancestry.push(link[0]);
@@ -1818,6 +1855,11 @@ function testCompletionBinding(temp, preparation) {
           assert.deepEqual(args, ['diff', '--name-only', shippedCommit, currentHead, '--no-renames', '--', '.']);
           calls?.promotedDiffs.push([...args]);
           return promotedPaths.join('\n');
+        }
+        if (args[2] === authorizedBaseCommit && args[3] === currentHead) {
+          assert.deepEqual(args, ['diff', '--name-only', authorizedBaseCommit, currentHead, '--no-renames', '--', '.']);
+          calls?.amendmentDiffs.push([...args]);
+          return basePaths.join('\n');
         }
         if (args[2] === COMMIT && args[3] === shippedCommit) {
           assert.deepEqual(args, [
@@ -1852,7 +1894,7 @@ function testCompletionBinding(temp, preparation) {
 
   const finished = makePlan('2026-07-17');
   const proofOut = path.join(temp, 'source-proof.json');
-  const successfulCalls = { ancestry: [], promotedDiffs: [] };
+  const successfulCalls = { ancestry: [], promotedDiffs: [], amendmentDiffs: [] };
   const result = bindCompletion(
     new Map([
       ['finished-plan', finished],
@@ -1892,9 +1934,17 @@ function testCompletionBinding(temp, preparation) {
     verified: true,
   });
   assert.equal(loaded.value.public_reviewed_commit, PUBLIC_COMMIT);
-  assert.deepEqual(successfulCalls.ancestry, ['source-evidence', 'evidence-shipped', 'shipped-promoted']);
+  assert.deepEqual(successfulCalls.ancestry, [
+    'source-evidence',
+    'evidence-shipped',
+    'shipped-promoted',
+    'authorized-base-promoted',
+  ]);
   assert.deepEqual(successfulCalls.promotedDiffs, [
     ['diff', '--name-only', shippedCommit, currentHead, '--no-renames', '--', '.'],
+  ]);
+  assert.deepEqual(successfulCalls.amendmentDiffs, [
+    ['diff', '--name-only', authorizedBaseCommit, currentHead, '--no-renames', '--', '.'],
   ]);
   assert.deepEqual(result.receipt.candidate, preparation.candidate.receipt);
 
@@ -2060,6 +2110,7 @@ function testCompletionBinding(temp, preparation) {
     ['source-evidence', '2026-07-19', 'broken source-to-evidence ancestry'],
     ['evidence-shipped', '2026-07-25', 'broken evidence-to-shipped ancestry'],
     ['shipped-promoted', '2026-07-26', 'stale promoted HEAD ancestry'],
+    ['authorized-base-promoted', '2026-07-31', 'unrelated authorized current-main base'],
   ]) {
     expectReject(
       label,
@@ -2163,6 +2214,31 @@ function testCompletionBinding(temp, preparation) {
           adapter({ finishedDate, promotedPaths }),
         ),
       /shipped|promoted|path|allow|exact/i,
+    );
+  }
+  for (const [label, finishedDate, basePaths] of [
+    ['missing base-to-promoted contract path', '2026-08-01', amendmentChangedPaths.slice(1)],
+    ['extra base-to-promoted contract path', '2026-08-02', [...amendmentChangedPaths, 'README.md']],
+    [
+      'substituted base-to-promoted contract path',
+      '2026-08-03',
+      amendmentChangedPaths.map((item) =>
+        item === 'scripts/lib/session-relay-release-preparation.mjs' ? 'scripts/substituted.mjs' : item,
+      ),
+    ],
+  ]) {
+    expectReject(
+      label,
+      () =>
+        bindCompletion(
+          new Map([
+            ['finished-plan', makePlan(finishedDate)],
+            ['embedded-candidate-sha256', sha256(fs.readFileSync(preparation.candidateOut))],
+            ['receipt-out', path.join(temp, `base-paths-${finishedDate}.json`)],
+          ]),
+          adapter({ finishedDate, basePaths }),
+        ),
+      /authorized|base|promoted|path|allow|exact/i,
     );
   }
 }
