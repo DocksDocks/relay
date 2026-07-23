@@ -1693,7 +1693,8 @@ function testCompletionBinding(temp, preparation) {
       const joined = args.join(' ');
       if (joined === 'rev-parse HEAD^{commit}') return currentHead;
       if (
-        joined === `log -n1 --format=%H -- docs/plans/finished/${finishedDate}-session-relay-linux-workspace-recertification.md`
+        joined ===
+        `log -n1 --format=%H -- docs/plans/finished/${finishedDate}-session-relay-linux-workspace-recertification.md`
       )
         return shippedCommit;
       if (joined === `show ${evidenceCommit}:docs/plans/active/session-relay-linux-workspace-recertification.md`)
@@ -1701,7 +1702,8 @@ function testCompletionBinding(temp, preparation) {
       if (joined === `show ${COMMIT}:docs/plans/active/session-relay-linux-workspace-recertification.md`)
         return Buffer.from(sourceBody);
       if (
-        joined === `show ${shippedCommit}:docs/plans/finished/${finishedDate}-session-relay-linux-workspace-recertification.md`
+        joined ===
+        `show ${shippedCommit}:docs/plans/finished/${finishedDate}-session-relay-linux-workspace-recertification.md`
       ) {
         return Buffer.from(shippedPlanMatches ? shippedBody : `${shippedBody}\nsubstituted\n`);
       }
