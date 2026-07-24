@@ -20,7 +20,7 @@ import {
 } from '../../../scripts/lib/session-relay-release-core.mjs';
 import { finalizeReviewed, publishReviewed } from '../../../scripts/lib/session-relay-release-publication.mjs';
 
-const SOURCE = '1'.repeat(40);
+const SOURCE = '3fb9211f3309977f24853a10714d4b7a82b38c8f';
 const EXPECTED_VERSION = '0.13.0';
 const EXPECTED_TAG = 'session-relay--v0.13.0';
 const DOCKS_PLAN_PATH = 'docs/plans/active/session-relay-linux-workspace-recertification.md';
@@ -37,6 +37,41 @@ const WORKFLOW_PATH = '.github/workflows/build-binaries.yml';
 const POLL_LIMIT = 12;
 const acceptPromotionReceipt = (receipt) => receipt;
 const RECONCILER = Object.freeze({ id: 55303379, login: 'DocksDocks', type: 'User' });
+const GITHUB_ACTIONS_BOT = Object.freeze({ id: 41898282, login: 'github-actions[bot]', type: 'Bot' });
+const CAPTURED_RUN_ID = 30061627175;
+const CAPTURED_RELEASE_ID = 359049927;
+const CAPTURED_RELEASE_ASSETS = Object.freeze([
+  Object.freeze({
+    id: 487897754,
+    name: 'SHA256SUMS',
+    size: 414,
+    digest: '7e0f8d120200f96897af9a54f3b79f2f3f8cc06d7047664e770d82db1cd009eb',
+  }),
+  Object.freeze({
+    id: 487897750,
+    name: 'session-relay-aarch64-apple-darwin',
+    size: 1638528,
+    digest: '0686e68e3a88dd0dee647fc18211e941dd0d8012818d0bcfb79fac142b5baf21',
+  }),
+  Object.freeze({
+    id: 487897753,
+    name: 'session-relay-aarch64-unknown-linux-musl',
+    size: 2164536,
+    digest: '6ebc6d9a38a8c3d1f191647d3ab679d56b69cffba36c3bc3c8eb99b0e163852e',
+  }),
+  Object.freeze({
+    id: 487897751,
+    name: 'session-relay-x86_64-apple-darwin',
+    size: 2108472,
+    digest: '06c046182922c6897e81278fecd7280008fa8040a489910993283017101f1be3',
+  }),
+  Object.freeze({
+    id: 487897749,
+    name: 'session-relay-x86_64-unknown-linux-musl',
+    size: 2849088,
+    digest: 'f8c6374c2c704f48135cd646028fbd9e53fd43f9800b4a255fa36a0818744b7b',
+  }),
+]);
 let checks = 0;
 
 function writeCanonical(directory, name, value) {
@@ -280,6 +315,75 @@ function reconciledPrerelease(runAssets, overrides = {}) {
       uploader: RECONCILER,
     })),
     ...overrides,
+  });
+}
+
+function capturedRun() {
+  return {
+    id: CAPTURED_RUN_ID,
+    run_attempt: 1,
+    head_sha: SOURCE,
+    head_branch: EXPECTED_TAG,
+    path: WORKFLOW_PATH,
+    event: 'push',
+    status: 'completed',
+    conclusion: 'success',
+    run_started_at: '2026-07-24T02:26:14Z',
+    updated_at: '2026-07-24T02:28:56Z',
+    actor: RECONCILER,
+  };
+}
+
+function capturedRunAssetRecords() {
+  return CAPTURED_RELEASE_ASSETS.map(({ name, size, digest }, index) => ({
+    name,
+    size,
+    digest,
+    path: `/captured-run/${index}-${name}`,
+  }));
+}
+
+function capturedPrerelease(overrides = {}) {
+  return {
+    id: CAPTURED_RELEASE_ID,
+    tag_name: TAG,
+    target_commitish: SOURCE,
+    prerelease: true,
+    draft: false,
+    body: PRERELEASE_BODY,
+    created_at: '2026-07-23T14:26:39Z',
+    published_at: '2026-07-24T02:28:53Z',
+    author: GITHUB_ACTIONS_BOT,
+    assets: CAPTURED_RELEASE_ASSETS.map(({ id, name, size, digest }) => ({
+      id,
+      name,
+      size,
+      digest: `sha256:${digest}`,
+      created_at: '2026-07-24T02:28:52Z',
+      updated_at: '2026-07-24T02:28:53Z',
+      uploader: GITHUB_ACTIONS_BOT,
+    })),
+    ...overrides,
+  };
+}
+
+function capturedAdapter({
+  runs = [capturedRun()],
+  release = capturedPrerelease(),
+  runAssets = capturedRunAssetRecords(),
+  publisher = GITHUB_ACTIONS_BOT,
+} = {}) {
+  const attestationRun = runs.find(({ id }) => id === CAPTURED_RUN_ID) ?? capturedRun();
+  return fakeAdapter({
+    runs,
+    release,
+    runAssets,
+    attestations: runAttestationRecords(attestationRun, runAssets),
+    liveReleaseAssets: runAssets,
+    checksumEntries: runAssets
+      .filter(({ name }) => name !== 'SHA256SUMS')
+      .map(({ name, digest }) => ({ name, digest })),
+    publisher,
   });
 }
 
@@ -718,6 +822,149 @@ try {
     assert.deepEqual(fake.state.downloaded, []);
     assert.equal(fake.state.releaseDownloads, 1);
     checks += 1;
+  }
+
+  {
+    const directory = fs.mkdtempSync(path.join(root, 'captured-commit-time-release-created-at-'));
+    const fake = capturedAdapter();
+    const rebound = rebind(directory, fake);
+    assert.equal(rebound.receipt.transition, 'reconciled');
+    assert.equal(rebound.receipt.release_database_id, CAPTURED_RELEASE_ID);
+    assert.equal(rebound.receipt.workflow.run_id, CAPTURED_RUN_ID);
+    assert.equal(rebound.receipt.workflow.attempt, 1);
+    assert.deepEqual(
+      rebound.receipt.assets,
+      CAPTURED_RELEASE_ASSETS.map(({ id, name, size, digest }) => ({
+        name,
+        database_id: id,
+        size,
+        digest,
+      })),
+    );
+    assertNoPublicationMutation(fake.state);
+    assert.deepEqual(fake.state.dispatched, [], 'captured receipt rebind must not dispatch another workflow');
+    assert.equal(fake.state.releaseDownloads, 1);
+    checks += 1;
+  }
+
+  for (const [label, mutate, pattern] of [
+    [
+      'malformed-release-created-at',
+      (release) => {
+        release.created_at = 'not-a-timestamp';
+      },
+      /live release timestamps are invalid/i,
+    ],
+    [
+      'release-created-after-published',
+      (release) => {
+        release.created_at = '2026-07-24T02:28:54Z';
+      },
+      /live release timestamps are invalid/i,
+    ],
+    [
+      'release-published-before-run',
+      (release) => {
+        release.published_at = '2026-07-24T02:26:13Z';
+      },
+      /release published_at timestamp is outside the bound workflow run window/i,
+    ],
+    [
+      'release-published-after-run',
+      (release) => {
+        release.published_at = '2026-07-24T02:28:57Z';
+      },
+      /publisher identity|asset timestamps are inconsistent/i,
+    ],
+    [
+      'release-publisher-mismatch',
+      (release) => {
+        release.author = { id: 1, login: 'replacement-user', type: 'User' };
+      },
+      /live release publisher identity conflict/i,
+    ],
+    [
+      'release-uploader-mismatch',
+      (release) => {
+        release.assets[0].uploader = { id: 1, login: 'replacement-user', type: 'User' };
+      },
+      /publisher identity conflict/i,
+    ],
+    [
+      'release-missing-asset',
+      (release) => {
+        release.assets.pop();
+      },
+      /rebind requires a complete matching prerelease/i,
+    ],
+    [
+      'release-extra-asset',
+      (release) => {
+        release.assets.push({
+          ...structuredClone(release.assets[0]),
+          id: 999999999,
+          name: 'session-relay-substituted',
+        });
+      },
+      /rebind requires a complete matching prerelease/i,
+    ],
+    [
+      'release-digest-mismatch',
+      (release) => {
+        release.assets[0].digest = `sha256:${'f'.repeat(64)}`;
+      },
+      /live release asset digest conflict/i,
+    ],
+  ]) {
+    const directory = fs.mkdtempSync(path.join(root, `captured-${label}-`));
+    const release = capturedPrerelease();
+    mutate(release);
+    const fake = capturedAdapter({ release });
+    const sourceProof = proof(directory);
+    const options = optionsFor(directory, sourceProof);
+    options.set('rebind-complete-publication', true);
+    expectConflict(() => publishReviewed(options, fake.adapter), pattern);
+    assertNoPublicationMutation(fake.state);
+    assert.equal(fs.existsSync(options.get('receipt-out')), false);
+  }
+
+  for (const asset of CAPTURED_RELEASE_ASSETS) {
+    for (const [field, value] of [
+      ['created_at', '2026-07-24T02:26:13Z'],
+      ['updated_at', '2026-07-24T02:28:57Z'],
+    ]) {
+      const directory = fs.mkdtempSync(path.join(root, `captured-${asset.name}-${field}-outside-run-`));
+      const release = capturedPrerelease();
+      release.assets.find(({ id }) => id === asset.id)[field] = value;
+      const fake = capturedAdapter({ release });
+      const sourceProof = proof(directory);
+      const options = optionsFor(directory, sourceProof);
+      options.set('rebind-complete-publication', true);
+      expectConflict(
+        () => publishReviewed(options, fake.adapter),
+        new RegExp(`${asset.name} ${field} timestamp is outside the bound workflow run window`, 'i'),
+      );
+      assertNoPublicationMutation(fake.state);
+      assert.equal(fs.existsSync(options.get('receipt-out')), false);
+    }
+  }
+
+  for (const [label, runs, pattern] of [
+    [
+      'multiple-runs',
+      [capturedRun(), { ...capturedRun(), id: CAPTURED_RUN_ID + 1 }],
+      /multiple duplicate usable publication workflow runs conflict/i,
+    ],
+    ['wrong-run', [{ ...capturedRun(), head_sha: '0'.repeat(40) }], /workflow run identity conflict/i],
+  ]) {
+    const directory = fs.mkdtempSync(path.join(root, `captured-${label}-`));
+    const fake = capturedAdapter({ runs });
+    const sourceProof = proof(directory);
+    const options = optionsFor(directory, sourceProof);
+    options.set('rebind-complete-publication', true);
+    expectConflict(() => publishReviewed(options, fake.adapter), pattern);
+    assertNoPublicationMutation(fake.state);
+    assert.equal(fs.existsSync(options.get('receipt-out')), false);
   }
 
   {

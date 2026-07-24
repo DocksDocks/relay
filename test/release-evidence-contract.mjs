@@ -2189,6 +2189,7 @@ function testCompletionBinding(temp, preparation) {
     'plugins/session-relay/test/release-publication-contract.mjs',
     'scripts/agents/score.mjs',
     'scripts/lib/session-relay-release-preparation.mjs',
+    'scripts/lib/session-relay-release-publication.mjs',
     'scripts/lib/session-relay-release-promotion.mjs',
     'scripts/tests/plan-review-convergence-repair.mjs',
     'scripts/tests/plan-review-policy-regressions.mjs',
@@ -2199,9 +2200,14 @@ function testCompletionBinding(temp, preparation) {
     'docs/plans/active/session-relay-linux-workspace-publication.md',
     'plugins/session-relay/test/companion-distribution-contract.mjs',
     'plugins/session-relay/test/release-evidence-contract.mjs',
+    'plugins/session-relay/test/release-publication-contract.mjs',
     'scripts/lib/session-relay-release-preparation.mjs',
+    'scripts/lib/session-relay-release-publication.mjs',
   ];
-  assert.equal(promotedChangedPaths.length, 35);
+  assert.equal(promotedChangedPaths.length, 36);
+  assert.equal(amendmentChangedPaths.length, 6);
+  assert.deepEqual(promotedChangedPaths, [...new Set(promotedChangedPaths)].sort());
+  assert.deepEqual(amendmentChangedPaths, [...new Set(amendmentChangedPaths)].sort());
   testArchivedLegacyCompletionBinding(temp, { promotedChangedPaths, amendmentChangedPaths });
   const evidencePlan = preparation.plan
     .replace('status: ongoing', 'status: in_review')
