@@ -5,8 +5,8 @@ user-invocable: true
 allowed-tools: Bash, Read
 metadata:
   pattern: tool-wrapper
-  updated: "2026-07-22"
-  content_hash: "a808ce07853fcae779f0feb44299eeac361dfa7432d5e9a6ce56edd8daa262b9"
+  updated: "2026-07-24"
+  content_hash: "7913ba093c78727b4a218b807022b8ef8f59c25fbd86fb888d1b47dff770abe0"
 ---
 
 # Session relay
@@ -49,7 +49,7 @@ quality, authentication, usage discount, or host-policy bypass.
 
 | Need | Use | Not |
 |---|---|---|
-| Canonical Docks plan review with sealed input and closed structured evidence | `plan-manager` dispatch to internal `plan-reviewer` through the direct explicit-model path | `session-relay spawn` (resumable bus output is not the canonical receipt boundary) |
+| Canonical Docks plan review with immutable input and closed `PlanReviewV1` evidence | unified `plan-manager` reservation + fresh internal `plan-reviewer` through the runtime-native reviewer path | `session-relay spawn` (resumable bus output is not the canonical review boundary) |
 | Small one-shot task in the current project | the current agent or a direct CLI | relay (persistent-session overhead adds no value) |
 | Cross-provider implementation needing an isolated committed handback | `session-relay spawn --fanout` → `session-relay handback` → parent `session-relay collect` | a bare writable CLI against the shared worktree |
 | Long-running/resumable worker or later human takeover | `session-relay spawn`, then `session-relay send`/`session-relay wake`/`session-relay attach` | a one-shot command whose process exit loses addressability |
@@ -454,25 +454,13 @@ guarantee, refusal cases, and cleanup boundaries are in
 
 ## Red-team pair spawn
 
-Use this when a plan needs a two-model adversarial review. The orchestrator owns
-the plan and the final verdict; workers edit only their assigned sections.
+Use this only for an ordinary two-model collaborative debate. The orchestrator owns the artifact and final verdict; workers edit only their assigned sections.
 
-This is an ordinary collaborative debate, **not** Docks' canonical strong-default
-plan-policy review. Current schema-6 policy review requires a sealed non-git
-read-only bundle, one closed typed request, structured evidence, persisted
-orchestration, and no reviewer writes. Historical schemas 1–5 are
-validation-only; they are not live dispatch routes. Current `session-relay
-spawn` injects separate-branch/write guardrails and returns at birth
-registration, so it is deliberately rejected as canonical review transport.
-Use `plan-manager` with internal `plan-reviewer` through the portable
-explicit-model path instead. Skill prose cannot bypass the binary guardrail. A future
-dedicated non-writing relay reviewer mode requires binary implementation, tests,
-and its own approved release; do not simulate it with flags or an alternate
-export route.
+This is **not** Docks canonical plan review. Current orchestration stores one compact `Plan-run:` `PlanRunV1` record and reserves a fresh reviewer permit before dispatch. Canonical draft review reads a private immutable bundle and returns bound `PlanReviewV1` evidence; schemas 1–6 are historical validation/quarantine only, never live dispatch routes. `session-relay spawn` injects separate-branch/write guardrails, returns at birth registration, and produces resumable bus output, so it is deliberately rejected as canonical review transport.
 
-1. For a missing plan, route creation to `plan-creator`; for an existing plan,
-   route public management to `plan-manager`. Add `## Debate` with `### [a-team]`
-   and `### [b-team]`, then state the exact question.
+Use the unified `plan-manager`, which dispatches a fresh internal `plan-reviewer` through the invoking runtime's native reviewer wrapper or fresh read-only task. Session Relay is never review evidence, a fallback reviewer, or reusable launch authority. A future dedicated non-writing relay reviewer mode would require binary implementation, tests, and an independently approved release; do not simulate it with flags or an alternate export route.
+
+1. Route both missing-plan creation and existing-plan lifecycle to unified `plan-manager`. For this non-canonical debate only, add `## Debate` with `### [a-team]` and `### [b-team]`, then state the exact question.
 2. Spawn `a-team` first, usually Codex:
    `session-relay spawn <dir> --tool codex --model gpt-5.6-sol --effort xhigh --name a-team --reply-to <me> -- "<question + absolute plan path + edit ONLY ### [a-team]>"`
 3. After `a-team` reports over the bus, spawn `b-team`, usually Claude:
@@ -482,6 +470,7 @@ export route.
    Never let both workers write the plan at the same time.
 5. The orchestrator writes `### Verdict`: agreements are confirmed conclusions;
    disagreements are open questions.
+6. An assessment-only debate ends after reporting the verdict. If the current request includes implementation, return the verdict to unified `plan-manager` and continue its orchestration without another user lifecycle command.
 
 ## Gotchas
 

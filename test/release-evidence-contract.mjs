@@ -11,7 +11,7 @@ import { parse as parseYaml } from 'yaml';
 import {
   canonicalPlanView,
   validateDraftReceipt,
-} from '../../../plugins/docks/skills/productivity/plan-reviewer/scripts/review-policy.mjs';
+} from '../../../plugins/docks/skills/productivity/plan-manager/scripts/legacy-review-records.mjs';
 import { gitRaw } from '../../../scripts/lib/session-relay-release-core.mjs';
 import { runFixture } from '../../../scripts/lib/session-relay-release-fixture.mjs';
 import {
@@ -2191,9 +2191,9 @@ function testCompletionBinding(temp, preparation) {
     'scripts/lib/session-relay-release-preparation.mjs',
     'scripts/lib/session-relay-release-promotion.mjs',
     'scripts/lib/session-relay-release-publication.mjs',
-    'scripts/tests/plan-review-convergence-repair.mjs',
-    'scripts/tests/plan-review-policy-regressions.mjs',
-    'scripts/tests/plan-review-policy.mjs',
+    'scripts/tests/plan-orchestration.mjs',
+    'scripts/tests/plan-orchestration/historical-characterization.mjs',
+    'scripts/tests/plan-orchestration/historical-malformed-corpus.mjs',
     'scripts/tests/plan-skill-phases.mjs',
   ];
   const amendmentChangedPaths = [

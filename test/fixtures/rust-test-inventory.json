@@ -13,7 +13,7 @@
     "A10": "workspace_coordination_process::overlapping_path_claims_are_atomic_and_refused",
     "A11": "workspace_coordination_process::coordinator_integrates_commits_serially",
     "A12": "workspace_coordination_process::conflicting_commits_settle_once_needs_user_action",
-    "A13": "scripts/tests/plan-review-policy-regressions.mjs --orchestration-oracle",
+    "A13": "scripts/tests/plan-orchestration.mjs --case historical",
     "A14": "workspace_resources::all_six_resource_kinds_are_isolated_and_receipted",
     "A15": "workspace_coordination_process::cleanup_refuses_dirty_or_unretained_work",
     "A16": "workspace_identity::integration_checkout_refuses_supported_writer",
