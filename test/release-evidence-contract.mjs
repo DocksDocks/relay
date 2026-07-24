@@ -1719,6 +1719,441 @@ function completionTemplate() {
   return JSON.parse(match[1]);
 }
 
+function testArchivedLegacyCompletionBinding(temp, { promotedChangedPaths, amendmentChangedPaths }) {
+  const activePath = 'docs/plans/active/session-relay-linux-workspace-recertification.md';
+  const finishedRelative = 'docs/plans/finished/2026-07-23-session-relay-linux-workspace-recertification.md';
+  const candidateSha256 = '75e5bf5386a203cd81e3930ca2309ceed4e1a665d995848a29eb73a0fa5cb395';
+  const receiptRawSha256 = 'd929ab3156532858ec515cc4bcecc00500adb24009dd2cc6b38bc3c396d42cfc';
+  const policySha256 = 'bb95e1516f9fc1b6f4d8a75991d4650428428dc35d842db1710f4d64dc082a1b';
+  const reviewedHead = '762f2ad2b173c964435364cac651a63e43e2501c';
+  const planInputSha256 = '5275399617cf4812a55523aa30606e8a1aad34bf0d36bdf1ee40de3f2f5ebbbf';
+  const seriesId = 'cd8ec18d-fed0-4063-b49d-812d0f5bda05';
+  const settledStateSha256 = '064e08a437e587d6f5600788754a8af2cc3d5800adfdcb520b7399c7162ed3bb';
+  const sourceCommit = '3fb9211f3309977f24853a10714d4b7a82b38c8f';
+  const shippedCommit = 'cdca867e6a140311ea865a81229fb30de1df32c1';
+  const archivedBlob = 'c293926b907dfbbc87c011cb0ce9848bbe37a604';
+  const archivedSha256 = '983f41103d41439c5dfa1928a9bd1c2542ef332613a2bd15afd6038e94633abf';
+  const currentHead = '9'.repeat(40);
+  const authorizedBaseCommit = '25592c6550069e300a7a0148d3cd3c21880da8e7';
+  const expectedPolicy = {
+    candidates: [
+      {
+        company: 'openai',
+        effort: 'high',
+        model: 'gpt-5.6-sol',
+        service_tier: 'default',
+        tool: 'codex',
+      },
+      { company: 'anthropic', effort: 'high', model: 'fable', tool: 'claude' },
+      { company: 'anthropic', effort: 'xhigh', model: 'opus', tool: 'claude' },
+    ],
+    fallback: 'availability_only',
+    max_rounds: 2,
+    provenance: {
+      candidates: 'skill_default',
+      fallback: 'skill_default',
+      max_rounds: 'skill_default',
+      role: 'skill_default',
+    },
+    role: 'primary',
+    schema: 6,
+  };
+  const expectedState = {
+    apply_state: 'none',
+    current_input_sha256: planInputSha256,
+    initial_input_sha256: planInputSha256,
+    lifecycle_intent: 'none',
+    orchestration_attempt: 1,
+    phase: 'completion',
+    plan_path: activePath,
+    request_ids: ['c83e57f6-d6f1-4420-894c-7d71ee44b2fc'],
+    retry_authorization: null,
+    round_index: 1,
+    schema: 2,
+    series_id: seriesId,
+    series_sha256: 'a5f83bf419edde75160f8e67193ca555f15da4d2f78fbb5fd495e91295b508ba',
+    state_sha256: settledStateSha256,
+    status: 'passed',
+    stop_reason: null,
+    terminal_evidence_sha256: null,
+    terminated_from_state: null,
+    terminated_from_state_sha256: null,
+    transitioned_from_state_sha256: null,
+  };
+  const archivedBytes = fs.readFileSync(finishedRelative);
+  const archivedPlan = archivedBytes.toString('utf8');
+  const candidateMatches = [...archivedPlan.matchAll(/^- Source preparation candidate JCS bytes: (\{.*\})$/gm)];
+  const stateMatches = [...archivedPlan.matchAll(/^Review-orchestration-state: (\{.*\})$/gm)];
+  const receiptMatches = [...archivedPlan.matchAll(/^Completion-review-receipt: (\{.*\})$/gm)];
+  assert.equal(candidateMatches.length, 1, 'the pinned archive contains exactly one source preparation candidate');
+  assert.equal(stateMatches.length, 1, 'the pinned archive contains exactly one settled completion state');
+  assert.equal(receiptMatches.length, 1, 'the pinned archive contains exactly one completion receipt');
+  const candidateRaw = candidateMatches[0][1];
+  const stateRaw = stateMatches[0][1];
+  const receiptRaw = receiptMatches[0][1];
+  const receipt = JSON.parse(receiptRaw);
+  assert.equal(sha256(archivedBytes), archivedSha256);
+  assert.equal(
+    gitRaw(['rev-parse', `${shippedCommit}:${finishedRelative}`]).toString('utf8').trim(),
+    archivedBlob,
+  );
+  assert.equal(sha256(Buffer.from(candidateRaw)), candidateSha256);
+  assert.equal(sha256(Buffer.from(receiptRaw)), receiptRawSha256);
+  assert.equal(jcs(receipt), receiptRaw, 'the pinned completion receipt remains canonical JCS');
+  assert.equal(receipt.reviewed_head, reviewedHead);
+  assert.equal(receipt.plan_input_sha256, planInputSha256);
+  assert.equal(receipt.policy_sha256, policySha256);
+  assert.equal(receipt.series.orchestration_series_id, seriesId);
+  assert.equal(receipt.settled_orchestration_state_sha256, settledStateSha256);
+  assert.deepEqual(receipt.policy, expectedPolicy);
+  assert.equal(sha256(Buffer.from(jcs(expectedPolicy))), policySha256);
+  const state = JSON.parse(stateRaw);
+  assert.equal(jcs(state), stateRaw, 'the pinned settled state remains canonical JCS');
+  assert.deepEqual(state, expectedState);
+  const stateWithoutSelfHash = { ...state };
+  delete stateWithoutSelfHash.state_sha256;
+  assert.equal(sha256(Buffer.from(jcs(stateWithoutSelfHash))), settledStateSha256);
+
+  const currentPublicReview = publicDraftReviewFixture();
+  assert.equal(currentPublicReview.receipt.policy.fallback, 'none');
+  validateDraftReceipt(currentPublicReview.receipt, currentPublicReview.receipt.input_sha256, {
+    orchestration: currentPublicReview.state,
+  });
+
+  const evidencePlan = gitRaw(['show', `${reviewedHead}:${activePath}`]);
+  const sourcePlan = gitRaw(['show', `${sourceCommit}:${activePath}`]);
+  assert.equal(sha256(canonicalPlanView(evidencePlan)), planInputSha256);
+  const legacyCandidate = JSON.parse(candidateRaw);
+  assert.ok(
+    [sha256(sourcePlan), sha256(Buffer.from(sourcePlan.toString('utf8').trim(), 'utf8'))].includes(
+      legacyCandidate.plan.source_blob_sha256,
+    ),
+    'the pinned candidate binds the immutable source plan blob',
+  );
+  assert.deepEqual(legacyCandidate.companion, {
+    blocked_reason: 'Awaiting the four independently hashed `session-relay--v0.13.0` production asset digests.',
+    commit: PUBLIC_COMMIT,
+    execution_base_commit: 'c0dfa7aeb6ea3bc7de5a78bd4896b1993746b117',
+    input_sha256: '818766be3668ad02bfce234cdb25e5d65bf0760bd7c7b2aea05fb8f075a99ed3',
+    plan_path: PUBLIC_PLAN_PATH,
+    red_receipt_sha256: '833e777a509b44584f873628a65212fd92bd8a9305cd2f5f6699fc172738402c',
+    repository_id: 'DocksDocks/public',
+    review_receipt_sha256: '097206c0611c3357e10c0bf69a70819ea67901ef1ae8c3ef1d9e8207520f7c52',
+    status: 'blocked',
+    validation_ref: PUBLIC_VALIDATION_REF,
+  });
+
+  let fixtureIndex = 0;
+  const invoke = ({
+    planBytes = archivedBytes,
+    relative = finishedRelative,
+    embeddedCandidateSha256 = candidateSha256,
+    calls = null,
+  } = {}) => {
+    fixtureIndex += 1;
+    const root = path.join(temp, `legacy-completion-${fixtureIndex}`);
+    const finishedPath = path.join(root, relative);
+    fs.mkdirSync(path.dirname(finishedPath), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(finishedPath, planBytes);
+    const proofOut = path.join(root, 'source-proof.json');
+    const observed = calls ?? {
+      ancestry: [],
+      companionReviewPolicyValidations: 0,
+      inspectPublic: 0,
+      run: 0,
+    };
+    const adapter = {
+      repoRoot: root,
+      git(args) {
+        const joined = args.join(' ');
+        if (joined === 'rev-parse HEAD^{commit}') return currentHead;
+        if (joined === `log -n1 --format=%H -- ${relative}`) return shippedCommit;
+        if (joined === `show ${reviewedHead}:${activePath}`) return evidencePlan;
+        if (joined === `show ${sourceCommit}:${activePath}`) return sourcePlan;
+        if (joined === `show ${shippedCommit}:${relative}`) return Buffer.from(planBytes);
+        if (args[0] === 'status') return '';
+        if (args[0] === 'merge-base' && args[1] === '--is-ancestor') {
+          const link = [
+            ['source-evidence', sourceCommit, reviewedHead],
+            ['evidence-shipped', reviewedHead, shippedCommit],
+            ['shipped-current', shippedCommit, currentHead],
+            ['authorized-base-promoted', authorizedBaseCommit, currentHead],
+          ].find(([, ancestor, descendant]) => args[2] === ancestor && args[3] === descendant);
+          assert.ok(link, `unexpected archived completion ancestry call: ${joined}`);
+          observed.ancestry.push(link[0]);
+          return '';
+        }
+        if (args[0] === 'diff' && args[1] === '--name-only') {
+          if (args[2] === sourceCommit && args[3] === reviewedHead) return activePath;
+          if (args[2] === reviewedHead && args[3] === shippedCommit) return `${activePath}\n${relative}`;
+          if (args[2] === shippedCommit && args[3] === currentHead) return promotedChangedPaths.join('\n');
+          if (args[2] === authorizedBaseCommit && args[3] === currentHead) return amendmentChangedPaths.join('\n');
+          if (args[2] === sourceCommit && args[3] === shippedCommit) return '';
+        }
+        assert.fail(`unexpected archived completion git call: ${joined}`);
+      },
+      inspectPublic() {
+        observed.inspectPublic += 1;
+        observed.companionReviewPolicyValidations += 1;
+        assert.fail('completion binding must not inspect or validate companion Review-policy state');
+      },
+      run() {
+        observed.run += 1;
+        assert.fail('completion binding must not execute commands');
+      },
+      now() {
+        return '2026-07-23T18:00:00.000Z';
+      },
+      readFile(file) {
+        return fs.readFileSync(file);
+      },
+    };
+    return {
+      calls: observed,
+      proofOut,
+      result: bindCompletion(
+        new Map([
+          ['finished-plan', finishedPath],
+          ['embedded-candidate-sha256', embeddedCandidateSha256],
+          ['receipt-out', proofOut],
+        ]),
+        adapter,
+      ),
+    };
+  };
+
+  const positiveCalls = {
+    ancestry: [],
+    companionReviewPolicyValidations: 0,
+    inspectPublic: 0,
+    run: 0,
+  };
+  const positive = invoke({ calls: positiveCalls });
+  assert.equal(positive.result.receipt.completion_review_sha256, receiptRawSha256);
+  assert.equal(positive.result.receipt.candidate_sha256, candidateSha256);
+  assert.equal(positive.result.receipt.evidence_commit, reviewedHead);
+  assert.equal(positive.result.receipt.plans.finished_path, finishedRelative);
+  assert.equal(fs.readFileSync(positive.proofOut, 'utf8'), jcs(positive.result.receipt));
+  assert.equal(positive.result.state.receipt_sha256, sha256(Buffer.from(jcs(positive.result.receipt))));
+  assert.deepEqual(positiveCalls, {
+    ancestry: ['source-evidence', 'evidence-shipped', 'shipped-current', 'authorized-base-promoted'],
+    companionReviewPolicyValidations: 0,
+    inspectPublic: 0,
+    run: 0,
+  });
+
+  const replaceRecord = (plan, label, transform) => {
+    const expression = new RegExp(`^${label}: (\\{.*\\})$`, 'm');
+    const matches = [...plan.matchAll(new RegExp(expression.source, 'gm'))];
+    assert.equal(matches.length, 1, `${label} mutation fixture starts from one record`);
+    return plan.replace(expression, `${label}: ${transform(matches[0][1])}`);
+  };
+  const mutateReceipt = (mutate) =>
+    Buffer.from(
+      replaceRecord(archivedPlan, 'Completion-review-receipt', (raw) => {
+        const changed = structuredClone(JSON.parse(raw));
+        mutate(changed);
+        return jcs(changed);
+      }),
+    );
+  const mutateLegacyPolicy = (mutate) =>
+    mutateReceipt((changedReceipt) => {
+      const changedPolicy = structuredClone(expectedPolicy);
+      mutate(changedPolicy);
+      const changedPolicySha256 = sha256(Buffer.from(jcs(changedPolicy)));
+      const rewritten = replaceReceiptIdentity(
+        replaceReceiptPolicy(changedReceipt, policySha256, changedPolicy),
+        new Map([[policySha256, changedPolicySha256]]),
+      );
+      for (const key of Object.keys(changedReceipt)) delete changedReceipt[key];
+      Object.assign(changedReceipt, rewritten);
+    });
+  const expectLegacyReject = (label, options, pattern) => {
+    expectReject(label, () => invoke(options), pattern);
+  };
+
+  expectLegacyReject(
+    'pinned legacy finished-plan stem substitution',
+    { relative: 'docs/plans/finished/2026-07-23-session-relay-linux-workspace-recertification-copy.md' },
+    /finished|dated|plan|path/i,
+  );
+  expectLegacyReject(
+    'pinned legacy finished-plan date substitution',
+    { relative: 'docs/plans/finished/2026-07-24-session-relay-linux-workspace-recertification.md' },
+    /finished|date|identity|legacy|receipt|pinned/i,
+  );
+  expectLegacyReject(
+    'pinned legacy candidate digest substitution',
+    { embeddedCandidateSha256: '0'.repeat(64) },
+    /candidate|digest/i,
+  );
+  expectLegacyReject(
+    'pinned legacy completion receipt raw-byte substitution',
+    {
+      planBytes: Buffer.from(
+        replaceRecord(archivedPlan, 'Completion-review-receipt', (raw) => raw.replace('{', '{ ')),
+      ),
+    },
+    /canonical|completion|receipt|legacy|pinned/i,
+  );
+  expectLegacyReject(
+    'pinned legacy policy content without digest substitution',
+    {
+      planBytes: mutateReceipt((changed) => {
+        changed.policy.max_rounds = 3;
+      }),
+    },
+    /policy|digest|completion|receipt/i,
+  );
+  expectLegacyReject(
+    'pinned legacy policy digest substitution',
+    {
+      planBytes: mutateReceipt((changed) => {
+        changed.policy_sha256 = '0'.repeat(64);
+      }),
+    },
+    /policy|digest|completion|receipt/i,
+  );
+  expectLegacyReject(
+    'pinned legacy policy candidate order substitution',
+    {
+      planBytes: mutateLegacyPolicy((policy) => {
+        [policy.candidates[1], policy.candidates[2]] = [policy.candidates[2], policy.candidates[1]];
+      }),
+    },
+    /policy|candidate|order|legacy|pinned|receipt/i,
+  );
+  expectLegacyReject(
+    'pinned legacy policy candidate count substitution',
+    {
+      planBytes: mutateLegacyPolicy((policy) => {
+        policy.candidates.pop();
+      }),
+    },
+    /policy|candidate|count|legacy|pinned|receipt/i,
+  );
+  expectLegacyReject(
+    'pinned legacy policy candidate provenance substitution',
+    {
+      planBytes: mutateLegacyPolicy((policy) => {
+        policy.provenance.candidates = 'runtime_global';
+      }),
+    },
+    /policy|provenance|candidate|legacy|pinned|receipt/i,
+  );
+  expectLegacyReject(
+    'pinned legacy reviewed head substitution',
+    {
+      planBytes: mutateReceipt((changed) => {
+        changed.reviewed_head = '0'.repeat(40);
+      }),
+    },
+    /reviewed|head|completion|receipt/i,
+  );
+  expectLegacyReject(
+    'pinned legacy plan input substitution',
+    {
+      planBytes: mutateReceipt((changed) => {
+        changed.plan_input_sha256 = '0'.repeat(64);
+      }),
+    },
+    /plan|input|completion|receipt/i,
+  );
+  expectLegacyReject(
+    'pinned legacy series identity substitution',
+    {
+      planBytes: mutateReceipt((changed) => {
+        changed.series.orchestration_series_id = '00000000-0000-4000-8000-000000000000';
+      }),
+    },
+    /series|completion|receipt|orchestration/i,
+  );
+  expectLegacyReject(
+    'pinned legacy settled state self-hash substitution',
+    {
+      planBytes: mutateReceipt((changed) => {
+        changed.settled_orchestration_state_sha256 = '0'.repeat(64);
+      }),
+    },
+    /state|hash|completion|receipt/i,
+  );
+  expectLegacyReject(
+    'pinned legacy settled state content substitution',
+    {
+      planBytes: Buffer.from(
+        replaceRecord(archivedPlan, 'Review-orchestration-state', (raw) => {
+          const changed = JSON.parse(raw);
+          changed.round_index = 2;
+          return jcs(changed);
+        }),
+      ),
+    },
+    /state|hash|round|orchestration|completion/i,
+  );
+  expectLegacyReject(
+    'pinned legacy missing settled state',
+    { planBytes: Buffer.from(archivedPlan.replace(`Review-orchestration-state: ${stateRaw}\n`, '')) },
+    /state|missing|orchestration|completion/i,
+  );
+  expectLegacyReject(
+    'pinned legacy duplicate settled state',
+    {
+      planBytes: Buffer.from(
+        archivedPlan.replace(
+          `Review-orchestration-state: ${stateRaw}`,
+          `Review-orchestration-state: ${stateRaw}\nReview-orchestration-state: ${stateRaw}`,
+        ),
+      ),
+    },
+    /state|duplicate|orchestration|completion/i,
+  );
+  const waiver = {
+    actor: 'user',
+    at: '2026-07-23T15:12:00.000Z',
+    input_sha256: planInputSha256,
+    phase: 'completion',
+    reason: 'User explicitly waived the bounded completion review.',
+    roles: ['primary'],
+  };
+  expectLegacyReject(
+    'pinned legacy waiver insertion',
+    {
+      planBytes: Buffer.from(
+        archivedPlan.replace('review_status: passed', `review_waivers: ${jcs([waiver])}\nreview_status: passed`),
+      ),
+    },
+    /waiver|completion|legacy|pinned|receipt/i,
+  );
+  expectLegacyReject(
+    'pinned legacy duplicate completion receipt',
+    {
+      planBytes: Buffer.from(
+        archivedPlan.replace(
+          `Completion-review-receipt: ${receiptRaw}`,
+          `Completion-review-receipt: ${receiptRaw}\nCompletion-review-receipt: ${receiptRaw}`,
+        ),
+      ),
+    },
+    /completion|receipt|exactly one|duplicate/i,
+  );
+  const unpinnedPlan = fs.readFileSync('docs/plans/finished/2026-07-19-session-relay-prebuilt-cli-release.md', 'utf8');
+  const unpinnedMatches = [...unpinnedPlan.matchAll(/^Completion-review-receipt: (\{.*\})$/gm)];
+  assert.equal(unpinnedMatches.length, 1, 'the independent unpinned legacy archive has one completion receipt');
+  expectLegacyReject(
+    'unpinned legacy completion receipt substitution',
+    {
+      planBytes: Buffer.from(
+        archivedPlan.replace(
+          `Completion-review-receipt: ${receiptRaw}`,
+          `Completion-review-receipt: ${unpinnedMatches[0][1]}`,
+        ),
+      ),
+    },
+    /completion|receipt|legacy|pinned|reviewed|candidate|plan/i,
+  );
+}
+
+
 function testCompletionBinding(temp, preparation) {
   const evidenceCommit = '234567890abcdef1234567890abcdef123456789';
   const shippedCommit = '567890abcdef1234567890abcdef123456789012';
@@ -1768,6 +2203,7 @@ function testCompletionBinding(temp, preparation) {
     'scripts/lib/session-relay-release-preparation.mjs',
   ];
   assert.equal(promotedChangedPaths.length, 35);
+  testArchivedLegacyCompletionBinding(temp, { promotedChangedPaths, amendmentChangedPaths });
   const evidencePlan = preparation.plan
     .replace('status: ongoing', 'status: in_review')
     .replace('review_status: null', 'review_status: null');
