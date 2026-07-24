@@ -263,7 +263,6 @@ const PUBLIC_RELEASE_ASSET_NAMES = [
   'docks-kit-darwin-x64',
   'docks-kit-linux-arm64',
   'docks-kit-linux-x64',
-  'docks-kit-windows-x64.exe',
 ];
 const publicationAssetPins = Object.fromEntries(
   PUBLIC_ASSET_TARGETS.map((target) => [target, assets.find(({ name }) => name === `session-relay-${target}`).digest]),
@@ -693,8 +692,13 @@ const boundaryFixtureNames = [
   'verify-public-release broken plan ancestry',
   'verify-public-release missing successful workflow run',
   'verify-public-release duplicate successful workflow run',
-  'verify-public-release wrong six-asset set',
-  'verify-public-release checksum conflict',
+  'verify-public-release wrong five-asset set',
+  'verify-public-release present Windows asset',
+  'verify-public-release extra asset',
+  'verify-public-release missing checksum row',
+  'verify-public-release extra checksum row',
+  'verify-public-release checksum name conflict',
+  'verify-public-release checksum digest conflict',
   'verify-public-release digest-pin mismatch',
   'verify-public-release completion line hash mismatch',
   'verify-public-release non-passed review_status',
@@ -822,7 +826,8 @@ function makePublicReleaseAdapter(
     planAncestry = true,
     runs,
     removeAsset = null,
-    checksumConflict = false,
+    extraAsset = null,
+    checksumMutation = null,
     pinnedAssets = request.value.assets,
     reviewStatus = 'passed',
     completionReceipt = completePublicCompletionReceipt(),
@@ -831,13 +836,27 @@ function makePublicReleaseAdapter(
   const completionReceiptText = canonicalize(completionReceipt);
   const binaryNames = PUBLIC_RELEASE_ASSET_NAMES.filter((name) => name !== 'SHA256SUMS');
   const binaries = new Map(binaryNames.map((name) => [name, Buffer.from(`public-release:${name}`)]));
-  let checksumBytes = Buffer.from(`${binaryNames.map((name) => `${hash(binaries.get(name))}  ${name}`).join('\n')}\n`);
-  if (checksumConflict) checksumBytes = Buffer.from(`${DIGEST('f')}  ${binaryNames[0]}\n`);
+  const checksumRows = binaryNames.map((name) => `${hash(binaries.get(name))}  ${name}`);
+  if (checksumMutation === 'missing') checksumRows.pop();
+  if (checksumMutation === 'extra') checksumRows.push(`${DIGEST('e')}  docks-kit-extra-x64`);
+  if (checksumMutation === 'name') checksumRows[0] = `${hash(binaries.get(binaryNames[0]))}  docks-kit-renamed`;
+  if (checksumMutation === 'digest') checksumRows[0] = `${DIGEST('f')}  ${binaryNames[0]}`;
+  const checksumBytes = Buffer.from(`${checksumRows.join('\n')}\n`);
   const bytesByName = new Map([...binaries, ['SHA256SUMS', checksumBytes]]);
   let releaseAssets = PUBLIC_RELEASE_ASSET_NAMES.map((name, index) => {
     const bytes = bytesByName.get(name);
     return { id: 1000 + index, name, size: bytes.length, digest: `sha256:${hash(bytes)}` };
   });
+  if (extraAsset !== null) {
+    const bytes = Buffer.from(`public-release:${extraAsset}`);
+    bytesByName.set(extraAsset, bytes);
+    releaseAssets.push({
+      id: 1000 + releaseAssets.length,
+      name: extraAsset,
+      size: bytes.length,
+      digest: `sha256:${hash(bytes)}`,
+    });
+  }
   if (removeAsset !== null) releaseAssets = releaseAssets.filter(({ name }) => name !== removeAsset);
   const release = {
     id: 901,
@@ -977,14 +996,44 @@ function verifyPublicBoundary(
         /workflow.*run|duplicate|exactly one/i,
       ],
       [
-        'wrong six-asset set',
-        makePublicReleaseAdapter(boundary.request, { removeAsset: 'docks-kit-windows-x64.exe' }),
+        'wrong five-asset set',
+        makePublicReleaseAdapter(boundary.request, { removeAsset: 'docks-kit-linux-x64' }),
         {},
-        /asset set|six|assets/i,
+        /asset set|five|assets/i,
       ],
       [
-        'checksum conflict',
-        makePublicReleaseAdapter(boundary.request, { checksumConflict: true }),
+        'present Windows asset',
+        makePublicReleaseAdapter(boundary.request, { extraAsset: 'docks-kit-windows-x64.exe' }),
+        {},
+        /asset set|five|assets/i,
+      ],
+      [
+        'extra asset',
+        makePublicReleaseAdapter(boundary.request, { extraAsset: 'docks-kit-extra-x64' }),
+        {},
+        /asset set|five|assets/i,
+      ],
+      [
+        'missing checksum row',
+        makePublicReleaseAdapter(boundary.request, { checksumMutation: 'missing' }),
+        {},
+        /checksum|row/i,
+      ],
+      [
+        'extra checksum row',
+        makePublicReleaseAdapter(boundary.request, { checksumMutation: 'extra' }),
+        {},
+        /checksum|row/i,
+      ],
+      [
+        'checksum name conflict',
+        makePublicReleaseAdapter(boundary.request, { checksumMutation: 'name' }),
+        {},
+        /checksum|identity/i,
+      ],
+      [
+        'checksum digest conflict',
+        makePublicReleaseAdapter(boundary.request, { checksumMutation: 'digest' }),
         {},
         /checksum|digest/i,
       ],
