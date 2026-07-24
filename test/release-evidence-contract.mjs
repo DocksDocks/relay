@@ -1794,7 +1794,9 @@ function testArchivedLegacyCompletionBinding(temp, { promotedChangedPaths, amend
   const receipt = JSON.parse(receiptRaw);
   assert.equal(sha256(archivedBytes), archivedSha256);
   assert.equal(
-    gitRaw(['rev-parse', `${shippedCommit}:${finishedRelative}`]).toString('utf8').trim(),
+    gitRaw(['rev-parse', `${shippedCommit}:${finishedRelative}`])
+      .toString('utf8')
+      .trim(),
     archivedBlob,
   );
   assert.equal(sha256(Buffer.from(candidateRaw)), candidateSha256);
@@ -1990,9 +1992,7 @@ function testArchivedLegacyCompletionBinding(temp, { promotedChangedPaths, amend
   expectLegacyReject(
     'pinned legacy completion receipt raw-byte substitution',
     {
-      planBytes: Buffer.from(
-        replaceRecord(archivedPlan, 'Completion-review-receipt', (raw) => raw.replace('{', '{ ')),
-      ),
+      planBytes: Buffer.from(replaceRecord(archivedPlan, 'Completion-review-receipt', (raw) => raw.replace('{', '{ '))),
     },
     /canonical|completion|receipt|legacy|pinned/i,
   );
@@ -2152,7 +2152,6 @@ function testArchivedLegacyCompletionBinding(temp, { promotedChangedPaths, amend
     /completion|receipt|legacy|pinned|reviewed|candidate|plan/i,
   );
 }
-
 
 function testCompletionBinding(temp, preparation) {
   const evidenceCommit = '234567890abcdef1234567890abcdef123456789';
