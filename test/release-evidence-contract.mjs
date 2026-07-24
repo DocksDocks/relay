@@ -1503,8 +1503,8 @@ function testPreparationHandlers(temp, preflight, sourceCi) {
     candidate.receipt.checks.map(({ steps }) => steps.map(({ argv }) => argv)),
     [
       [['node', 'plugins/session-relay/test/release-evidence-contract.mjs']],
-      [['node', 'plugins/session-relay/test/release-publication-contract.mjs']],
       [['node', 'plugins/session-relay/test/release-promotion-contract.mjs']],
+      [['node', 'plugins/session-relay/test/release-publication-contract.mjs']],
       [['node', 'plugins/session-relay/test/distribution-contract.mjs']],
       [
         [
@@ -2189,8 +2189,8 @@ function testCompletionBinding(temp, preparation) {
     'plugins/session-relay/test/release-publication-contract.mjs',
     'scripts/agents/score.mjs',
     'scripts/lib/session-relay-release-preparation.mjs',
-    'scripts/lib/session-relay-release-publication.mjs',
     'scripts/lib/session-relay-release-promotion.mjs',
+    'scripts/lib/session-relay-release-publication.mjs',
     'scripts/tests/plan-review-convergence-repair.mjs',
     'scripts/tests/plan-review-policy-regressions.mjs',
     'scripts/tests/plan-review-policy.mjs',
