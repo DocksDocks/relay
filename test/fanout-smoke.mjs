@@ -103,6 +103,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 const sleep = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+if (process.env.STUB_PROMPT_FILE) fs.writeFileSync(process.env.STUB_PROMPT_FILE, process.argv.at(-1));
 const sessionIndex = process.argv.indexOf('--session-id');
 const sessionId = process.argv[sessionIndex + 1];
 const event = JSON.stringify({ session_id: sessionId, cwd: process.cwd(), hook_event_name: 'SessionStart', source: 'startup' });
@@ -124,11 +125,46 @@ while (true) sleep(1000);
 
 try {
   const rootTrigger = triggerPath('root');
-  const rootId = spawnId(
-    relay(['spawn', repo, '--fanout', '--from', invoker, '--tool', 'claude', '--timeout', '5', '--', 'root task'], {
-      env: { STUB_HANDBACK_TRIGGER: rootTrigger, STUB_OUTPUT_FILE: 'root.txt' },
-    }),
+  const rootPromptFile = path.join(home, 'root-prompt.txt');
+  const rootTask = 'root task --json --tool codex --reply-to task-recipient';
+  const rootSpawn = relay(
+    [
+      'spawn',
+      repo,
+      '--fanout',
+      '--from',
+      invoker,
+      '--tool',
+      'claude',
+      '--timeout',
+      '5',
+      '--',
+      'root task',
+      '--json',
+      '--tool',
+      'codex',
+      '--reply-to',
+      'task-recipient',
+    ],
+    {
+      env: {
+        STUB_HANDBACK_TRIGGER: rootTrigger,
+        STUB_OUTPUT_FILE: 'root.txt',
+        STUB_PROMPT_FILE: rootPromptFile,
+      },
+    },
   );
+  assert.equal(rootSpawn.status, 0, `fanout spawn failed:\n${rootSpawn.stdout}\n${rootSpawn.stderr}`);
+  const rootPrompt = fs.readFileSync(rootPromptFile, 'utf8');
+  assert.ok(
+    rootPrompt.endsWith(`Your task:\n\n${rootTask}`),
+    'every option-looking token after -- must reach the worker as literal task text',
+  );
+  assert.ok(
+    rootPrompt.includes(`spawned by "${invoker}"`),
+    'task --reply-to after -- must not override the explicit --from parent',
+  );
+  const rootId = spawnId(rootSpawn);
   const rootRecord = fanoutRecords().find((record) => record.runtime_session_id === rootId);
   assert.equal(rootRecord?.depth, '0');
   assert.equal(rootRecord?.state, 'Running');
@@ -228,13 +264,10 @@ try {
   const collectedLeaf1 = fanoutRecords().find((record) => record.runtime_session_id === leaf1Id);
   assert.ok(collectedLeaf1?.worker_result, 'new fanout generation stores WorkerResultV1');
   assert.match(collectedLeaf1.worker_result_sha256, /^[0-9a-f]{64}$/);
-  assert.equal(
-    leaf1Result.stdout,
-    `${JSON.stringify({
-      result: collectedLeaf1.worker_result,
-      sha256: collectedLeaf1.worker_result_sha256,
-    })}\n`,
-  );
+  assert.deepEqual(JSON.parse(leaf1Result.stdout), {
+    result: collectedLeaf1.worker_result,
+    sha256: collectedLeaf1.worker_result_sha256,
+  });
 
   fs.writeFileSync(rootTrigger, 'go');
   waitFor('root exact reap', () => workerState(rootId) === 'TerminalReleasable');

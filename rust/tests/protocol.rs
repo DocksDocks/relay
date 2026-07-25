@@ -1733,6 +1733,188 @@ fn typed_rows_without_authoritative_claims_are_never_surfaced() {
 }
 
 #[test]
+fn typed_drain_preflights_unclaimed_suffix_before_consuming_valid_prefix() {
+    let fixture = Fixture::new("protocol-typed-drain-preflight-unclaimed");
+    let request = fixture
+        .store
+        .request(
+            REQUESTER_ID,
+            RESPONDER_ID,
+            "deliver only after full preflight",
+        )
+        .unwrap();
+    let mailbox = fixture
+        .home
+        .join("mailbox")
+        .join(format!("{RESPONDER_ID}.jsonl"));
+    let valid_prefix = fs::read(&mailbox).unwrap();
+    let claim = claim_path(&fixture.home, &request.correlation_id);
+    let claim_before = fs::read(&claim).unwrap();
+
+    let unclaimed = request_message();
+    assert!(
+        fixture
+            .store
+            .read_claim(&unclaimed.correlation_id)
+            .unwrap()
+            .is_none()
+    );
+    let mut mailbox_file = fs::OpenOptions::new().append(true).open(&mailbox).unwrap();
+    mailbox_file
+        .write_all(&unclaimed.canonical_bytes())
+        .unwrap();
+    mailbox_file.write_all(b"\n").unwrap();
+    drop(mailbox_file);
+    let mailbox_before = fs::read(&mailbox).unwrap();
+
+    let error = fixture.store.drain_typed(RESPONDER_ID).unwrap_err();
+    assert_eq!(error_code(&error), "protocol_store_error");
+    assert!(
+        error.to_string().contains("typed mailbox row has no claim"),
+        "{error}"
+    );
+    assert_eq!(
+        read_claim_file(&claim).request_delivery,
+        DeliveryState::Enqueued
+    );
+    assert_eq!(fs::read(&claim).unwrap(), claim_before);
+    assert_eq!(fs::read(&mailbox).unwrap(), mailbox_before);
+
+    fs::write(&mailbox, valid_prefix).unwrap();
+    assert_eq!(
+        fixture.store.drain_typed(RESPONDER_ID).unwrap(),
+        vec![request.clone()]
+    );
+    assert!(fixture.store.drain_typed(RESPONDER_ID).unwrap().is_empty());
+    assert_eq!(
+        read_claim_file(&claim).request_delivery,
+        DeliveryState::Consumed
+    );
+}
+
+#[test]
+fn renderable_drain_preflights_mismatched_suffix_before_consuming_valid_prefix() {
+    let fixture = Fixture::new("protocol-renderable-preflight-mismatch");
+    let first = fixture
+        .store
+        .request(
+            REQUESTER_ID,
+            RESPONDER_ID,
+            "deliver after every row validates",
+        )
+        .unwrap();
+    let mailbox = fixture
+        .home
+        .join("mailbox")
+        .join(format!("{RESPONDER_ID}.jsonl"));
+    let valid_prefix = fs::read(&mailbox).unwrap();
+    let second = fixture
+        .store
+        .request(REQUESTER_ID, RESPONDER_ID, "authoritative suffix")
+        .unwrap();
+    let first_claim = claim_path(&fixture.home, &first.correlation_id);
+    let second_claim = claim_path(&fixture.home, &second.correlation_id);
+    let first_claim_before = fs::read(&first_claim).unwrap();
+    let second_claim_before = fs::read(&second_claim).unwrap();
+
+    let mut mismatched = second.clone();
+    mismatched.body = "mismatched suffix".into();
+    assert!(validate_record(&mismatched).is_ok());
+    assert_ne!(mismatched, second);
+    let mut mailbox_before = valid_prefix.clone();
+    mailbox_before.extend_from_slice(&mismatched.canonical_bytes());
+    mailbox_before.push(b'\n');
+    fs::write(&mailbox, &mailbox_before).unwrap();
+
+    let error = match lifecycle_drain(&fixture.home, RESPONDER_ID) {
+        Err(error) => error,
+        Ok(_) => panic!("renderable drain surfaced a mismatched typed suffix"),
+    };
+    assert!(
+        error.contains("typed mailbox claim binding mismatch"),
+        "{error}"
+    );
+    assert_eq!(
+        read_claim_file(&first_claim).request_delivery,
+        DeliveryState::Enqueued
+    );
+    assert_eq!(
+        read_claim_file(&second_claim).request_delivery,
+        DeliveryState::Enqueued
+    );
+    assert_eq!(fs::read(&first_claim).unwrap(), first_claim_before);
+    assert_eq!(fs::read(&second_claim).unwrap(), second_claim_before);
+    assert_eq!(fs::read(&mailbox).unwrap(), mailbox_before);
+
+    fs::write(&mailbox, valid_prefix).unwrap();
+    let retried = lifecycle_drain(&fixture.home, RESPONDER_ID).unwrap();
+    let rows = retried.messages().to_vec();
+    retried.commit();
+    assert_eq!(
+        rows,
+        vec![
+            String::from_utf8(first.canonical_bytes())
+                .unwrap()
+                .parse::<JsonValue>()
+                .unwrap()
+        ]
+    );
+    let empty = lifecycle_drain(&fixture.home, RESPONDER_ID).unwrap();
+    assert!(empty.messages().is_empty());
+    empty.commit();
+    assert_eq!(
+        read_claim_file(&first_claim).request_delivery,
+        DeliveryState::Consumed
+    );
+    assert_eq!(
+        read_claim_file(&second_claim).request_delivery,
+        DeliveryState::Enqueued
+    );
+}
+
+#[test]
+fn renderable_drain_rejects_noncanonical_typed_row_before_consuming_claim() {
+    let fixture = Fixture::new("protocol-renderable-noncanonical");
+    let request = fixture
+        .store
+        .request(REQUESTER_ID, RESPONDER_ID, "reject noncanonical transport")
+        .unwrap();
+    let mailbox = fixture
+        .home
+        .join("mailbox")
+        .join(format!("{RESPONDER_ID}.jsonl"));
+    let claim = claim_path(&fixture.home, &request.correlation_id);
+    let claim_before = fs::read(&claim).unwrap();
+    let canonical_mailbox = fs::read(&mailbox).unwrap();
+
+    let canonical = String::from_utf8(request.canonical_bytes()).unwrap();
+    let noncanonical = format!(" {canonical}\n");
+    let parsed = noncanonical.trim_end().parse::<JsonValue>().unwrap();
+    assert_eq!(MessageV2::from_tinyjson(&parsed).unwrap(), request);
+    assert_ne!(noncanonical.as_bytes(), canonical_mailbox.as_slice());
+    fs::write(&mailbox, noncanonical.as_bytes()).unwrap();
+    let mailbox_before = fs::read(&mailbox).unwrap();
+
+    let error = match lifecycle_drain(&fixture.home, RESPONDER_ID) {
+        Err(error) => error,
+        Ok(receipt) => {
+            receipt.commit();
+            String::new()
+        }
+    };
+    assert_eq!(
+        read_claim_file(&claim).request_delivery,
+        DeliveryState::Enqueued
+    );
+    assert_eq!(fs::read(&claim).unwrap(), claim_before);
+    assert_eq!(fs::read(&mailbox).unwrap(), mailbox_before);
+    assert!(
+        error.contains("malformed typed mailbox row"),
+        "noncanonical typed row was not rejected: {error}"
+    );
+}
+
+#[test]
 fn requeued_request_row_after_pre_inject_failure_redelivers_exactly_once() {
     let fixture = Fixture::new("protocol-requeue-request");
     let request = fixture
