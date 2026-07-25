@@ -11,17 +11,20 @@ mod git;
 pub use authority::{CollectionPhase, FanoutMode, FanoutRecord, FanoutState, FanoutStore};
 
 use crate::lifecycle::LifecycleStore;
+use crate::protocol::{TerminalStatus, WorkerResultV1};
 use crate::store;
 use crate::workspace::authority::{
     AuthorityRootProvider, AuthorityRoots, SystemAuthorityRootProvider, WorkspaceAuthority,
 };
 use crate::workspace::repository_gate::RepositoryGate;
+use crate::workspace::schema::{ClosedJcs, ObjectFormat, parse_jcs};
 use authority::{
     ReservationRequest, acquire_collection_lock, increment_record_version, lifecycle_worker,
     optional_string, record_by_runtime_session_id, registered_entry, resolve_entry,
+    validated_worker_result,
 };
 use git::{
-    PreparedMergeOutcome, add_worktree, canonicalize_repository, ensure_clean,
+    PreparedMergeOutcome, add_worktree, canonicalize_repository, changed_paths, ensure_clean,
     ensure_worktree_root, merge_prepared_handback, remove_merged_worktree,
     remove_unstarted_worktree, repo_identity, repository_head, validate_sha,
 };
@@ -151,15 +154,26 @@ pub fn handback(
     status: &str,
     note: &str,
 ) -> Result<FanoutRecord, String> {
-    if !matches!(status, "completed" | "failed") {
-        return Err("handback status must be completed|failed".to_string());
-    }
+    let terminal_status = match status {
+        "completed" => TerminalStatus::Completed,
+        "failed" => TerminalStatus::Failed,
+        _ => return Err("handback status must be completed|failed".to_string()),
+    };
     if note.len() > 4096 || note.contains('\0') {
         return Err("handback note must be at most 4096 bytes without NUL".to_string());
     }
-    let snapshot = fanout.read_transaction(|records, _| {
+    let mut snapshot = fanout.read_transaction(|records, _| {
         let record = record_by_runtime_session_id(records, runtime_session_id)?;
         if record.state == FanoutState::HandedBack {
+            if record.correlation_id.is_some() {
+                let (result, _) = validated_worker_result(record)?;
+                if result.status != terminal_status || result.summary != note {
+                    return Err(
+                        "correlation_conflict: fanout worker result is already immutable"
+                            .to_string(),
+                    );
+                }
+            }
             return Ok(record.clone());
         }
         if record.state != FanoutState::Running {
@@ -179,12 +193,71 @@ pub fn handback(
         }
         Ok(record.clone())
     })?;
-    let worktree_identity = repo_identity(Path::new(&snapshot.worktree))?;
+    if snapshot.state == FanoutState::HandedBack {
+        if snapshot.correlation_id.is_some() {
+            return fanout.ensure_worker_result_enqueued(&snapshot.reservation_id);
+        }
+        return Ok(snapshot);
+    }
+    if snapshot.correlation_id.is_some() {
+        snapshot = fanout.reconcile_fanout_claim(&snapshot.reservation_id)?;
+    }
+    let worktree = Path::new(&snapshot.worktree);
+    let worktree_identity = repo_identity(worktree)?;
+    if !worktree_identity.matches_record(&snapshot) {
+        return Err("fanout handback repository identity changed".to_string());
+    }
     let (_repository_gate, _roots) = acquire_legacy_gate(&worktree_identity)?;
-    ensure_clean(Path::new(&snapshot.worktree), "handback worktree")?;
-    let head = repository_head(Path::new(&snapshot.worktree))?;
+    ensure_clean(worktree, "handback worktree")?;
+    let head = repository_head(worktree)?;
     validate_sha(&head, worktree_identity.object_format)?;
-    fanout.transaction(|records, _, _| {
+
+    let worker_result = if let Some(correlation_id) = snapshot.correlation_id.as_ref() {
+        let stored_format = snapshot
+            .object_format
+            .as_deref()
+            .ok_or_else(|| "correlated fanout record has no object format".to_string())
+            .and_then(ObjectFormat::parse)?;
+        if stored_format != worktree_identity.object_format {
+            return Err("fanout handback object format changed".to_string());
+        }
+        let result = WorkerResultV1 {
+            schema: 1,
+            result_id: store::uuid_v4(),
+            correlation_id: correlation_id.clone(),
+            reservation_id: snapshot.reservation_id.clone(),
+            root_reservation_id: snapshot.root_reservation_id.clone(),
+            parent_session_id: snapshot.parent_session_id.clone(),
+            worker_id: snapshot
+                .worker_id
+                .clone()
+                .ok_or_else(|| "fanout record has no managed worker".to_string())?,
+            generation: snapshot
+                .generation
+                .clone()
+                .ok_or_else(|| "fanout record has no managed generation".to_string())?,
+            runtime_session_id: snapshot
+                .runtime_session_id
+                .clone()
+                .ok_or_else(|| "fanout record has no runtime session".to_string())?,
+            repo_common_dir: snapshot.repo_common_dir.clone(),
+            repo_dev: snapshot.repo_dev.clone(),
+            repo_ino: snapshot.repo_ino.clone(),
+            object_format: stored_format,
+            base_commit: snapshot.base_sha.clone(),
+            handback_commit: head.clone(),
+            status: terminal_status,
+            summary: note.to_string(),
+            changed_paths: changed_paths(worktree, &snapshot.base_sha, &head)?,
+            created_at: store::iso_now(),
+        };
+        WorkerResultV1::from_jcs(parse_jcs(&result.canonical_bytes(), false)?)?;
+        Some(result)
+    } else {
+        None
+    };
+    let worker_result_sha256 = worker_result.as_ref().map(WorkerResultV1::sha256);
+    let handed = match fanout.transaction(|records, _, _| {
         let mut record = records
             .get(&snapshot.reservation_id)
             .cloned()
@@ -192,14 +265,60 @@ pub fn handback(
         if record.version != snapshot.version || record.state != FanoutState::Running {
             return Err("fanout handback authority changed".to_string());
         }
+        if record.depth == 0
+            && records.values().any(|child| {
+                child.depth == 1
+                    && child.root_reservation_id == record.root_reservation_id
+                    && !matches!(
+                        child.state,
+                        FanoutState::Collected | FanoutState::FailedNoProcess
+                    )
+            })
+        {
+            return Err("fanout root has uncollected children".to_string());
+        }
         record.state = FanoutState::HandedBack;
-        record.handback_head = Some(head);
+        record.handback_head = Some(head.clone());
         record.handback_status = Some(status.to_string());
         record.handback_note = Some(note.to_string());
+        record.worker_result = worker_result;
+        record.worker_result_sha256 = worker_result_sha256;
         increment_record_version(&mut record)?;
         records.insert(record.reservation_id.clone(), record.clone());
         Ok(record)
-    })
+    }) {
+        Ok(record) => record,
+        Err(error)
+            if error == "fanout handback authority changed"
+                && snapshot.correlation_id.is_some() =>
+        {
+            let current = fanout
+                .read(&snapshot.reservation_id)?
+                .ok_or_else(|| "fanout reservation disappeared".to_string())?;
+            if current.state == FanoutState::HandedBack {
+                let (result, _) = validated_worker_result(&current)?;
+                if result.status == terminal_status
+                    && result.summary == note
+                    && result.handback_commit == head
+                {
+                    current
+                } else {
+                    return Err(
+                        "correlation_conflict: fanout worker result is already immutable"
+                            .to_string(),
+                    );
+                }
+            } else {
+                return Err(error);
+            }
+        }
+        Err(error) => return Err(error),
+    };
+    if handed.correlation_id.is_some() {
+        fanout.ensure_worker_result_enqueued(&handed.reservation_id)
+    } else {
+        Ok(handed)
+    }
 }
 
 pub fn collect(
@@ -223,10 +342,29 @@ pub fn collect(
     let _collection_lock = acquire_collection_lock(fanout.root(), &reservation_id)?;
     let parent_identity = repo_identity(&parent_dir_before_lock)?;
     let (_repository_gate, _roots) = acquire_legacy_gate(&parent_identity)?;
+    let mut validated_record = fanout
+        .read(&reservation_id)?
+        .ok_or_else(|| "fanout reservation disappeared".to_string())?;
+    if validated_record.parent_session_id != parent_session_id
+        || validated_record.runtime_session_id.as_deref() != Some(runtime_session_id)
+    {
+        return Err("fanout collect authority binding changed".to_string());
+    }
+    if validated_record.correlation_id.is_some() {
+        validated_record = fanout.ensure_worker_result_enqueued(&reservation_id)?;
+        validate_correlated_collection(
+            &validated_record,
+            &parent_dir_before_lock,
+            &parent_identity,
+        )?;
+    }
     let mut record = fanout.transaction(|records, lifecycle, registry| {
         let mut record = record_by_runtime_session_id(records, runtime_session_id)?.clone();
         if record.parent_session_id != parent_session_id {
             return Err("fanout collect parent does not own this worker".to_string());
+        }
+        if validated_record.correlation_id.is_some() && record.version != validated_record.version {
+            return Err("fanout collection authority changed after result validation".to_string());
         }
         if record.state == FanoutState::Collected {
             return Ok(record);
@@ -362,12 +500,26 @@ pub fn run_collect(raw: Vec<String>) -> ! {
         parent_session_id,
     )
     .unwrap_or_else(|error| fanout_die(&error));
-    println!(
-        "collected {} into {}",
-        runtime_session_id, parent_session_id
-    );
     if record.state != FanoutState::Collected {
         fanout_die("fanout collection did not reach Collected");
+    }
+    if args.has("result-json") {
+        let result = record
+            .worker_result
+            .as_ref()
+            .unwrap_or_else(|| fanout_die("fanout collection has no correlated worker result"));
+        let digest = record
+            .worker_result_sha256
+            .as_deref()
+            .unwrap_or_else(|| fanout_die("fanout collection has no worker result digest"));
+        let result_json = String::from_utf8(result.canonical_bytes())
+            .unwrap_or_else(|_| fanout_die("worker result canonical JSON is not UTF-8"));
+        println!(r#"{{"result":{result_json},"sha256":"{digest}"}}"#);
+    } else {
+        println!(
+            "collected {} into {}",
+            runtime_session_id, parent_session_id
+        );
     }
     std::process::exit(0);
 }
@@ -375,6 +527,52 @@ pub fn run_collect(raw: Vec<String>) -> ! {
 fn fanout_die(message: &str) -> ! {
     eprintln!("{message}");
     std::process::exit(1);
+}
+
+fn validate_correlated_collection(
+    record: &FanoutRecord,
+    parent_dir: &Path,
+    parent_identity: &git::RepoIdentity,
+) -> Result<(), String> {
+    let (result, _) = validated_worker_result(record)?;
+    if !parent_identity.matches_record(record)
+        || result.repo_common_dir != parent_identity.common_dir
+        || result.repo_dev != parent_identity.dev
+        || result.repo_ino != parent_identity.ino
+        || result.object_format != parent_identity.object_format
+    {
+        return Err("worker result repository binding mismatch".to_string());
+    }
+    let actual_paths = changed_paths(parent_dir, &result.base_commit, &result.handback_commit)?;
+    if actual_paths != result.changed_paths {
+        return Err("worker result changed-path binding mismatch".to_string());
+    }
+    let worktree = Path::new(&record.worktree);
+    let worktree_required = record.state != FanoutState::Collected
+        && matches!(
+            record.collection_phase,
+            None | Some(CollectionPhase::Prepared)
+        );
+    if worktree_required && !worktree.is_dir() {
+        return Err("fanout child worktree disappeared before collection".to_string());
+    }
+    if worktree.exists() {
+        let worktree_identity = repo_identity(worktree)?;
+        if !worktree_identity.matches_record(record)
+            || worktree_identity.object_format != result.object_format
+        {
+            return Err("worker result repository binding mismatch".to_string());
+        }
+        let current_head = repository_head(worktree)?;
+        if current_head != result.handback_commit {
+            return Err(format!(
+                "fanout child HEAD changed after handback; restore {} to {} before retrying collection",
+                worktree.display(),
+                result.handback_commit
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn advance_collection(

@@ -7,6 +7,7 @@ pub mod fanout;
 mod gc;
 pub mod hook;
 pub mod lifecycle;
+pub mod protocol;
 pub(crate) mod sha256;
 pub mod spawn;
 pub mod store;

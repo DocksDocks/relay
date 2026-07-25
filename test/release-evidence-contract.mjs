@@ -12,6 +12,7 @@ import {
   canonicalPlanView,
   validateDraftReceipt,
 } from '../../../plugins/docks/skills/productivity/plan-manager/scripts/legacy-review-records.mjs';
+import { canonicalPlanView as canonicalCurrentPlanView } from '../../../plugins/docks/skills/productivity/plan-manager/scripts/plan-run.mjs';
 import { gitRaw } from '../../../scripts/lib/session-relay-release-core.mjs';
 import { runFixture } from '../../../scripts/lib/session-relay-release-fixture.mjs';
 import {
@@ -46,6 +47,22 @@ const TARGETS = [
   ['x86_64-apple-darwin', 'macOS', 'X64'],
   ['aarch64-apple-darwin', 'macOS', 'ARM64'],
 ];
+const CURRENT_RELEASE_VERSION = '0.14.0';
+const CURRENT_RELEASE_TAG = 'session-relay--v0.14.0';
+const CURRENT_PUBLIC_VERSION = '0.12.0';
+const CURRENT_PUBLIC_TAG = 'cli-v0.12.0';
+const CURRENT_GOAL_ID = '8b89aabf-7336-4352-bc11-225bab67f9aa';
+const CURRENT_DOCKS_RUN_ID = '9349cb79-232f-48fc-a7de-5da7eae64e84';
+const CURRENT_PUBLIC_RUN_ID = '1f801952-705e-4c7e-a533-91026c013383';
+const CURRENT_DOCKS_PLAN_PATH = 'docs/plans/active/session-relay-correlated-results-release-continuation.md';
+const CURRENT_PUBLIC_PLAN_PATH = 'docs/plans/active/session-relay-0.14.0-docks-kit-0.12.0-release.md';
+const HISTORICAL_RELEASE_PLAN_PATH = 'docs/plans/active/session-relay-linux-workspace-publication.md';
+const HISTORICAL_RECEIPT_SHA256 = Object.freeze({
+  source_proof_v1: '419b23ccdcf0ca21672e81c05ae9d22c55bc67781839ffb6a29e7eecc2b59396',
+  source_proof_v2: '87a6260ae20280712ebb2d76d39667b128c8f6cf687141ebd779d8eca16c2262',
+  publication: '31d096d31702b66d7e97085a82d8b7da1b75155f828b1d2382a0ac8427ba7ea2',
+  public_request: '7cf02781a2ed3c75423321492fb2cd4c4944f6da6d6d41290e26a5f3ca0cf902',
+});
 
 function sha256(bytes) {
   return createHash('sha256').update(bytes).digest('hex');
@@ -214,7 +231,7 @@ function nativeProducerJobs() {
   }));
 }
 
-function artifactFixture({ mutateArchive } = {}) {
+function artifactFixture({ mutateArchive, releaseVersion = CURRENT_RELEASE_VERSION } = {}) {
   const archives = new Map();
   const artifacts = [];
   const binaryDigests = new Map();
@@ -235,7 +252,7 @@ function artifactFixture({ mutateArchive } = {}) {
         sha256: digest,
         source_commit: COMMIT,
         target,
-        version_stdout: 'session-relay 0.13.0',
+        version_stdout: `session-relay ${releaseVersion}`,
         workflow_run_attempt: RUN_ATTEMPT,
         workflow_run_id: RUN_ID,
       }),
@@ -245,7 +262,7 @@ function artifactFixture({ mutateArchive } = {}) {
       { name: `attestation-${target}.json`, bytes: attestation, deflate: true, dataDescriptor: true },
     ]);
     archives.set(databaseId, archive);
-    artifacts.push(artifactRecord(databaseId, artifactName, archive));
+    artifacts.push(artifactRecord(databaseId, artifactName, archive, releaseVersion));
     databaseId += 1;
   }
   const manifest = Buffer.from(
@@ -256,12 +273,12 @@ function artifactFixture({ mutateArchive } = {}) {
   );
   const checksumArchive = zip([{ name: 'SHA256SUMS', bytes: manifest, deflate: true, dataDescriptor: true }]);
   archives.set(databaseId, checksumArchive);
-  artifacts.push(artifactRecord(databaseId, 'session-relay-checksums', checksumArchive));
+  artifacts.push(artifactRecord(databaseId, 'session-relay-checksums', checksumArchive, releaseVersion));
   if (mutateArchive) mutateArchive({ archives, artifacts });
-  return { archives, artifacts, jobs: nativeProducerJobs() };
+  return { archives, artifacts, jobs: nativeProducerJobs(), releaseVersion };
 }
 
-function artifactRecord(id, name, archive) {
+function artifactRecord(id, name, archive, releaseVersion = CURRENT_RELEASE_VERSION) {
   return {
     id,
     name,
@@ -272,7 +289,7 @@ function artifactRecord(id, name, archive) {
       id: RUN_ID,
       repository_id: REPOSITORY_DATABASE_ID,
       head_repository_id: REPOSITORY_DATABASE_ID,
-      head_branch: `preflight/session-relay-0.13.0-${COMMIT.slice(0, 12)}`,
+      head_branch: `preflight/session-relay-${releaseVersion}-${COMMIT.slice(0, 12)}`,
       head_sha: COMMIT,
     },
   };
@@ -288,7 +305,7 @@ function preflightAdapter(fixture) {
           status: 'completed',
           conclusion: 'success',
           head_sha: COMMIT,
-          head_branch: `preflight/session-relay-0.13.0-${COMMIT.slice(0, 12)}`,
+          head_branch: `preflight/session-relay-${fixture.releaseVersion}-${COMMIT.slice(0, 12)}`,
           path: '.github/workflows/build-binaries.yml',
           run_attempt: RUN_ATTEMPT,
           workflow_id: WORKFLOW_ID,
@@ -453,7 +470,7 @@ function sourceCiFixture(
           status: 'completed',
           conclusion: 'success',
           head_sha: COMMIT,
-          head_branch: `preflight/session-relay-0.13.0-${COMMIT.slice(0, 12)}`,
+          head_branch: `preflight/session-relay-${CURRENT_RELEASE_VERSION}-${COMMIT.slice(0, 12)}`,
           path: '.github/workflows/ci.yml',
           run_started_at: '2026-07-17T18:00:00Z',
           updated_at: '2026-07-17T18:10:00Z',
@@ -2782,6 +2799,498 @@ function testLiveSourceCiAndPrepareDryRun() {
   for (const [relative, bytes] of before) assert.deepEqual(fs.readFileSync(path.join(repo, relative)), bytes);
 }
 
+function currentSourcePreparationProofV2() {
+  const sourceCommit = '1'.repeat(40);
+  const redCommit = '2'.repeat(40);
+  const implementationCommit = '3'.repeat(40);
+  const reviewedCommit = implementationCommit;
+  return {
+    schema: 2,
+    type: 'SourcePreparationProofV2',
+    repository_id: REPOSITORY_ID,
+    version: CURRENT_RELEASE_VERSION,
+    tag: CURRENT_RELEASE_TAG,
+    goal_id: CURRENT_GOAL_ID,
+    run_id: CURRENT_DOCKS_RUN_ID,
+    source_commit: sourceCommit,
+    implementation_commit: implementationCommit,
+    tag_commit: implementationCommit,
+    plan_run: {
+      schema: 1,
+      repository_id: REPOSITORY_ID,
+      goal_id: CURRENT_GOAL_ID,
+      run_id: CURRENT_DOCKS_RUN_ID,
+      plan_path: CURRENT_DOCKS_PLAN_PATH,
+      source_base: sourceCommit,
+      implementation_commit: implementationCommit,
+      status: 'ongoing',
+    },
+    tdd_red: {
+      schema: 1,
+      type: 'TddRedReceiptV1',
+      repository_id: REPOSITORY_ID,
+      pre_production_commit: redCommit,
+      receipt_sha256: '4'.repeat(64),
+      test_blob_sha256: '5'.repeat(64),
+      expected_failure_sha256: '6'.repeat(64),
+      command: {
+        cwd: '/home/vagrant/projects/docks',
+        argv: ['node', 'plugins/session-relay/test/release-evidence-contract.mjs'],
+      },
+      expected_exit_code: 1,
+      observed_exit_code: 1,
+      failure_signature: 'SourcePreparationProofV2 is not implemented',
+      stdout_sha256: '8'.repeat(64),
+      stderr_sha256: '9'.repeat(64),
+      test_blobs: [
+        {
+          path: 'plugins/session-relay/test/release-evidence-contract.mjs',
+          blob_id: 'a'.repeat(40),
+        },
+      ],
+      observed_before_implementation: true,
+    },
+    completion_review: {
+      schema: 1,
+      type: 'CompletionReviewV1',
+      reviewed_commit: reviewedCommit,
+      result_sha256: '7'.repeat(64),
+      verdict: 'pass',
+    },
+    ancestry: {
+      source_to_red: true,
+      red_to_implementation: true,
+      implementation_to_reviewed: true,
+      reviewed_to_tag: true,
+    },
+    companion: {
+      repository_id: 'DocksDocks/public',
+      goal_id: CURRENT_GOAL_ID,
+      run_id: CURRENT_PUBLIC_RUN_ID,
+      plan_path: CURRENT_PUBLIC_PLAN_PATH,
+      version: CURRENT_PUBLIC_VERSION,
+      tag: CURRENT_PUBLIC_TAG,
+      session_relay_version: CURRENT_RELEASE_VERSION,
+      session_relay_tag: CURRENT_RELEASE_TAG,
+      package: 'docks-kit',
+      npm_version: CURRENT_PUBLIC_VERSION,
+    },
+    historical_receipts: {
+      version: '0.13.0',
+      tag: 'session-relay--v0.13.0',
+      ...HISTORICAL_RECEIPT_SHA256,
+    },
+    created_at: '2026-07-25T14:00:00.000Z',
+  };
+}
+
+function bindCurrentCompletionFixture(
+  temp,
+  {
+    name,
+    includeVersion = true,
+    version = CURRENT_RELEASE_VERSION,
+    transformPlan = (plan) => plan,
+    brokenAncestry = null,
+    implementationBlob = 'a'.repeat(40),
+  },
+) {
+  const sourceCommit = '1'.repeat(40);
+  const redCommit = '2'.repeat(40);
+  const implementationCommit = '3'.repeat(40);
+  const testPath = 'plugins/session-relay/test/release-evidence-contract.mjs';
+  const testBlob = 'a'.repeat(40);
+  const sourceSha256 = 'b'.repeat(64);
+  const completionDiffSha256 = 'c'.repeat(64);
+  const red = structuredClone(currentSourcePreparationProofV2().tdd_red);
+  red.pre_production_commit = redCommit;
+  red.test_blobs = [{ path: testPath, blob_id: testBlob }];
+  const completionReview = {
+    schema: 1,
+    run_id: CURRENT_DOCKS_RUN_ID,
+    invocation: 1,
+    implementation_commit: implementationCommit,
+    diff_sha256: completionDiffSha256,
+    verdict: 'pass',
+    findings: [],
+  };
+  const completionReviewJcs = jcs(completionReview);
+  const completionReviewSha256 = sha256(Buffer.from(completionReviewJcs));
+  const renderPlan = (run, draftReview = {}, completion = {}) => `---
+title: Current completion fixture
+goal: Bind the reviewed Session Relay source proof.
+status: ongoing
+created: "2026-07-25T13:24:00.000Z"
+updated: "2026-07-25T14:00:00.000Z"
+started_at: "2026-07-25T13:38:39.988Z"
+finished_at: null
+affected_paths:
+  - plugins/session-relay/test/release-evidence-contract.mjs
+---
+
+# Current completion fixture
+
+Plan-run: ${jcs(run)}
+
+## Goal
+
+Bind the reviewed source, red evidence, implementation, completion review, and release tag.
+
+## Review
+
+Review-result: ${jcs(draftReview)}
+Review-result: ${jcs(completion)}
+
+## Verification Results
+
+TDD-red-evidence: ${jcs(red)}
+- Focused current release evidence passed on the reviewed implementation.
+`;
+  const planSha256 = sha256(canonicalCurrentPlanView(Buffer.from(renderPlan({}))));
+  const draftReview = {
+    schema: 1,
+    run_id: CURRENT_DOCKS_RUN_ID,
+    invocation: 1,
+    plan_sha256: planSha256,
+    source_sha256: sourceSha256,
+    verdict: 'pass',
+    findings: [],
+  };
+  const run = {
+    schema: 1,
+    goal_id: CURRENT_GOAL_ID,
+    run_id: CURRENT_DOCKS_RUN_ID,
+    repository_id: REPOSITORY_ID,
+    plan_path: CURRENT_DOCKS_PLAN_PATH,
+    requested_effects: ['local', 'probe', 'push', 'release'],
+    risk: 'external',
+    plan_sha256: planSha256,
+    source_base: sourceCommit,
+    source_sha256: sourceSha256,
+    draft_review: {
+      state: 'passed',
+      invocations: 1,
+      input_sha256: planSha256,
+      result_sha256: sha256(Buffer.from(jcs(draftReview))),
+    },
+    execution_parent: sourceCommit,
+    implementation_commit: implementationCommit,
+    completion_review: {
+      state: 'passed',
+      invocations: 1,
+      input_sha256: completionDiffSha256,
+      result_sha256: completionReviewSha256,
+    },
+    acceptance: {
+      source_sha256: 'd'.repeat(64),
+      verification_sha256: 'e'.repeat(64),
+    },
+    blocker: null,
+  };
+  const fixtureContext = {
+    red,
+    run,
+    completionReview,
+    completionReviewSha256,
+  };
+  const plan = transformPlan(renderPlan(run, draftReview, completionReview), fixtureContext);
+  const root = path.join(temp, `current-completion-${name}`);
+  const planPath = path.join(root, CURRENT_DOCKS_PLAN_PATH);
+  fs.mkdirSync(path.dirname(planPath), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(planPath, plan);
+  const receiptOut = path.join(root, 'source-proof-v2.json');
+  const calls = { ancestry: [] };
+  const ancestry = [
+    ['source-to-red', sourceCommit, redCommit],
+    ['red-to-implementation', redCommit, implementationCommit],
+    ['implementation-to-reviewed', implementationCommit, implementationCommit],
+    ['reviewed-to-tag', implementationCommit, implementationCommit],
+  ];
+  let ancestryIndex = 0;
+  const adapter = {
+    repoRoot: root,
+    git(args) {
+      if (args[0] === 'rev-parse') {
+        const revision = args[1];
+        if (revision === `${sourceCommit}^{commit}`) return sourceCommit;
+        if (revision === `${redCommit}^{commit}`) return redCommit;
+        if (revision === `${implementationCommit}^{commit}`) return implementationCommit;
+        if (revision === `${redCommit}:${testPath}`) return testBlob;
+        if (revision === `${implementationCommit}:${testPath}`) return implementationBlob;
+      }
+      if (args[0] === 'merge-base' && args[1] === '--is-ancestor') {
+        const expected = ancestry[ancestryIndex];
+        assert.ok(expected, `unexpected current ancestry call: ${args.join(' ')}`);
+        assert.deepEqual(args, ['merge-base', '--is-ancestor', expected[1], expected[2]]);
+        ancestryIndex += 1;
+        calls.ancestry.push(expected[0]);
+        if (brokenAncestry === expected[0]) throw new Error(`${expected[0]} is not ancestral`);
+        return '';
+      }
+      assert.fail(`unexpected current completion git call: ${args.join(' ')}`);
+    },
+    inspectPublic() {
+      assert.fail('current source binding must not inspect public state');
+    },
+    run() {
+      assert.fail('current source binding must not execute commands');
+    },
+    now() {
+      return '2026-07-25T14:00:00.000Z';
+    },
+    readFile(file) {
+      assert.equal(file, planPath);
+      return fs.readFileSync(file);
+    },
+  };
+  const optionEntries = [
+    ['finished-plan', planPath],
+    ['receipt-out', receiptOut],
+  ];
+  if (includeVersion) optionEntries.push(['version', version]);
+  const result = bindCompletion(new Map(optionEntries), adapter);
+  return {
+    ...fixtureContext,
+    sourceCommit,
+    redCommit,
+    implementationCommit,
+    testBlob,
+    planPath,
+    receiptOut,
+    calls,
+    result,
+  };
+}
+
+function testCurrentCompletionBinding(temp) {
+  const generated = bindCurrentCompletionFixture(temp, { name: 'generated' });
+  assert.equal(generated.result.receipt.schema, 2);
+  assert.equal(generated.result.receipt.type, 'SourcePreparationProofV2');
+  assert.equal(generated.result.receipt.source_commit, generated.sourceCommit);
+  assert.equal(generated.result.receipt.implementation_commit, generated.implementationCommit);
+  assert.equal(generated.result.receipt.tag_commit, generated.implementationCommit);
+  assert.equal(generated.result.receipt.completion_review.result_sha256, generated.completionReviewSha256);
+  assert.deepEqual(generated.result.receipt.tdd_red, generated.red);
+  assert.deepEqual(generated.result.receipt.plan_run, {
+    schema: 1,
+    repository_id: REPOSITORY_ID,
+    goal_id: CURRENT_GOAL_ID,
+    run_id: CURRENT_DOCKS_RUN_ID,
+    plan_path: CURRENT_DOCKS_PLAN_PATH,
+    source_base: generated.sourceCommit,
+    implementation_commit: generated.implementationCommit,
+    status: 'ongoing',
+  });
+  assert.deepEqual(generated.result.receipt.companion, {
+    repository_id: 'DocksDocks/public',
+    goal_id: CURRENT_GOAL_ID,
+    run_id: CURRENT_PUBLIC_RUN_ID,
+    plan_path: CURRENT_PUBLIC_PLAN_PATH,
+    version: CURRENT_PUBLIC_VERSION,
+    tag: CURRENT_PUBLIC_TAG,
+    session_relay_version: CURRENT_RELEASE_VERSION,
+    session_relay_tag: CURRENT_RELEASE_TAG,
+    package: 'docks-kit',
+    npm_version: CURRENT_PUBLIC_VERSION,
+  });
+  assert.deepEqual(generated.result.receipt.historical_receipts, {
+    version: '0.13.0',
+    tag: 'session-relay--v0.13.0',
+    ...HISTORICAL_RECEIPT_SHA256,
+  });
+  assert.deepEqual(generated.calls.ancestry, [
+    'source-to-red',
+    'red-to-implementation',
+    'implementation-to-reviewed',
+    'reviewed-to-tag',
+  ]);
+  validateSourcePreparationProof(generated.result.receipt);
+  const loaded = validateProof(
+    new Map([
+      ['source-proof', generated.receiptOut],
+      ['source-proof-sha256', sha256(fs.readFileSync(generated.receiptOut))],
+    ]),
+  );
+  assert.deepEqual(loaded.value, generated.result.receipt);
+
+  const pathSelected = bindCurrentCompletionFixture(temp, {
+    name: 'path-selected',
+    includeVersion: false,
+  });
+  assert.equal(pathSelected.result.receipt.type, 'SourcePreparationProofV2');
+
+  expectReject(
+    'current binder rejects a legacy CLI version on the current active plan',
+    () =>
+      bindCurrentCompletionFixture(temp, {
+        name: 'legacy-version',
+        version: '0.13.0',
+      }),
+    /current|0\.14|version/i,
+  );
+  expectReject(
+    'current binder rejects duplicate red evidence',
+    () =>
+      bindCurrentCompletionFixture(temp, {
+        name: 'duplicate-red',
+        transformPlan(plan) {
+          const line = plan.split('\n').find((item) => item.startsWith('TDD-red-evidence:'));
+          assert.ok(line);
+          return plan.replace(line, `${line}\n${line}`);
+        },
+      }),
+    /exactly one|TDD-red-evidence/i,
+  );
+  expectReject(
+    'current binder rejects noncanonical red evidence',
+    () =>
+      bindCurrentCompletionFixture(temp, {
+        name: 'noncanonical-red',
+        transformPlan(plan) {
+          return plan.replace(/^(TDD-red-evidence: \{.*\})$/m, '$1 ');
+        },
+      }),
+    /TDD-red-evidence|canonical/i,
+  );
+  expectReject(
+    'current binder rejects a completion result digest drift',
+    () =>
+      bindCurrentCompletionFixture(temp, {
+        name: 'review-digest-drift',
+        transformPlan(plan, { completionReviewSha256 }) {
+          return plan.replace(completionReviewSha256, '0'.repeat(64));
+        },
+      }),
+    /CompletionReviewV1|bind|result/i,
+  );
+  expectReject(
+    'current binder rejects red evidence after the implementation',
+    () =>
+      bindCurrentCompletionFixture(temp, {
+        name: 'misordered-red',
+        brokenAncestry: 'red-to-implementation',
+      }),
+    /red-to-implementation|ancestry/i,
+  );
+  expectReject(
+    'current binder rejects frozen test blob drift',
+    () =>
+      bindCurrentCompletionFixture(temp, {
+        name: 'test-blob-drift',
+        implementationBlob: '0'.repeat(40),
+      }),
+    /TDD-red|blob|drift/i,
+  );
+  expectReject(
+    'current binder rejects canonical plan drift',
+    () =>
+      bindCurrentCompletionFixture(temp, {
+        name: 'plan-drift',
+        transformPlan(plan) {
+          return plan.replace(
+            'Bind the reviewed source, red evidence, implementation, completion review, and release tag.',
+            'Bind substituted source evidence, implementation, completion review, and release tag.',
+          );
+        },
+      }),
+    /PlanRunV1|plan_sha256|canonical active plan/i,
+  );
+}
+
+function testCurrentCorrelatedReleaseEvidence() {
+  const historicalPlan = fs.readFileSync(path.resolve(HISTORICAL_RELEASE_PLAN_PATH), 'utf8');
+  for (const [name, digest] of Object.entries(HISTORICAL_RECEIPT_SHA256)) {
+    assert.match(
+      historicalPlan,
+      new RegExp(digest),
+      `historical Session Relay 0.13.0 ${name} receipt identity changed`,
+    );
+  }
+
+  const proof = currentSourcePreparationProofV2();
+  assert.deepEqual(Object.keys(proof).sort(), [
+    'ancestry',
+    'companion',
+    'completion_review',
+    'created_at',
+    'goal_id',
+    'historical_receipts',
+    'implementation_commit',
+    'plan_run',
+    'repository_id',
+    'run_id',
+    'schema',
+    'source_commit',
+    'tag',
+    'tag_commit',
+    'tdd_red',
+    'type',
+    'version',
+  ]);
+  assert.equal(proof.version, CURRENT_RELEASE_VERSION);
+  assert.equal(proof.tag, CURRENT_RELEASE_TAG);
+  assert.equal(proof.companion.version, CURRENT_PUBLIC_VERSION);
+  assert.equal(proof.companion.tag, CURRENT_PUBLIC_TAG);
+  assert.equal(proof.companion.package, 'docks-kit');
+  assert.equal(proof.companion.npm_version, CURRENT_PUBLIC_VERSION);
+  assert.equal(proof.companion.goal_id, proof.goal_id);
+  assert.equal(proof.tdd_red.observed_before_implementation, true);
+  assert.equal(proof.tdd_red.expected_exit_code, 1);
+  assert.equal(proof.tdd_red.observed_exit_code, 1);
+  assert.equal(proof.tdd_red.test_blobs.length, 1);
+  assert.equal(proof.completion_review.reviewed_commit, proof.implementation_commit);
+  assert.deepEqual(proof.ancestry, {
+    source_to_red: true,
+    red_to_implementation: true,
+    implementation_to_reviewed: true,
+    reviewed_to_tag: true,
+  });
+
+  validateSourcePreparationProof(proof);
+
+  for (const [label, mutate, pattern] of [
+    [
+      'red receipt captured after implementation',
+      (value) => {
+        value.tdd_red.observed_before_implementation = false;
+      },
+      /red|production|implementation|order/i,
+    ],
+    [
+      'completion review bound to another commit',
+      (value) => {
+        value.completion_review.reviewed_commit = '8'.repeat(40);
+      },
+      /review|commit|identity/i,
+    ],
+    [
+      'broken reviewed source ancestry',
+      (value) => {
+        value.ancestry.red_to_implementation = false;
+      },
+      /ancestry|red|implementation/i,
+    ],
+    [
+      'unrelated public child goal',
+      (value) => {
+        value.companion.goal_id = '00000000-0000-4000-8000-000000000000';
+      },
+      /companion|goal/i,
+    ],
+    [
+      'historical 0.13 receipt rewrite',
+      (value) => {
+        value.historical_receipts.publication = '0'.repeat(64);
+      },
+      /historical|0\.13|publication|receipt/i,
+    ],
+  ]) {
+    const changed = structuredClone(proof);
+    mutate(changed);
+    assert.throws(() => validateSourcePreparationProof(changed), pattern, label);
+  }
+}
+
 function main() {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'session-relay-release-evidence-'));
   fs.chmodSync(temp, 0o700);
@@ -2810,6 +3319,8 @@ function main() {
     testNativeProducerWorkflow();
     testPrepareFixtureUsesFullCi(temp);
     testLiveSourceCiAndPrepareDryRun();
+    testCurrentCompletionBinding(temp);
+    testCurrentCorrelatedReleaseEvidence();
     console.log('release evidence contract: ok');
   } finally {
     fs.rmSync(temp, { recursive: true, force: true });

@@ -12,6 +12,7 @@
 use crate::discover;
 use crate::gc;
 use crate::lifecycle::{self, OperationKind};
+use crate::protocol::{MessageV2, ProtocolError, ProtocolStore, TerminalStatus};
 use crate::store;
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
@@ -19,7 +20,7 @@ use tinyjson::JsonValue;
 
 const PROTOCOL: &str = "2025-06-18";
 
-// The 6 tool schemas, verbatim from the Node bus (wire-identical surface).
+// The 6 legacy tool schemas are verbatim from the Node bus; request/reply are additive.
 const TOOLS_JSON: &str = r#"[
   {
     "name": "whoami",
@@ -80,6 +81,35 @@ const TOOLS_JSON: &str = r#"[
         "activeWithinMin": { "type": "number", "description": "Only sessions whose last activity is within this many minutes (default 60)." },
         "tool": { "type": "string", "enum": ["claude", "codex"], "description": "Restrict to one tool." }
       },
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "request",
+    "description": "Queue one correlated request to a registered session.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "to": { "type": "string", "description": "Recipient friendly name or session id (see roster)." },
+        "body": { "type": "string", "description": "Request text." },
+        "from": { "type": "string", "description": "Your own registered session id or name; defaults to the session resolved from the project dir." }
+      },
+      "required": ["to", "body"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "reply",
+    "description": "Publish the one terminal reply for a correlated request.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "correlation_id": { "type": "string", "description": "Correlation id returned by request." },
+        "status": { "type": "string", "enum": ["completed", "failed"], "description": "Terminal request status." },
+        "body": { "type": "string", "description": "Terminal reply text." },
+        "from": { "type": "string", "description": "Your own registered session id or name; defaults to the session resolved from the project dir." }
+      },
+      "required": ["correlation_id", "status", "body"],
       "additionalProperties": false
     }
   }
@@ -155,6 +185,74 @@ fn arg_str(args: &HashMap<String, JsonValue>, key: &str) -> Option<String> {
         .get::<String>()
         .filter(|s| !s.is_empty())
         .cloned()
+}
+
+fn invalid_protocol_args(name: &str) -> ToolErr {
+    ToolErr::Rpc(-32602.0, format!("Invalid arguments for tool: {name}"))
+}
+
+fn validate_protocol_args(name: &str, args: &HashMap<String, JsonValue>) -> Result<(), ToolErr> {
+    let (allowed, required): (&[&str], &[&str]) = match name {
+        "request" => (&["to", "body", "from"], &["to", "body"]),
+        "reply" => (
+            &["correlation_id", "status", "body", "from"],
+            &["correlation_id", "status", "body"],
+        ),
+        _ => return Ok(()),
+    };
+    if args.keys().any(|key| !allowed.contains(&key.as_str()))
+        || args.values().any(|value| value.get::<String>().is_none())
+        || required.iter().any(|key| !args.contains_key(*key))
+    {
+        return Err(invalid_protocol_args(name));
+    }
+    if name == "reply" {
+        let status = args
+            .get("status")
+            .and_then(|value| value.get::<String>())
+            .map(String::as_str);
+        if !matches!(status, Some("completed") | Some("failed")) {
+            return Err(invalid_protocol_args(name));
+        }
+    }
+    Ok(())
+}
+
+fn protocol_arg<'a>(
+    name: &str,
+    args: &'a HashMap<String, JsonValue>,
+    key: &str,
+) -> Result<&'a str, ToolErr> {
+    args.get(key)
+        .and_then(|value| value.get::<String>())
+        .map(String::as_str)
+        .ok_or_else(|| invalid_protocol_args(name))
+}
+
+fn protocol_identity(
+    supplied: Option<&str>,
+    fallback: Option<String>,
+) -> Result<String, ProtocolError> {
+    let identity = supplied.map(str::to_string).or(fallback).ok_or_else(|| {
+        ProtocolError::ProtocolStoreError("protocol identity is not registered".to_string())
+    })?;
+    store::resolve(&identity)
+        .map(|entry| entry.id)
+        .ok_or_else(|| {
+            ProtocolError::ProtocolStoreError(format!(
+                "protocol identity is not registered: {identity}"
+            ))
+        })
+}
+
+fn protocol_message(message: MessageV2) -> JsonValue {
+    let payload =
+        String::from_utf8(message.canonical_bytes()).expect("canonical MessageV2 is UTF-8");
+    text(js(payload), false)
+}
+
+fn protocol_failure(error: &ProtocolError) -> JsonValue {
+    text(js(format!(r#"{{"code":"{}"}}"#, error.code())), true)
 }
 
 // Flatten an Entry under {registered: true, ...entry} like the JS spread.
@@ -330,6 +428,48 @@ fn call_tool(
                 ]),
                 false,
             ))
+        }
+        "request" => {
+            validate_protocol_args(name, args)?;
+            let to = protocol_arg(name, args, "to")?;
+            let body = protocol_arg(name, args, "body")?;
+            let supplied_from = args
+                .get("from")
+                .and_then(|value| value.get::<String>())
+                .map(String::as_str);
+            let requester = match protocol_identity(supplied_from, self_id()) {
+                Ok(identity) => identity,
+                Err(error) => return Ok(protocol_failure(&error)),
+            };
+            let responder = match protocol_identity(Some(to), None) {
+                Ok(identity) => identity,
+                Err(error) => return Ok(protocol_failure(&error)),
+            };
+            let protocol = ProtocolStore::new(store::home_dir());
+            match protocol.request(&requester, &responder, body) {
+                Ok(message) => Ok(protocol_message(message)),
+                Err(error) => Ok(protocol_failure(&error)),
+            }
+        }
+        "reply" => {
+            validate_protocol_args(name, args)?;
+            let correlation_id = protocol_arg(name, args, "correlation_id")?;
+            let status = TerminalStatus::parse(protocol_arg(name, args, "status")?)
+                .map_err(|_| invalid_protocol_args(name))?;
+            let body = protocol_arg(name, args, "body")?;
+            let supplied_from = args
+                .get("from")
+                .and_then(|value| value.get::<String>())
+                .map(String::as_str);
+            let responder = match protocol_identity(supplied_from, self_id()) {
+                Ok(identity) => identity,
+                Err(error) => return Ok(protocol_failure(&error)),
+            };
+            let protocol = ProtocolStore::new(store::home_dir());
+            match protocol.reply(correlation_id, &responder, status, body) {
+                Ok(outcome) => Ok(protocol_message(outcome.message)),
+                Err(error) => Ok(protocol_failure(&error)),
+            }
         }
         "discover" => {
             let within = args

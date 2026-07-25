@@ -33,6 +33,7 @@ use crate::appserver;
 use crate::cli::{Args, DEFAULT_NUDGE};
 use crate::hook;
 use crate::lifecycle::{self, ChildLaunchSpec, DoorbellMessage, OperationKind};
+use crate::protocol::ProtocolStore;
 use crate::sha256::Sha256;
 use crate::spawn;
 use crate::store;
@@ -290,6 +291,15 @@ pub fn run(raw: Vec<String>) -> ! {
     let mut pending_ack: HashSet<String> = HashSet::new();
     let mut had_error = false;
     loop {
+        if let Err(error) = ProtocolStore::new(store::home_dir()).recover_pending() {
+            eprintln!("[relay watch] protocol recovery failed: {error}");
+            had_error = true;
+            if once {
+                std::process::exit(1);
+            }
+            std::thread::sleep(Duration::from_millis(POLL_MS));
+            continue;
+        }
         for t in &active_targets {
             if let Err(e) = store::update_watcher_progress(&t.id) {
                 eprintln!("[relay watch] progress update for {} failed: {e}", t.id);
@@ -643,6 +653,9 @@ fn push_target(
         return Ok(PushOutcome::Delivered);
     }
     let block = hook::mail_block(drained.messages(), &t.id);
+    if block.is_empty() {
+        return Ok(PushOutcome::Delivered);
+    }
     match appserver::deliver_with_guard(
         &mut guard,
         &block,

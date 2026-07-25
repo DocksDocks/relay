@@ -16,6 +16,8 @@ const workspaceTargets = [
   'workspace_coordination_process',
   'workspace_resources',
 ];
+const featureTargets = ['protocol', 'fanout', 'lifecycle_supervisor'];
+const runnableTargets = [...featureTargets, ...workspaceTargets];
 const acceptanceOwners = {
   A01: 'workspace_lease_process::two_writers_same_worktree_exactly_one_lease',
   A02: 'workspace_lease_process::separate_worktrees_both_hold_leases',
@@ -63,22 +65,22 @@ function listTests(target) {
 }
 
 if (process.argv.includes('--generate')) {
-  const cases = Object.fromEntries(workspaceTargets.map((target) => [target, { tests: listTests(target) }]));
+  const cases = Object.fromEntries(runnableTargets.map((target) => [target, { tests: listTests(target) }]));
   for (const [target, entry] of Object.entries(cases))
     assert.ok(entry.tests.length > 0, `${target}: generated test set is empty`);
   fs.writeFileSync(
     fixturePath,
-    `${JSON.stringify({ schema_version: 3, acceptance_owners: acceptanceOwners, pending_api_gaps: pendingApiGaps, cases }, null, 2)}\n`,
+    `${JSON.stringify({ schema_version: 4, acceptance_owners: acceptanceOwners, pending_api_gaps: pendingApiGaps, cases }, null, 2)}\n`,
   );
-  console.log(`PASS rust_test_inventory generated=${workspaceTargets.length}`);
+  console.log(`PASS rust_test_inventory generated=${runnableTargets.length}`);
   process.exit(0);
 }
 
 assert.deepEqual(Object.keys(fixture).sort(), ['acceptance_owners', 'cases', 'pending_api_gaps', 'schema_version']);
-assert.equal(fixture.schema_version, 3);
+assert.equal(fixture.schema_version, 4);
 assert.deepEqual(fixture.acceptance_owners, acceptanceOwners, 'A01-A29 owner matrix drifted');
 assert.deepEqual(fixture.pending_api_gaps, pendingApiGaps, 'declared production API gaps drifted');
-assert.deepEqual(Object.keys(fixture.cases).sort(), [...workspaceTargets].sort(), 'workspace Rust targets drifted');
+assert.deepEqual(Object.keys(fixture.cases).sort(), [...runnableTargets].sort(), 'Rust targets drifted');
 assert.deepEqual(
   Object.keys(fixture.acceptance_owners),
   Array.from({ length: 29 }, (_, index) => `A${String(index + 1).padStart(2, '0')}`),
@@ -99,7 +101,7 @@ const attachmentOwners = Object.entries(fixture.acceptance_owners).filter(
 );
 assert.equal(attachmentOwners.length, 17);
 assert.equal(new Set(attachmentOwners.map(([, owner]) => owner)).size, 17, 'A01-A17 owners must be one-to-one');
-for (const target of workspaceTargets) {
+for (const target of runnableTargets) {
   const tests = fixture.cases[target].tests;
   assert.ok(tests.length > 0, `${target}: frozen test set is empty`);
   assert.equal(new Set(tests).size, tests.length, `${target}: duplicate test`);
@@ -109,7 +111,7 @@ for (const target of workspaceTargets) {
 const caseIndex = process.argv.indexOf('--case');
 assert.ok(caseIndex >= 0 && process.argv[caseIndex + 1], 'usage: node rust-test-inventory.mjs --case <name>');
 const name = process.argv[caseIndex + 1];
-assert.ok(workspaceTargets.includes(name), `unknown rust test inventory case: ${name}`);
+assert.ok(runnableTargets.includes(name), `unknown rust test inventory case: ${name}`);
 let testEnv = process.env;
 let delegatedCgroupRoot = null;
 let originalCgroupProcs = null;

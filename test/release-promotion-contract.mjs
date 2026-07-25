@@ -7,11 +7,8 @@ import path from 'node:path';
 import { dispatchSessionRelayRelease } from '../../../scripts/lib/session-relay-release-cli.mjs';
 import {
   canonicalize,
-  LOCK_REF,
-  PRERELEASE_BODY,
   SessionRelayReleaseError,
   TAG,
-  TRANSACTION_REF,
   VERSION,
 } from '../../../scripts/lib/session-relay-release-core.mjs';
 import { validateSourcePreparationProof } from '../../../scripts/lib/session-relay-release-preparation.mjs';
@@ -46,6 +43,10 @@ const hash = (value) =>
 const HOST_ASSET_DIGEST = '5'.repeat(64);
 const RELEASE_VERSION = '0.13.0';
 const RELEASE_TAG = 'session-relay--v0.13.0';
+const LEGACY_PRERELEASE_BODY =
+  'Session Relay 0.13.0 is staged for compatibility validation. Do not install it directly or advertise installation instructions. Wait for the stable release.';
+const LOCK_REF = 'refs/heads/locks/session-relay-0.13.0';
+const TRANSACTION_REF = 'refs/heads/transactions/session-relay-0.13.0';
 const PUBLIC_VERSION = '0.10.2';
 const PUBLIC_TAG = 'cli-v0.10.2';
 const DOCKS_PLAN_PATH = 'docs/plans/active/session-relay-linux-workspace-recertification.md';
@@ -59,6 +60,18 @@ const ORDINARY_ASSET_NAMES = Object.freeze([
   'session-relay-x86_64-unknown-linux-musl',
 ]);
 const PUBLICATION_ASSET_NAMES = Object.freeze(['SHA256SUMS', ...ORDINARY_ASSET_NAMES]);
+const CURRENT_RELEASE_VERSION = '0.14.0';
+const CURRENT_RELEASE_TAG = 'session-relay--v0.14.0';
+const CURRENT_PUBLIC_VERSION = '0.12.0';
+const CURRENT_PUBLIC_TAG = 'cli-v0.12.0';
+const CURRENT_GOAL_ID = '8b89aabf-7336-4352-bc11-225bab67f9aa';
+const CURRENT_DOCKS_RUN_ID = '9349cb79-232f-48fc-a7de-5da7eae64e84';
+const CURRENT_DOCKS_PLAN_PATH = 'docs/plans/active/session-relay-correlated-results-release-continuation.md';
+const CURRENT_PUBLIC_RUN_ID = '1f801952-705e-4c7e-a533-91026c013383';
+const CURRENT_PUBLIC_PLAN_PATH = 'docs/plans/finished/2026-07-25-session-relay-0.14.0-docks-kit-0.12.0-release.md';
+const HISTORICAL_RELEASE_PLAN_PATH = 'docs/plans/active/session-relay-linux-workspace-publication.md';
+const HISTORICAL_PUBLICATION_SHA256 = '31d096d31702b66d7e97085a82d8b7da1b75155f828b1d2382a0ac8427ba7ea2';
+const HISTORICAL_PUBLIC_REQUEST_SHA256 = '7cf02781a2ed3c75423321492fb2cd4c4944f6da6d6d41290e26a5f3ca0cf902';
 
 const candidate = {
   schema: 1,
@@ -190,8 +203,8 @@ const proofValue = {
   review_status: 'passed',
   bound_at: '2026-07-17T19:30:00.000Z',
 };
-assert.equal(VERSION, RELEASE_VERSION, 'Session Relay production version must be 0.13.0');
-assert.equal(TAG, RELEASE_TAG, 'Session Relay production tag must be session-relay--v0.13.0');
+assert.equal(VERSION, CURRENT_RELEASE_VERSION, 'Session Relay production version must be 0.14.0');
+assert.equal(TAG, CURRENT_RELEASE_TAG, 'Session Relay production tag must be session-relay--v0.14.0');
 assert.match(
   candidate.companion.validation_ref,
   /^refs\/heads\/preflight\/session-relay-cli-0\.13\.0-[0-9a-f]{12}$/,
@@ -235,7 +248,7 @@ const publication = {
     },
     release_database_id: 91,
     release_state: 'prerelease',
-    body_sha256: hash(PRERELEASE_BODY),
+    body_sha256: hash(LEGACY_PRERELEASE_BODY),
     assets,
     transition: 'tag_and_release_created',
     created_at: '2026-07-17T20:00:00.000Z',
@@ -676,6 +689,400 @@ function phases(state) {
 
 function expectInterrupted(fn) {
   assert.throws(fn, /interrupted after/);
+}
+
+function currentReleaseChainV2() {
+  const relayImplementationCommit = 'a'.repeat(40);
+  const publicExecutionParent = 'b'.repeat(40);
+  const publicRedCommit = 'c'.repeat(40);
+  const publicImplementationCommit = 'd'.repeat(40);
+  const publicReleaseCommit = 'e'.repeat(40);
+  const publicArchiveCommit = 'f'.repeat(40);
+  const relayAssets = PUBLICATION_ASSET_NAMES.map((name, index) => ({
+    name,
+    database_id: 2_000 + index,
+    size: 20_000 + index,
+    digest: String(index + 1)
+      .repeat(64)
+      .slice(0, 64),
+  }));
+  const relayPins = Object.fromEntries(
+    PUBLIC_ASSET_TARGETS.map((target) => [
+      target,
+      relayAssets.find(({ name }) => name === `session-relay-${target}`).digest,
+    ]),
+  );
+  const publicationValue = {
+    schema: 2,
+    type: 'SessionRelayPublicationReceiptV2',
+    repository_id: 'DocksDocks/docks',
+    version: CURRENT_RELEASE_VERSION,
+    tag: CURRENT_RELEASE_TAG,
+    tag_commit: relayImplementationCommit,
+    release_state: 'prerelease',
+    release_database_id: 2_100,
+    workflow: { run_id: 2_101, attempt: 1 },
+    assets: relayAssets,
+    digest_evidence: {
+      artifact_sha256: structuredClone(relayPins),
+      release_download_sha256: structuredClone(relayPins),
+      checksum_rows: structuredClone(relayPins),
+    },
+    created_at: '2026-07-25T15:00:00.000Z',
+  };
+  const publication = { digest: hash(publicationValue), value: publicationValue };
+  const publicReleaseAssets = PUBLIC_RELEASE_ASSET_NAMES.map((name, index) => ({
+    name,
+    size: 30_000 + index,
+    digest: String(index + 7)
+      .slice(-1)
+      .repeat(64),
+  }));
+  const publicRedReceipt = {
+    schema: 1,
+    type: 'TddRedReceiptV1',
+    repository_id: 'DocksDocks/public',
+    pre_production_commit: publicRedCommit,
+    test_paths: [
+      {
+        path: 'cli/test/unit/sessionRelayCli.test.ts',
+        blob_id: '1'.repeat(40),
+      },
+      {
+        path: 'cli/test/unit/toolchain.test.ts',
+        blob_id: '2'.repeat(40),
+      },
+    ],
+    command: {
+      cwd: '/home/vagrant/projects/public',
+      argv: [
+        'bun',
+        'run',
+        'test:unit',
+        '--',
+        'cli/test/unit/sessionRelayCli.test.ts',
+        'cli/test/unit/toolchain.test.ts',
+      ],
+    },
+    exit_code: 1,
+    stdout_sha256: DIGEST('8'),
+    stderr_sha256: DIGEST('9'),
+    captured_at: '2026-07-25T15:30:00.000Z',
+    producer: {
+      path: 'scripts/capture-tdd-red.mjs',
+      blob_id: '3'.repeat(40),
+      version: '1',
+    },
+  };
+  const publicRedReceiptSha256 = hash(publicRedReceipt);
+  const publicReleaseValue = {
+    schema: 2,
+    type: 'PublicReleaseReceiptV2',
+    request_sha256: DIGEST('1'),
+    repository_id: 'DocksDocks/public',
+    tag: CURRENT_PUBLIC_TAG,
+    version: CURRENT_PUBLIC_VERSION,
+    release_commit: publicReleaseCommit,
+    companion_base_commit: publicExecutionParent,
+    ancestry: {
+      execution_parent: publicExecutionParent,
+      red_pre_production_commit: publicRedCommit,
+      implementation_commit: publicImplementationCommit,
+      reviewed_commit: publicImplementationCommit,
+      release_commit: publicReleaseCommit,
+      archive_commit: publicArchiveCommit,
+      red_captured_at: '2026-07-25T15:30:00.000Z',
+      implementation_reviewed_at: '2026-07-25T16:30:00.000Z',
+      red_to_implementation: true,
+      execution_parent_to_implementation: true,
+      implementation_to_release: true,
+      release_to_archive: true,
+    },
+    workflow: {
+      file: '.github/workflows/release-cli.yml',
+      run_database_id: 3_001,
+      run_attempt: 1,
+      conclusion: 'success',
+    },
+    release: {
+      database_id: 3_002,
+      assets: publicReleaseAssets,
+      checksums_sha256: publicReleaseAssets[0].digest,
+    },
+    npm: { package: 'docks-kit', state: 'published', version: CURRENT_PUBLIC_VERSION },
+    pinned_assets: structuredClone(relayPins),
+    public_plan: {
+      schema: 1,
+      repository_id: 'DocksDocks/public',
+      goal_id: CURRENT_GOAL_ID,
+      run_id: CURRENT_PUBLIC_RUN_ID,
+      path: CURRENT_PUBLIC_PLAN_PATH,
+      status: 'finished',
+      implementation_commit: publicImplementationCommit,
+      release_commit: publicReleaseCommit,
+      archive_commit: publicArchiveCommit,
+      red_receipt_sha256: publicRedReceiptSha256,
+      red_pre_production_commit: publicRedCommit,
+      red_evidence: {
+        schema: 1,
+        type: 'PublicRedFirstEvidenceV1',
+        receipt_sha256: publicRedReceiptSha256,
+        expected_failure_signature: 'Relay 0.14.0 and docks-kit 0.12.0 bindings are absent',
+        ordered_before_implementation: true,
+        receipt: publicRedReceipt,
+      },
+      completion_review_sha256: DIGEST('3'),
+      acceptance_sha256: DIGEST('4'),
+      verification_sha256: DIGEST('5'),
+      remote_read_back: true,
+      finished_at: '2026-07-25T17:30:00.000Z',
+    },
+    created_at: '2026-07-25T17:00:00.000Z',
+  };
+  const publicRelease = { digest: hash(publicReleaseValue), value: publicReleaseValue };
+  const stagedAssets = relayAssets.map(({ name, database_id: databaseId, size, digest }) => ({
+    name,
+    database_id: databaseId,
+    size,
+    digest,
+  }));
+  const promotionValue = {
+    schema: 2,
+    type: 'PromotionReceiptV2',
+    repository_id: 'DocksDocks/docks',
+    version: CURRENT_RELEASE_VERSION,
+    tag: CURRENT_RELEASE_TAG,
+    source_proof_sha256: DIGEST('6'),
+    reviewed_source_commit: relayImplementationCommit,
+    reviewed_source_ancestry: true,
+    docks_plan: {
+      repository_id: 'DocksDocks/docks',
+      goal_id: CURRENT_GOAL_ID,
+      run_id: CURRENT_DOCKS_RUN_ID,
+      plan_path: CURRENT_DOCKS_PLAN_PATH,
+      implementation_commit: relayImplementationCommit,
+      completion_review_sha256: DIGEST('7'),
+      status: 'ongoing',
+    },
+    publication_receipt_sha256: publication.digest,
+    public_release_receipt_sha256: publicRelease.digest,
+    public_child: {
+      repository_id: 'DocksDocks/public',
+      goal_id: CURRENT_GOAL_ID,
+      run_id: CURRENT_PUBLIC_RUN_ID,
+      version: CURRENT_PUBLIC_VERSION,
+      tag: CURRENT_PUBLIC_TAG,
+      npm_package: 'docks-kit',
+      npm_version: CURRENT_PUBLIC_VERSION,
+      plan_path: CURRENT_PUBLIC_PLAN_PATH,
+      status: 'finished',
+      red_first_verified: true,
+      finished_at: '2026-07-25T17:30:00.000Z',
+    },
+    staged_release: {
+      release_database_id: publicationValue.release_database_id,
+      tag_commit: publicationValue.tag_commit,
+      workflow_run_id: publicationValue.workflow.run_id,
+      workflow_run_attempt: publicationValue.workflow.attempt,
+      prerelease: true,
+      assets: stagedAssets,
+    },
+    stable_release: {
+      release_database_id: publicationValue.release_database_id,
+      tag_commit: publicationValue.tag_commit,
+      workflow_run_id: publicationValue.workflow.run_id,
+      workflow_run_attempt: publicationValue.workflow.attempt,
+      prerelease: false,
+      assets: structuredClone(stagedAssets),
+    },
+    byte_identical_promotion: true,
+    historical_receipts: {
+      version: RELEASE_VERSION,
+      tag: RELEASE_TAG,
+      publication_sha256: HISTORICAL_PUBLICATION_SHA256,
+      public_request_sha256: HISTORICAL_PUBLIC_REQUEST_SHA256,
+    },
+    outcome: 'success',
+    completed_at: '2026-07-25T18:00:00.000Z',
+  };
+  return {
+    publication,
+    publicRelease,
+    promotion: { digest: hash(promotionValue), value: promotionValue },
+  };
+}
+
+function assertCurrentReleasePromotionContract() {
+  const historicalPlan = fs.readFileSync(HISTORICAL_RELEASE_PLAN_PATH, 'utf8');
+  for (const digest of [HISTORICAL_PUBLICATION_SHA256, HISTORICAL_PUBLIC_REQUEST_SHA256]) {
+    assert.match(historicalPlan, new RegExp(digest), 'historical Session Relay 0.13.0 receipt identity changed');
+  }
+
+  const chain = currentReleaseChainV2();
+  const { publication, publicRelease, promotion } = chain;
+  assert.equal(publication.value.version, CURRENT_RELEASE_VERSION);
+  assert.equal(publication.value.tag, CURRENT_RELEASE_TAG);
+  assert.equal(publication.value.release_state, 'prerelease');
+  assert.deepEqual(
+    publication.value.assets.map(({ name }) => name),
+    PUBLICATION_ASSET_NAMES,
+    'Relay 0.14.0 prerelease must contain exactly four native binaries plus SHA256SUMS',
+  );
+  assert.equal(
+    publication.value.assets.some(({ name }) => /windows|win32|\.exe$/i.test(name)),
+    false,
+    'Relay 0.14.0 prerelease must not contain Windows',
+  );
+  assert.deepEqual(
+    publication.value.digest_evidence.artifact_sha256,
+    publication.value.digest_evidence.release_download_sha256,
+    'independent Relay download hashes must match producer artifact hashes',
+  );
+  assert.deepEqual(
+    publication.value.digest_evidence.artifact_sha256,
+    publication.value.digest_evidence.checksum_rows,
+    'independent Relay hashes must match SHA256SUMS',
+  );
+  assert.deepEqual(publicRelease.value.pinned_assets, publication.value.digest_evidence.artifact_sha256);
+  assert.equal(publicRelease.value.version, CURRENT_PUBLIC_VERSION);
+  assert.equal(publicRelease.value.tag, CURRENT_PUBLIC_TAG);
+  assert.deepEqual(publicRelease.value.npm, {
+    package: 'docks-kit',
+    state: 'published',
+    version: CURRENT_PUBLIC_VERSION,
+  });
+  assert.equal(promotion.value.public_child.npm_package, 'docks-kit');
+  assert.equal(promotion.value.public_child.npm_version, CURRENT_PUBLIC_VERSION);
+  assert.deepEqual(
+    {
+      repository_id: promotion.value.docks_plan.repository_id,
+      goal_id: promotion.value.docks_plan.goal_id,
+      run_id: promotion.value.docks_plan.run_id,
+      plan_path: promotion.value.docks_plan.plan_path,
+    },
+    {
+      repository_id: 'DocksDocks/docks',
+      goal_id: CURRENT_GOAL_ID,
+      run_id: CURRENT_DOCKS_RUN_ID,
+      plan_path: CURRENT_DOCKS_PLAN_PATH,
+    },
+  );
+  assert.equal(publicRelease.value.public_plan.status, 'finished');
+  assert.equal(publicRelease.value.public_plan.remote_read_back, true);
+  assert.equal(publicRelease.value.ancestry.red_to_implementation, true);
+  assert.equal(publicRelease.value.ancestry.implementation_to_release, true);
+  assert.equal(publicRelease.value.ancestry.release_to_archive, true);
+  const redEvidence = publicRelease.value.public_plan.red_evidence;
+  assert.ok(
+    Date.parse(redEvidence.receipt.captured_at) < Date.parse(publicRelease.value.ancestry.implementation_reviewed_at),
+    'public TDD red evidence must precede the reviewed implementation',
+  );
+  assert.equal(redEvidence.ordered_before_implementation, true);
+  assert.equal(redEvidence.receipt.exit_code, 1);
+  assert.equal(redEvidence.receipt.test_paths.length, 2);
+  assert.ok(redEvidence.receipt.command.argv.length > 0);
+  assert.equal(redEvidence.receipt.pre_production_commit, publicRelease.value.ancestry.red_pre_production_commit);
+  assert.equal(redEvidence.receipt_sha256, publicRelease.value.public_plan.red_receipt_sha256);
+  assert.ok(
+    Date.parse(publicRelease.value.created_at) < Date.parse(publicRelease.value.public_plan.finished_at),
+    'public release must precede the finished archived child receipt',
+  );
+  assert.ok(
+    Date.parse(publication.value.created_at) < Date.parse(publicRelease.value.created_at),
+    'Relay must remain prerelease until the public child release exists',
+  );
+  assert.ok(
+    Date.parse(publicRelease.value.public_plan.finished_at) < Date.parse(promotion.value.completed_at),
+    'public child must finish before stable Relay promotion',
+  );
+  assert.equal(promotion.value.public_child.red_first_verified, true);
+  assert.equal(promotion.value.byte_identical_promotion, true);
+  assert.equal(promotion.value.staged_release.prerelease, true);
+  assert.equal(promotion.value.stable_release.prerelease, false);
+  assert.equal(promotion.value.staged_release.release_database_id, promotion.value.stable_release.release_database_id);
+  assert.equal(promotion.value.staged_release.tag_commit, promotion.value.stable_release.tag_commit);
+  assert.equal(promotion.value.staged_release.workflow_run_id, promotion.value.stable_release.workflow_run_id);
+  assert.deepEqual(
+    promotion.value.staged_release.assets,
+    promotion.value.stable_release.assets,
+    'stable promotion must retain byte-identical prerelease assets',
+  );
+
+  releasePromotion.validatePublicReleaseReceipt(publicRelease, { publication });
+  for (const [label, mutate, pattern] of [
+    [
+      'public red command evidence removed',
+      (value) => {
+        value.public_plan.red_evidence.receipt.command.argv = [];
+      },
+      /red|command|evidence/i,
+    ],
+    [
+      'public red commit detached from ancestry',
+      (value) => {
+        value.public_plan.red_evidence.receipt.pre_production_commit = '0'.repeat(40);
+      },
+      /red|commit|ancestry/i,
+    ],
+    [
+      'public archive not remotely read back',
+      (value) => {
+        value.public_plan.remote_read_back = false;
+      },
+      /public|archive|read.back/i,
+    ],
+  ]) {
+    const changed = structuredClone(publicRelease.value);
+    mutate(changed);
+    assert.throws(
+      () => releasePromotion.validatePublicReleaseReceipt({ digest: hash(changed), value: changed }, { publication }),
+      pattern,
+      label,
+    );
+  }
+  validatePromotionReceipt(promotion.value);
+
+  for (const [label, mutate, pattern] of [
+    [
+      'unfinished public child',
+      (value) => {
+        value.public_child.status = 'ongoing';
+      },
+      /public|finished|status/i,
+    ],
+    [
+      'missing public red-first proof',
+      (value) => {
+        value.public_child.red_first_verified = false;
+      },
+      /public|red|order/i,
+    ],
+    [
+      'stable asset substitution',
+      (value) => {
+        value.stable_release.assets[1].digest = '0'.repeat(64);
+      },
+      /asset|byte|digest|promotion/i,
+    ],
+    [
+      'reviewed source ancestry failure',
+      (value) => {
+        value.reviewed_source_ancestry = false;
+      },
+      /review|source|ancestry/i,
+    ],
+    [
+      'historical 0.13 receipt rewrite',
+      (value) => {
+        value.historical_receipts.publication_sha256 = '0'.repeat(64);
+      },
+      /historical|0\.13|receipt/i,
+    ],
+  ]) {
+    const changed = structuredClone(promotion.value);
+    mutate(changed);
+    assert.throws(() => validatePromotionReceipt(changed), pattern, label);
+  }
 }
 
 function runGit(cwd, args, expectOk = true) {
@@ -1132,6 +1539,597 @@ function verifyPublicBoundary(
   } finally {
     fs.rmSync(directory, { recursive: true, force: true });
   }
+}
+
+const CURRENT_PUBLIC_EXECUTION_PARENT = 'b'.repeat(40);
+const CURRENT_PUBLIC_RED_COMMIT = 'c'.repeat(40);
+const CURRENT_PUBLIC_IMPLEMENTATION_COMMIT = 'd'.repeat(40);
+const CURRENT_PUBLIC_RELEASE_COMMIT = 'e'.repeat(40);
+const CURRENT_PUBLIC_ARCHIVE_COMMIT = 'f'.repeat(40);
+const CURRENT_PUBLIC_RELEASED_AT = '2026-07-25T17:00:00.000Z';
+
+function currentBoundaryPublicationValue() {
+  const tagCommit = 'a'.repeat(40);
+  const relayAssets = [...ORDINARY_ASSET_NAMES, 'SHA256SUMS'].sort().map((name, index) => ({
+    name,
+    database_id: 4_000 + index,
+    size: 40_000 + index,
+    digest: String(index + 1)
+      .repeat(64)
+      .slice(0, 64),
+  }));
+  const ordinaryDigests = Object.fromEntries(
+    relayAssets.filter(({ name }) => name !== 'SHA256SUMS').map(({ name, digest }) => [name, digest]),
+  );
+  return {
+    schema: 2,
+    type: 'SessionRelayPublicationReceiptV2',
+    repository_id: 'DocksDocks/docks',
+    version: CURRENT_RELEASE_VERSION,
+    source_proof_sha256: DIGEST('b'),
+    source: {
+      reviewed_commit: tagCommit,
+      implementation_commit: tagCommit,
+      reviewed_ancestry_verified: true,
+    },
+    tag: CURRENT_RELEASE_TAG,
+    tag_commit: tagCommit,
+    workflow: {
+      file: '.github/workflows/build-binaries.yml',
+      workflow_sha: tagCommit,
+      run_id: 4_100,
+      attempt: 1,
+      head_sha: tagCommit,
+      path: '.github/workflows/build-binaries.yml',
+      event: 'push',
+      inputs: { expected_commit: '', expected_tag: '', mode: '' },
+      conclusion: 'success',
+    },
+    release_database_id: 4_200,
+    release_state: 'prerelease',
+    body_sha256: hash(
+      'Session Relay 0.14.0 is staged for compatibility validation. Do not install it directly or advertise installation instructions. Wait for the stable release.',
+    ),
+    assets: relayAssets,
+    digest_evidence: {
+      workflow_run_id: 4_100,
+      workflow_run_attempt: 1,
+      artifact_sha256: ordinaryDigests,
+      release_download_sha256: structuredClone(ordinaryDigests),
+      checksum_rows: structuredClone(ordinaryDigests),
+    },
+    public_companion: {
+      repository_id: 'DocksDocks/public',
+      version: CURRENT_PUBLIC_VERSION,
+      tag: CURRENT_PUBLIC_TAG,
+      package: 'docks-kit',
+      npm_version: CURRENT_PUBLIC_VERSION,
+    },
+    historical_predecessor: {
+      version: RELEASE_VERSION,
+      tag: RELEASE_TAG,
+      publication_receipt_sha256: HISTORICAL_PUBLICATION_SHA256,
+    },
+    transition: 'tag_and_release_created',
+    created_at: '2026-07-25T15:00:00.000Z',
+  };
+}
+
+function currentPublicBoundaryFixture(directory) {
+  const publicationFile = writeBoundaryValue(directory, 'current-publication.json', currentBoundaryPublicationValue());
+  const publicationAssets = new Map(publicationFile.value.assets.map((asset) => [asset.name, asset]));
+  const pinnedAssets = Object.fromEntries(
+    PUBLIC_ASSET_TARGETS.map((target) => [target, publicationAssets.get(`session-relay-${target}`).digest]),
+  );
+  const request = writeBoundaryValue(directory, 'current-public-request.json', {
+    schema: 1,
+    type: 'PublicReleaseRequestV1',
+    repository_id: 'DocksDocks/public',
+    tag: CURRENT_PUBLIC_TAG,
+    version: CURRENT_PUBLIC_VERSION,
+    companion_base_commit: CURRENT_PUBLIC_EXECUTION_PARENT,
+    session_relay: {
+      repository_id: 'DocksDocks/docks',
+      tag: CURRENT_RELEASE_TAG,
+      version: CURRENT_RELEASE_VERSION,
+      tag_commit: publicationFile.value.tag_commit,
+      publication_receipt_sha256: publicationFile.digest,
+    },
+    assets: pinnedAssets,
+    created_at: '2026-07-25T15:15:00.000Z',
+  });
+  return { publicationFile, request };
+}
+
+function currentPublicReleaseEvidenceFixture(completionDigest) {
+  const { ancestry, public_plan: publicPlan } = currentReleaseChainV2().publicRelease.value;
+  return {
+    schema: 1,
+    type: 'PublicReleaseEvidenceV1',
+    ancestry: structuredClone(ancestry),
+    public_plan: {
+      ...structuredClone(publicPlan),
+      completion_review_sha256: completionDigest,
+    },
+  };
+}
+
+function makeCurrentPublicReleaseAdapter(
+  request,
+  {
+    ancestryFailure = null,
+    evidenceCopies = 1,
+    evidenceMutation = null,
+    npmState = 'published',
+    publishedAt = CURRENT_PUBLIC_RELEASED_AT,
+  } = {},
+) {
+  const completionReceipt = completionReceiptForReviewedHead(CURRENT_PUBLIC_IMPLEMENTATION_COMMIT);
+  const completionReceiptText = canonicalize(completionReceipt);
+  const completionDigest = hash(completionReceiptText);
+  const evidence = currentPublicReleaseEvidenceFixture(completionDigest);
+  evidenceMutation?.(evidence);
+  const evidenceText = canonicalize(evidence);
+
+  const binaryNames = PUBLIC_RELEASE_ASSET_NAMES.filter((name) => name !== 'SHA256SUMS');
+  const binaries = new Map(binaryNames.map((name) => [name, Buffer.from(`current-public-release:${name}`)]));
+  const checksumBytes = Buffer.from(
+    `${binaryNames.map((name) => `${hash(binaries.get(name))}  ${name}`).join('\n')}\n`,
+  );
+  const bytesByName = new Map([...binaries, ['SHA256SUMS', checksumBytes]]);
+  const releaseAssets = PUBLIC_RELEASE_ASSET_NAMES.map((name, index) => {
+    const bytes = bytesByName.get(name);
+    return { id: 5_000 + index, name, size: bytes.length, digest: `sha256:${hash(bytes)}` };
+  });
+  const release = {
+    id: 5_100,
+    tag_name: CURRENT_PUBLIC_TAG,
+    draft: false,
+    prerelease: false,
+    published_at: publishedAt,
+    assets: releaseAssets,
+  };
+  const successfulRun = {
+    id: 5_200,
+    run_attempt: 1,
+    head_sha: CURRENT_PUBLIC_RELEASE_COMMIT,
+    head_branch: CURRENT_PUBLIC_TAG,
+    path: '.github/workflows/release-cli.yml',
+    event: 'push',
+    status: 'completed',
+    conclusion: 'success',
+  };
+  const finishedPlan = Buffer.from(
+    [
+      '---',
+      'status: finished',
+      'review_status: passed',
+      '---',
+      '',
+      '# Public release',
+      '',
+      `Completion-review-receipt: ${completionReceiptText}`,
+      ...Array.from({ length: evidenceCopies }, () => `Public-release-evidence: ${evidenceText}`),
+      '',
+    ].join('\n'),
+  );
+  const ancestryFlags = new Map([
+    [`${CURRENT_PUBLIC_RED_COMMIT}...${CURRENT_PUBLIC_IMPLEMENTATION_COMMIT}`, 'red_to_implementation'],
+    [
+      `${CURRENT_PUBLIC_EXECUTION_PARENT}...${CURRENT_PUBLIC_IMPLEMENTATION_COMMIT}`,
+      'execution_parent_to_implementation',
+    ],
+    [`${CURRENT_PUBLIC_IMPLEMENTATION_COMMIT}...${CURRENT_PUBLIC_RELEASE_COMMIT}`, 'implementation_to_release'],
+    [`${CURRENT_PUBLIC_RELEASE_COMMIT}...${CURRENT_PUBLIC_ARCHIVE_COMMIT}`, 'release_to_archive'],
+  ]);
+  const adapter = {
+    now: () => '2026-07-25T18:00:00.000Z',
+    getTagCommit: () => CURRENT_PUBLIC_RELEASE_COMMIT,
+    isAncestor: (ancestor, descendant) => {
+      const flag = ancestryFlags.get(`${ancestor}...${descendant}`);
+      assert.ok(flag, `unexpected current public ancestry check: ${ancestor}...${descendant}`);
+      return flag !== ancestryFailure;
+    },
+    getFinishedPlan: (commit, planPath) => {
+      assert.equal(commit, CURRENT_PUBLIC_ARCHIVE_COMMIT, 'current finished plan must be read from archive commit');
+      assert.equal(planPath, CURRENT_PUBLIC_PLAN_PATH, 'current finished plan path identity');
+      return finishedPlan;
+    },
+    listWorkflowRuns: () => [structuredClone(successfulRun)],
+    getRelease: () => structuredClone(release),
+    downloadReleaseAsset: (id) => {
+      const asset = releaseAssets.find((candidate) => candidate.id === id);
+      assert.ok(asset, `unexpected current public asset download ${id}`);
+      return Buffer.from(bytesByName.get(asset.name));
+    },
+    getPinnedAssets: (commit) => {
+      assert.equal(commit, CURRENT_PUBLIC_RELEASE_COMMIT, 'current Relay pins must be read from release commit');
+      return structuredClone(request.value.assets);
+    },
+    getNpmState: (run) => {
+      assert.equal(run.id, successfulRun.id, 'npm docks-kit@0.12.0 must bind the exact successful workflow');
+      return npmState;
+    },
+  };
+  return { adapter, completionDigest, evidence };
+}
+
+function verifyCurrentPublicBoundary(directory, boundary, observation, output) {
+  return captureDigest(() =>
+    releasePromotion.verifyPublicRelease(
+      new Map([
+        ['request', boundary.request.file],
+        ['request-sha256', boundary.request.digest],
+        ['publication', boundary.publicationFile.file],
+        ['publication-sha256', boundary.publicationFile.digest],
+        ['public-finished-plan', CURRENT_PUBLIC_PLAN_PATH],
+        ['public-release-commit', CURRENT_PUBLIC_RELEASE_COMMIT],
+        ['public-plan-commit', CURRENT_PUBLIC_ARCHIVE_COMMIT],
+        ['public-completion-sha256', observation.completionDigest],
+        ['receipt-out', path.join(directory, output)],
+      ]),
+      observation.adapter,
+    ),
+  );
+}
+
+{
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'session-relay-current-public-boundary-'));
+  try {
+    const boundary = currentPublicBoundaryFixture(directory);
+    const success = makeCurrentPublicReleaseAdapter(boundary.request);
+    const verified = verifyCurrentPublicBoundary(directory, boundary, success, 'current-public-release.json');
+    assert.equal(verified.receipt.schema, 2, 'current verifier must emit schema 2');
+    assert.equal(verified.receipt.type, 'PublicReleaseReceiptV2', 'current verifier must emit PublicReleaseReceiptV2');
+    assert.equal(verified.receipt.request_sha256, boundary.request.digest);
+    assert.equal(verified.receipt.created_at, CURRENT_PUBLIC_RELEASED_AT);
+    assert.deepEqual(verified.receipt.ancestry, success.evidence.ancestry);
+    assert.deepEqual(verified.receipt.public_plan, success.evidence.public_plan);
+    assert.deepEqual(verified.receipt.npm, {
+      package: 'docks-kit',
+      state: 'published',
+      version: CURRENT_PUBLIC_VERSION,
+    });
+    assert.deepEqual(Object.keys(success.evidence).sort(), ['ancestry', 'public_plan', 'schema', 'type']);
+    assert.deepEqual(Object.keys(success.evidence.ancestry).sort(), [
+      'archive_commit',
+      'execution_parent',
+      'execution_parent_to_implementation',
+      'implementation_commit',
+      'implementation_reviewed_at',
+      'implementation_to_release',
+      'red_captured_at',
+      'red_pre_production_commit',
+      'red_to_implementation',
+      'release_commit',
+      'release_to_archive',
+      'reviewed_commit',
+    ]);
+    assert.deepEqual(Object.keys(success.evidence.public_plan).sort(), [
+      'acceptance_sha256',
+      'archive_commit',
+      'completion_review_sha256',
+      'finished_at',
+      'goal_id',
+      'implementation_commit',
+      'path',
+      'red_evidence',
+      'red_pre_production_commit',
+      'red_receipt_sha256',
+      'release_commit',
+      'remote_read_back',
+      'repository_id',
+      'run_id',
+      'schema',
+      'status',
+      'verification_sha256',
+    ]);
+    assert.equal(
+      fs.readFileSync(path.join(directory, 'current-public-release.json'), 'utf8'),
+      canonicalize(verified.receipt),
+    );
+
+    for (const [name, observation, pattern] of [
+      [
+        'wrong red-to-implementation order',
+        makeCurrentPublicReleaseAdapter(boundary.request, { ancestryFailure: 'red_to_implementation' }),
+        /ancestry|order|red-to-implementation/i,
+      ],
+      [
+        'wrong completion hash',
+        makeCurrentPublicReleaseAdapter(boundary.request, {
+          evidenceMutation: (evidence) => {
+            evidence.public_plan.completion_review_sha256 = DIGEST('0');
+          },
+        }),
+        /completion.*hash|digest/i,
+      ],
+      [
+        'wrong public plan identity',
+        makeCurrentPublicReleaseAdapter(boundary.request, {
+          evidenceMutation: (evidence) => {
+            evidence.public_plan.run_id = '00000000-0000-4000-8000-000000000000';
+          },
+        }),
+        /public|plan|identity|archive/i,
+      ],
+      [
+        'duplicate public release evidence',
+        makeCurrentPublicReleaseAdapter(boundary.request, { evidenceCopies: 2 }),
+        /exactly one|Public-release-evidence/i,
+      ],
+      [
+        'wrong public release evidence type',
+        makeCurrentPublicReleaseAdapter(boundary.request, {
+          evidenceMutation: (evidence) => {
+            evidence.type = 'PublicReleaseEvidenceV2';
+          },
+        }),
+        /evidence.*schema|type/i,
+      ],
+    ]) {
+      assert.throws(
+        () => verifyCurrentPublicBoundary(directory, boundary, observation, `${name.replaceAll(' ', '-')}.json`),
+        pattern,
+        `current verify-public-release ${name}`,
+      );
+    }
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+}
+
+function currentPromotionProofV2() {
+  const sourceCommit = '1'.repeat(40);
+  const redCommit = '2'.repeat(40);
+  const implementationCommit = 'a'.repeat(40);
+  return {
+    schema: 2,
+    type: 'SourcePreparationProofV2',
+    repository_id: 'DocksDocks/docks',
+    version: CURRENT_RELEASE_VERSION,
+    tag: CURRENT_RELEASE_TAG,
+    goal_id: CURRENT_GOAL_ID,
+    run_id: CURRENT_DOCKS_RUN_ID,
+    source_commit: sourceCommit,
+    implementation_commit: implementationCommit,
+    tag_commit: implementationCommit,
+    plan_run: {
+      schema: 1,
+      repository_id: 'DocksDocks/docks',
+      goal_id: CURRENT_GOAL_ID,
+      run_id: CURRENT_DOCKS_RUN_ID,
+      plan_path: CURRENT_DOCKS_PLAN_PATH,
+      source_base: sourceCommit,
+      implementation_commit: implementationCommit,
+      status: 'ongoing',
+    },
+    tdd_red: {
+      schema: 1,
+      type: 'TddRedReceiptV1',
+      repository_id: 'DocksDocks/docks',
+      pre_production_commit: redCommit,
+      receipt_sha256: DIGEST('4'),
+      test_blob_sha256: DIGEST('5'),
+      expected_failure_sha256: DIGEST('6'),
+      command: {
+        cwd: '/home/vagrant/projects/docks',
+        argv: ['node', 'plugins/session-relay/test/release-promotion-contract.mjs'],
+      },
+      expected_exit_code: 1,
+      observed_exit_code: 1,
+      failure_signature: 'current stable promotion was not implemented',
+      stdout_sha256: DIGEST('8'),
+      stderr_sha256: DIGEST('9'),
+      test_blobs: [
+        {
+          path: 'plugins/session-relay/test/release-promotion-contract.mjs',
+          blob_id: '3'.repeat(40),
+        },
+      ],
+      observed_before_implementation: true,
+    },
+    completion_review: {
+      schema: 1,
+      type: 'CompletionReviewV1',
+      reviewed_commit: implementationCommit,
+      result_sha256: DIGEST('7'),
+      verdict: 'pass',
+    },
+    ancestry: {
+      source_to_red: true,
+      red_to_implementation: true,
+      implementation_to_reviewed: true,
+      reviewed_to_tag: true,
+    },
+    companion: {
+      repository_id: 'DocksDocks/public',
+      goal_id: CURRENT_GOAL_ID,
+      run_id: CURRENT_PUBLIC_RUN_ID,
+      plan_path: 'docs/plans/active/session-relay-0.14.0-docks-kit-0.12.0-release.md',
+      version: CURRENT_PUBLIC_VERSION,
+      tag: CURRENT_PUBLIC_TAG,
+      session_relay_version: CURRENT_RELEASE_VERSION,
+      session_relay_tag: CURRENT_RELEASE_TAG,
+      package: 'docks-kit',
+      npm_version: CURRENT_PUBLIC_VERSION,
+    },
+    historical_receipts: {
+      version: RELEASE_VERSION,
+      tag: RELEASE_TAG,
+      source_proof_v1: '419b23ccdcf0ca21672e81c05ae9d22c55bc67781839ffb6a29e7eecc2b59396',
+      source_proof_v2: '87a6260ae20280712ebb2d76d39667b128c8f6cf687141ebd779d8eca16c2262',
+      publication: HISTORICAL_PUBLICATION_SHA256,
+      public_request: HISTORICAL_PUBLIC_REQUEST_SHA256,
+    },
+    created_at: '2026-07-25T14:00:00.000Z',
+  };
+}
+
+function makeCurrentPromotionAdapter({ byteDrift = false, refConflict = null, stableInitially = false } = {}) {
+  const proofValue = currentPromotionProofV2();
+  const proofEnvelope = { value: proofValue, digest: hash(proofValue) };
+  const publicationValue = currentBoundaryPublicationValue();
+  publicationValue.source_proof_sha256 = proofEnvelope.digest;
+  publicationValue.source.reviewed_commit = proofValue.implementation_commit;
+  publicationValue.source.implementation_commit = proofValue.implementation_commit;
+  publicationValue.tag_commit = proofValue.tag_commit;
+  publicationValue.workflow.workflow_sha = proofValue.tag_commit;
+  publicationValue.workflow.head_sha = proofValue.tag_commit;
+  const publicationEnvelope = { value: publicationValue, digest: hash(publicationValue) };
+  const publicReleaseValue = structuredClone(currentReleaseChainV2().publicRelease.value);
+  publicReleaseValue.pinned_assets = Object.fromEntries(
+    PUBLIC_ASSET_TARGETS.map((target) => [
+      target,
+      publicationValue.assets.find(({ name }) => name === `session-relay-${target}`).digest,
+    ]),
+  );
+  const publicReleaseEnvelope = { value: publicReleaseValue, digest: hash(publicReleaseValue) };
+  const prereleaseBody =
+    'Session Relay 0.14.0 is staged for compatibility validation. Do not install it directly or advertise installation instructions. Wait for the stable release.';
+  const stableBody =
+    'Session Relay 0.14.0 is available through docks-kit.\n\n## Install or update\n\n```\ndocks-kit sync\n```';
+  const state = {
+    main: proofValue.implementation_commit,
+    promotions: 0,
+    outputs: new Map(),
+    release: {
+      id: publicationValue.release_database_id,
+      tag_name: CURRENT_RELEASE_TAG,
+      draft: false,
+      prerelease: !stableInitially,
+      body: stableInitially ? stableBody : prereleaseBody,
+      assets: publicationValue.assets.map(({ name, database_id: databaseId, size, digest }) => ({
+        id: databaseId,
+        name,
+        size,
+        digest: `sha256:${digest}`,
+      })),
+    },
+  };
+  const adapter = {
+    now: () => '2026-07-25T18:00:00.000Z',
+    loadProof: () => proofEnvelope,
+    loadPublication: () => publicationEnvelope,
+    loadPublicRelease: () => publicReleaseEnvelope,
+    remoteRef: (ref) => {
+      if (ref === 'refs/heads/main') return state.main;
+      if (
+        refConflict !== null &&
+        ['refs/heads/transactions/session-relay-0.14.0', 'refs/heads/locks/session-relay-0.14.0'].includes(ref)
+      ) {
+        return refConflict;
+      }
+      return null;
+    },
+    isAncestor: () => true,
+    isPublicAncestor: () => true,
+    currentReleaseState: () => ({
+      commit: proofValue.tag_commit,
+      release: structuredClone(state.release),
+    }),
+    promoteStable: ({ tag, releaseDatabaseId, body }) => {
+      assert.equal(tag, CURRENT_RELEASE_TAG);
+      assert.equal(releaseDatabaseId, publicationValue.release_database_id);
+      assert.equal(body, stableBody);
+      state.promotions += 1;
+      state.release.prerelease = false;
+      state.release.body = stableBody;
+      if (byteDrift) state.release.assets[0].digest = `sha256:${DIGEST('f')}`;
+    },
+    assertReceiptOutputAvailable: ({ path: output }) => {
+      if (state.outputs.has(output)) throw new Error('receipt output conflict');
+    },
+    writeReceipt: ({ path: output, receipt, allowExisting }) => {
+      assert.equal(allowExisting, false);
+      const bytes = canonicalize(receipt);
+      if (state.outputs.has(output)) throw new Error('receipt output conflict');
+      state.outputs.set(output, bytes);
+      return { digest: hash(bytes) };
+    },
+  };
+  assert.deepEqual(
+    Object.keys(adapter).sort(),
+    [...releasePromotion.CURRENT_PROMOTION_ADAPTER_KEYS].sort(),
+    'current promotion adapter surface changed',
+  );
+  return {
+    adapter,
+    options: new Map([
+      ['docks-kit-release', CURRENT_PUBLIC_TAG],
+      ['expected-origin-main', proofValue.implementation_commit],
+      ['receipt-out', '/receipts/current-promotion.json'],
+    ]),
+    publicationEnvelope,
+    publicReleaseEnvelope,
+    state,
+  };
+}
+
+{
+  const current = makeCurrentPromotionAdapter();
+  const result = promoteReviewed(current.options, false, current.adapter);
+  validatePromotionReceipt(result.receipt);
+  assert.equal(result.receipt.schema, 2);
+  assert.equal(result.receipt.type, 'PromotionReceiptV2');
+  assert.equal(result.receipt.publication_receipt_sha256, current.publicationEnvelope.digest);
+  assert.equal(result.receipt.public_release_receipt_sha256, current.publicReleaseEnvelope.digest);
+  assert.equal(result.receipt.public_child.npm_version, CURRENT_PUBLIC_VERSION);
+  assert.equal(result.receipt.staged_release.prerelease, true);
+  assert.equal(result.receipt.stable_release.prerelease, false);
+  assert.deepEqual(result.receipt.staged_release.assets, result.receipt.stable_release.assets);
+  assert.equal(current.state.promotions, 1, 'current release must be promoted exactly once');
+  assert.equal(
+    current.state.outputs.get('/receipts/current-promotion.json'),
+    canonicalize(result.receipt),
+    'current promotion receipt output must be canonical',
+  );
+}
+
+{
+  const current = makeCurrentPromotionAdapter({ stableInitially: true });
+  assert.throws(
+    () => promoteReviewed(current.options, false, current.adapter),
+    /already stable|public child.*first|prerelease/i,
+    'current promotion must reject a release made stable before this reviewed public-child boundary',
+  );
+  assert.equal(current.state.promotions, 0);
+  assert.equal(current.state.outputs.size, 0);
+}
+
+{
+  const current = makeCurrentPromotionAdapter({ byteDrift: true });
+  assert.throws(
+    () => promoteReviewed(current.options, false, current.adapter),
+    /asset.*drift|asset.*IDs|digest/i,
+    'current promotion must reject stable read-back byte drift',
+  );
+  assert.equal(current.state.promotions, 1);
+  assert.equal(current.state.outputs.size, 0);
+}
+
+{
+  const current = makeCurrentPromotionAdapter({ refConflict: '9'.repeat(40) });
+  assert.throws(
+    () => promoteReviewed(current.options, false, current.adapter),
+    /authority ref|retries.*not permitted/i,
+    'current promotion must reject conflicting current authority refs',
+  );
+  assert.equal(current.state.promotions, 0);
+  assert.equal(current.state.outputs.size, 0);
+}
+
+{
+  const current = makeCurrentPromotionAdapter();
+  current.options.set('retry-failed', '/receipts/legacy-failure.json');
+  current.options.set('retry-failed-sha256', DIGEST('0'));
+  assert.throws(
+    () => promoteReviewed(current.options, false, current.adapter),
+    /single-shot|cannot.*retry/i,
+    'current promotion must reject legacy retry machinery',
+  );
+  assert.equal(current.state.promotions, 0);
+  assert.equal(current.state.outputs.size, 0);
 }
 
 for (const [label, mutate] of [
@@ -2246,5 +3244,7 @@ await assert.rejects(
   /repair-prepush.*repair-implementation-commit.*together/i,
   'repair-prepush CLI mode must require its committed repair identity',
 );
+
+assertCurrentReleasePromotionContract();
 
 process.stdout.write('release promotion contract: OK\n');

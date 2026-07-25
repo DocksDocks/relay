@@ -28,8 +28,9 @@ use crate::lifecycle::{
     RequiredScope, ServiceTier, TerminalAction,
 };
 use crate::store;
+use crate::workspace::schema::{JcsValue, serialize_jcs};
 use rustix::fs::{FlockOperation, flock};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::os::unix::process::*;
@@ -72,6 +73,7 @@ struct FanoutLaunchOptions<'a> {
     reply_to: &'a str,
     timeout_secs: u64,
     permissions: &'a [String; 2],
+    json: bool,
     task: &'a str,
 }
 
@@ -84,7 +86,10 @@ struct ChildRole<'a> {
 
 enum WorkerWorkspace<'a> {
     CreateBranch,
-    AssignedFanoutWorktree { handback_session_id: &'a str },
+    AssignedFanoutWorktree {
+        handback_session_id: &'a str,
+        correlation_id: Option<&'a str>,
+    },
 }
 
 impl FanoutSpawnConfig {
@@ -518,6 +523,7 @@ fn build_prompt(reply_to: &str, abs_relay: &str, premint: Option<&str>, task: &s
     )
 }
 
+#[cfg(test)]
 fn build_fanout_prompt(
     reply_to: &str,
     abs_relay: &str,
@@ -530,6 +536,26 @@ fn build_fanout_prompt(
         premint,
         WorkerWorkspace::AssignedFanoutWorktree {
             handback_session_id: premint.unwrap_or("<session-relay-id>"),
+            correlation_id: None,
+        },
+        task,
+    )
+}
+
+fn build_correlated_fanout_prompt(
+    reply_to: &str,
+    abs_relay: &str,
+    premint: Option<&str>,
+    correlation_id: &str,
+    task: &str,
+) -> String {
+    build_worker_prompt(
+        reply_to,
+        abs_relay,
+        premint,
+        WorkerWorkspace::AssignedFanoutWorktree {
+            handback_session_id: premint.unwrap_or("<session-relay-id>"),
+            correlation_id: Some(correlation_id),
         },
         task,
     )
@@ -555,23 +581,29 @@ fn build_worker_prompt(
         ),
         WorkerWorkspace::AssignedFanoutWorktree {
             handback_session_id,
-        } => (
-            format!(
-                "If you need a decision, report to \"{reply_to}\" over the bus and wait for its reply."
-            ),
-            "Work only in the already assigned isolated worktree and branch; do not create or\n   switch branches.".to_string(),
-            format!(
-                r#"
+            correlation_id,
+        } => {
+            let correlation_rule = correlation_id
+                .map(|correlation_id| format!("Correlation ID: {correlation_id}\n"))
+                .unwrap_or_default();
+            (
+                format!(
+                    "If you need a decision, report to \"{reply_to}\" over the bus and wait for its reply."
+                ),
+                "Work only in the already assigned isolated worktree and branch; do not create or\n   switch branches.".to_string(),
+                format!(
+                    r#"
 Completion contract:
-1. You must commit all intended changes on the assigned branch.
+{correlation_rule}1. You must commit all intended changes on the assigned branch.
 2. You must verify the worktree is clean.
 3. Run:
    {abs_relay} handback --from {handback_session_id} --status completed --note "<brief note>"
    Replace <session-relay-id> with the identity supplied at SessionStart when needed.
 This must be your final action; do not write to the worktree afterward.
 "#
-            ),
-        ),
+                ),
+            )
+        }
     };
     format!(
         r#"You are a session-relay bus worker spawned by "{reply_to}". You are running in a
@@ -976,19 +1008,24 @@ fn run_fanout_spawn(options: FanoutLaunchOptions<'_>) -> ! {
         options.mode,
     )
     .unwrap_or_else(|error| die(&error));
+    let correlation_id = reservation
+        .correlation_id
+        .clone()
+        .unwrap_or_else(|| die("new fanout reservation has no correlation id"));
     let preminted_session_id = (options.tool != "codex").then(store::uuid_v4);
     let relay = std::env::current_exe()
         .ok()
         .map(|path| path.to_string_lossy().into_owned())
         .unwrap_or_else(|| "relay".to_string());
-    let prompt = build_fanout_prompt(
+    let prompt = build_correlated_fanout_prompt(
         options.reply_to,
         &relay,
         preminted_session_id.as_deref(),
+        &correlation_id,
         options.task,
     );
     let config = FanoutSpawnConfig {
-        reservation_id: reservation.reservation_id,
+        reservation_id: reservation.reservation_id.clone(),
         cwd: reservation.worktree.clone(),
         tool: options.tool.to_string(),
         command: child_cmd(options.tool),
@@ -1054,7 +1091,24 @@ fn run_fanout_spawn(options: FanoutLaunchOptions<'_>) -> ! {
         ));
     });
     drop(supervisor);
-    if let Some(name) = options.name {
+    if options.json {
+        let output = JcsValue::Object(BTreeMap::from([
+            (
+                "correlation_id".to_string(),
+                JcsValue::String(correlation_id),
+            ),
+            (
+                "reservation_id".to_string(),
+                JcsValue::String(reservation.reservation_id),
+            ),
+            ("session_id".to_string(), JcsValue::String(id)),
+            (
+                "worktree".to_string(),
+                JcsValue::String(reservation.worktree),
+            ),
+        ]));
+        println!("{}", serialize_jcs(&output));
+    } else if let Some(name) = options.name {
         println!("spawned {name} ({id}) in {}", reservation.worktree);
     } else {
         println!("spawned {id} in {}", reservation.worktree);
@@ -1167,6 +1221,20 @@ fn terminate_and_retain_fanout_child(
     }
 }
 
+fn prove_fanout_result_delivery(
+    fanout_store: &FanoutStore,
+    record: &crate::fanout::FanoutRecord,
+) -> Result<(), String> {
+    if record.correlation_id.is_none() {
+        return Ok(());
+    }
+    fanout_store.ensure_worker_result_enqueued(&record.reservation_id)?;
+    if !fanout_store.result_delivery_ready(&record.reservation_id)? {
+        return Err("fanout worker result delivery is not terminally proven".to_string());
+    }
+    Ok(())
+}
+
 fn supervise_fanout_child(
     fanout_store: &FanoutStore,
     lifecycle: &LifecycleStore,
@@ -1180,6 +1248,7 @@ fn supervise_fanout_child(
             .read(&config.reservation_id)?
             .ok_or_else(|| "fanout reservation disappeared".to_string())?;
         if record.state == FanoutState::HandedBack {
+            prove_fanout_result_delivery(fanout_store, &record)?;
             let permit = lifecycle
                 .publish_fence(&birth.worker_id, &birth.generation, "fanout handback")
                 .and_then(|intent| {
@@ -1216,9 +1285,20 @@ fn supervise_fanout_child(
             .try_wait()
             .map_err(|error| format!("inspect fanout child: {error}"))?
         {
-            let release = fanout_store
+            let current = fanout_store
                 .read(&config.reservation_id)?
-                .is_some_and(|current| current.state == FanoutState::HandedBack);
+                .ok_or_else(|| "fanout reservation disappeared".to_string())?;
+            let release = if current.state == FanoutState::HandedBack {
+                if let Err(error) = prove_fanout_result_delivery(fanout_store, &current) {
+                    lifecycle.record_owned_process_reaped(custody, exit_code(&status))?;
+                    return Err(format!(
+                        "{error}; exact process reaped but capacity retained"
+                    ));
+                }
+                true
+            } else {
+                false
+            };
             return release_reaped_fanout_worker(lifecycle, birth, custody, &status, release);
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -1552,6 +1632,7 @@ pub fn run(raw: Vec<String>) -> ! {
             reply_to: &reply_to,
             timeout_secs,
             permissions: &perm,
+            json: args.has("json"),
             task: &task,
         });
     }

@@ -65,6 +65,7 @@
       "plugins/session-relay/rust/src/workspace.rs::wait_pipe_record",
       "plugins/session-relay/rust/src/workspace.rs::wait_supervisor_bootstrap_ready",
       "plugins/session-relay/rust/src/workspace/git.rs::apply_wip",
+      "plugins/session-relay/rust/src/workspace/git.rs::command_with_input",
       "plugins/session-relay/rust/src/workspace/git.rs::create_pax_archive",
       "plugins/session-relay/rust/src/workspace/platform/linux.rs::prove_runtime_closure",
       "plugins/session-relay/rust/src/workspace/resources.rs::invoke_provider",
@@ -104,6 +105,14 @@
       "id": "broker:plugins/session-relay/rust/src/appserver.rs:connect_checked:stream_connect:1",
       "file": "plugins/session-relay/rust/src/appserver.rs",
       "function": "connect_checked",
+      "category": "broker",
+      "operation": "stream_connect",
+      "anchor": "UnixStream::connect("
+    },
+    {
+      "id": "broker:plugins/session-relay/rust/src/lifecycle.rs:ping_supervisor:stream_connect:1",
+      "file": "plugins/session-relay/rust/src/lifecycle.rs",
+      "function": "ping_supervisor",
       "category": "broker",
       "operation": "stream_connect",
       "anchor": "UnixStream::connect("
@@ -205,6 +214,14 @@
       "anchor": "run_git("
     },
     {
+      "id": "git:plugins/session-relay/rust/src/fanout/git.rs:changed_paths:git_api:1",
+      "file": "plugins/session-relay/rust/src/fanout/git.rs",
+      "function": "changed_paths",
+      "category": "git",
+      "operation": "git_api",
+      "anchor": "run_git_bytes("
+    },
+    {
       "id": "git:plugins/session-relay/rust/src/fanout/git.rs:ensure_clean:git_api:1",
       "file": "plugins/session-relay/rust/src/fanout/git.rs",
       "function": "ensure_clean",
@@ -261,12 +278,20 @@
       "anchor": "run_git("
     },
     {
-      "id": "git:plugins/session-relay/rust/src/fanout/git.rs:run_git:direct_git_command:1",
+      "id": "git:plugins/session-relay/rust/src/fanout/git.rs:run_git_bytes:direct_git_command:1",
       "file": "plugins/session-relay/rust/src/fanout/git.rs",
-      "function": "run_git",
+      "function": "run_git_bytes",
       "category": "git",
       "operation": "direct_git_command",
       "anchor": "Command::new(\"git\")"
+    },
+    {
+      "id": "git:plugins/session-relay/rust/src/fanout/git.rs:run_git:git_api:1",
+      "file": "plugins/session-relay/rust/src/fanout/git.rs",
+      "function": "run_git",
+      "category": "git",
+      "operation": "git_api",
+      "anchor": "run_git_bytes("
     },
     {
       "id": "git:plugins/session-relay/rust/src/workspace.rs:broker_git_commit:git_api:1",
@@ -549,9 +574,153 @@
       "anchor": "run_git_text("
     },
     {
+      "id": "git:plugins/session-relay/rust/src/workspace/git.rs:apply_wip:direct_git_command:1",
+      "file": "plugins/session-relay/rust/src/workspace/git.rs",
+      "function": "apply_wip",
+      "category": "git",
+      "operation": "direct_git_command",
+      "anchor": "Command::new(\"git\")"
+    },
+    {
+      "id": "git:plugins/session-relay/rust/src/workspace/git.rs:apply_wip:git_api:1",
+      "file": "plugins/session-relay/rust/src/workspace/git.rs",
+      "function": "apply_wip",
+      "category": "git",
+      "operation": "git_api",
+      "anchor": "run_git_text("
+    },
+    {
+      "id": "git:plugins/session-relay/rust/src/workspace/git.rs:apply_wip:git_api:10",
+      "file": "plugins/session-relay/rust/src/workspace/git.rs",
+      "function": "apply_wip",
+      "category": "git",
+      "operation": "git_api",
+      "anchor": "run_git_text("
+    },
+    {
+      "id": "git:plugins/session-relay/rust/src/workspace/git.rs:apply_wip:git_api:2",
+      "file": "plugins/session-relay/rust/src/workspace/git.rs",
+      "function": "apply_wip",
+      "category": "git",
+      "operation": "git_api",
+      "anchor": "run_git_text("
+    },
+    {
+      "id": "git:plugins/session-relay/rust/src/workspace/git.rs:apply_wip:git_api:3",
+      "file": "plugins/session-relay/rust/src/workspace/git.rs",
+      "function": "apply_wip",
+      "category": "git",
+      "operation": "git_api",
+      "anchor": "run_git_text("
+    },
+    {
+      "id": "git:plugins/session-relay/rust/src/workspace/git.rs:apply_wip:git_api:4",
+      "file": "plugins/session-relay/rust/src/workspace/git.rs",
+      "function": "apply_wip",
+      "category": "git",
+      "operation": "git_api",
+      "anchor": "run_git_text("
+    },
+    {
+      "id": "git:plugins/session-relay/rust/src/workspace/git.rs:apply_wip:git_api:5",
+      "file": "plugins/session-relay/rust/src/workspace/git.rs",
+      "function": "apply_wip",
+      "category": "git",
+      "operation": "git_api",
+      "anchor": "run_git_text("
+    },
+    {
+      "id": "git:plugins/session-relay/rust/src/workspace/git.rs:apply_wip:git_api:6",
+      "file": "plugins/session-relay/rust/src/workspace/git.rs",
+      "function": "apply_wip",
+      "category": "git",
+      "operation": "git_api",
+      "anchor": "run_git_text("
+    },
+    {
+      "id": "git:plugins/session-relay/rust/src/workspace/git.rs:apply_wip:git_api:7",
+      "file": "plugins/session-relay/rust/src/workspace/git.rs",
+      "function": "apply_wip",
+      "category": "git",
+      "operation": "git_api",
+      "anchor": "run_git_text("
+    },
+    {
+      "id": "git:plugins/session-relay/rust/src/workspace/git.rs:apply_wip:git_api:8",
+      "file": "plugins/session-relay/rust/src/workspace/git.rs",
+      "function": "apply_wip",
+      "category": "git",
+      "operation": "git_api",
+      "anchor": "run_git_text("
+    },
+    {
+      "id": "git:plugins/session-relay/rust/src/workspace/git.rs:apply_wip:git_api:9",
+      "file": "plugins/session-relay/rust/src/workspace/git.rs",
+      "function": "apply_wip",
+      "category": "git",
+      "operation": "git_api",
+      "anchor": "run_git_text("
+    },
+    {
       "id": "git:plugins/session-relay/rust/src/workspace/git.rs:command:direct_git_command:1",
       "file": "plugins/session-relay/rust/src/workspace/git.rs",
       "function": "command",
+      "category": "git",
+      "operation": "direct_git_command",
+      "anchor": "Command::new(\"git\")"
+    },
+    {
+      "id": "git:plugins/session-relay/rust/src/workspace/git.rs:commit_patch_id:direct_git_command:1",
+      "file": "plugins/session-relay/rust/src/workspace/git.rs",
+      "function": "commit_patch_id",
+      "category": "git",
+      "operation": "direct_git_command",
+      "anchor": "Command::new(\"git\")"
+    },
+    {
+      "id": "git:plugins/session-relay/rust/src/workspace/git.rs:coordinator_git_output:direct_git_command:1",
+      "file": "plugins/session-relay/rust/src/workspace/git.rs",
+      "function": "coordinator_git_output",
+      "category": "git",
+      "operation": "direct_git_command",
+      "anchor": "Command::new(\"git\")"
+    },
+    {
+      "id": "git:plugins/session-relay/rust/src/workspace/git.rs:create_worker_commit:git_api:1",
+      "file": "plugins/session-relay/rust/src/workspace/git.rs",
+      "function": "create_worker_commit",
+      "category": "git",
+      "operation": "git_api",
+      "anchor": "run_git_text("
+    },
+    {
+      "id": "git:plugins/session-relay/rust/src/workspace/git.rs:create_worker_commit:git_api:2",
+      "file": "plugins/session-relay/rust/src/workspace/git.rs",
+      "function": "create_worker_commit",
+      "category": "git",
+      "operation": "git_api",
+      "anchor": "run_git_text("
+    },
+    {
+      "id": "git:plugins/session-relay/rust/src/workspace/git.rs:create_worker_commit:git_api:3",
+      "file": "plugins/session-relay/rust/src/workspace/git.rs",
+      "function": "create_worker_commit",
+      "category": "git",
+      "operation": "git_api",
+      "anchor": "run_git_text("
+    },
+    {
+      "id": "git:plugins/session-relay/rust/src/workspace/git.rs:create_worker_commit:git_api:4",
+      "file": "plugins/session-relay/rust/src/workspace/git.rs",
+      "function": "create_worker_commit",
+      "category": "git",
+      "operation": "git_api",
+      "anchor": "run_git_text("
+    },
+    {
+      "id": "git:plugins/session-relay/rust/src/workspace/git.rs:git_env:direct_git_command:1",
+      "file": "plugins/session-relay/rust/src/workspace/git.rs",
+      "function": "git_env",
       "category": "git",
       "operation": "direct_git_command",
       "anchor": "Command::new(\"git\")"
@@ -699,6 +868,22 @@
       "category": "git",
       "operation": "git_api",
       "anchor": "run_git("
+    },
+    {
+      "id": "git:plugins/session-relay/rust/src/workspace/git.rs:provision_worktree:git_api:1",
+      "file": "plugins/session-relay/rust/src/workspace/git.rs",
+      "function": "provision_worktree",
+      "category": "git",
+      "operation": "git_api",
+      "anchor": "run_git_text("
+    },
+    {
+      "id": "git:plugins/session-relay/rust/src/workspace/git.rs:provision_worktree:git_api:2",
+      "file": "plugins/session-relay/rust/src/workspace/git.rs",
+      "function": "provision_worktree",
+      "category": "git",
+      "operation": "git_api",
+      "anchor": "run_git_text("
     },
     {
       "id": "git:plugins/session-relay/rust/src/workspace/git.rs:run_git_bytes:git_api:1",
@@ -1677,6 +1862,14 @@
       "anchor": "libc::fcntl("
     },
     {
+      "id": "platform:plugins/session-relay/rust/src/workspace/git.rs:exact_index_file:libc_geteuid:1",
+      "file": "plugins/session-relay/rust/src/workspace/git.rs",
+      "function": "exact_index_file",
+      "category": "platform",
+      "operation": "libc_geteuid",
+      "anchor": "libc::geteuid("
+    },
+    {
       "id": "platform:plugins/session-relay/rust/src/workspace/git.rs:open:libc_geteuid:1",
       "file": "plugins/session-relay/rust/src/workspace/git.rs",
       "function": "open",
@@ -1704,6 +1897,30 @@
       "id": "platform:plugins/session-relay/rust/src/workspace/git.rs:preserve:libc_geteuid:1",
       "file": "plugins/session-relay/rust/src/workspace/git.rs",
       "function": "preserve",
+      "category": "platform",
+      "operation": "libc_geteuid",
+      "anchor": "libc::geteuid("
+    },
+    {
+      "id": "platform:plugins/session-relay/rust/src/workspace/git.rs:read_content_addressed:libc_geteuid:1",
+      "file": "plugins/session-relay/rust/src/workspace/git.rs",
+      "function": "read_content_addressed",
+      "category": "platform",
+      "operation": "libc_geteuid",
+      "anchor": "libc::geteuid("
+    },
+    {
+      "id": "platform:plugins/session-relay/rust/src/workspace/git.rs:restore_exact_index_file:libc_geteuid:1",
+      "file": "plugins/session-relay/rust/src/workspace/git.rs",
+      "function": "restore_exact_index_file",
+      "category": "platform",
+      "operation": "libc_geteuid",
+      "anchor": "libc::geteuid("
+    },
+    {
+      "id": "platform:plugins/session-relay/rust/src/workspace/git.rs:worktree_identity:libc_geteuid:1",
+      "file": "plugins/session-relay/rust/src/workspace/git.rs",
+      "function": "worktree_identity",
       "category": "platform",
       "operation": "libc_geteuid",
       "anchor": "libc::geteuid("
@@ -2637,6 +2854,30 @@
       "anchor": ".spawn()"
     },
     {
+      "id": "process_birth:plugins/session-relay/rust/src/workspace/git.rs:apply_wip:command:1",
+      "file": "plugins/session-relay/rust/src/workspace/git.rs",
+      "function": "apply_wip",
+      "category": "process_birth",
+      "operation": "command",
+      "anchor": "Command::new("
+    },
+    {
+      "id": "process_birth:plugins/session-relay/rust/src/workspace/git.rs:apply_wip:command:2",
+      "file": "plugins/session-relay/rust/src/workspace/git.rs",
+      "function": "apply_wip",
+      "category": "process_birth",
+      "operation": "command",
+      "anchor": "Command::new("
+    },
+    {
+      "id": "process_birth:plugins/session-relay/rust/src/workspace/git.rs:command_with_input:spawn:1",
+      "file": "plugins/session-relay/rust/src/workspace/git.rs",
+      "function": "command_with_input",
+      "category": "process_birth",
+      "operation": "spawn",
+      "anchor": ".spawn()"
+    },
+    {
       "id": "process_birth:plugins/session-relay/rust/src/workspace/platform/linux.rs:prove_runtime_closure:command:1",
       "file": "plugins/session-relay/rust/src/workspace/platform/linux.rs",
       "function": "prove_runtime_closure",
@@ -2659,6 +2900,14 @@
       "category": "process_birth",
       "operation": "spawn",
       "anchor": ".spawn()"
+    },
+    {
+      "id": "signal:plugins/session-relay/rust/src/lifecycle.rs:process_observation_is_live:libc_kill:1",
+      "file": "plugins/session-relay/rust/src/lifecycle.rs",
+      "function": "process_observation_is_live",
+      "category": "signal",
+      "operation": "libc_kill",
+      "anchor": "libc::kill("
     },
     {
       "id": "signal:plugins/session-relay/rust/src/spawn.rs:run:child_kill:1",

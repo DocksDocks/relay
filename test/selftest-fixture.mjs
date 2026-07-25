@@ -166,7 +166,7 @@ export function createFixture({ bin: configuredBin, home }) {
   function envFor(extra = {}) {
     const env = { ...process.env };
     for (const key of SCRUBBED_ENV) delete env[key];
-    return { ...env, ...extra, SESSION_RELAY_HOME: home };
+    return { ...env, ...extra, SESSION_RELAY_HOME: home, AGENT_RELAY_HOME: extra.AGENT_RELAY_HOME ?? home };
   }
 
   const relay = (args, opts = {}) =>

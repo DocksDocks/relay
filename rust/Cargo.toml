@@ -1,10 +1,18 @@
 [package]
-name = "relay"
-version = "0.13.0"
+name = "session-relay"
+version = "0.14.0"
 edition = "2024"
 rust-version = "1.85"
 description = "session-relay: cross-session/cross-tool agent message bus, single static binary"
 publish = false
+
+[lib]
+name = "relay"
+path = "src/lib.rs"
+
+[[bin]]
+name = "relay"
+path = "src/main.rs"
 
 [dependencies]
 tinyjson = "2.5"

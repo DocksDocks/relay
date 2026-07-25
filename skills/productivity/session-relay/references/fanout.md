@@ -4,6 +4,12 @@ Fan-out is for one managed relay worker that needs isolated parallel work in the
 same Git repository. It is deliberately fixed at one depth-0 root and at most
 two live depth-1 leaves.
 
+## Contents
+
+- [Workflow](#workflow)
+- [Guarantee boundary](#guarantee-boundary)
+- [Spawn a new full-context worker session (`session-relay spawn`)](#spawn-a-new-full-context-worker-session-session-relay-spawn)
+
 ## Workflow
 
 ```bash
@@ -65,3 +71,75 @@ This first release does not provide cgroups, pidfds, descendant containment,
 automatic recovery/GC, lease stealing, branch deletion, app-server fan-out,
 cross-repository collection, or depth greater than one. Historical recovery is
 operator context, not a product guarantee.
+
+## Spawn a new full-context worker session (`session-relay spawn`)
+
+A native subagent runs inside THIS session and project. When the work belongs in
+ANOTHER project — with that project's CLAUDE.md/AGENTS.md, skills, and plugins —
+birth a real, resumable session there instead:
+
+```bash
+session-relay spawn <dir> --tool claude|codex --model <model> --effort <effort> [--service-tier default|fast for Codex] --name worker1 [--reply-to <me>] [--watch] -- "<first task>"
+```
+
+- **Pick the tool from standing preference first.** If `RELAY_SPAWN_TOOL`, user
+  config, or session memory names `claude` or `codex`, use that tool without asking.
+  Ask via the native question UI only when no preference is discoverable; the bare
+  CLI defaults to `codex` when the codex CLI is installed, else `claude` — a
+  printed note names the choice either way.
+- **Model/tier discipline:** pass `--model`/`--effort` every time. For Codex,
+  pass `--service-tier fast` only for an explicitly Fast role; otherwise pass
+  `--service-tier default` (omission has the same Standard meaning). The flag is
+  rejected for Claude. Classic Standard launches append
+  `-c service_tier="default"`; Fast appends both `-c features.fast_mode=true`
+  and `-c service_tier="fast"` without modifying global config.
+- **Managed birth:** before launching a classic Claude/Codex child, relay writes
+  a pending worker and passes one exact claim token only to that child. Its
+  SessionStart hook must bind the observed session id `Active` before spawn
+  reports birth; a registration without that claim is killed and refused. With
+  Codex `--server <socket>`, relay instead orders `pending → thread/start →
+  atomic exact claim + discovery → guarded turn/start`. No `codex exec` process
+  or hook runs on the app-server path, and first-turn bytes cannot precede
+  `Active`.
+- The first prompt carries a standing prefix: report results/questions to
+  `--reply-to` (default: this session's bus name) via the absolute installed
+  `session-relay` path — so the reply loop works even in a project where the plugin isn't
+  installed. App-server spawn includes `--from <returned-id>` directly because
+  there is no hook-provided identity line.
+- **App-server turn pump:** after confirming `turn/start`, foreground spawn
+  returns while a detached relay helper keeps the same connection alive for MCP
+  elicitations. `--watch` waits for that helper instead. The helper accepts
+  `bus` only because the relay registered the thread's origin before starting
+  the turn; joined/foreign threads still decline all elicitations. The existing
+  `--timeout` (30 seconds by default) is a hard pump cap. At timeout relay first
+  publishes a lifecycle fence, then interrupts only the exact recorded
+  `{threadId, turnId}` under the drained fence permit. Matching completion or an
+  idle exact thread confirms `Fenced`; missing/mismatched evidence stays
+  `FencingUnconfirmed` and refuses re-entry. The cancellation wait is capped at
+  five seconds. A failed `turn/start` has no safe turn id, so it fences
+  unconfirmed and emits no interrupt. A connection/pump failure after
+  `turn/start` also fences unconfirmed because terminal state cannot be proven.
+- **App-server tier boundary:** relay sends explicit `serviceTier:"default"` or
+  `"fast"` on thread start/resume and every turn start. It verifies the effective
+  tier reported by thread start/resume. Missing or mismatched Fast support fails
+  closed; relay never downgrades to Standard or inherits a shared server's state.
+- **Completion signal:** add `--watch` to keep the spawn caller attached to the
+  direct child process until its first turn exits. The relay exit mirrors the
+  child and stdout reports `first turn complete` or `first turn failed`; without
+  the flag, registration-time return stays unchanged.
+- **Permissions (symmetric):** default = Claude `--permission-mode auto` / Codex
+  `--sandbox workspace-write`; `--read-only` opts down (plan / read-only);
+  `--full-access` opts up (bypassPermissions / danger-full-access). Guardrail rules
+  ride in every child's prompt regardless: separate git branch only, no
+  live/production mutations, ask the parent before destructive ops.
+- Continue the conversation with `session-relay send worker1` + `session-relay wake worker1` — the id is
+  durable and resumable; the process being one-shot is expected.
+- On birth timeout, the error names the child's stderr log
+  (`~/.agent-relay/spawn-logs/<id>.stderr`) — read it before retrying. Each log
+  keeps only its newest approximately 4 MiB, so copy it before another long run
+  if the earliest output matters.
+- **Billing:** every spawned child is a full agent session on your subscription
+  (Claude OAuth / ChatGPT login) — heavier than a wake; spawn deliberately, never
+  in loops.
+
+For managed writing, use only the exact nine `session-relay workspace` commands after reading the Linux-only admission, exact macOS STOP, ordinary macOS release boundary, actors, recovery, integration, and unmanaged-process limits in [`references/workspace.md`](references/workspace.md); this is neither legacy fan-out nor Docks plan-review evidence.

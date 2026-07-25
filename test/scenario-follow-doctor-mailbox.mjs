@@ -6,6 +6,80 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createFixture, createScenarioCheck, runScenarioCli } from './selftest-fixture.mjs';
 
+const testUuid = (value) => `00000000-0000-4000-8000-${value.toString(16).padStart(12, '0')}`;
+
+const messageV2 = ({
+  body,
+  correlationId,
+  fromSessionId,
+  id,
+  kind,
+  replyTo = null,
+  resultSha256 = null,
+  terminalStatus = null,
+  toSessionId,
+}) => ({
+  body,
+  correlation_id: correlationId,
+  created_at: '2026-07-25T12:34:56.789Z',
+  from_session_id: fromSessionId,
+  id,
+  kind,
+  reply_to: replyTo,
+  result_sha256: resultSha256,
+  schema: 2,
+  terminal_status: terminalStatus,
+  to_session_id: toSessionId,
+});
+
+const followedDeliveryRows = ({ recipientId, seed, senderId }) => {
+  const id = (offset) => testUuid(seed + offset);
+  const reservationId = id(9);
+  const workerId = id(10);
+  const generation = id(11);
+  const collectCommand = `relay collect ${senderId} --from ${recipientId}`;
+  const request = messageV2({
+    body: 'followed typed request',
+    correlationId: id(2),
+    fromSessionId: senderId,
+    id: id(1),
+    kind: 'request',
+    toSessionId: recipientId,
+  });
+  const terminalReply = messageV2({
+    body: 'followed typed terminal reply',
+    correlationId: id(5),
+    fromSessionId: senderId,
+    id: id(3),
+    kind: 'terminal_reply',
+    replyTo: id(4),
+    terminalStatus: 'failed',
+    toSessionId: recipientId,
+  });
+  const workerResult = messageV2({
+    body:
+      `worker_result reservation_id=${reservationId} worker_id=${workerId} generation=${generation} ` +
+      `runtime_session_id=${senderId} parent_session_id=${recipientId}; collect: ${collectCommand}`,
+    correlationId: id(8),
+    fromSessionId: senderId,
+    id: id(6),
+    kind: 'worker_result',
+    replyTo: id(7),
+    resultSha256: 'cd'.repeat(32),
+    terminalStatus: 'completed',
+    toSessionId: recipientId,
+  });
+  const legacy = {
+    body: 'legacy follow row',
+    from: senderId,
+    fromName: 'legacy-follow-sender',
+    id: id(12),
+    to: recipientId,
+    ts: '2026-07-25T12:34:57.000Z',
+  };
+  return [request, terminalReply, workerResult, legacy];
+};
+
 export const EXPECTED_LABELS = [
   'follow watcher provides live/dead/never/unknown status and tail -n0 -F semantics',
   'follow detects consumed-prefix rewrites that preserve the prior 64-byte suffix',
@@ -172,6 +246,46 @@ export async function run({ bin, home, emit }) {
       } finally {
         fs.chmodSync(unknownLock, 0o600);
       }
+      const recipientId = testUuid(0x701);
+      const senderId = testUuid(0x702);
+      const typedDir = path.join(HOME, 'proj-follow-typed');
+      fs.mkdirSync(typedDir, { recursive: true });
+      assert.equal(relay(['register', 'follow-typed-target', '--id', recipientId, '--dir', typedDir]).status, 0);
+      assert.equal(relay(['register', 'follow-typed-sender', '--id', senderId, '--dir', typedDir]).status, 0);
+
+      const typedMailbox = path.join(HOME, 'mailbox', `${recipientId}.jsonl`);
+      fs.writeFileSync(typedMailbox, '', { mode: 0o600 });
+      const typedFollowed = spawnToFiles(['watch', '--follow', recipientId], {}, 'follow-typed-watch');
+      const typedLock = path.join(HOME, 'watchers', `${recipientId}.lock`);
+      waitFor(() => {
+        try {
+          return JSON.parse(fs.readFileSync(typedLock, 'utf8')).pid === typedFollowed.child.pid;
+        } catch {
+          return false;
+        }
+      }, 'the typed follow watcher lock');
+      waitForProgressAfter(recipientId, -1, 'the typed follow watcher first cycle');
+      assert.equal(fs.readFileSync(typedFollowed.stdoutPath, 'utf8'), '', 'an empty mailbox emits no follow bytes');
+
+      const rows = followedDeliveryRows({ recipientId, senderId, seed: 0x710 });
+      const payload = `${rows.map((row) => JSON.stringify(row)).join('\n')}\n`;
+      fs.appendFileSync(typedMailbox, payload);
+      waitFor(
+        () => fs.readFileSync(typedFollowed.stdoutPath, 'utf8') === payload,
+        'the canonical typed and legacy follow rows',
+      );
+      const typedOutput = fs.readFileSync(typedFollowed.stdoutPath, 'utf8');
+      assert.equal(typedOutput, payload, 'follow does not rewrite canonical MessageV2 or legacy JSONL bytes');
+      assert.deepEqual(
+        typedOutput
+          .trimEnd()
+          .split('\n')
+          .map((line) => JSON.parse(line)),
+        rows,
+        'every correlation, reply, status, digest, collection, and legacy field survives follow',
+      );
+      typedFollowed.child.kill('SIGKILL');
+      sleep(100);
     });
 
     check('follow detects consumed-prefix rewrites that preserve the prior 64-byte suffix', () => {

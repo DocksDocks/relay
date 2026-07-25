@@ -1,7 +1,7 @@
 {
   "name": "session-relay",
-  "description": "Cross-session, cross-project, cross-tool agent message bus (Claude Code + Codex). A SessionStart hook auto-registers each session and drains its inbox; an MCP server (bus) exposes whoami/register/roster/send/inbox over a shared on-disk store keyed by session id; and a relay CLI wakes an idle target with a tool-aware doorbell — headless `claude -p --resume` (from its project dir) or `codex exec resume`.",
-  "version": "0.13.0",
+  "description": "Cross-session, cross-project, cross-tool agent message bus (Claude Code + Codex). A SessionStart hook auto-registers sessions and drains inboxes; the MCP bus exposes whoami/register/roster/send/request/reply/inbox/discover; correlated MessageV2 requests admit one terminal reply; typed fan-out results are available through opt-in result JSON; and the CLI wakes idle targets with a tool-aware doorbell.",
+  "version": "0.14.0",
   "author": {
     "name": "Eduardo Marquez"
   },

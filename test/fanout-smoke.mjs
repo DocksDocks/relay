@@ -57,7 +57,19 @@ const spawnId = (result) => {
   assert.equal(result.status, 0, `fanout spawn failed:\n${result.stdout}\n${result.stderr}`);
   const id = /spawned (?:[^\s]+ \()?([0-9a-f-]{36})\)? in /.exec(result.stdout)?.[1];
   assert.ok(id, `missing spawned session id: ${result.stdout}`);
+  const record = fanoutRecords().find((candidate) => candidate.runtime_session_id === id);
+  assert.equal(result.stdout, `spawned ${id} in ${record?.worktree}\n`);
   return id;
+};
+const spawnJson = (result) => {
+  assert.equal(result.status, 0, `fanout spawn --json failed:\n${result.stdout}\n${result.stderr}`);
+  const output = JSON.parse(result.stdout);
+  assert.deepEqual(Object.keys(output), ['correlation_id', 'reservation_id', 'session_id', 'worktree']);
+  for (const key of ['correlation_id', 'reservation_id', 'session_id']) {
+    assert.match(output[key], /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+  }
+  assert.equal(result.stdout, `${JSON.stringify(output)}\n`);
+  return output;
 };
 const triggerPath = (name) => {
   const trigger = path.join(home, `${name}.trigger`);
@@ -122,7 +134,7 @@ try {
   assert.equal(rootRecord?.state, 'Running');
 
   const leaf1Trigger = triggerPath('leaf1');
-  const leaf1Id = spawnId(
+  const leaf1Spawn = spawnJson(
     relay(
       [
         'spawn',
@@ -134,12 +146,21 @@ try {
         'claude',
         '--timeout',
         '5',
+        '--json',
         '--',
         'leaf one',
       ],
       { env: { STUB_HANDBACK_TRIGGER: leaf1Trigger, STUB_OUTPUT_FILE: 'leaf-one.txt' } },
     ),
   );
+  const leaf1Id = leaf1Spawn.session_id;
+  const leaf1Record = fanoutRecords().find((record) => record.runtime_session_id === leaf1Id);
+  assert.deepEqual(leaf1Spawn, {
+    correlation_id: leaf1Record?.correlation_id,
+    reservation_id: leaf1Record?.reservation_id,
+    session_id: leaf1Id,
+    worktree: leaf1Record?.worktree,
+  });
   const leaf2Trigger = triggerPath('leaf2');
   const leaf2Id = spawnId(
     relay(
@@ -196,14 +217,31 @@ try {
   for (const leafId of [leaf1Id, leaf2Id]) {
     const collected = relay(['collect', leafId, '--from', rootId]);
     assert.equal(collected.status, 0, `leaf collect failed: ${collected.stderr}`);
+    assert.equal(collected.stdout, `collected ${leafId} into ${rootId}\n`);
+    assert.equal(collected.stderr, '');
   }
   assert.equal(fs.readFileSync(path.join(rootRecord.worktree, 'leaf-one.txt'), 'utf8'), 'leaf-one.txt\n');
   assert.equal(fs.readFileSync(path.join(rootRecord.worktree, 'leaf-two.txt'), 'utf8'), 'leaf-two.txt\n');
+  const leaf1Result = relay(['collect', leaf1Id, '--from', rootId, '--result-json']);
+  assert.equal(leaf1Result.status, 0, leaf1Result.stderr);
+  assert.equal(leaf1Result.stderr, '');
+  const collectedLeaf1 = fanoutRecords().find((record) => record.runtime_session_id === leaf1Id);
+  assert.ok(collectedLeaf1?.worker_result, 'new fanout generation stores WorkerResultV1');
+  assert.match(collectedLeaf1.worker_result_sha256, /^[0-9a-f]{64}$/);
+  assert.equal(
+    leaf1Result.stdout,
+    `${JSON.stringify({
+      result: collectedLeaf1.worker_result,
+      sha256: collectedLeaf1.worker_result_sha256,
+    })}\n`,
+  );
 
   fs.writeFileSync(rootTrigger, 'go');
   waitFor('root exact reap', () => workerState(rootId) === 'TerminalReleasable');
   const collectedRoot = relay(['collect', rootId, '--from', invoker]);
   assert.equal(collectedRoot.status, 0, `root collect failed: ${collectedRoot.stderr}`);
+  assert.equal(collectedRoot.stdout, `collected ${rootId} into ${invoker}\n`);
+  assert.equal(collectedRoot.stderr, '');
   for (const file of ['leaf-one.txt', 'leaf-two.txt', 'root.txt']) {
     assert.equal(fs.readFileSync(path.join(repo, file), 'utf8'), `${file}\n`);
   }

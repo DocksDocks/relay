@@ -166,7 +166,7 @@ const operationPatterns = [
 ];
 
 function runtimeText(source) {
-  const tests = source.text.indexOf('#[cfg(test)]');
+  const tests = source.text.search(/#\[cfg\(test\)\]\s*mod tests\b/);
   return tests < 0 ? source.text : source.text.slice(0, tests);
 }
 

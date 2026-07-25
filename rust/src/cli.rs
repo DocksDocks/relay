@@ -5,6 +5,8 @@
 //   relay list
 //   relay register <name> --id <uuid> [--dir <path>] [--tool claude|codex]
 //   relay send <to> [--] <message...>            (or: send --id <id> [--] <message...>)
+//   relay request <to> --from <registered> [--] <message...>
+//   relay reply <correlation-id> --from <registered> --status completed|failed [--] <message...>
 //   relay inbox <nameOrId>
 //   relay peek <nameOrId>                        (read-only: inbox without draining)
 //   relay attach <nameOrId> [--exec]             (interactive human takeover)
@@ -23,6 +25,7 @@ use crate::lifecycle::{
     self, AttachOptions, ChildLaunchSpec, DoorbellMessage, OperationKind, ServiceTier,
     ValidatedEffort, ValidatedModel,
 };
+use crate::protocol::{ProtocolError, ProtocolStore, TerminalStatus};
 use crate::spawn;
 use crate::store;
 use std::collections::HashMap;
@@ -31,9 +34,10 @@ use tinyjson::JsonValue;
 
 pub(crate) const DEFAULT_NUDGE: &str = "You have new session-relay mail. Use the session-relay skill: call inbox to read your pending messages and act on them.";
 const DEFAULT_TURN_SETTLE_MS: u64 = 5000;
-const BOOL_FLAGS: [&str; 10] = [
+const BOOL_FLAGS: [&str; 11] = [
     "dry",
     "json",
+    "result-json",
     "auto-turn",
     "once",
     "all",
@@ -47,6 +51,24 @@ const BOOL_FLAGS: [&str; 10] = [
 fn die(msg: &str) -> ! {
     eprintln!("{msg}");
     std::process::exit(1);
+}
+
+fn protocol_die(error: ProtocolError) -> ! {
+    let status = if matches!(&error, ProtocolError::CorrelationConflict) {
+        2
+    } else {
+        1
+    };
+    eprintln!("{}", error.code());
+    std::process::exit(status);
+}
+
+fn protocol_identity(identity: &str) -> store::Entry {
+    store::resolve(identity).unwrap_or_else(|| {
+        protocol_die(ProtocolError::ProtocolStoreError(format!(
+            "protocol identity is not registered: {identity}"
+        )))
+    })
 }
 
 pub(crate) struct Args(pub(crate) Vec<String>);
@@ -80,6 +102,31 @@ impl Args {
         };
         self.0
             .get(index + 1)
+            .map(String::as_str)
+            .filter(|value| !value.is_empty() && !value.starts_with("--"))
+            .map(Some)
+            .ok_or_else(|| format!("--{name} requires a value"))
+    }
+    fn unique_flag_before_sep(&self, name: &str) -> Result<Option<&str>, String> {
+        let key = format!("--{name}");
+        let end = self
+            .0
+            .iter()
+            .position(|value| value == "--")
+            .unwrap_or(self.0.len());
+        let mut positions = self.0[..end]
+            .iter()
+            .enumerate()
+            .filter_map(|(index, value)| (value == &key).then_some(index));
+        let Some(index) = positions.next() else {
+            return Ok(None);
+        };
+        if positions.next().is_some() {
+            return Err(format!("duplicate --{name}"));
+        }
+        self.0
+            .get(index + 1)
+            .filter(|_| index + 1 < end)
             .map(String::as_str)
             .filter(|value| !value.is_empty() && !value.starts_with("--"))
             .map(Some)
@@ -828,6 +875,63 @@ pub fn run(cmd: &str, raw: Vec<String>) -> ! {
             println!("queued -> {}", target.name.as_deref().unwrap_or(&target.id));
             std::process::exit(0);
         }
+        "request" => {
+            let rest = args.positionals(1);
+            let body = args
+                .message_after_sep()
+                .unwrap_or_else(|| rest.iter().skip(1).copied().collect::<Vec<_>>().join(" "));
+            let from = args
+                .unique_flag_before_sep("from")
+                .unwrap_or_else(|error| die(&error));
+            let (Some(to), Some(from), false) = (rest.first().copied(), from, body.is_empty())
+            else {
+                die("usage: relay request <to> --from <registered> [--] <message...>");
+            };
+            let requester = protocol_identity(from);
+            let responder = protocol_identity(to);
+            let protocol = ProtocolStore::new(store::home_dir());
+            let message = protocol
+                .request(&requester.id, &responder.id, &body)
+                .unwrap_or_else(|error| protocol_die(error));
+            println!(
+                r#"{{"correlation_id":"{}","message_id":"{}","outcome":"enqueued"}}"#,
+                message.correlation_id, message.id
+            );
+            std::process::exit(0);
+        }
+        "reply" => {
+            let rest = args.positionals(1);
+            let body = args
+                .message_after_sep()
+                .unwrap_or_else(|| rest.iter().skip(1).copied().collect::<Vec<_>>().join(" "));
+            let from = args
+                .unique_flag_before_sep("from")
+                .unwrap_or_else(|error| die(&error));
+            let status = args
+                .unique_flag_before_sep("status")
+                .unwrap_or_else(|error| die(&error));
+            let (Some(correlation_id), Some(from), Some(status), false) =
+                (rest.first().copied(), from, status, body.is_empty())
+            else {
+                die(
+                    "usage: relay reply <correlation-id> --from <registered> --status completed|failed [--] <message...>",
+                );
+            };
+            let status = TerminalStatus::parse(status)
+                .unwrap_or_else(|_| die("--status must be completed or failed"));
+            let responder = protocol_identity(from);
+            let protocol = ProtocolStore::new(store::home_dir());
+            let outcome = protocol
+                .reply(correlation_id, &responder.id, status, &body)
+                .unwrap_or_else(|error| protocol_die(error));
+            println!(
+                r#"{{"correlation_id":"{}","message_id":"{}","outcome":"enqueued","status":"{}"}}"#,
+                outcome.message.correlation_id,
+                outcome.message.id,
+                status.as_str()
+            );
+            std::process::exit(0);
+        }
         "inbox" => {
             let pos = args.positionals(1);
             let Some(who) = pos.first() else {
@@ -953,6 +1057,10 @@ pub fn run(cmd: &str, raw: Vec<String>) -> ! {
                     lifecycle::admit_operation(&target.id, OperationKind::WakeAppServer)
                         .and_then(lifecycle::Admission::into_guard)
                         .unwrap_or_else(|error| die(&error));
+                if let Err(error) = ProtocolStore::new(store::home_dir()).recover_pending() {
+                    drop(guard);
+                    protocol_die(error);
+                }
                 if !store::mailbox_has_content(&target.id) && custom_message.is_none() {
                     drop(guard);
                     std::process::exit(0);
@@ -986,6 +1094,10 @@ pub fn run(cmd: &str, raw: Vec<String>) -> ! {
                     std::process::exit(0);
                 }
                 let block = hook::mail_block(&payload, &target.id);
+                if block.is_empty() {
+                    drop(guard);
+                    std::process::exit(0);
+                }
                 let settle_ms = std::env::var("RELAY_TURN_SETTLE_MS")
                     .ok()
                     .and_then(|value| value.parse().ok())
@@ -1136,7 +1248,7 @@ pub fn run(cmd: &str, raw: Vec<String>) -> ! {
             std::process::exit(code);
         }
         _ => die(
-            "usage: relay discover [--within min] [--tool t] | list | register <name> --id <uuid> [--dir <path>] [--server <sock>] | send <to> <msg> | inbox <who> | peek <who> | attach <who> [--exec] | wake <who> [--model m] [--effort e] [--service-tier default|fast] [msg] | doctor [--id <session>]",
+            "usage: relay discover [--within min] [--tool t] | list | register <name> --id <uuid> [--dir <path>] [--server <sock>] | send <to> <msg> | request <to> --from <registered> [--] <msg> | reply <correlation-id> --from <registered> --status completed|failed [--] <msg> | inbox <who> | peek <who> | attach <who> [--exec] | wake <who> [--model m] [--effort e] [--service-tier default|fast] [msg] | doctor [--id <session>]",
         ),
     }
 }

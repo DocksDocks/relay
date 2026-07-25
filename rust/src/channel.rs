@@ -8,6 +8,7 @@
 // wrong mailbox.
 
 use crate::lifecycle::{self, OperationKind};
+use crate::protocol::ProtocolStore;
 use crate::{hook, store};
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
@@ -173,6 +174,9 @@ fn initialize(message: &HashMap<String, JsonValue>) -> Result<(), String> {
 }
 
 fn emit_mail(id: &str) -> Result<(), String> {
+    ProtocolStore::new(store::home_dir())
+        .recover_pending()
+        .map_err(|error| error.to_string())?;
     if !store::mailbox_has_content(id) {
         return Ok(());
     }
@@ -180,6 +184,9 @@ fn emit_mail(id: &str) -> Result<(), String> {
     let messages = lifecycle::drain_with_guard(&mut guard)?.into_messages();
     for message in messages {
         let content = hook::mail_block(std::slice::from_ref(&message), id);
+        if content.is_empty() {
+            continue;
+        }
         send_frame(object(vec![
             ("jsonrpc", string("2.0")),
             ("method", string("notifications/claude/channel")),

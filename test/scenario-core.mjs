@@ -7,6 +7,489 @@ import { createFixture, createScenarioCheck, runScenarioCli } from './selftest-f
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 
+const UUID_V4_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const MESSAGE_V2_KEYS = [
+  'body',
+  'correlation_id',
+  'created_at',
+  'from_session_id',
+  'id',
+  'kind',
+  'reply_to',
+  'result_sha256',
+  'schema',
+  'terminal_status',
+  'to_session_id',
+];
+const LEGACY_MCP_INPUT_SCHEMAS = {
+  whoami: { type: 'object', properties: {}, additionalProperties: false },
+  register: {
+    type: 'object',
+    properties: {
+      name: { type: 'string', description: 'Friendly name to claim, e.g. "frontend" or "agent-A".' },
+      id: {
+        type: 'string',
+        description: 'Override session id (defaults to this session, resolved from the project dir).',
+      },
+      dir: { type: 'string', description: 'Override project dir (defaults to the launch dir).' },
+      server: { type: 'string', description: 'Codex app-server Unix socket for live delivery to this session.' },
+    },
+    required: ['name'],
+    additionalProperties: false,
+  },
+  roster: { type: 'object', properties: {}, additionalProperties: false },
+  send: {
+    type: 'object',
+    properties: {
+      to: { type: 'string', description: 'Recipient friendly name or session id (see roster).' },
+      body: { type: 'string', description: 'Message text.' },
+      from: {
+        type: 'string',
+        description:
+          'Your own registered session id or name (see the identity line injected at session start). Pass it whenever this project dir may host more than one session — the dir-marker fallback mis-attributes the sender in shared dirs.',
+      },
+    },
+    required: ['to', 'body'],
+    additionalProperties: false,
+  },
+  inbox: {
+    type: 'object',
+    properties: {
+      id: {
+        type: 'string',
+        description:
+          "Your own registered session id or name (see the identity line injected at session start). Pass it whenever this project dir may host more than one session — the dir-marker fallback can drain another session's mailbox.",
+      },
+    },
+    additionalProperties: false,
+  },
+  discover: {
+    type: 'object',
+    properties: {
+      activeWithinMin: {
+        type: 'number',
+        description: 'Only sessions whose last activity is within this many minutes (default 60).',
+      },
+      tool: { type: 'string', enum: ['claude', 'codex'], description: 'Restrict to one tool.' },
+    },
+    additionalProperties: false,
+  },
+};
+
+function compactJcsObject(value) {
+  return JSON.stringify(
+    Object.fromEntries(
+      Object.keys(value)
+        .sort()
+        .map((key) => [key, value[key]]),
+    ),
+  );
+}
+
+function assertMessageV2(message, expected) {
+  assert.deepEqual(Object.keys(message).sort(), MESSAGE_V2_KEYS);
+  assert.equal(message.schema, 2);
+  assert.match(message.id, UUID_V4_RE);
+  assert.match(message.correlation_id, UUID_V4_RE);
+  assert.match(message.from_session_id, UUID_V4_RE);
+  assert.match(message.to_session_id, UUID_V4_RE);
+  assert.match(message.created_at, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+  assert.equal(Buffer.byteLength(message.created_at), 24);
+  for (const [key, value] of Object.entries(expected)) assert.deepEqual(message[key], value, key);
+}
+
+function assertToolMessage(response, expected) {
+  assert.equal(response.result.isError, false);
+  assert.deepEqual(
+    response.result.content.map(({ type }) => type),
+    ['text'],
+  );
+  const text = response.result.content[0].text;
+  const message = JSON.parse(text);
+  assertMessageV2(message, expected);
+  assert.equal(text, compactJcsObject(message), 'MCP typed message text is canonical compact JCS');
+  return message;
+}
+
+function assertToolDomainError(response, code) {
+  assert.deepEqual(response.result, {
+    content: [{ type: 'text', text: JSON.stringify({ code }) }],
+    isError: true,
+  });
+}
+
+function assertRpcInvalidParams(response) {
+  assert.equal(response.error.code, -32602);
+  assert.equal(response.result, undefined);
+}
+
+function assertCliDomainError(result, status, code) {
+  assert.equal(result.status, status);
+  assert.equal(result.stdout, '');
+  assert.equal(result.stderr, `${code}\n`);
+}
+
+function assertCliOutcome(result, keys, expected) {
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stderr, '');
+  const output = JSON.parse(result.stdout);
+  assert.deepEqual(Object.keys(output), keys);
+  assert.match(output.correlation_id, UUID_V4_RE);
+  assert.match(output.message_id, UUID_V4_RE);
+  assert.deepEqual(output, { ...output, ...expected });
+  assert.equal(result.stdout, `${JSON.stringify(output)}\n`);
+  return output;
+}
+
+function mcpSchemaShape(schema) {
+  return {
+    type: schema.type,
+    properties: Object.fromEntries(
+      Object.entries(schema.properties).map(([name, property]) => [
+        name,
+        { type: property.type, ...(property.enum === undefined ? {} : { enum: property.enum }) },
+      ]),
+    ),
+    required: schema.required,
+    additionalProperties: schema.additionalProperties,
+  };
+}
+
+function assertMcpToolCatalog(tools) {
+  const byName = Object.fromEntries(tools.map((tool) => [tool.name, tool]));
+  assert.deepEqual(tools.map(({ name }) => name).sort(), [
+    'discover',
+    'inbox',
+    'register',
+    'reply',
+    'request',
+    'roster',
+    'send',
+    'whoami',
+  ]);
+  for (const [name, schema] of Object.entries(LEGACY_MCP_INPUT_SCHEMAS)) {
+    assert.deepEqual(byName[name].inputSchema, schema, `${name} MCP input schema changed`);
+  }
+  assert.deepEqual(mcpSchemaShape(byName.request.inputSchema), {
+    type: 'object',
+    properties: {
+      to: { type: 'string' },
+      body: { type: 'string' },
+      from: { type: 'string' },
+    },
+    required: ['to', 'body'],
+    additionalProperties: false,
+  });
+  assert.deepEqual(mcpSchemaShape(byName.reply.inputSchema), {
+    type: 'object',
+    properties: {
+      correlation_id: { type: 'string' },
+      status: { type: 'string', enum: ['completed', 'failed'] },
+      body: { type: 'string' },
+      from: { type: 'string' },
+    },
+    required: ['correlation_id', 'status', 'body'],
+    additionalProperties: false,
+  });
+}
+
+function assertCorrelatedCliMcpContracts({ HOME, relay, runHook, runBus, peek, tools }) {
+  const requesterId = 'a1111111-1111-4111-8111-111111111111';
+  const responderId = 'b2222222-2222-4222-8222-222222222222';
+  const otherId = 'c3333333-3333-4333-8333-333333333333';
+  const unknownCorrelation = 'f7777777-7777-4777-8777-777777777777';
+  const requesterDir = path.join(HOME, 'protocol-requester');
+  const responderDir = path.join(HOME, 'protocol-responder');
+  const otherDir = path.join(HOME, 'protocol-other');
+  for (const dir of [requesterDir, responderDir, otherDir]) fs.mkdirSync(dir);
+  for (const [name, id, dir] of [
+    ['protocol-a', requesterId, requesterDir],
+    ['protocol-b', responderId, responderDir],
+    ['protocol-c', otherId, otherDir],
+  ]) {
+    const registered = relay(['register', name, '--id', id, '--dir', dir]);
+    assert.equal(registered.status, 0, registered.stderr);
+  }
+  for (const [sessionId, cwd] of [
+    [requesterId, requesterDir],
+    [responderId, responderDir],
+    [otherId, otherDir],
+  ]) {
+    const hooked = runHook({ session_id: sessionId, cwd, hook_event_name: 'SessionStart', source: 'startup' });
+    assert.equal(hooked.status, 0, hooked.stderr);
+  }
+
+  assertMcpToolCatalog(tools);
+
+  const cliRequest = relay(['request', 'protocol-b', '--from', 'protocol-a', '--', 'cli request']);
+  const requestOutcome = assertCliOutcome(cliRequest, ['correlation_id', 'message_id', 'outcome'], {
+    outcome: 'enqueued',
+  });
+  const queuedRequest = peek('protocol-b');
+  assert.equal(queuedRequest.count, 1);
+  assert.equal(queuedRequest.messages[0].id, requestOutcome.message_id);
+  assertMessageV2(queuedRequest.messages[0], {
+    body: 'cli request',
+    correlation_id: requestOutcome.correlation_id,
+    from_session_id: requesterId,
+    kind: 'request',
+    reply_to: null,
+    result_sha256: null,
+    terminal_status: null,
+    to_session_id: responderId,
+  });
+
+  const cliUnknown = relay([
+    'reply',
+    unknownCorrelation,
+    '--from',
+    'protocol-b',
+    '--status',
+    'completed',
+    '--',
+    'none',
+  ]);
+  assertCliDomainError(cliUnknown, 1, 'unknown_correlation');
+
+  const cliUnauthorized = relay([
+    'reply',
+    requestOutcome.correlation_id,
+    '--from',
+    'protocol-c',
+    '--status',
+    'completed',
+    '--',
+    'forged',
+  ]);
+  assertCliDomainError(cliUnauthorized, 1, 'unauthorized_responder');
+  assert.equal(peek('protocol-a').count, 0);
+
+  const replyArgs = [
+    'reply',
+    requestOutcome.correlation_id,
+    '--from',
+    'protocol-b',
+    '--status',
+    'completed',
+    '--',
+    'cli reply',
+  ];
+  const cliReply = relay(replyArgs);
+  const replyOutcome = assertCliOutcome(cliReply, ['correlation_id', 'message_id', 'outcome', 'status'], {
+    correlation_id: requestOutcome.correlation_id,
+    outcome: 'enqueued',
+    status: 'completed',
+  });
+  const queuedReply = peek('protocol-a');
+  assert.equal(queuedReply.count, 1);
+  assert.equal(queuedReply.messages[0].id, replyOutcome.message_id);
+  assertMessageV2(queuedReply.messages[0], {
+    body: 'cli reply',
+    correlation_id: requestOutcome.correlation_id,
+    from_session_id: responderId,
+    kind: 'terminal_reply',
+    reply_to: requestOutcome.message_id,
+    result_sha256: null,
+    terminal_status: 'completed',
+    to_session_id: requesterId,
+  });
+
+  const cliExactRetry = relay(replyArgs);
+  assert.equal(cliExactRetry.status, 0, cliExactRetry.stderr);
+  assert.equal(cliExactRetry.stdout, cliReply.stdout);
+  assert.equal(cliExactRetry.stderr, '');
+  assert.equal(peek('protocol-a').count, 1, 'exact retry must not enqueue a second terminal reply');
+
+  const cliCompetitor = relay([
+    'reply',
+    requestOutcome.correlation_id,
+    '--from',
+    'protocol-b',
+    '--status',
+    'failed',
+    '--',
+    'changed reply',
+  ]);
+  assertCliDomainError(cliCompetitor, 2, 'correlation_conflict');
+  assert.equal(peek('protocol-a').count, 1, 'competing claim must not enqueue');
+
+  const failedRequestRun = relay(['request', 'protocol-b', '--from', 'protocol-a', 'failure request']);
+  const failedRequest = assertCliOutcome(failedRequestRun, ['correlation_id', 'message_id', 'outcome'], {
+    outcome: 'enqueued',
+  });
+  const failedReplyRun = relay([
+    'reply',
+    failedRequest.correlation_id,
+    '--from',
+    'protocol-b',
+    '--status',
+    'failed',
+    'could not complete',
+  ]);
+  const failedReply = assertCliOutcome(failedReplyRun, ['correlation_id', 'message_id', 'outcome', 'status'], {
+    correlation_id: failedRequest.correlation_id,
+    outcome: 'enqueued',
+    status: 'failed',
+  });
+  const failedEnvelope = peek('protocol-a').messages.find(({ id }) => id === failedReply.message_id);
+  assertMessageV2(failedEnvelope, {
+    body: 'could not complete',
+    correlation_id: failedRequest.correlation_id,
+    from_session_id: responderId,
+    kind: 'terminal_reply',
+    reply_to: failedRequest.message_id,
+    result_sha256: null,
+    terminal_status: 'failed',
+    to_session_id: requesterId,
+  });
+
+  const malformed = runBus(requesterDir, [
+    { jsonrpc: '2.0', id: 1, method: 'initialize', params: {} },
+    {
+      jsonrpc: '2.0',
+      id: 2,
+      method: 'tools/call',
+      params: { name: 'request', arguments: { to: 'protocol-b' } },
+    },
+    {
+      jsonrpc: '2.0',
+      id: 3,
+      method: 'tools/call',
+      params: { name: 'request', arguments: { to: 'protocol-b', body: 'x', unexpected: true } },
+    },
+    {
+      jsonrpc: '2.0',
+      id: 4,
+      method: 'tools/call',
+      params: {
+        name: 'reply',
+        arguments: { correlation_id: unknownCorrelation, status: 'done', body: 'x', from: 'protocol-b' },
+      },
+    },
+  ]);
+  for (const id of [2, 3, 4]) assertRpcInvalidParams(malformed.get(id));
+
+  const mcpRequestResponse = runBus(requesterDir, [
+    { jsonrpc: '2.0', id: 1, method: 'initialize', params: {} },
+    {
+      jsonrpc: '2.0',
+      id: 2,
+      method: 'tools/call',
+      params: { name: 'request', arguments: { to: 'protocol-b', body: 'mcp request' } },
+    },
+  ]).get(2);
+  const mcpRequest = assertToolMessage(mcpRequestResponse, {
+    body: 'mcp request',
+    from_session_id: requesterId,
+    kind: 'request',
+    reply_to: null,
+    result_sha256: null,
+    terminal_status: null,
+    to_session_id: responderId,
+  });
+
+  const mcpReplyArgs = {
+    correlation_id: mcpRequest.correlation_id,
+    status: 'completed',
+    body: 'mcp reply',
+    from: 'protocol-b',
+  };
+  const responderCalls = runBus(responderDir, [
+    { jsonrpc: '2.0', id: 1, method: 'initialize', params: {} },
+    {
+      jsonrpc: '2.0',
+      id: 2,
+      method: 'tools/call',
+      params: {
+        name: 'reply',
+        arguments: {
+          correlation_id: unknownCorrelation,
+          status: 'completed',
+          body: 'none',
+          from: 'protocol-b',
+        },
+      },
+    },
+    {
+      jsonrpc: '2.0',
+      id: 3,
+      method: 'tools/call',
+      params: {
+        name: 'reply',
+        arguments: { ...mcpReplyArgs, body: 'forged', from: 'protocol-c' },
+      },
+    },
+    { jsonrpc: '2.0', id: 4, method: 'tools/call', params: { name: 'reply', arguments: mcpReplyArgs } },
+    { jsonrpc: '2.0', id: 5, method: 'tools/call', params: { name: 'reply', arguments: mcpReplyArgs } },
+    {
+      jsonrpc: '2.0',
+      id: 6,
+      method: 'tools/call',
+      params: { name: 'reply', arguments: { ...mcpReplyArgs, body: 'different' } },
+    },
+  ]);
+  assertToolDomainError(responderCalls.get(2), 'unknown_correlation');
+  assertToolDomainError(responderCalls.get(3), 'unauthorized_responder');
+  const mcpReply = assertToolMessage(responderCalls.get(4), {
+    body: 'mcp reply',
+    correlation_id: mcpRequest.correlation_id,
+    from_session_id: responderId,
+    kind: 'terminal_reply',
+    reply_to: mcpRequest.id,
+    result_sha256: null,
+    terminal_status: 'completed',
+    to_session_id: requesterId,
+  });
+  assert.equal(responderCalls.get(5).result.isError, false);
+  assert.equal(responderCalls.get(5).result.content[0].text, responderCalls.get(4).result.content[0].text);
+  assert.equal(JSON.parse(responderCalls.get(5).result.content[0].text).id, mcpReply.id);
+  assertToolDomainError(responderCalls.get(6), 'correlation_conflict');
+  assert.equal(
+    peek('protocol-a').messages.filter(({ correlation_id }) => correlation_id === mcpRequest.correlation_id).length,
+    1,
+  );
+
+  const brokenHome = path.join(HOME, 'protocol-store-error-home');
+  const brokenRequesterDir = path.join(brokenHome, 'requester');
+  const brokenResponderDir = path.join(brokenHome, 'responder');
+  const brokenRequesterId = 'd4444444-4444-4444-8444-444444444444';
+  const brokenResponderId = 'e5555555-5555-4555-8555-555555555555';
+  fs.mkdirSync(brokenRequesterDir, { recursive: true });
+  fs.mkdirSync(brokenResponderDir);
+  const brokenEnv = { AGENT_RELAY_HOME: brokenHome };
+  assert.equal(
+    relay(['register', 'broken-a', '--id', brokenRequesterId, '--dir', brokenRequesterDir], {
+      env: brokenEnv,
+    }).status,
+    0,
+  );
+  assert.equal(
+    relay(['register', 'broken-b', '--id', brokenResponderId, '--dir', brokenResponderDir], {
+      env: brokenEnv,
+    }).status,
+    0,
+  );
+  fs.writeFileSync(path.join(brokenHome, 'protocol-v1'), 'not a directory');
+  const cliStoreFailure = relay(['request', 'broken-b', '--from', 'broken-a', '--', 'cannot persist'], {
+    env: brokenEnv,
+  });
+  assertCliDomainError(cliStoreFailure, 1, 'protocol_store_error');
+  const mcpStoreFailure = runBus(
+    brokenRequesterDir,
+    [
+      { jsonrpc: '2.0', id: 1, method: 'initialize', params: {} },
+      {
+        jsonrpc: '2.0',
+        id: 2,
+        method: 'tools/call',
+        params: { name: 'request', arguments: { to: 'broken-b', body: 'cannot persist', from: 'broken-a' } },
+      },
+    ],
+    brokenEnv,
+  );
+  assertToolDomainError(mcpStoreFailure.get(2), 'protocol_store_error');
+}
+
 export const EXPECTED_LABELS = [
   '--version prints the exact Cargo package version',
   'hook seeds marker + registration for both sessions (exit 0)',
@@ -136,9 +619,18 @@ export async function run({ bin, home, emit }) {
     check('tools/list returns the 6 bus tools', () => {
       const names = res
         .get(2)
-        .result.tools.map((tool) => tool.name)
+        .result.tools.filter(({ name }) => name !== 'request' && name !== 'reply')
+        .map((tool) => tool.name)
         .sort();
       assert.deepEqual(names, ['discover', 'inbox', 'register', 'roster', 'send', 'whoami']);
+      assertCorrelatedCliMcpContracts({
+        HOME,
+        relay,
+        runHook,
+        runBus,
+        peek,
+        tools: res.get(2).result.tools,
+      });
     });
     check('whoami resolves this session from the cwd marker', () => {
       const me = toolJSON(res.get(3));

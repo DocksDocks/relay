@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -40,6 +41,258 @@ const usage = () => {
   assert.notEqual(result.status, 0, 'empty invocation must print usage and refuse');
   return `${result.stdout}\n${result.stderr}`;
 };
+function explicitFreshBinaryCorrelatedResult() {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'session-relay-workspace-correlated-'));
+  const repo = path.join(home, 'repo');
+  fs.mkdirSync(repo);
+  const env = { ...process.env, AGENT_RELAY_HOME: home, SESSION_RELAY_HOME: '' };
+  const parent = '73333333-3333-4333-8333-333333333333';
+  const trigger = path.join(home, 'correlated.trigger');
+  const promptFile = path.join(home, 'correlated.prompt');
+  const receiptFile = path.join(home, 'correlated.receipt.json');
+  const sleep = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  const git = (args, gitCwd = repo) => {
+    const result = spawnSync('git', args, { cwd: gitCwd, encoding: 'utf8', env });
+    assert.equal(result.status, 0, `git ${args.join(' ')} failed:\n${result.stderr}`);
+    return result.stdout.trim();
+  };
+  const waitFor = (description, predicate, timeoutMs = 10_000) => {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (predicate()) return;
+      sleep(50);
+    }
+    assert.fail(`timed out waiting for ${description}`);
+  };
+  const fanoutRecords = () =>
+    Object.values(JSON.parse(fs.readFileSync(path.join(home, 'fanout-v1.json'), 'utf8')).records);
+  const workerState = (sessionId) => {
+    const lifecycle = JSON.parse(fs.readFileSync(path.join(home, 'lifecycle-v1.json'), 'utf8')).state;
+    return Object.values(lifecycle.managed_workers ?? {}).find((worker) => worker.runtime_session_id === sessionId)
+      ?.state;
+  };
+  const canonicalJson = (value) => {
+    if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+    if (value !== null && typeof value === 'object') {
+      return `{${Object.keys(value)
+        .sort()
+        .map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`)
+        .join(',')}}`;
+    }
+    return JSON.stringify(value);
+  };
+
+  try {
+    git(['init', '-q']);
+    git(['config', 'user.email', 'relay@example.test']);
+    git(['config', 'user.name', 'Relay Test']);
+    fs.writeFileSync(path.join(repo, 'base.txt'), 'base\n');
+    git(['add', 'base.txt']);
+    git(['commit', '-qm', 'base']);
+    const baseCommit = git(['rev-parse', 'HEAD']);
+
+    const hook = run(['hook'], {
+      cwd: repo,
+      env,
+      input: `${JSON.stringify({
+        session_id: parent,
+        cwd: repo,
+        hook_event_name: 'SessionStart',
+        source: 'startup',
+      })}\n`,
+    });
+    assert.equal(hook.status, 0, `register correlated fanout parent failed: ${hook.stderr}`);
+
+    const stub = path.join(home, 'correlated-worker.mjs');
+    fs.writeFileSync(
+      stub,
+      `#!/usr/bin/env node
+import fs from 'node:fs';
+import path from 'node:path';
+import { spawnSync } from 'node:child_process';
+const sleep = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+const sessionIndex = process.argv.indexOf('--session-id');
+const sessionId = process.argv[sessionIndex + 1];
+fs.writeFileSync(process.env.STUB_PROMPT_FILE, process.argv.at(-1));
+const hook = spawnSync(process.env.STUB_RELAY_BIN, ['hook'], {
+  input: JSON.stringify({
+    session_id: sessionId,
+    cwd: process.cwd(),
+    hook_event_name: 'SessionStart',
+    source: 'startup',
+  }),
+  encoding: 'utf8',
+  env: process.env,
+});
+if (hook.status !== 0) process.exit(20);
+while (!fs.existsSync(process.env.STUB_HANDBACK_TRIGGER)) sleep(25);
+const output = path.join(process.cwd(), 'result.txt');
+fs.writeFileSync(output, 'correlated result\\n');
+for (const args of [
+  ['add', 'result.txt'],
+  ['commit', '-qm', 'correlated result'],
+]) {
+  const result = spawnSync('git', args, { cwd: process.cwd(), encoding: 'utf8' });
+  if (result.status !== 0) process.exit(21);
+}
+const head = spawnSync('git', ['rev-parse', 'HEAD'], {
+  cwd: process.cwd(),
+  encoding: 'utf8',
+}).stdout.trim();
+const handback = spawnSync(
+  process.env.STUB_RELAY_BIN,
+  ['handback', '--from', sessionId, '--status', 'completed', '--note', 'ready'],
+  { encoding: 'utf8', env: process.env },
+);
+fs.writeFileSync(
+  process.env.STUB_RECEIPT_FILE,
+  JSON.stringify({ status: handback.status, stdout: handback.stdout, stderr: handback.stderr, head }),
+);
+if (handback.status !== 0) process.exit(22);
+while (true) sleep(1000);
+`,
+      { mode: 0o755 },
+    );
+    const correlatedEnv = {
+      ...env,
+      RELAY_SPAWN_CMD_CLAUDE: stub,
+      STUB_RELAY_BIN: bin,
+      STUB_HANDBACK_TRIGGER: trigger,
+      STUB_PROMPT_FILE: promptFile,
+      STUB_RECEIPT_FILE: receiptFile,
+    };
+    const spawn = run(
+      ['spawn', repo, '--fanout', '--from', parent, '--tool', 'claude', '--timeout', '5', '--', 'correlated task'],
+      { cwd: repo, env: correlatedEnv },
+    );
+    assert.equal(spawn.status, 0, `correlated spawn failed:\n${spawn.stdout}\n${spawn.stderr}`);
+    const workerId = /spawned (?:[^\s]+ \()?([0-9a-f-]{36})\)? in /.exec(spawn.stdout)?.[1];
+    assert.ok(workerId, `correlated spawn did not report its session: ${spawn.stdout}`);
+
+    const running = fanoutRecords().find((record) => record.runtime_session_id === workerId);
+    assert.ok(running, 'correlated spawn must persist its fanout record');
+    assert.match(running.correlation_id, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+    assert.match(running.request_message_id, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+    const prompt = fs.readFileSync(promptFile, 'utf8');
+    assert.match(prompt, new RegExp(`\\bcorrelation(?: ID)?: ${running.correlation_id}\\b`, 'i'));
+    const finalCommand = `${bin} handback --from ${workerId} --status completed --note "<brief note>"`;
+    assert.equal(
+      prompt.split(finalCommand).length - 1,
+      1,
+      `fanout prompt must contain the exact final correlated handback/reply command once: ${finalCommand}`,
+    );
+    assert.match(prompt, /This must be your final action; do not write to the worktree afterward\./);
+    assert.ok(prompt.trimEnd().endsWith('correlated task'), 'correlated prompt must retain the task payload');
+
+    fs.writeFileSync(trigger, 'go');
+    waitFor('correlated handback receipt', () => fs.existsSync(receiptFile));
+    waitFor('correlated exact reap after result enqueue', () => workerState(workerId) === 'TerminalReleasable');
+    const handback = JSON.parse(fs.readFileSync(receiptFile, 'utf8'));
+    assert.deepEqual(handback, {
+      status: 0,
+      stdout: `handed back ${workerId} at ${handback.head}\n`,
+      stderr: '',
+      head: handback.head,
+    });
+
+    const handedBack = fanoutRecords().find((record) => record.runtime_session_id === workerId);
+    assert.equal(handedBack.state, 'HandedBack');
+    assert.equal(handedBack.handback_head, handback.head);
+    assert.equal(handedBack.worker_result_sha256?.length, 64);
+    const result = handedBack.worker_result;
+    assert.deepEqual(Object.keys(result).sort(), [
+      'base_commit',
+      'changed_paths',
+      'correlation_id',
+      'created_at',
+      'generation',
+      'handback_commit',
+      'object_format',
+      'parent_session_id',
+      'repo_common_dir',
+      'repo_dev',
+      'repo_ino',
+      'reservation_id',
+      'result_id',
+      'root_reservation_id',
+      'runtime_session_id',
+      'schema',
+      'status',
+      'summary',
+      'worker_id',
+    ]);
+    assert.equal(result.schema, 1);
+    assert.match(result.result_id, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+    assert.equal(result.correlation_id, running.correlation_id);
+    assert.equal(result.reservation_id, handedBack.reservation_id);
+    assert.equal(result.root_reservation_id, handedBack.root_reservation_id);
+    assert.equal(result.parent_session_id, parent);
+    assert.equal(result.worker_id, handedBack.worker_id);
+    assert.equal(result.generation, handedBack.generation);
+    assert.equal(result.runtime_session_id, workerId);
+    assert.equal(result.repo_common_dir, handedBack.repo_common_dir);
+    assert.equal(result.repo_dev, handedBack.repo_dev);
+    assert.equal(result.repo_ino, handedBack.repo_ino);
+    assert.equal(result.object_format, handedBack.object_format);
+    assert.equal(result.base_commit, baseCommit);
+    assert.equal(result.handback_commit, handback.head);
+    assert.equal(result.status, 'completed');
+    assert.equal(result.summary, 'ready');
+    assert.deepEqual(result.changed_paths, ['result.txt']);
+    assert.match(result.created_at, /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/);
+    const resultSha256 = createHash('sha256').update(canonicalJson(result)).digest('hex');
+    assert.equal(handedBack.worker_result_sha256, resultSha256);
+
+    const notificationResult = run(['inbox', parent], { cwd: repo, env: correlatedEnv });
+    assert.equal(notificationResult.status, 0, notificationResult.stderr);
+    const notificationPayload = JSON.parse(notificationResult.stdout);
+    assert.equal(notificationPayload.count, 1);
+    const notification = notificationPayload.messages[0];
+    assert.deepEqual(Object.keys(notification).sort(), [
+      'body',
+      'correlation_id',
+      'created_at',
+      'from_session_id',
+      'id',
+      'kind',
+      'reply_to',
+      'result_sha256',
+      'schema',
+      'terminal_status',
+      'to_session_id',
+    ]);
+    assert.equal(notification.schema, 2);
+    assert.match(notification.id, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+    assert.match(notification.created_at, /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/);
+    assert.equal(notification.from_session_id, workerId);
+    assert.equal(notification.to_session_id, parent);
+    assert.equal(notification.correlation_id, running.correlation_id);
+    assert.equal(notification.kind, 'worker_result');
+    assert.equal(notification.reply_to, running.request_message_id);
+    assert.equal(notification.terminal_status, 'completed');
+    assert.ok(Buffer.byteLength(notification.body, 'utf8') >= 1);
+    assert.ok(Buffer.byteLength(notification.body, 'utf8') <= 4096);
+    assert.ok(!notification.body.includes('\0'));
+    assert.equal(notification.result_sha256, resultSha256);
+    const notificationEmpty = run(['inbox', parent], { cwd: repo, env: correlatedEnv });
+    assert.equal(notificationEmpty.status, 0, notificationEmpty.stderr);
+    assert.deepEqual(JSON.parse(notificationEmpty.stdout), { count: 0, messages: [] });
+
+    const collect = run(['collect', workerId, '--from', parent, '--result-json'], {
+      cwd: repo,
+      env: correlatedEnv,
+    });
+    assert.equal(collect.status, 0, collect.stderr);
+    assert.equal(collect.stdout, `{"result":${canonicalJson(result)},"sha256":"${resultSha256}"}\n`);
+    assert.deepEqual(JSON.parse(collect.stdout), { result, sha256: resultSha256 });
+    assert.equal(fs.readFileSync(path.join(repo, 'result.txt'), 'utf8'), 'correlated result\n');
+    assert.equal(git(['status', '--porcelain']), '');
+  } finally {
+    fs.writeFileSync(trigger, 'cleanup');
+    sleep(300);
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+}
 
 function singleSessionCompat() {
   const text = usage();
@@ -53,6 +306,7 @@ function singleSessionCompat() {
   assert.ok(text.includes('workspace preserve|start|list|inspect|handback|integrate|recover|finish|abort'));
   assert.ok(!text.includes('spawn --workspace'), 'forbidden spawn --workspace alias is advertised');
   assert.ok(!text.includes('docks session'), 'forbidden docks session command is advertised');
+  explicitFreshBinaryCorrelatedResult();
 
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'session-relay-workspace-compat-'));
   const cwd = path.join(home, 'project');
@@ -78,6 +332,24 @@ function singleSessionCompat() {
   };
   const fanoutRecords = () =>
     Object.values(JSON.parse(fs.readFileSync(path.join(home, 'fanout-v1.json'), 'utf8')).records);
+  const downgradeFanoutRecordToLegacy = (reservationId) => {
+    const file = path.join(home, 'fanout-v1.json');
+    const state = JSON.parse(fs.readFileSync(file, 'utf8'));
+    const record = state.records[reservationId];
+    assert.ok(record, `cannot fixture missing fanout record ${reservationId}`);
+    for (const field of ['correlation_id', 'request_message_id', 'worker_result', 'worker_result_sha256']) {
+      assert.ok(
+        Object.hasOwn(record, field),
+        `fresh fanout record must persist ${field} before legacy fixture downgrade`,
+      );
+      delete record[field];
+    }
+    fs.writeFileSync(file, JSON.stringify(state));
+    const legacy = JSON.parse(fs.readFileSync(file, 'utf8')).records[reservationId];
+    for (const field of ['correlation_id', 'request_message_id', 'worker_result', 'worker_result_sha256']) {
+      assert.ok(!Object.hasOwn(legacy, field), `old-state fixture unexpectedly contains ${field}`);
+    }
+  };
   const workerState = (sessionId) => {
     const lifecycle = JSON.parse(fs.readFileSync(path.join(home, 'lifecycle-v1.json'), 'utf8')).state;
     return Object.values(lifecycle.managed_workers ?? {}).find((worker) => worker.runtime_session_id === sessionId)
@@ -323,6 +595,7 @@ while (true) sleep(1000);
     assert.equal(handedBackRoot?.handback_head, rootHandback.head);
     assert.equal(handedBackRoot?.handback_status, 'completed');
     assert.equal(handedBackRoot?.handback_note, 'ready');
+    downgradeFanoutRecordToLegacy(handedBackRoot.reservation_id);
 
     const collectRoot = run(['collect', rootId, '--from', invoker], { cwd: repo, env: legacyEnv });
     assert.equal(collectRoot.status, 0, collectRoot.stderr);

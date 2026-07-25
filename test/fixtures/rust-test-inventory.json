@@ -1,5 +1,5 @@
 {
-  "schema_version": 3,
+  "schema_version": 4,
   "acceptance_owners": {
     "A01": "workspace_lease_process::two_writers_same_worktree_exactly_one_lease",
     "A02": "workspace_lease_process::separate_worktrees_both_hold_leases",
@@ -33,6 +33,88 @@
   },
   "pending_api_gaps": {},
   "cases": {
+    "protocol": {
+      "tests": [
+        "claim_origin_state_and_delivery_matrix_is_exhaustive_and_closed",
+        "claim_rejects_unknown_origin_state_delivery_and_digest_syntax",
+        "claim_status_v1_has_exact_canonical_round_trip_and_digest",
+        "claim_validates_request_identity_digest_and_endpoint_bindings",
+        "claim_validates_terminal_reply_identity_digest_and_origin_binding",
+        "concurrent_competing_terminal_claims_have_one_logical_winner",
+        "every_protocol_record_is_closed_and_rejects_noncanonical_transport",
+        "exact_reply_retry_is_idempotent_but_changed_payload_conflicts",
+        "exact_responder_is_authorized_and_unknown_or_other_responders_fail_closed",
+        "explicit_protocol_roots_are_fresh_store_isolated",
+        "malformed_tampered_or_wrong_mode_claims_fail_closed_without_mailbox_mutation",
+        "message_body_uses_utf8_byte_bounds_rejects_nul_and_enforces_envelope_limit",
+        "message_digest_fields_are_lowercase_exact_sha256",
+        "message_uuid_fields_require_lowercase_v4_with_rfc_variant",
+        "message_v2_has_exact_canonical_round_trip_and_digest",
+        "message_variant_matrix_is_exhaustive_and_closed",
+        "pending_recovery_replays_embedded_exact_bytes_and_deduplicates_existing_append",
+        "protocol_timestamps_require_exact_real_millisecond_utc_instants",
+        "recovery_rejects_same_message_id_with_different_bytes",
+        "reply_crash_failpoints_recover_without_loss_or_duplicate_delivery",
+        "request_crash_failpoints_recover_without_loss_or_duplicate_delivery",
+        "request_requires_exact_registered_endpoints_and_persists_one_open_claim",
+        "typed_drain_marks_delivery_consumed_before_removal_and_recovery_cannot_redeliver",
+        "worker_result_common_dir_is_an_absolute_lexically_canonical_path",
+        "worker_result_enforces_the_one_mib_canonical_encoded_limit",
+        "worker_result_paths_are_sorted_unique_normalized_git_relative_paths",
+        "worker_result_summary_uses_utf8_byte_bounds_and_rejects_nul",
+        "worker_result_uuid_decimal_format_and_oid_fields_are_closed",
+        "worker_result_v1_has_exact_canonical_round_trip_and_digest"
+      ]
+    },
+    "fanout": {
+      "tests": [
+        "authority_cap_is_atomic_and_child_ancestry_is_derived",
+        "authority_child_depth_and_root_are_not_caller_forgeable",
+        "authority_managed_worker_cannot_create_a_nested_root",
+        "authority_proven_no_launch_rollback_removes_only_the_pristine_worktree",
+        "authority_read_only_fanout_is_rejected_before_reservation",
+        "authority_reserved_and_running_records_remain_counted_after_lifecycle_disagreement",
+        "authority_terminal_root_cannot_admit_a_new_leaf",
+        "authority_uses_separate_file_without_breaking_lifecycle_v1",
+        "collection_refuses_mismatched_terminal_claim_before_merge_and_retains_capacity",
+        "collection_validates_every_repository_base_head_generation_and_runtime_binding",
+        "correlated_reservation_and_attach_publish_exact_authority_request",
+        "corrupt_result_never_self_heals_merges_or_releases_capacity",
+        "custody_collection_waits_for_exact_owned_process_reap",
+        "custody_exact_owned_process_reap_is_required_before_slot_release",
+        "custody_uncertain_process_state_keeps_the_slot_counted",
+        "depth_zero_handback_accepts_failed_no_process_child_without_fabricated_result",
+        "depth_zero_handback_waits_for_depth_one_collection_then_publishes_its_result",
+        "duplicate_handback_is_exactly_idempotent_and_changed_retry_conflicts",
+        "handback_publishes_exact_completed_and_failed_worker_results_with_sorted_paths",
+        "non_utf8_changed_path_is_refused_before_handback_authority_mutation",
+        "pre_upgrade_record_without_result_fields_retains_legacy_handback_and_collect",
+        "repository_gate_refuses_legacy_mode_before_fanout_mutation",
+        "repository_identity_accepts_reported_sha1_and_sha256_oid_widths",
+        "restart_replays_embedded_result_bytes_once_for_handback_and_collect",
+        "supervisor_release_gate_requires_exact_terminal_result_delivery",
+        "worktree_collect_recovers_when_removal_preceded_the_phase_write",
+        "worktree_collection_lock_refuses_a_concurrent_collector_before_git_changes",
+        "worktree_dirty_handback_is_refused_without_publishing_merge_authority",
+        "worktree_dirty_parent_blocks_collection_until_the_same_checkout_is_clean",
+        "worktree_handback_and_collect_merge_once_then_remove_exact_tree",
+        "worktree_head_changed_after_handback_is_refused_without_removal",
+        "worktree_merge_conflict_aborts_cleanly_and_retries_after_parent_repair"
+      ]
+    },
+    "lifecycle_supervisor": {
+      "tests": [
+        "lifecycle_supervisor_disconnect_linearizes_unmanaged_cancel_and_reap",
+        "lifecycle_supervisor_pipe_preserves_bytes_eof_streams_and_reap_custody",
+        "lifecycle_supervisor_preserves_codex_fast_and_default_tiers_in_exact_argv",
+        "lifecycle_supervisor_wake_uses_closed_stdin_and_separate_output",
+        "lifecycle_supervisor_watchdog_first_loss_refuses_next_reentry",
+        "lifecycle_supervisor_watchdog_marks_managed_worker_on_supervisor_death",
+        "managed_attach_cancel_deadline_binds_fencing_unconfirmed_never_active",
+        "managed_attach_cancel_first_reap_transfers_waiting_claim_exactly_once",
+        "watchdog_retires_bootstrap_when_the_caller_disconnects_before_reply"
+      ]
+    },
     "workspace_identity": {
       "tests": [
         "failed_preflight_or_lease_changes_no_source_bytes",

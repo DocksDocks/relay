@@ -21,6 +21,20 @@ const RELEASE_VERSION = '0.13.0';
 const RELEASE_TAG = `session-relay--v${RELEASE_VERSION}`;
 const PUBLIC_REF = /^refs\/heads\/preflight\/session-relay-cli-0\.13\.0-[0-9a-f]{12}$/;
 const COMMIT = /^[0-9a-f]{40}$/;
+const CURRENT_RELEASE_VERSION = '0.14.0';
+const CURRENT_RELEASE_TAG = `session-relay--v${CURRENT_RELEASE_VERSION}`;
+const CURRENT_PUBLIC_VERSION = '0.12.0';
+const CURRENT_PUBLIC_TAG = `cli-v${CURRENT_PUBLIC_VERSION}`;
+const CURRENT_DOCKS_PLAN = 'docs/plans/active/session-relay-correlated-results-release-continuation.md';
+const CURRENT_DOCKS_RUN_ID = '9349cb79-232f-48fc-a7de-5da7eae64e84';
+const CURRENT_PUBLIC_PLAN = 'docs/plans/active/session-relay-0.14.0-docks-kit-0.12.0-release.md';
+const HISTORICAL_RELEASE_PLAN = 'docs/plans/active/session-relay-linux-workspace-publication.md';
+const HISTORICAL_RECEIPT_SHA256 = Object.freeze([
+  '419b23ccdcf0ca21672e81c05ae9d22c55bc67781839ffb6a29e7eecc2b59396',
+  '87a6260ae20280712ebb2d76d39667b128c8f6cf687141ebd779d8eca16c2262',
+  '31d096d31702b66d7e97085a82d8b7da1b75155f828b1d2382a0ac8427ba7ea2',
+  '7cf02781a2ed3c75423321492fb2cd4c4944f6da6d6d41290e26a5f3ca0cf902',
+]);
 const ASSETS = [
   'session-relay-aarch64-apple-darwin',
   'session-relay-aarch64-unknown-linux-musl',
@@ -406,10 +420,10 @@ check('Cargo and plugin manifests expose exact synchronized release version', ()
   const market = JSON.parse(fs.readFileSync(path.join(REPO, '.claude-plugin/marketplace.json'))).plugins.find(
     ({ name }) => name === 'session-relay',
   ).version;
-  assert.equal(cargo, RELEASE_VERSION);
-  assert.equal(claude, RELEASE_VERSION);
-  assert.equal(codex, RELEASE_VERSION);
-  assert.equal(market, RELEASE_VERSION);
+  assert.equal(cargo, CURRENT_RELEASE_VERSION);
+  assert.equal(claude, CURRENT_RELEASE_VERSION);
+  assert.equal(codex, CURRENT_RELEASE_VERSION);
+  assert.equal(market, CURRENT_RELEASE_VERSION);
 });
 
 function assertNativeWorkflowBoundary(document) {
@@ -992,6 +1006,86 @@ check(
   releaseContracts,
 );
 
+function currentCorrelatedReleaseContract() {
+  const historicalPlan = fs.readFileSync(path.join(REPO, HISTORICAL_RELEASE_PLAN), 'utf8');
+  for (const digest of HISTORICAL_RECEIPT_SHA256) {
+    assert.match(historicalPlan, new RegExp(digest), `historical Session Relay 0.13.0 receipt ${digest} changed`);
+  }
+
+  const cargo = fs
+    .readFileSync(path.join(REPO, 'plugins/session-relay/rust/Cargo.toml'), 'utf8')
+    .match(/^version\s*=\s*"([^"]+)"/m)?.[1];
+  const claude = JSON.parse(
+    fs.readFileSync(path.join(REPO, 'plugins/session-relay/.claude-plugin/plugin.json'), 'utf8'),
+  ).version;
+  const codex = JSON.parse(
+    fs.readFileSync(path.join(REPO, 'plugins/session-relay/.codex-plugin/plugin.json'), 'utf8'),
+  ).version;
+  const claudeMarket = JSON.parse(
+    fs.readFileSync(path.join(REPO, '.claude-plugin/marketplace.json'), 'utf8'),
+  ).plugins.find(({ name }) => name === 'session-relay')?.version;
+  const agentsRelay = JSON.parse(
+    fs.readFileSync(path.join(REPO, '.agents/plugins/marketplace.json'), 'utf8'),
+  ).plugins.find(({ name }) => name === 'session-relay');
+  assert.deepEqual(
+    [cargo, claude, codex, claudeMarket],
+    Array(4).fill(CURRENT_RELEASE_VERSION),
+    'all version-bearing current Session Relay manifests must bind 0.14.0',
+  );
+  assert.deepEqual(agentsRelay.source, { source: 'local', path: './plugins/session-relay' });
+  assert.match(
+    fs.readFileSync(path.join(REPO, 'plugins/session-relay/rust/Cargo.lock'), 'utf8'),
+    /\[\[package\]\]\nname = "session-relay"\nversion = "0\.14\.0"/,
+    'Cargo.lock must bind Session Relay 0.14.0',
+  );
+
+  const coreSource = fs.readFileSync(path.join(REPO, 'scripts/lib/session-relay-release-core.mjs'), 'utf8');
+  assert.match(coreSource, /export const VERSION = '0\.14\.0';/);
+  assert.match(coreSource, /Session Relay 0\.14\.0 is staged for compatibility validation/);
+  assert.match(coreSource, /Session Relay 0\.14\.0 is available through docks-kit/);
+  const promotionSource = fs.readFileSync(path.join(REPO, 'scripts/lib/session-relay-release-promotion.mjs'), 'utf8');
+  assert.match(promotionSource, /const PUBLIC_VERSION = '0\.12\.0';/);
+  assert.match(promotionSource, /const PUBLIC_TAG = `cli-v\$\{PUBLIC_VERSION\}`;/);
+  assert.match(promotionSource, /const CURRENT_DOCKS_KIT_RELEASE = 'cli-v0\.12\.0';/);
+  assert.match(promotionSource, /session-relay-0\.14\.0-docks-kit-0\.12\.0-release/);
+
+  const document = parseYaml(fs.readFileSync(WORKFLOW, 'utf8'));
+  const matrixAssets = document.jobs.build.strategy.matrix.include.map(({ asset }) => asset);
+  assert.deepEqual(matrixAssets.sort(), [...ASSETS].sort(), '0.14 producer must retain exactly four native binaries');
+  assert.equal(
+    matrixAssets.some((name) => /windows|win32|\.exe$/i.test(name)),
+    false,
+    'Windows is unsupported',
+  );
+  assert.deepEqual(document.jobs.aggregate.needs, ['identity', 'build']);
+  assert.deepEqual(document.jobs.publish.needs, ['identity', 'aggregate']);
+  const aggregate = document.jobs.aggregate.steps.find(
+    ({ name }) => name === 'validate closed attestations and generate SHA256SUMS',
+  );
+  assert.match(aggregate.env.WORKFLOW_RUN_ID, /\{\{\s*github\.run_id\s*\}\}/);
+  assert.match(aggregate.env.WORKFLOW_RUN_ATTEMPT, /\{\{\s*github\.run_attempt\s*\}\}/);
+  assert.match(aggregate.run, /record\.sha256,\s*crypto\.createHash\('sha256'\)\.update\(asset\)\.digest\('hex'\)/);
+  assert.match(aggregate.run, /record\.workflow_run_id,\s*Number\(process\.env\.WORKFLOW_RUN_ID\)/);
+  assert.match(aggregate.run, /record\.workflow_run_attempt,\s*Number\(process\.env\.WORKFLOW_RUN_ATTEMPT\)/);
+  const publish = document.jobs.publish.steps.find(
+    ({ name }) => name === 'create or reconcile public prerelease from exactly five same-run assets',
+  );
+  assert.match(publish.run, /local_digest\["\$name"\]="\$\(sha256sum "\$file"/);
+  assert.match(publish.run, /"sha256:\$\{local_digest\[\$name\]\}" = "\$digest"/);
+  assert.match(
+    document.jobs.publish.steps.find(({ name }) => name === 'validate and stage exactly five release assets').run,
+    /sha256sum --check --strict SHA256SUMS/,
+  );
+
+  const currentPlan = fs.readFileSync(path.join(REPO, CURRENT_DOCKS_PLAN), 'utf8');
+  assert.match(currentPlan, new RegExp(`"run_id":"${CURRENT_DOCKS_RUN_ID}"`));
+  assert.match(currentPlan, /"draft_review":\{[^}]*"state":"passed"/);
+  assert.match(currentPlan, new RegExp(CURRENT_RELEASE_TAG.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  assert.match(currentPlan, new RegExp(CURRENT_PUBLIC_TAG.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  assert.match(currentPlan, new RegExp(CURRENT_PUBLIC_PLAN.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  assert.match(currentPlan, /prerelease[\s\S]*public child[\s\S]*stable/i);
+}
+
 function verifyCompanion() {
   if (!cli.publicRemote) return;
   assert.equal(cli.publicRemote, 'https://github.com/DocksDocks/public.git');
@@ -1014,5 +1108,9 @@ function verifyCompanion() {
   assert.equal(result.status, 0, result.stderr || result.stdout);
 }
 check('companion validation ref is a clean detached, receipt-bound installer contract', verifyCompanion);
+check(
+  'current Relay 0.14.0 and docks-kit 0.12.0 release chain is exact while 0.13 receipts stay immutable',
+  currentCorrelatedReleaseContract,
+);
 
 process.stdout.write(`\nPASS: session-relay distribution contract — ${passed} checks\n`);

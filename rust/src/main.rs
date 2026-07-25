@@ -23,8 +23,8 @@ fn main() {
         Some("channel") => relay::channel::run(),
         Some("hook") => relay::hook::run(&argv[1..]),
         Some(
-            cmd @ ("discover" | "list" | "register" | "send" | "inbox" | "peek" | "attach" | "wake"
-            | "doctor"),
+            cmd @ ("discover" | "list" | "register" | "send" | "request" | "reply" | "inbox"
+            | "peek" | "attach" | "wake" | "doctor"),
         ) => relay::cli::run(cmd, argv.clone()),
         Some("watch") => relay::watch::run(argv.clone()),
         Some("spawn") => relay::spawn::run(argv.clone()),
@@ -69,7 +69,7 @@ fn main() {
             }
         }
         _ => die(
-            "usage: relay bus | channel | hook [codex] [--event prompt] | discover [--within min] [--tool t] | list | register <name> --id <uuid> [--dir <path>] [--server <sock>] | send <to> [--] <msg> | inbox <who> | peek <who> | attach <who> [--exec] | wake <who> [--model m] [--effort e] [--service-tier default|fast] [msg] | doctor [--id <session>] | watch <who>...|--all [--server <sock>] [--auto-turn] [--once] | spawn <dir> [--fanout|--worktree --from <session>] [--service-tier default|fast] [options] -- <task> | handback --from <session> --status completed|failed [--note <text>] | collect <session> --from <parent> | workspace preserve|start|list|inspect|handback|integrate|recover|finish|abort ...",
+            "usage: relay bus | channel | hook [codex] [--event prompt] | discover [--within min] [--tool t] | list | register <name> --id <uuid> [--dir <path>] [--server <sock>] | send <to> [--] <msg> | request <to> --from <registered> [--] <msg> | reply <correlation-id> --from <registered> --status completed|failed [--] <msg> | inbox <who> | peek <who> | attach <who> [--exec] | wake <who> [--model m] [--effort e] [--service-tier default|fast] [msg] | doctor [--id <session>] | watch <who>...|--all [--server <sock>] [--auto-turn] [--once] | spawn <dir> [--fanout|--worktree --from <session>] [--service-tier default|fast] [options] -- <task> | handback --from <session> --status completed|failed [--note <text>] | collect <session> --from <parent> [--result-json] | workspace preserve|start|list|inspect|handback|integrate|recover|finish|abort ...",
         ),
     }
 }

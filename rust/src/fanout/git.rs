@@ -17,7 +17,13 @@ pub(super) struct RepoIdentity {
 
 impl RepoIdentity {
     pub(super) fn matches_record(&self, record: &FanoutRecord) -> bool {
-        self.dev == record.repo_dev && self.ino == record.repo_ino
+        self.common_dir == record.repo_common_dir
+            && self.dev == record.repo_dev
+            && self.ino == record.repo_ino
+            && record
+                .object_format
+                .as_deref()
+                .is_none_or(|format| format == self.object_format.as_str())
     }
 
     pub(super) fn workspace_identity(&self) -> &RepositoryIdentityV1 {
@@ -72,6 +78,48 @@ pub(super) fn ensure_clean(repo: &Path, label: &str) -> Result<(), String> {
 
 pub(super) fn repository_head(repo: &Path) -> Result<String, String> {
     run_git(repo, &["rev-parse", "--verify", "HEAD"])
+}
+
+pub(super) fn changed_paths(
+    repo: &Path,
+    base_commit: &str,
+    handback_commit: &str,
+) -> Result<Vec<String>, String> {
+    let range = format!("{base_commit}..{handback_commit}");
+    let output = run_git_bytes(
+        repo,
+        &[
+            "diff",
+            "--name-only",
+            "-z",
+            "--no-renames",
+            "--no-ext-diff",
+            "--no-textconv",
+            &range,
+            "--",
+        ],
+    )?;
+    if output.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !output.ends_with(b"\0") {
+        return Err("git changed-path output is not NUL terminated".to_string());
+    }
+    let mut paths = Vec::new();
+    for path in output[..output.len() - 1].split(|byte| *byte == 0) {
+        if path.is_empty() {
+            return Err("git changed-path output contains an empty path".to_string());
+        }
+        let path = std::str::from_utf8(path)
+            .map_err(|_| "fanout changed path is not UTF-8".to_string())?;
+        paths.push(path.to_string());
+    }
+    paths.sort();
+    paths.dedup();
+    if paths.len() > 4096 {
+        return Err("fanout result has more than 4096 changed paths".to_string());
+    }
+    Ok(paths)
 }
 
 pub(super) fn add_worktree(
@@ -170,6 +218,12 @@ pub(super) fn remove_merged_worktree(
 }
 
 fn run_git(cwd: &Path, args: &[&str]) -> Result<String, String> {
+    String::from_utf8(run_git_bytes(cwd, args)?)
+        .map(|output| output.trim().to_string())
+        .map_err(|_| "git output was not UTF-8".to_string())
+}
+
+fn run_git_bytes(cwd: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
     let output = Command::new("git")
         .args(args)
         .current_dir(cwd)
@@ -183,9 +237,7 @@ fn run_git(cwd: &Path, args: &[&str]) -> Result<String, String> {
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
-    String::from_utf8(output.stdout)
-        .map(|output| output.trim().to_string())
-        .map_err(|_| "git output was not UTF-8".to_string())
+    Ok(output.stdout)
 }
 
 fn git_tracks_worktree(repo: &Path, worktree: &Path) -> Result<bool, String> {

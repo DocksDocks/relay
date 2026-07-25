@@ -1653,8 +1653,9 @@ pub(crate) fn drain_authorized_mailbox(
         .root
         .join("mailbox")
         .join(format!("{}.jsonl", sanitize(target.runtime_session_id)));
-    let raw = fs::read_to_string(&path).unwrap_or_default();
-    let messages = parse_lines(&raw);
+    let (messages, raw) = crate::protocol::ProtocolStore::new(target.root.to_path_buf())
+        .drain_renderable_locked(target.runtime_session_id)
+        .map_err(|error| error.to_string())?;
     let _ = fs::remove_file(&path);
     Ok(DrainReceipt {
         messages,
