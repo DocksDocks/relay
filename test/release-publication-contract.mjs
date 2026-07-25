@@ -48,8 +48,9 @@ const CURRENT_PUBLIC_TAG = 'cli-v0.12.0';
 const HISTORICAL_PUBLICATION_SHA256 = '31d096d31702b66d7e97085a82d8b7da1b75155f828b1d2382a0ac8427ba7ea2';
 const HISTORICAL_RELEASE_PLAN_PATH = 'docs/plans/active/session-relay-linux-workspace-publication.md';
 const CURRENT_GOAL_ID = '8b89aabf-7336-4352-bc11-225bab67f9aa';
-const CURRENT_DOCKS_RUN_ID = 'a69dcd97-d1bd-46fc-9b6b-70e349e353fc';
-const CURRENT_DOCKS_PLAN_PATH = 'docs/plans/active/session-relay-correlated-results-release-completion.md';
+const CURRENT_DOCKS_RUN_ID = '88732ba0-ef06-411b-a31c-93705ccefb27';
+const CURRENT_DOCKS_PLAN_PATH = 'docs/plans/active/session-relay-correlated-results-release-remediation-v4.md';
+const CURRENT_DOCKS_SOURCE_BASE = '494881a0d973863d1ac8e233734c827eb6913ce8';
 const CURRENT_PUBLIC_RUN_ID = '1f801952-705e-4c7e-a533-91026c013383';
 const CURRENT_PUBLIC_ACTIVE_PLAN_PATH = 'docs/plans/active/session-relay-0.14.0-docks-kit-0.12.0-release.md';
 const CURRENT_PUBLIC_FINISHED_PLAN_PATH =
@@ -958,9 +959,19 @@ function assertCurrentPublicationContract() {
 }
 
 function currentSourcePreparationProofV2(directory) {
-  const sourceCommit = '1'.repeat(40);
+  const sourceCommit = CURRENT_DOCKS_SOURCE_BASE;
   const redCommit = '2'.repeat(40);
   const implementationCommit = 'a'.repeat(40);
+  const proofPath = 'plugins/session-relay/test/release-publication-contract.mjs';
+  const manifestPaths = [{ path: proofPath, state: 'missing', kind: null, mode: null, sha256: null }];
+  const manifest = {
+    schema: 1,
+    source_base: implementationCommit,
+    source_sha256: sha256(
+      Buffer.from(canonicalize({ schema: 1, source_base: implementationCommit, paths: manifestPaths })),
+    ),
+    paths: manifestPaths,
+  };
   return writeCanonical(directory, 'current-source-proof.json', {
     schema: 2,
     type: 'SourcePreparationProofV2',
@@ -987,32 +998,33 @@ function currentSourcePreparationProofV2(directory) {
       type: 'TddRedReceiptV1',
       repository_id: REPOSITORY_ID,
       pre_production_commit: redCommit,
-      receipt_sha256: '4'.repeat(64),
-      test_blob_sha256: '5'.repeat(64),
-      expected_failure_sha256: '6'.repeat(64),
+      test_paths: [{ path: proofPath, blob_id: '3'.repeat(40) }],
       command: {
         cwd: '/home/vagrant/projects/docks',
-        argv: ['node', 'plugins/session-relay/test/release-publication-contract.mjs'],
+        argv: ['node', proofPath],
       },
-      expected_exit_code: 1,
-      observed_exit_code: 1,
-      failure_signature: 'current stable finalization was not implemented',
+      exit_code: 17,
       stdout_sha256: '8'.repeat(64),
       stderr_sha256: '9'.repeat(64),
-      test_blobs: [
-        {
-          path: 'plugins/session-relay/test/release-publication-contract.mjs',
-          blob_id: '3'.repeat(40),
-        },
-      ],
-      observed_before_implementation: true,
+      captured_at: '2026-07-25T13:55:00.000Z',
+      producer: {
+        path: 'scripts/capture-tdd-red.mjs',
+        blob_id: '4'.repeat(40),
+        version: '1',
+      },
     },
     completion_review: {
       schema: 1,
       type: 'CompletionReviewV1',
       reviewed_commit: implementationCommit,
+      diff_sha256: '6'.repeat(64),
       result_sha256: '7'.repeat(64),
       verdict: 'pass',
+    },
+    acceptance: {
+      manifest,
+      verification_sha256: '5'.repeat(64),
+      changed_paths: [proofPath],
     },
     ancestry: {
       source_to_red: true,

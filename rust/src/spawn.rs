@@ -1539,7 +1539,7 @@ pub fn run(raw: Vec<String>) -> ! {
         .unwrap_or_else(|| die(USAGE));
 
     let (tool, default_note) = resolve_spawn_tool(
-        args.flag("tool"),
+        args.flag_before_sep("tool"),
         std::env::var("RELAY_SPAWN_TOOL").ok(),
         codex_available(),
     )
@@ -1547,36 +1547,36 @@ pub fn run(raw: Vec<String>) -> ! {
     if let Some(note) = default_note {
         eprintln!("{note}");
     }
-    let model = args.flag("model");
-    let effort = args.flag("effort");
+    let model = args.flag_before_sep("model");
+    let effort = args.flag_before_sep("effort");
     let requested_service_tier = args
-        .unique_flag("service-tier")
+        .unique_flag_before_sep("service-tier")
         .unwrap_or_else(|error| die(&error));
     if tool != "codex" && requested_service_tier.is_some() {
         die("--service-tier is Codex-only");
     }
     let service_tier = ServiceTier::parse(requested_service_tier.unwrap_or("default"))
         .unwrap_or_else(|error| die(&error));
-    let server = args.flag("server");
+    let server = args.flag_before_sep("server");
     if model.is_none() {
         eprintln!(
             "[relay spawn] no --model given — pass --model/--effort to pin a deliberate worker model"
         );
     }
-    let read_only = args.has("read-only");
-    let full_access = args.has("full-access");
-    let watch = args.has("watch");
+    let read_only = args.has_before_sep("read-only");
+    let full_access = args.has_before_sep("full-access");
+    let watch = args.has_before_sep("watch");
     if read_only && full_access {
         die("--read-only and --full-access are mutually exclusive");
     }
     crate::workspace::refuse_unsupported_managed_mutation(
         &dir,
-        read_only || args.has("dry"),
+        read_only || args.has_before_sep("dry"),
         "spawn",
     )
     .unwrap_or_else(|error| die(&error));
     let timeout_secs: u64 = args
-        .flag("timeout")
+        .flag_before_sep("timeout")
         .map(|v| {
             v.parse()
                 .unwrap_or_else(|_| die("--timeout must be a number of seconds"))
@@ -1584,9 +1584,9 @@ pub fn run(raw: Vec<String>) -> ! {
         .unwrap_or(DEFAULT_TIMEOUT_SECS);
 
     let reply_to = args
-        .flag("reply-to")
+        .flag_before_sep("reply-to")
         .map(str::to_string)
-        .or_else(|| args.flag("from").map(str::to_string))
+        .or_else(|| args.flag_before_sep("from").map(str::to_string))
         .or_else(default_reply_to)
         .unwrap_or_else(|| {
             die("no --reply-to given and this directory has no registered session; pass --reply-to <name-or-id> (see `relay whoami`)")
@@ -1598,7 +1598,10 @@ pub fn run(raw: Vec<String>) -> ! {
         .unwrap_or_else(|| "relay".to_string());
 
     let perm = perm_args(&tool, read_only, full_access);
-    let fanout_mode = match (args.has("fanout"), args.has("worktree")) {
+    let fanout_mode = match (
+        args.has_before_sep("fanout"),
+        args.has_before_sep("worktree"),
+    ) {
         (true, false) => Some(FanoutMode::Root),
         (false, true) => Some(FanoutMode::Child),
         (false, false) => None,
@@ -1606,7 +1609,7 @@ pub fn run(raw: Vec<String>) -> ! {
     };
     if let Some(mode) = fanout_mode {
         let parent_session_id = args
-            .flag("from")
+            .flag_before_sep("from")
             .unwrap_or_else(|| die("fanout spawn requires --from <session UUID>"));
         if server.is_some() {
             die("fanout spawn does not support --server");
@@ -1614,7 +1617,7 @@ pub fn run(raw: Vec<String>) -> ! {
         if read_only {
             die("fanout spawn does not support --read-only");
         }
-        if args.has("dry") {
+        if args.has_before_sep("dry") {
             die("fanout spawn does not support --dry");
         }
         if watch {
@@ -1628,17 +1631,17 @@ pub fn run(raw: Vec<String>) -> ! {
             model,
             effort,
             service_tier,
-            name: args.flag("name"),
+            name: args.flag_before_sep("name"),
             reply_to: &reply_to,
             timeout_secs,
             permissions: &perm,
-            json: args.has("json"),
+            json: args.has_before_sep("json"),
             task: &task,
         });
     }
     if tool == "codex" {
         if let Some(server) = server {
-            if args.has("dry") {
+            if args.has_before_sep("dry") {
                 let mut out: HashMap<String, JsonValue> = HashMap::new();
                 for (key, value) in [
                     ("action", "app-server-spawn"),
@@ -1671,7 +1674,7 @@ pub fn run(raw: Vec<String>) -> ! {
             run_appserver_spawn(AppServerSpawn {
                 server,
                 dir: &dir_s,
-                name: args.flag("name"),
+                name: args.flag_before_sep("name"),
                 reply_to: &reply_to,
                 task: &task,
                 model,
@@ -1703,7 +1706,7 @@ pub fn run(raw: Vec<String>) -> ! {
         &prompt,
     );
 
-    if args.has("dry") {
+    if args.has_before_sep("dry") {
         let mut m: std::collections::HashMap<String, tinyjson::JsonValue> =
             std::collections::HashMap::new();
         m.insert("tool".into(), tinyjson::JsonValue::from(tool.clone()));
@@ -1837,13 +1840,13 @@ pub fn run(raw: Vec<String>) -> ! {
         }
     }
     associate_spawn_log(&log_path, &id);
-    let name = args.flag("name");
+    let name = args.flag_before_sep("name");
     if name.is_some() || server.is_some() {
         store::register(&id, Some(&dir_s), name, Some(&tool), server).unwrap_or_else(|e| die(&e));
     }
     let display = name.map(str::to_string).unwrap_or_else(|| id.clone());
     if !watch {
-        if let Some(name) = args.flag("name") {
+        if let Some(name) = args.flag_before_sep("name") {
             println!("spawned {name} ({id}) in {dir_s}");
         } else {
             println!("spawned {id} in {dir_s}");

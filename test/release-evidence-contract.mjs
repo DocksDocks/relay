@@ -6,13 +6,18 @@ import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { deflateRawSync } from 'node:zlib';
 import { parse as parseYaml } from 'yaml';
 import {
   canonicalPlanView,
   validateDraftReceipt,
 } from '../../../plugins/docks/skills/productivity/plan-manager/scripts/legacy-review-records.mjs';
-import { canonicalPlanView as canonicalCurrentPlanView } from '../../../plugins/docks/skills/productivity/plan-manager/scripts/plan-run.mjs';
+import {
+  canonicalPlanView as canonicalCurrentPlanView,
+  canonicalVerificationResults,
+  createAffectedPathManifest,
+} from '../../../plugins/docks/skills/productivity/plan-manager/scripts/plan-run.mjs';
 import { gitRaw } from '../../../scripts/lib/session-relay-release-core.mjs';
 import { runFixture } from '../../../scripts/lib/session-relay-release-fixture.mjs';
 import {
@@ -30,6 +35,7 @@ import {
 } from '../../../scripts/lib/session-relay-release-preparation.mjs';
 import { verifyPreflight } from '../../../scripts/verify-session-relay-preflight.mjs';
 
+const REPO = fs.realpathSync.native(path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..'));
 const REPOSITORY_ID = 'DocksDocks/docks';
 const COMMIT = '1234567890abcdef1234567890abcdef12345678';
 const WORKFLOW_BLOB = 'abcdef1234567890abcdef1234567890abcdef12';
@@ -52,9 +58,30 @@ const CURRENT_RELEASE_TAG = 'session-relay--v0.14.0';
 const CURRENT_PUBLIC_VERSION = '0.12.0';
 const CURRENT_PUBLIC_TAG = 'cli-v0.12.0';
 const CURRENT_GOAL_ID = '8b89aabf-7336-4352-bc11-225bab67f9aa';
-const CURRENT_DOCKS_RUN_ID = 'a69dcd97-d1bd-46fc-9b6b-70e349e353fc';
+const CURRENT_DOCKS_RUN_ID = '88732ba0-ef06-411b-a31c-93705ccefb27';
 const CURRENT_PUBLIC_RUN_ID = '1f801952-705e-4c7e-a533-91026c013383';
-const CURRENT_DOCKS_PLAN_PATH = 'docs/plans/active/session-relay-correlated-results-release-completion.md';
+const CURRENT_DOCKS_PLAN_PATH = 'docs/plans/active/session-relay-correlated-results-release-remediation-v4.md';
+const CURRENT_DOCKS_SOURCE_BASE = '494881a0d973863d1ac8e233734c827eb6913ce8';
+const CURRENT_RED_TEST_PATH = 'plugins/session-relay/test/release-evidence-contract.mjs';
+const CURRENT_RED_PRODUCER_PATH = 'scripts/capture-tdd-red.mjs';
+const CURRENT_AFFECTED_PATHS = [
+  'plugins/session-relay/README.md',
+  'plugins/session-relay/rust/src/cli.rs',
+  'plugins/session-relay/rust/src/protocol.rs',
+  'plugins/session-relay/rust/src/spawn.rs',
+  'plugins/session-relay/rust/tests/protocol.rs',
+  'plugins/session-relay/test/companion-distribution-contract.mjs',
+  'plugins/session-relay/test/distribution-contract.mjs',
+  'plugins/session-relay/test/fanout-smoke.mjs',
+  'plugins/session-relay/test/fixtures/rust-test-inventory.json',
+  CURRENT_RED_TEST_PATH,
+  'plugins/session-relay/test/release-promotion-contract.mjs',
+  'plugins/session-relay/test/release-publication-contract.mjs',
+  'plugins/session-relay/test/remediation-contract.mjs',
+  'scripts/lib/session-relay-release-preparation.mjs',
+  'scripts/lib/session-relay-release-promotion.mjs',
+  'scripts/lib/session-relay-release-publication.mjs',
+];
 const CURRENT_PUBLIC_PLAN_PATH = 'docs/plans/active/session-relay-0.14.0-docks-kit-0.12.0-release.md';
 const HISTORICAL_RELEASE_PLAN_PATH = 'docs/plans/active/session-relay-linux-workspace-publication.md';
 const HISTORICAL_RECEIPT_SHA256 = Object.freeze({
@@ -2800,10 +2827,23 @@ function testLiveSourceCiAndPrepareDryRun() {
 }
 
 function currentSourcePreparationProofV2() {
-  const sourceCommit = '1'.repeat(40);
+  const sourceCommit = CURRENT_DOCKS_SOURCE_BASE;
   const redCommit = '2'.repeat(40);
   const implementationCommit = '3'.repeat(40);
   const reviewedCommit = implementationCommit;
+  const manifestPaths = CURRENT_AFFECTED_PATHS.map((logical) => ({
+    path: logical,
+    state: 'missing',
+    kind: null,
+    mode: null,
+    sha256: null,
+  }));
+  const manifest = {
+    schema: 1,
+    source_base: implementationCommit,
+    source_sha256: sha256(Buffer.from(jcs({ schema: 1, source_base: implementationCommit, paths: manifestPaths }))),
+    paths: manifestPaths,
+  };
   return {
     schema: 2,
     type: 'SourcePreparationProofV2',
@@ -2830,32 +2870,33 @@ function currentSourcePreparationProofV2() {
       type: 'TddRedReceiptV1',
       repository_id: REPOSITORY_ID,
       pre_production_commit: redCommit,
-      receipt_sha256: '4'.repeat(64),
-      test_blob_sha256: '5'.repeat(64),
-      expected_failure_sha256: '6'.repeat(64),
+      test_paths: [{ path: CURRENT_RED_TEST_PATH, blob_id: 'a'.repeat(40) }],
       command: {
-        cwd: '/home/vagrant/projects/docks',
-        argv: ['node', 'plugins/session-relay/test/release-evidence-contract.mjs'],
+        cwd: REPO,
+        argv: [process.execPath, '-e', 'process.exit(17)'],
       },
-      expected_exit_code: 1,
-      observed_exit_code: 1,
-      failure_signature: 'SourcePreparationProofV2 is not implemented',
+      exit_code: 17,
       stdout_sha256: '8'.repeat(64),
       stderr_sha256: '9'.repeat(64),
-      test_blobs: [
-        {
-          path: 'plugins/session-relay/test/release-evidence-contract.mjs',
-          blob_id: 'a'.repeat(40),
-        },
-      ],
-      observed_before_implementation: true,
+      captured_at: '2026-07-25T13:55:00.000Z',
+      producer: {
+        path: CURRENT_RED_PRODUCER_PATH,
+        blob_id: 'b'.repeat(40),
+        version: '1',
+      },
     },
     completion_review: {
       schema: 1,
       type: 'CompletionReviewV1',
       reviewed_commit: reviewedCommit,
+      diff_sha256: '6'.repeat(64),
       result_sha256: '7'.repeat(64),
       verdict: 'pass',
+    },
+    acceptance: {
+      manifest,
+      verification_sha256: '5'.repeat(64),
+      changed_paths: [CURRENT_RED_TEST_PATH],
     },
     ancestry: {
       source_to_red: true,
@@ -2892,19 +2933,114 @@ function bindCurrentCompletionFixture(
     version = CURRENT_RELEASE_VERSION,
     transformPlan = (plan) => plan,
     brokenAncestry = null,
-    implementationBlob = 'a'.repeat(40),
+    implementationBlob = null,
   },
 ) {
-  const sourceCommit = '1'.repeat(40);
-  const redCommit = '2'.repeat(40);
-  const implementationCommit = '3'.repeat(40);
-  const testPath = 'plugins/session-relay/test/release-evidence-contract.mjs';
-  const testBlob = 'a'.repeat(40);
-  const sourceSha256 = 'b'.repeat(64);
-  const completionDiffSha256 = 'c'.repeat(64);
-  const red = structuredClone(currentSourcePreparationProofV2().tdd_red);
-  red.pre_production_commit = redCommit;
-  red.test_blobs = [{ path: testPath, blob_id: testBlob }];
+  const clonePath = path.join(temp, `current-completion-${name}`);
+  const cloned = spawnSync('git', ['clone', '--quiet', '--no-hardlinks', REPO, clonePath], {
+    cwd: temp,
+    encoding: 'utf8',
+    shell: false,
+  });
+  assert.equal(cloned.status, 0, cloned.stderr);
+  const root = fs.realpathSync.native(clonePath);
+  const runGit = (args, { bytes = false, env = process.env } = {}) => {
+    const result = spawnSync('git', args, {
+      cwd: root,
+      encoding: bytes ? null : 'utf8',
+      env,
+      shell: false,
+      maxBuffer: Infinity,
+    });
+    if (result.error) throw result.error;
+    if (result.signal !== null || result.status !== 0) {
+      throw new Error(`git ${args.join(' ')} failed: ${String(result.stderr).trim()}`);
+    }
+    return bytes ? result.stdout : result.stdout.trim();
+  };
+  for (const args of [
+    ['config', 'user.name', 'Session Relay Evidence Contract'],
+    ['config', 'user.email', 'relay-evidence@example.invalid'],
+    ['config', 'commit.gpgsign', 'false'],
+    ['checkout', '--quiet', '--detach', CURRENT_DOCKS_SOURCE_BASE],
+  ]) {
+    runGit(args);
+  }
+  const commitFixture = (message, timestamp) => {
+    runGit(['commit', '--quiet', '-m', message], {
+      env: {
+        ...process.env,
+        GIT_AUTHOR_DATE: timestamp,
+        GIT_COMMITTER_DATE: timestamp,
+      },
+    });
+    return runGit(['rev-parse', 'HEAD^{commit}']);
+  };
+  const copyFromRepository = (logical) => {
+    const target = path.join(root, ...logical.split('/'));
+    fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
+    fs.copyFileSync(path.join(REPO, ...logical.split('/')), target);
+  };
+
+  copyFromRepository(CURRENT_DOCKS_PLAN_PATH);
+  copyFromRepository(CURRENT_RED_TEST_PATH);
+  runGit(['add', '--', CURRENT_DOCKS_PLAN_PATH, CURRENT_RED_TEST_PATH]);
+  const redCommit = commitFixture('test: bind current release evidence fixture', '2026-07-25T13:50:00.000Z');
+  const redReceiptPath = path.join(temp, `current-completion-${name}-red.json`);
+  const redCapture = spawnSync(
+    process.execPath,
+    [
+      path.join(root, CURRENT_RED_PRODUCER_PATH),
+      '--repo',
+      root,
+      '--repository-id',
+      REPOSITORY_ID,
+      '--pre-production-commit',
+      redCommit,
+      '--test',
+      CURRENT_RED_TEST_PATH,
+      '--receipt-out',
+      redReceiptPath,
+      '--',
+      process.execPath,
+      '-e',
+      'process.exit(17)',
+    ],
+    { cwd: root, encoding: 'utf8', shell: false },
+  );
+  assert.equal(redCapture.status, 0, redCapture.stderr);
+  const red = JSON.parse(fs.readFileSync(redReceiptPath, 'utf8'));
+  validateTddRedReceipt(red, { repositoryId: REPOSITORY_ID });
+  assert.equal(red.exit_code, 17);
+
+  fs.appendFileSync(
+    path.join(root, 'scripts/lib/session-relay-release-preparation.mjs'),
+    '\n// Current release-evidence contract implementation fixture.\n',
+  );
+  runGit(['add', '--', 'scripts/lib/session-relay-release-preparation.mjs']);
+  const implementationCommit = commitFixture('fix: bind current release evidence fixture', '2026-07-25T14:00:00.000Z');
+  const sourceCommit = CURRENT_DOCKS_SOURCE_BASE;
+  const acceptanceManifest = createAffectedPathManifest({
+    repo: root,
+    paths: CURRENT_AFFECTED_PATHS,
+    sourceBase: implementationCommit,
+  });
+  const completionDiffBytes = runGit(
+    [
+      'diff',
+      '--binary',
+      '--full-index',
+      '--find-renames',
+      '--no-ext-diff',
+      '--no-textconv',
+      '--no-color',
+      sourceCommit,
+      implementationCommit,
+      '--',
+    ],
+    { bytes: true },
+  );
+  const completionDiffSha256 = sha256(completionDiffBytes);
   const completionReview = {
     schema: 1,
     run_id: CURRENT_DOCKS_RUN_ID,
@@ -2916,127 +3052,103 @@ function bindCurrentCompletionFixture(
   };
   const completionReviewJcs = jcs(completionReview);
   const completionReviewSha256 = sha256(Buffer.from(completionReviewJcs));
-  const renderPlan = (run, draftReview = {}, completion = {}) => `---
-title: Current completion fixture
-goal: Bind the reviewed Session Relay source proof.
-status: ongoing
-created: "2026-07-25T13:24:00.000Z"
-updated: "2026-07-25T14:00:00.000Z"
-started_at: "2026-07-25T13:38:39.988Z"
-finished_at: null
-affected_paths:
-  - plugins/session-relay/test/release-evidence-contract.mjs
----
-
-# Current completion fixture
-
-Plan-run: ${jcs(run)}
-
-## Goal
-
-Bind the reviewed source, red evidence, implementation, completion review, and release tag.
-
-## Review
-
-Review-result: ${jcs(draftReview)}
-Review-result: ${jcs(completion)}
-
-## Verification Results
-
-TDD-red-evidence: ${jcs(red)}
-- Focused current release evidence passed on the reviewed implementation.
-`;
-  const planSha256 = sha256(canonicalCurrentPlanView(Buffer.from(renderPlan({}))));
-  const draftReview = {
-    schema: 1,
-    run_id: CURRENT_DOCKS_RUN_ID,
-    invocation: 1,
-    plan_sha256: planSha256,
-    source_sha256: sourceSha256,
-    verdict: 'pass',
-    findings: [],
-  };
+  const template = fs.readFileSync(path.join(REPO, CURRENT_DOCKS_PLAN_PATH), 'utf8');
+  const runMatch = /^Plan-run: (\{.*\})$/m.exec(template);
+  assert.ok(runMatch, 'active remediation v4 PlanRun fixture is absent');
+  const templateRun = JSON.parse(runMatch[1]);
+  let plan = template.replace(
+    /## Verification Results\n[\s\S]*$/u,
+    `## Verification Results\n\nTDD-red-evidence: ${jcs(red)}\n- Focused current release evidence passed on the reviewed implementation.\n`,
+  );
+  plan = plan.replace(
+    '\n## Verification Results\n',
+    `\nCompletion-review-result: ${completionReviewJcs}\n\n## Verification Results\n`,
+  );
+  const verificationSha256 = sha256(Buffer.from(canonicalVerificationResults(Buffer.from(plan))));
+  const completionInputSha256 = sha256(
+    Buffer.from(
+      jcs({
+        schema: 1,
+        type: 'CurrentReleaseEvidenceCompletionBundleFixtureV1',
+        run_id: CURRENT_DOCKS_RUN_ID,
+        implementation_commit: implementationCommit,
+        acceptance_source_sha256: acceptanceManifest.source_sha256,
+      }),
+    ),
+  );
+  assert.notEqual(completionInputSha256, completionDiffSha256);
   const run = {
-    schema: 1,
-    goal_id: CURRENT_GOAL_ID,
-    run_id: CURRENT_DOCKS_RUN_ID,
-    repository_id: REPOSITORY_ID,
-    plan_path: CURRENT_DOCKS_PLAN_PATH,
-    requested_effects: ['local', 'probe', 'push', 'release'],
-    risk: 'external',
-    plan_sha256: planSha256,
-    source_base: sourceCommit,
-    source_sha256: sourceSha256,
-    draft_review: {
-      state: 'passed',
-      invocations: 1,
-      input_sha256: planSha256,
-      result_sha256: sha256(Buffer.from(jcs(draftReview))),
-    },
+    ...templateRun,
     execution_parent: sourceCommit,
     implementation_commit: implementationCommit,
     completion_review: {
       state: 'passed',
       invocations: 1,
-      input_sha256: completionDiffSha256,
+      input_sha256: completionInputSha256,
       result_sha256: completionReviewSha256,
     },
     acceptance: {
-      source_sha256: 'd'.repeat(64),
-      verification_sha256: 'e'.repeat(64),
+      source_sha256: acceptanceManifest.source_sha256,
+      verification_sha256: verificationSha256,
     },
     blocker: null,
+    goal_id: CURRENT_GOAL_ID,
+    run_id: CURRENT_DOCKS_RUN_ID,
+    plan_path: CURRENT_DOCKS_PLAN_PATH,
+    source_base: sourceCommit,
   };
+  plan = plan.replace(/^Plan-run: \{.*\}$/m, `Plan-run: ${jcs(run)}`);
+  assert.equal(sha256(canonicalCurrentPlanView(Buffer.from(plan))), templateRun.plan_sha256);
   const fixtureContext = {
+    acceptanceManifest,
+    completionDiffSha256,
     red,
     run,
     completionReview,
     completionReviewSha256,
   };
-  const plan = transformPlan(renderPlan(run, draftReview, completionReview), fixtureContext);
-  const root = path.join(temp, `current-completion-${name}`);
+  plan = transformPlan(plan, fixtureContext);
   const planPath = path.join(root, CURRENT_DOCKS_PLAN_PATH);
-  fs.mkdirSync(path.dirname(planPath), { recursive: true, mode: 0o700 });
   fs.writeFileSync(planPath, plan);
   const receiptOut = path.join(root, 'source-proof-v2.json');
   const calls = { ancestry: [] };
-  const ancestry = [
-    ['source-to-red', sourceCommit, redCommit],
-    ['red-to-implementation', redCommit, implementationCommit],
-    ['implementation-to-reviewed', implementationCommit, implementationCommit],
-    ['reviewed-to-tag', implementationCommit, implementationCommit],
-  ];
-  let ancestryIndex = 0;
+  const ancestry = new Map([
+    [`${sourceCommit}\0${redCommit}`, 'source-to-red'],
+    [`${redCommit}\0${implementationCommit}`, 'red-to-implementation'],
+    [`${implementationCommit}\0${implementationCommit}`, 'implementation-to-reviewed'],
+  ]);
+  let implementationSelfCalls = 0;
   const adapter = {
     repoRoot: root,
     git(args) {
-      if (args[0] === 'rev-parse') {
-        const revision = args[1];
-        if (revision === `${sourceCommit}^{commit}`) return sourceCommit;
-        if (revision === `${redCommit}^{commit}`) return redCommit;
-        if (revision === `${implementationCommit}^{commit}`) return implementationCommit;
-        if (revision === `${redCommit}:${testPath}`) return testBlob;
-        if (revision === `${implementationCommit}:${testPath}`) return implementationBlob;
+      if (
+        implementationBlob !== null &&
+        args[0] === 'rev-parse' &&
+        args[1] === `${implementationCommit}:${CURRENT_RED_TEST_PATH}`
+      ) {
+        return implementationBlob;
       }
       if (args[0] === 'merge-base' && args[1] === '--is-ancestor') {
-        const expected = ancestry[ancestryIndex];
-        assert.ok(expected, `unexpected current ancestry call: ${args.join(' ')}`);
-        assert.deepEqual(args, ['merge-base', '--is-ancestor', expected[1], expected[2]]);
-        ancestryIndex += 1;
-        calls.ancestry.push(expected[0]);
-        if (brokenAncestry === expected[0]) throw new Error(`${expected[0]} is not ancestral`);
-        return '';
+        const key = `${args[2]}\0${args[3]}`;
+        let label = ancestry.get(key);
+        if (key === `${implementationCommit}\0${implementationCommit}`) {
+          label = implementationSelfCalls === 0 ? 'implementation-to-reviewed' : 'reviewed-to-tag';
+          implementationSelfCalls += 1;
+        }
+        assert.ok(label, `unexpected current ancestry call: ${args.join(' ')}`);
+        calls.ancestry.push(label);
+        if (brokenAncestry === label) throw new Error(`${label} is not ancestral`);
       }
-      assert.fail(`unexpected current completion git call: ${args.join(' ')}`);
+      return runGit(args, { bytes: true });
     },
     inspectPublic() {
-      assert.fail('current source binding must not inspect public state');
+      assert.fail('current source binding must not inspect or mutate public state');
     },
     run() {
       assert.fail('current source binding must not execute commands');
     },
     now() {
-      return '2026-07-25T14:00:00.000Z';
+      return '2026-07-25T14:30:00.000Z';
     },
     readFile(file) {
       assert.equal(file, planPath);
@@ -3054,7 +3166,7 @@ TDD-red-evidence: ${jcs(red)}
     sourceCommit,
     redCommit,
     implementationCommit,
-    testBlob,
+    testBlob: red.test_paths[0].blob_id,
     planPath,
     receiptOut,
     calls,
@@ -3070,6 +3182,16 @@ function testCurrentCompletionBinding(temp) {
   assert.equal(generated.result.receipt.implementation_commit, generated.implementationCommit);
   assert.equal(generated.result.receipt.tag_commit, generated.implementationCommit);
   assert.equal(generated.result.receipt.completion_review.result_sha256, generated.completionReviewSha256);
+  assert.equal(generated.result.receipt.completion_review.diff_sha256, generated.completionDiffSha256);
+  assert.deepEqual(generated.result.receipt.acceptance, {
+    manifest: generated.acceptanceManifest,
+    verification_sha256: generated.run.acceptance.verification_sha256,
+    changed_paths: [
+      CURRENT_DOCKS_PLAN_PATH,
+      CURRENT_RED_TEST_PATH,
+      'scripts/lib/session-relay-release-preparation.mjs',
+    ].sort(),
+  });
   assert.deepEqual(generated.result.receipt.tdd_red, generated.red);
   assert.deepEqual(generated.result.receipt.plan_run, {
     schema: 1,
@@ -3122,8 +3244,8 @@ function testCurrentCompletionBinding(temp) {
   const completionLabeled = bindCurrentCompletionFixture(temp, {
     name: 'completion-review-result-label',
     transformPlan(plan, { completionReview }) {
-      const line = `Review-result: ${jcs(completionReview)}`;
-      assert.ok(plan.includes(line), 'fixture plan must embed the completion Review-result line');
+      const line = `Completion-review-result: ${jcs(completionReview)}`;
+      assert.ok(plan.includes(line), 'fixture plan must embed the completion Completion-review-result line');
       const repair = structuredClone(completionReview);
       repair.verdict = 'repair';
       repair.findings = [
@@ -3135,10 +3257,7 @@ function testCurrentCompletionBinding(temp) {
           locator: 'scripts/lib/session-relay-release-promotion.mjs',
         },
       ];
-      return plan.replace(
-        line,
-        `Completion-review-result: ${jcs(repair)}\nCompletion-review-result: ${jcs(completionReview)}`,
-      );
+      return plan.replace(line, `Review-result: ${jcs(repair)}\n${line}`);
     },
   });
   assert.equal(
@@ -3217,8 +3336,8 @@ function testCurrentCompletionBinding(temp) {
         name: 'plan-drift',
         transformPlan(plan) {
           return plan.replace(
-            'Bind the reviewed source, red evidence, implementation, completion review, and release tag.',
-            'Bind substituted source evidence, implementation, completion review, and release tag.',
+            'Fix the terminal typed-drain mail-loss finding',
+            'Substitute the terminal typed-drain mail-loss finding',
           );
         },
       }),
@@ -3238,6 +3357,7 @@ function testCurrentCorrelatedReleaseEvidence() {
 
   const proof = currentSourcePreparationProofV2();
   assert.deepEqual(Object.keys(proof).sort(), [
+    'acceptance',
     'ancestry',
     'companion',
     'completion_review',
@@ -3263,11 +3383,12 @@ function testCurrentCorrelatedReleaseEvidence() {
   assert.equal(proof.companion.package, 'docks-kit');
   assert.equal(proof.companion.npm_version, CURRENT_PUBLIC_VERSION);
   assert.equal(proof.companion.goal_id, proof.goal_id);
-  assert.equal(proof.tdd_red.observed_before_implementation, true);
-  assert.equal(proof.tdd_red.expected_exit_code, 1);
-  assert.equal(proof.tdd_red.observed_exit_code, 1);
-  assert.equal(proof.tdd_red.test_blobs.length, 1);
+  assert.equal(proof.tdd_red.exit_code, 17);
+  assert.equal(proof.tdd_red.test_paths.length, 1);
+  assert.equal(proof.tdd_red.producer.path, CURRENT_RED_PRODUCER_PATH);
   assert.equal(proof.completion_review.reviewed_commit, proof.implementation_commit);
+  assert.match(proof.completion_review.diff_sha256, /^[0-9a-f]{64}$/);
+  assert.deepEqual(proof.acceptance.changed_paths, [CURRENT_RED_TEST_PATH]);
   assert.deepEqual(proof.ancestry, {
     source_to_red: true,
     red_to_implementation: true,
@@ -3279,11 +3400,11 @@ function testCurrentCorrelatedReleaseEvidence() {
 
   for (const [label, mutate, pattern] of [
     [
-      'red receipt captured after implementation',
+      'red receipt captured at the implementation commit',
       (value) => {
-        value.tdd_red.observed_before_implementation = false;
+        value.tdd_red.pre_production_commit = value.implementation_commit;
       },
-      /red|production|implementation|order/i,
+      /red|source|implementation|distinct|precede/i,
     ],
     [
       'completion review bound to another commit',
@@ -3291,6 +3412,13 @@ function testCurrentCorrelatedReleaseEvidence() {
         value.completion_review.reviewed_commit = '8'.repeat(40);
       },
       /review|commit|identity/i,
+    ],
+    [
+      'tampered acceptance manifest',
+      (value) => {
+        value.acceptance.manifest.source_sha256 = '0'.repeat(64);
+      },
+      /acceptance|manifest|source_sha256/i,
     ],
     [
       'broken reviewed source ancestry',

@@ -1038,6 +1038,20 @@ fn stale_reply_pending_of_terminal(stale: &ClaimStatusV1, authoritative: &ClaimS
         && authoritative.reply_sha256 == stale.reply_sha256
 }
 
+/// One parsed mailbox row. Typed envelopes own their validated message while
+/// legacy rows borrow their exact bytes from the single raw mailbox snapshot.
+enum MailboxRow<'a> {
+    Typed {
+        line: &'a str,
+        message: MessageV2,
+        deliver: bool,
+    },
+    Legacy {
+        line: &'a str,
+        exact: &'a str,
+    },
+}
+
 #[derive(Clone)]
 pub struct ProtocolStore {
     root: PathBuf,
@@ -1660,69 +1674,128 @@ impl ProtocolStore {
     ) -> Result<(Vec<JsonValue>, String), ProtocolError> {
         self.recover_pending_locked()?;
         let raw = fs::read_to_string(self.mailbox_path(recipient_id)).unwrap_or_default();
-        let mut messages = Vec::new();
-        for line in raw.lines().filter(|line| !line.is_empty()) {
-            let Ok(value) = line.parse::<JsonValue>() else {
-                continue;
-            };
-            let is_typed = value
-                .get::<HashMap<String, JsonValue>>()
-                .is_some_and(|object| object.contains_key("schema"));
-            let deliver = if is_typed {
-                let message = MessageV2::from_tinyjson(&value).map_err(ProtocolError::store)?;
-                if message.to_session_id != recipient_id {
-                    return Err(ProtocolError::store(
-                        "typed mailbox recipient binding mismatch",
-                    ));
+        let rows = self.preflight_mailbox_locked(recipient_id, &raw)?;
+
+        // Rendering is part of preflight: no claim may transition if a typed
+        // row cannot be represented after its authority check succeeds.
+        let mut messages = Vec::with_capacity(rows.len());
+        for row in &rows {
+            match row {
+                MailboxRow::Typed {
+                    line,
+                    deliver: true,
+                    ..
+                } => {
+                    let value = line
+                        .parse::<JsonValue>()
+                        .map_err(|_| ProtocolError::store("malformed typed mailbox row"))?;
+                    messages.push(value);
                 }
-                self.consume_message_locked(&message)?
-            } else {
-                true
-            };
-            if deliver {
-                messages.push(value);
+                MailboxRow::Typed { .. } => {}
+                MailboxRow::Legacy { line, .. } => {
+                    if let Ok(value) = line.parse::<JsonValue>() {
+                        messages.push(value);
+                    }
+                }
             }
         }
+
+        for row in &rows {
+            if let MailboxRow::Typed {
+                message,
+                deliver: true,
+                ..
+            } = row
+            {
+                if !self.consume_message_locked(message)? {
+                    return Err(ProtocolError::store(
+                        "typed mailbox claim changed after preflight",
+                    ));
+                }
+            }
+        }
+        drop(rows);
         Ok((messages, raw))
     }
 
-    fn typed_mailbox(
+    /// Parse and validate a complete mailbox snapshot without writing. Exact
+    /// typed duplicates share one logical delivery; conflicting reuse of a
+    /// message id fails before any caller can consume the first row.
+    fn preflight_mailbox_locked<'a>(
         &self,
         recipient_id: &str,
-    ) -> Result<(Vec<MessageV2>, Vec<String>), ProtocolError> {
-        let raw = fs::read_to_string(self.mailbox_path(recipient_id)).unwrap_or_default();
-        let mut typed = Vec::new();
-        let mut legacy = Vec::new();
-        for line in raw.lines() {
-            match parse_jcs(line.as_bytes(), false).and_then(MessageV2::from_jcs) {
-                Ok(message) if message.to_session_id == recipient_id => typed.push(message),
-                Ok(_) => {
-                    return Err(ProtocolError::store(
-                        "typed mailbox recipient binding mismatch",
-                    ));
-                }
+        raw: &'a str,
+    ) -> Result<Vec<MailboxRow<'a>>, ProtocolError> {
+        let mut rows: Vec<MailboxRow<'a>> = Vec::new();
+        let mut message_ids: HashMap<String, usize> = HashMap::new();
+
+        for exact in raw.split_inclusive('\n') {
+            let line = exact.strip_suffix('\n').unwrap_or(exact);
+            let message = match parse_jcs(line.as_bytes(), false).and_then(MessageV2::from_jcs) {
+                Ok(message) => message,
                 Err(_) => {
-                    let typed_looking = line
-                        .parse::<JsonValue>()
-                        .ok()
-                        .and_then(|value| value.get::<HashMap<String, JsonValue>>().cloned())
-                        .is_some_and(|object| object.contains_key("schema"));
+                    let typed_looking = line.parse::<JsonValue>().ok().is_some_and(|value| {
+                        value
+                            .get::<HashMap<String, JsonValue>>()
+                            .is_some_and(|object| object.contains_key("schema"))
+                    });
                     if typed_looking {
                         return Err(ProtocolError::store("malformed typed mailbox row"));
                     }
-                    legacy.push(line.to_string());
+                    rows.push(MailboxRow::Legacy { line, exact });
+                    continue;
                 }
+            };
+
+            if message.to_session_id != recipient_id {
+                return Err(ProtocolError::store(
+                    "typed mailbox recipient binding mismatch",
+                ));
             }
+
+            let duplicate = if let Some(index) = message_ids.get(&message.id) {
+                match &rows[*index] {
+                    MailboxRow::Typed {
+                        message: existing, ..
+                    } if existing == &message => true,
+                    MailboxRow::Typed { .. } => {
+                        return Err(ProtocolError::store(
+                            "mailbox message id has different bytes",
+                        ));
+                    }
+                    MailboxRow::Legacy { .. } => {
+                        unreachable!("typed message id index must address a typed row")
+                    }
+                }
+            } else {
+                false
+            };
+
+            let deliver = !duplicate && self.peek_message_locked(&message)?;
+            if !duplicate {
+                message_ids.insert(message.id.clone(), rows.len());
+            }
+            rows.push(MailboxRow::Typed {
+                line,
+                message,
+                deliver,
+            });
         }
-        Ok((typed, legacy))
+        Ok(rows)
     }
 
     pub fn peek_typed(&self, recipient_id: &str) -> Result<Vec<MessageV2>, ProtocolError> {
         self.locked(|| {
-            let (typed, _legacy) = self.typed_mailbox(recipient_id)?;
-            let mut deliverable = Vec::with_capacity(typed.len());
-            for message in typed {
-                if self.peek_message_locked(&message)? {
+            let raw = fs::read_to_string(self.mailbox_path(recipient_id)).unwrap_or_default();
+            let rows = self.preflight_mailbox_locked(recipient_id, &raw)?;
+            let mut deliverable = Vec::new();
+            for row in rows {
+                if let MailboxRow::Typed {
+                    message,
+                    deliver: true,
+                    ..
+                } = row
+                {
                     deliverable.push(message);
                 }
             }
@@ -1765,20 +1838,55 @@ impl ProtocolStore {
     pub fn drain_typed(&self, recipient_id: &str) -> Result<Vec<MessageV2>, ProtocolError> {
         self.locked(|| {
             self.recover_pending_locked()?;
-            let (typed, legacy) = self.typed_mailbox(recipient_id)?;
-            let mut delivered = Vec::with_capacity(typed.len());
-            for message in typed {
-                if self.consume_message_locked(&message)? {
+            let raw = fs::read_to_string(self.mailbox_path(recipient_id)).unwrap_or_default();
+            let rows = self.preflight_mailbox_locked(recipient_id, &raw)?;
+
+            let legacy_len = rows
+                .iter()
+                .map(|row| match row {
+                    MailboxRow::Legacy { exact, .. } => exact.len(),
+                    MailboxRow::Typed { .. } => 0,
+                })
+                .sum();
+            let mut legacy = String::with_capacity(legacy_len);
+            for row in &rows {
+                if let MailboxRow::Legacy { exact, .. } = row {
+                    legacy.push_str(exact);
+                }
+            }
+
+            for row in &rows {
+                if let MailboxRow::Typed {
+                    message,
+                    deliver: true,
+                    ..
+                } = row
+                {
+                    if !self.consume_message_locked(message)? {
+                        return Err(ProtocolError::store(
+                            "typed mailbox claim changed after preflight",
+                        ));
+                    }
+                }
+            }
+
+            let mut delivered = Vec::new();
+            for row in rows {
+                if let MailboxRow::Typed {
+                    message,
+                    deliver: true,
+                    ..
+                } = row
+                {
                     delivered.push(message);
                 }
             }
+
             let path = self.mailbox_path(recipient_id);
             if legacy.is_empty() {
                 let _ = fs::remove_file(path);
-            } else {
-                let mut text = legacy.join("\n");
-                text.push('\n');
-                store::atomic_write_private(&path, &text).map_err(ProtocolError::store)?;
+            } else if legacy.len() != raw.len() {
+                store::atomic_write_private(&path, &legacy).map_err(ProtocolError::store)?;
             }
             Ok(delivered)
         })

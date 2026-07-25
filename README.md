@@ -18,8 +18,8 @@ The existing fire-and-forget interfaces are unchanged:
 
 ```bash
 session-relay send <to> [--from <session>] -- <message>
-session-relay inbox [--id <session>]
-session-relay peek [--id <session>]
+session-relay inbox <nameOrId>
+session-relay peek <nameOrId>
 ```
 
 Existing `send`, `inbox`, `peek`, `handback`, and default `collect` syntax, JSON, and human-readable output remain the compatibility surface. Legacy JSONL records remain readable and are not rewritten as typed messages.

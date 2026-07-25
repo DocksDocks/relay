@@ -65,8 +65,9 @@ const CURRENT_RELEASE_TAG = 'session-relay--v0.14.0';
 const CURRENT_PUBLIC_VERSION = '0.12.0';
 const CURRENT_PUBLIC_TAG = 'cli-v0.12.0';
 const CURRENT_GOAL_ID = '8b89aabf-7336-4352-bc11-225bab67f9aa';
-const CURRENT_DOCKS_RUN_ID = 'a69dcd97-d1bd-46fc-9b6b-70e349e353fc';
-const CURRENT_DOCKS_PLAN_PATH = 'docs/plans/active/session-relay-correlated-results-release-completion.md';
+const CURRENT_DOCKS_RUN_ID = '88732ba0-ef06-411b-a31c-93705ccefb27';
+const CURRENT_DOCKS_PLAN_PATH = 'docs/plans/active/session-relay-correlated-results-release-remediation-v4.md';
+const CURRENT_DOCKS_SOURCE_BASE = '494881a0d973863d1ac8e233734c827eb6913ce8';
 const CURRENT_PUBLIC_RUN_ID = '1f801952-705e-4c7e-a533-91026c013383';
 const CURRENT_PUBLIC_PLAN_PATH = 'docs/plans/finished/2026-07-25-session-relay-0.14.0-docks-kit-0.12.0-release.md';
 const HISTORICAL_RELEASE_PLAN_PATH = 'docs/plans/active/session-relay-linux-workspace-publication.md';
@@ -1880,9 +1881,17 @@ function verifyCurrentPublicBoundary(directory, boundary, observation, output) {
 }
 
 function currentPromotionProofV2() {
-  const sourceCommit = '1'.repeat(40);
+  const sourceCommit = CURRENT_DOCKS_SOURCE_BASE;
   const redCommit = '2'.repeat(40);
   const implementationCommit = 'a'.repeat(40);
+  const proofPath = 'plugins/session-relay/test/release-promotion-contract.mjs';
+  const manifestPaths = [{ path: proofPath, state: 'missing', kind: null, mode: null, sha256: null }];
+  const manifest = {
+    schema: 1,
+    source_base: implementationCommit,
+    source_sha256: hash({ schema: 1, source_base: implementationCommit, paths: manifestPaths }),
+    paths: manifestPaths,
+  };
   return {
     schema: 2,
     type: 'SourcePreparationProofV2',
@@ -1909,32 +1918,33 @@ function currentPromotionProofV2() {
       type: 'TddRedReceiptV1',
       repository_id: 'DocksDocks/docks',
       pre_production_commit: redCommit,
-      receipt_sha256: DIGEST('4'),
-      test_blob_sha256: DIGEST('5'),
-      expected_failure_sha256: DIGEST('6'),
+      test_paths: [{ path: proofPath, blob_id: '3'.repeat(40) }],
       command: {
         cwd: '/home/vagrant/projects/docks',
-        argv: ['node', 'plugins/session-relay/test/release-promotion-contract.mjs'],
+        argv: ['node', proofPath],
       },
-      expected_exit_code: 1,
-      observed_exit_code: 1,
-      failure_signature: 'current stable promotion was not implemented',
+      exit_code: 17,
       stdout_sha256: DIGEST('8'),
       stderr_sha256: DIGEST('9'),
-      test_blobs: [
-        {
-          path: 'plugins/session-relay/test/release-promotion-contract.mjs',
-          blob_id: '3'.repeat(40),
-        },
-      ],
-      observed_before_implementation: true,
+      captured_at: '2026-07-25T13:55:00.000Z',
+      producer: {
+        path: 'scripts/capture-tdd-red.mjs',
+        blob_id: '4'.repeat(40),
+        version: '1',
+      },
     },
     completion_review: {
       schema: 1,
       type: 'CompletionReviewV1',
       reviewed_commit: implementationCommit,
+      diff_sha256: DIGEST('6'),
       result_sha256: DIGEST('7'),
       verdict: 'pass',
+    },
+    acceptance: {
+      manifest,
+      verification_sha256: DIGEST('5'),
+      changed_paths: [proofPath],
     },
     ancestry: {
       source_to_red: true,

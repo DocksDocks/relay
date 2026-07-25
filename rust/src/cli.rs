@@ -96,12 +96,26 @@ impl Args {
             .map(String::as_str)
             .filter(|v| !v.is_empty())
     }
+    // First --name <value> before the `--` separator; message tokens are opaque.
+    pub(crate) fn flag_before_sep(&self, name: &str) -> Option<&str> {
+        let key = format!("--{name}");
+        let end = self
+            .0
+            .iter()
+            .position(|value| value == "--")
+            .unwrap_or(self.0.len());
+        let index = self.0[..end].iter().position(|value| value == &key)?;
+        self.0[..end]
+            .get(index + 1)
+            .map(String::as_str)
+            .filter(|value| !value.is_empty())
+    }
     pub(crate) fn has(&self, name: &str) -> bool {
         self.0.iter().any(|a| a == &format!("--{name}"))
     }
     // Boolean flag present before the `--` separator; text after the separator
     // is verbatim message body and never parsed as options.
-    fn has_before_sep(&self, name: &str) -> bool {
+    pub(crate) fn has_before_sep(&self, name: &str) -> bool {
         let key = format!("--{name}");
         self.0
             .iter()
@@ -129,7 +143,7 @@ impl Args {
             .map(Some)
             .ok_or_else(|| format!("--{name} requires a value"))
     }
-    fn unique_flag_before_sep(&self, name: &str) -> Result<Option<&str>, String> {
+    pub(crate) fn unique_flag_before_sep(&self, name: &str) -> Result<Option<&str>, String> {
         let key = format!("--{name}");
         let end = self
             .0
