@@ -5,8 +5,8 @@
 //   relay list
 //   relay register <name> --id <uuid> [--dir <path>] [--tool claude|codex]
 //   relay send <to> [--] <message...>            (or: send --id <id> [--] <message...>)
-//   relay request <to> --from <registered> [--] <message...>
-//   relay reply <correlation-id> --from <registered> --status completed|failed [--] <message...>
+//   relay request <to> [--from <registered>] [--json] [--] <message...>
+//   relay reply <correlation-id> [--from <registered>] --status completed|failed [--] <message...>
 //   relay inbox <nameOrId>
 //   relay peek <nameOrId>                        (read-only: inbox without draining)
 //   relay attach <nameOrId> [--exec]             (interactive human takeover)
@@ -71,6 +71,19 @@ fn protocol_identity(identity: &str) -> store::Entry {
     })
 }
 
+// The registered current-project self identity — the cwd marker written by the
+// SessionStart hook, resolved against the registry. Same dir-marker fallback
+// the MCP bus uses when a `request`/`reply` tool call omits `from`.
+fn protocol_self_identity() -> store::Entry {
+    let cwd = cwd_string();
+    let Some(id) = store::id_for_dir(&cwd) else {
+        protocol_die(ProtocolError::ProtocolStoreError(format!(
+            "protocol identity is not registered: no session marker for {cwd}"
+        )));
+    };
+    protocol_identity(&id)
+}
+
 pub(crate) struct Args(pub(crate) Vec<String>);
 
 impl Args {
@@ -85,6 +98,15 @@ impl Args {
     }
     pub(crate) fn has(&self, name: &str) -> bool {
         self.0.iter().any(|a| a == &format!("--{name}"))
+    }
+    // Boolean flag present before the `--` separator; text after the separator
+    // is verbatim message body and never parsed as options.
+    fn has_before_sep(&self, name: &str) -> bool {
+        let key = format!("--{name}");
+        self.0
+            .iter()
+            .take_while(|arg| arg.as_str() != "--")
+            .any(|arg| *arg == key)
     }
     pub(crate) fn unique_flag(&self, name: &str) -> Result<Option<&str>, String> {
         let key = format!("--{name}");
@@ -883,20 +905,31 @@ pub fn run(cmd: &str, raw: Vec<String>) -> ! {
             let from = args
                 .unique_flag_before_sep("from")
                 .unwrap_or_else(|error| die(&error));
-            let (Some(to), Some(from), false) = (rest.first().copied(), from, body.is_empty())
-            else {
-                die("usage: relay request <to> --from <registered> [--] <message...>");
+            let (Some(to), false) = (rest.first().copied(), body.is_empty()) else {
+                die("usage: relay request <to> [--from <registered>] [--json] [--] <message...>");
             };
-            let requester = protocol_identity(from);
+            let requester = match from {
+                Some(identity) => protocol_identity(identity),
+                None => protocol_self_identity(),
+            };
             let responder = protocol_identity(to);
             let protocol = ProtocolStore::new(store::home_dir());
             let message = protocol
                 .request(&requester.id, &responder.id, &body)
                 .unwrap_or_else(|error| protocol_die(error));
-            println!(
-                r#"{{"correlation_id":"{}","message_id":"{}","outcome":"enqueued"}}"#,
-                message.correlation_id, message.id
-            );
+            if args.has_before_sep("json") {
+                // Documented machine mode: the complete canonical MessageV2 envelope.
+                println!(
+                    "{}",
+                    String::from_utf8(message.canonical_bytes())
+                        .expect("canonical MessageV2 is UTF-8")
+                );
+            } else {
+                println!(
+                    r#"{{"correlation_id":"{}","message_id":"{}","outcome":"enqueued"}}"#,
+                    message.correlation_id, message.id
+                );
+            }
             std::process::exit(0);
         }
         "reply" => {
@@ -910,16 +943,19 @@ pub fn run(cmd: &str, raw: Vec<String>) -> ! {
             let status = args
                 .unique_flag_before_sep("status")
                 .unwrap_or_else(|error| die(&error));
-            let (Some(correlation_id), Some(from), Some(status), false) =
-                (rest.first().copied(), from, status, body.is_empty())
+            let (Some(correlation_id), Some(status), false) =
+                (rest.first().copied(), status, body.is_empty())
             else {
                 die(
-                    "usage: relay reply <correlation-id> --from <registered> --status completed|failed [--] <message...>",
+                    "usage: relay reply <correlation-id> [--from <registered>] --status completed|failed [--] <message...>",
                 );
             };
             let status = TerminalStatus::parse(status)
                 .unwrap_or_else(|_| die("--status must be completed or failed"));
-            let responder = protocol_identity(from);
+            let responder = match from {
+                Some(identity) => protocol_identity(identity),
+                None => protocol_self_identity(),
+            };
             let protocol = ProtocolStore::new(store::home_dir());
             let outcome = protocol
                 .reply(correlation_id, &responder.id, status, &body)
@@ -1248,7 +1284,7 @@ pub fn run(cmd: &str, raw: Vec<String>) -> ! {
             std::process::exit(code);
         }
         _ => die(
-            "usage: relay discover [--within min] [--tool t] | list | register <name> --id <uuid> [--dir <path>] [--server <sock>] | send <to> <msg> | request <to> --from <registered> [--] <msg> | reply <correlation-id> --from <registered> --status completed|failed [--] <msg> | inbox <who> | peek <who> | attach <who> [--exec] | wake <who> [--model m] [--effort e] [--service-tier default|fast] [msg] | doctor [--id <session>]",
+            "usage: relay discover [--within min] [--tool t] | list | register <name> --id <uuid> [--dir <path>] [--server <sock>] | send <to> <msg> | request <to> [--from <registered>] [--json] [--] <msg> | reply <correlation-id> [--from <registered>] --status completed|failed [--] <msg> | inbox <who> | peek <who> | attach <who> [--exec] | wake <who> [--model m] [--effort e] [--service-tier default|fast] [msg] | doctor [--id <session>]",
         ),
     }
 }
@@ -1415,5 +1451,19 @@ mod tests {
         assert!(parse_attach_args(&strings(&["attach", "worker", "extra"])).is_err());
         assert!(parse_attach_args(&strings(&["attach", "worker", "--bogus"])).is_err());
         assert!(parse_attach_args(&strings(&["attach", "worker", "--", "--exec"])).is_err());
+    }
+
+    #[test]
+    fn request_json_flag_counts_only_before_the_separator() {
+        let args = Args(strings(&["request", "agent-b", "--json", "--", "body"]));
+        assert!(args.has_before_sep("json"));
+
+        let args = Args(strings(&[
+            "request",
+            "agent-b",
+            "--",
+            "pass --json literally",
+        ]));
+        assert!(!args.has_before_sep("json"));
     }
 }

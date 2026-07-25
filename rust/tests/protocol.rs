@@ -1,5 +1,6 @@
 pub mod support;
 
+use relay::lifecycle::{self, Admission, LifecycleStore, OperationKind};
 use relay::protocol::{
     ClaimOrigin, ClaimState, ClaimStatusV1, DeliveryState, MessageKind, MessageV2, ObjectFormat,
     ProtocolError, ProtocolFailpoint, ProtocolStore, ReplyDisposition, TerminalStatus,
@@ -9,6 +10,7 @@ use relay::workspace::schema::{ClosedJcs, JcsValue, LowerUuidV4, parse_jcs, seri
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::fs;
+use std::io::Write as _;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Barrier};
@@ -1183,6 +1185,7 @@ fn request_crash_failpoints_recover_without_loss_or_duplicate_delivery() {
         ProtocolFailpoint::RequestBeforeMailboxAppend,
         ProtocolFailpoint::RequestAfterMailboxAppend,
         ProtocolFailpoint::RequestBeforeOpenMove,
+        ProtocolFailpoint::RequestOpenMoveBeforeSourceUnlink,
         ProtocolFailpoint::RequestAfterOpenMove,
     ];
     for (index, point) in points.into_iter().enumerate() {
@@ -1218,10 +1221,12 @@ fn request_crash_failpoints_recover_without_loss_or_duplicate_delivery() {
 fn reply_crash_failpoints_recover_without_loss_or_duplicate_delivery() {
     let points = [
         ProtocolFailpoint::ReplyBeforePendingWrite,
+        ProtocolFailpoint::ReplyPendingMoveBeforeSourceUnlink,
         ProtocolFailpoint::ReplyAfterPendingWrite,
         ProtocolFailpoint::ReplyBeforeMailboxAppend,
         ProtocolFailpoint::ReplyAfterMailboxAppend,
         ProtocolFailpoint::ReplyBeforeEnqueuedMove,
+        ProtocolFailpoint::ReplyEnqueuedMoveBeforeSourceUnlink,
         ProtocolFailpoint::ReplyAfterEnqueuedMove,
     ];
     for (index, point) in points.into_iter().enumerate() {
@@ -1523,4 +1528,364 @@ fn explicit_protocol_roots_are_fresh_store_isolated() {
     );
     assert_eq!(claim_files(&first.home).len(), 1);
     assert_eq!(claim_files(&second.home).len(), 1);
+}
+
+fn lifecycle_drain(home: &Path, session: &str) -> Result<relay::store::DrainReceipt, String> {
+    let store = LifecycleStore::new(home.to_path_buf());
+    let Admission::Unmanaged(mut guard) =
+        store.admit_operation(session, OperationKind::CliInboxDrain)?
+    else {
+        panic!("expected unmanaged admission");
+    };
+    lifecycle::drain_with_guard(&mut guard)
+}
+
+fn claim_file_in(home: &Path, directory: &str) -> PathBuf {
+    claim_files(home)
+        .into_iter()
+        .find(|path| path.parent().unwrap().file_name().unwrap() == directory)
+        .unwrap_or_else(|| panic!("no claim file in {directory}"))
+}
+
+#[test]
+fn interrupted_request_move_after_destination_write_recovers_deterministically() {
+    let fixture = Fixture::new("protocol-move-unlink-request");
+    let faulted = ProtocolStore::new(fixture.home.clone())
+        .with_failpoint(ProtocolFailpoint::RequestOpenMoveBeforeSourceUnlink);
+    assert!(
+        faulted
+            .request(REQUESTER_ID, RESPONDER_ID, "converge exact request")
+            .is_err()
+    );
+
+    // The crash window leaves the stale source beside the authoritative
+    // destination.
+    let stale = read_claim_file(&claim_file_in(&fixture.home, "pending"));
+    let authoritative = read_claim_file(&claim_file_in(&fixture.home, "open"));
+    assert_eq!(stale.state, ClaimState::RequestPending);
+    assert_eq!(authoritative.state, ClaimState::Open);
+    let correlation_id = stale.correlation_id.clone();
+
+    // Read-side resolution returns the later state without reconciling files.
+    let resolved = fixture.store.read_claim(&correlation_id).unwrap().unwrap();
+    assert_eq!(resolved.state, ClaimState::Open);
+    assert_eq!(resolved.request_delivery, DeliveryState::Enqueued);
+    assert_eq!(claim_files(&fixture.home).len(), 2);
+
+    // Recovery converges idempotently to exactly one claim and one row.
+    fixture.store.recover_pending().unwrap();
+    fixture.store.recover_pending().unwrap();
+    let paths = claim_files(&fixture.home);
+    assert_eq!(paths.len(), 1);
+    let converged = read_claim_file(&paths[0]);
+    assert_eq!(converged.state, ClaimState::Open);
+    assert_eq!(converged.request_delivery, DeliveryState::Enqueued);
+    assert_eq!(
+        mailbox_messages(&fixture.home, RESPONDER_ID),
+        vec![converged.request.clone()]
+    );
+    assert_eq!(
+        fixture.store.drain_typed(RESPONDER_ID).unwrap(),
+        vec![converged.request]
+    );
+    assert!(fixture.store.drain_typed(RESPONDER_ID).unwrap().is_empty());
+}
+
+#[test]
+fn interrupted_reply_moves_after_destination_write_recover_deterministically() {
+    for (index, point) in [
+        ProtocolFailpoint::ReplyPendingMoveBeforeSourceUnlink,
+        ProtocolFailpoint::ReplyEnqueuedMoveBeforeSourceUnlink,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let fixture = Fixture::new(&format!("protocol-move-unlink-reply-{index}"));
+        let request = fixture
+            .store
+            .request(REQUESTER_ID, RESPONDER_ID, "perform the task")
+            .unwrap();
+        assert_eq!(
+            fixture.store.drain_typed(RESPONDER_ID).unwrap(),
+            vec![request.clone()]
+        );
+        let faulted = ProtocolStore::new(fixture.home.clone()).with_failpoint(point);
+        assert!(
+            faulted
+                .reply(
+                    &request.correlation_id,
+                    RESPONDER_ID,
+                    TerminalStatus::Completed,
+                    "converge exact reply",
+                )
+                .is_err(),
+            "{point:?} did not interrupt"
+        );
+        assert_eq!(claim_files(&fixture.home).len(), 2, "{point:?}");
+
+        // Read-side resolution returns the later Pending/Terminal state
+        // without reconciling files.
+        let resolved = fixture
+            .store
+            .read_claim(&request.correlation_id)
+            .unwrap()
+            .unwrap();
+        if point == ProtocolFailpoint::ReplyPendingMoveBeforeSourceUnlink {
+            assert_eq!(resolved.state, ClaimState::ReplyPending);
+            assert!(mailbox_messages(&fixture.home, REQUESTER_ID).is_empty());
+        } else {
+            assert_eq!(resolved.state, ClaimState::ReplyEnqueued);
+            assert_eq!(mailbox_messages(&fixture.home, REQUESTER_ID).len(), 1);
+        }
+        assert_eq!(claim_files(&fixture.home).len(), 2, "{point:?}");
+
+        fixture.store.recover_pending().unwrap();
+        fixture.store.recover_pending().unwrap();
+        let paths = claim_files(&fixture.home);
+        assert_eq!(paths.len(), 1, "{point:?}");
+        let converged = read_claim_file(&paths[0]);
+        assert_eq!(converged.state, ClaimState::ReplyEnqueued, "{point:?}");
+        assert_eq!(converged.reply_delivery, Some(DeliveryState::Enqueued));
+        let replies = mailbox_messages(&fixture.home, REQUESTER_ID);
+        assert_eq!(replies.len(), 1, "{point:?}");
+        assert_eq!(converged.reply.as_ref(), replies.first());
+
+        // The converged claim keeps the exact idempotent-retry contract and
+        // delivers exactly once.
+        let retry = fixture
+            .store
+            .reply(
+                &request.correlation_id,
+                RESPONDER_ID,
+                TerminalStatus::Completed,
+                "converge exact reply",
+            )
+            .unwrap();
+        assert_eq!(retry.disposition, ReplyDisposition::Idempotent);
+        assert_eq!(fixture.store.drain_typed(REQUESTER_ID).unwrap(), replies);
+        assert!(fixture.store.drain_typed(REQUESTER_ID).unwrap().is_empty());
+    }
+}
+
+#[test]
+fn conflicting_duplicate_claims_fail_closed_without_convergence_or_append() {
+    let fixture = Fixture::new("protocol-duplicate-conflict");
+    fixture.store.recover_pending().unwrap();
+    let open = open_claim(ClaimOrigin::Message);
+    let mut conflicting_request = request_message();
+    conflicting_request.body = "conflicting body".into();
+    let pending = ClaimStatusV1 {
+        state: ClaimState::RequestPending,
+        request_delivery: DeliveryState::Pending,
+        request_sha256: conflicting_request.sha256(),
+        request: conflicting_request,
+        ..open_claim(ClaimOrigin::Message)
+    };
+    assert!(validate_record(&pending).is_ok());
+    write_jcs_file(
+        &fixture
+            .home
+            .join("protocol-v1/open")
+            .join(format!("{CORRELATION_ID}.json")),
+        open.to_jcs(),
+    );
+    write_jcs_file(
+        &fixture
+            .home
+            .join("protocol-v1/pending")
+            .join(format!("{CORRELATION_ID}.json")),
+        pending.to_jcs(),
+    );
+
+    let read_error = fixture.store.read_claim(CORRELATION_ID).unwrap_err();
+    assert_eq!(error_code(&read_error), "protocol_store_error");
+    let recover_error = fixture.store.recover_pending().unwrap_err();
+    assert_eq!(error_code(&recover_error), "protocol_store_error");
+    // Nothing converged and nothing was appended.
+    assert_eq!(claim_files(&fixture.home).len(), 2);
+    assert!(mailbox_messages(&fixture.home, RESPONDER_ID).is_empty());
+}
+
+#[test]
+fn typed_rows_without_authoritative_claims_are_never_surfaced() {
+    let fixture = Fixture::new("protocol-unclaimed-typed-row");
+    write_mailbox_message(&fixture.home, RESPONDER_ID, &request_message());
+    let mailbox = fixture
+        .home
+        .join("mailbox")
+        .join(format!("{RESPONDER_ID}.jsonl"));
+    let before = fs::read(&mailbox).unwrap();
+
+    let peek_error = fixture.store.peek_typed(RESPONDER_ID).unwrap_err();
+    assert_eq!(error_code(&peek_error), "protocol_store_error");
+    let drain_error = fixture.store.drain_typed(RESPONDER_ID).unwrap_err();
+    assert_eq!(error_code(&drain_error), "protocol_store_error");
+    let renderable_error = match lifecycle_drain(&fixture.home, RESPONDER_ID) {
+        Err(error) => error,
+        Ok(_) => panic!("renderable drain surfaced an unclaimed typed row"),
+    };
+    assert!(
+        renderable_error.contains("typed mailbox row has no claim"),
+        "{renderable_error}"
+    );
+    // The refused drains leave the mailbox untouched.
+    assert_eq!(fs::read(&mailbox).unwrap(), before);
+}
+
+#[test]
+fn requeued_request_row_after_pre_inject_failure_redelivers_exactly_once() {
+    let fixture = Fixture::new("protocol-requeue-request");
+    let request = fixture
+        .store
+        .request(REQUESTER_ID, RESPONDER_ID, "perform the task")
+        .unwrap();
+    let mailbox = fixture
+        .home
+        .join("mailbox")
+        .join(format!("{RESPONDER_ID}.jsonl"));
+    let legacy_line =
+        "{\"id\":\"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa\",\"body\":\"legacy first\"}\n";
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&mailbox)
+        .unwrap()
+        .write_all(legacy_line.as_bytes())
+        .unwrap();
+    let before = fs::read_to_string(&mailbox).unwrap();
+
+    let receipt = lifecycle_drain(&fixture.home, RESPONDER_ID).unwrap();
+    assert_eq!(receipt.messages().len(), 2);
+    assert!(!mailbox.exists());
+    assert_eq!(
+        fixture
+            .store
+            .read_claim(&request.correlation_id)
+            .unwrap()
+            .unwrap()
+            .request_delivery,
+        DeliveryState::Consumed
+    );
+
+    // Documented pre-inject failure: the requeue restores the raw bytes AND
+    // the claim delivery state, so the row stays deliverable.
+    receipt.rollback().unwrap();
+    assert_eq!(fs::read_to_string(&mailbox).unwrap(), before);
+    assert_eq!(
+        fixture
+            .store
+            .read_claim(&request.correlation_id)
+            .unwrap()
+            .unwrap()
+            .request_delivery,
+        DeliveryState::Enqueued
+    );
+    assert_eq!(
+        fixture.store.peek_typed(RESPONDER_ID).unwrap(),
+        vec![request.clone()]
+    );
+
+    // The retry delivers the typed row exactly once, in order, with the
+    // legacy row preserved byte-for-byte.
+    let retried = lifecycle_drain(&fixture.home, RESPONDER_ID).unwrap();
+    let rows = retried.messages().to_vec();
+    retried.commit();
+    assert_eq!(rows.len(), 2);
+    let typed_row = String::from_utf8(request.canonical_bytes())
+        .unwrap()
+        .parse::<JsonValue>()
+        .unwrap();
+    assert_eq!(rows[0], typed_row);
+    assert_eq!(
+        rows[1],
+        legacy_line.trim_end().parse::<JsonValue>().unwrap()
+    );
+    assert_eq!(
+        fixture
+            .store
+            .read_claim(&request.correlation_id)
+            .unwrap()
+            .unwrap()
+            .request_delivery,
+        DeliveryState::Consumed
+    );
+    assert!(!mailbox.exists());
+    assert!(
+        lifecycle_drain(&fixture.home, RESPONDER_ID)
+            .unwrap()
+            .messages()
+            .is_empty()
+    );
+}
+
+#[test]
+fn requeued_terminal_reply_restores_consumed_claim_for_exact_redelivery() {
+    let fixture = Fixture::new("protocol-requeue-reply");
+    let request = fixture
+        .store
+        .request(REQUESTER_ID, RESPONDER_ID, "perform the task")
+        .unwrap();
+    assert_eq!(
+        fixture.store.drain_typed(RESPONDER_ID).unwrap(),
+        vec![request.clone()]
+    );
+    let reply = fixture
+        .store
+        .reply(
+            &request.correlation_id,
+            RESPONDER_ID,
+            TerminalStatus::Completed,
+            "done",
+        )
+        .unwrap()
+        .message;
+
+    let receipt = lifecycle_drain(&fixture.home, REQUESTER_ID).unwrap();
+    assert_eq!(receipt.messages().len(), 1);
+    assert_eq!(
+        fixture
+            .store
+            .read_claim(&request.correlation_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        ClaimState::ReplyConsumed
+    );
+
+    receipt.rollback().unwrap();
+    let restored = fixture
+        .store
+        .read_claim(&request.correlation_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(restored.state, ClaimState::ReplyEnqueued);
+    assert_eq!(restored.reply_delivery, Some(DeliveryState::Enqueued));
+    assert_eq!(
+        fixture.store.peek_typed(REQUESTER_ID).unwrap(),
+        vec![reply.clone()]
+    );
+
+    let retried = lifecycle_drain(&fixture.home, REQUESTER_ID).unwrap();
+    let rows = retried.messages().to_vec();
+    retried.commit();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0],
+        String::from_utf8(reply.canonical_bytes())
+            .unwrap()
+            .parse::<JsonValue>()
+            .unwrap()
+    );
+    let consumed = fixture
+        .store
+        .read_claim(&request.correlation_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(consumed.state, ClaimState::ReplyConsumed);
+    assert_eq!(consumed.reply_delivery, Some(DeliveryState::Consumed));
+    assert!(
+        lifecycle_drain(&fixture.home, REQUESTER_ID)
+            .unwrap()
+            .messages()
+            .is_empty()
+    );
 }

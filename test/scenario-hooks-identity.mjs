@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -33,6 +34,25 @@ const messageV2 = ({
   to_session_id: toSessionId,
 });
 
+const sha256 = (value) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
+
+const claimStatusV1 = ({ origin, reply = null, request, requesterId, responderId }) => ({
+  correlation_id: request.correlation_id,
+  created_at: request.created_at,
+  origin,
+  reply,
+  reply_delivery: reply === null ? null : 'enqueued',
+  reply_sha256: reply === null ? null : sha256(reply),
+  request,
+  request_delivery: origin === 'fanout' ? 'not_applicable' : 'enqueued',
+  request_sha256: sha256(request),
+  requester_session_id: requesterId,
+  responder_session_id: responderId,
+  schema: 1,
+  state: reply === null ? 'Open' : 'ReplyEnqueued',
+  updated_at: '2026-07-25T12:35:00.001Z',
+});
+
 const typedDeliveryFixture = ({ recipientId, seed, senderId }) => {
   const id = (offset) => testUuid(seed + offset);
   const reservationId = id(9);
@@ -50,6 +70,14 @@ const typedDeliveryFixture = ({ recipientId, seed, senderId }) => {
     kind: 'request',
     toSessionId: recipientId,
   });
+  const terminalRequest = messageV2({
+    body: 'terminal reply authority request',
+    correlationId: id(5),
+    fromSessionId: recipientId,
+    id: id(4),
+    kind: 'request',
+    toSessionId: senderId,
+  });
   const terminalReply = messageV2({
     body: 'typed terminal reply',
     correlationId: id(5),
@@ -59,6 +87,14 @@ const typedDeliveryFixture = ({ recipientId, seed, senderId }) => {
     replyTo: id(4),
     terminalStatus: 'failed',
     toSessionId: recipientId,
+  });
+  const workerRequest = messageV2({
+    body: 'worker result authority request',
+    correlationId: id(8),
+    fromSessionId: recipientId,
+    id: id(7),
+    kind: 'request',
+    toSessionId: senderId,
   });
   const workerResult = messageV2({
     body: workerBody,
@@ -79,8 +115,31 @@ const typedDeliveryFixture = ({ recipientId, seed, senderId }) => {
     to: recipientId,
     ts: '2026-07-25T12:34:57.000Z',
   };
+  const claims = [
+    claimStatusV1({
+      origin: 'message',
+      request,
+      requesterId: senderId,
+      responderId: recipientId,
+    }),
+    claimStatusV1({
+      origin: 'message',
+      reply: terminalReply,
+      request: terminalRequest,
+      requesterId: recipientId,
+      responderId: senderId,
+    }),
+    claimStatusV1({
+      origin: 'fanout',
+      reply: workerResult,
+      request: workerRequest,
+      requesterId: recipientId,
+      responderId: senderId,
+    }),
+  ];
   return {
     collectCommand,
+    claims,
     generation,
     legacy,
     messages: [request, terminalReply, workerResult],
@@ -102,6 +161,19 @@ const appendMailboxRows = (home, recipientId, rows) => {
     `${rows.map((row) => JSON.stringify(row)).join('\n')}\n`,
     { mode: 0o600 },
   );
+};
+
+const seedClaimBoundTypedRows = (home, recipientId, fixture) => {
+  const protocolRoot = path.join(home, 'protocol-v1');
+  fs.mkdirSync(protocolRoot, { recursive: true, mode: 0o700 });
+  for (const claim of fixture.claims) {
+    const directory = path.join(protocolRoot, claim.state === 'Open' ? 'open' : 'terminal');
+    fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(directory, `${claim.correlation_id}.json`), `${JSON.stringify(claim)}\n`, {
+      mode: 0o600,
+    });
+  }
+  appendMailboxRows(home, recipientId, [fixture.legacy, ...fixture.messages]);
 };
 
 const defuseMailDelimiter = (value) => String(value).replace(/<\/?session-relay-mail>/giu, '[session-relay-mail]');
@@ -221,7 +293,7 @@ export async function run({ bin, home, emit }) {
         'the complete legacy mail_block remains byte-identical',
       );
 
-      appendMailboxRows(home, recipientId, [fixture.legacy, ...fixture.messages]);
+      seedClaimBoundTypedRows(home, recipientId, fixture);
       const delivered = runHook({ session_id: recipientId, cwd: recipientDir, source: 'compact' });
       assert.equal(delivered.status, 0);
       const context = JSON.parse(delivered.stdout).hookSpecificOutput.additionalContext;

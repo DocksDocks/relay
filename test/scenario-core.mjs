@@ -343,6 +343,121 @@ function assertCorrelatedCliMcpContracts({ HOME, relay, runHook, runBus, peek, t
     to_session_id: requesterId,
   });
 
+  // Documented CLI defaults: omitted --from resolves the registered
+  // current-project self identity via the cwd marker (same dir-marker
+  // fallback as the MCP bus), and request --json emits the complete
+  // canonical MessageV2 envelope instead of the three-key outcome.
+  const cliSelfRequest = relay(['request', 'protocol-b', '--', 'self request'], { cwd: requesterDir });
+  const selfRequestOutcome = assertCliOutcome(cliSelfRequest, ['correlation_id', 'message_id', 'outcome'], {
+    outcome: 'enqueued',
+  });
+  const selfQueuedRequest = peek('protocol-b').messages.find(({ id }) => id === selfRequestOutcome.message_id);
+  assertMessageV2(selfQueuedRequest, {
+    body: 'self request',
+    correlation_id: selfRequestOutcome.correlation_id,
+    from_session_id: requesterId,
+    kind: 'request',
+    reply_to: null,
+    result_sha256: null,
+    terminal_status: null,
+    to_session_id: responderId,
+  });
+
+  const cliSelfReply = relay(
+    ['reply', selfRequestOutcome.correlation_id, '--status', 'completed', '--', 'self reply'],
+    { cwd: responderDir },
+  );
+  const selfReplyOutcome = assertCliOutcome(cliSelfReply, ['correlation_id', 'message_id', 'outcome', 'status'], {
+    correlation_id: selfRequestOutcome.correlation_id,
+    outcome: 'enqueued',
+    status: 'completed',
+  });
+  const selfQueuedReply = peek('protocol-a').messages.find(({ id }) => id === selfReplyOutcome.message_id);
+  assertMessageV2(selfQueuedReply, {
+    body: 'self reply',
+    correlation_id: selfRequestOutcome.correlation_id,
+    from_session_id: responderId,
+    kind: 'terminal_reply',
+    reply_to: selfRequestOutcome.message_id,
+    result_sha256: null,
+    terminal_status: 'completed',
+    to_session_id: requesterId,
+  });
+
+  const cliJsonRequest = relay(['request', 'protocol-b', '--json', '--', 'canonical json request'], {
+    cwd: requesterDir,
+  });
+  assert.equal(cliJsonRequest.status, 0, cliJsonRequest.stderr);
+  assert.equal(cliJsonRequest.stderr, '');
+  const jsonEnvelope = JSON.parse(cliJsonRequest.stdout);
+  assertMessageV2(jsonEnvelope, {
+    body: 'canonical json request',
+    from_session_id: requesterId,
+    kind: 'request',
+    reply_to: null,
+    result_sha256: null,
+    terminal_status: null,
+    to_session_id: responderId,
+  });
+  assert.equal(
+    cliJsonRequest.stdout,
+    `${compactJcsObject(jsonEnvelope)}\n`,
+    'request --json emits the complete canonical MessageV2',
+  );
+  const queuedJsonEnvelope = peek('protocol-b').messages.find(({ id }) => id === jsonEnvelope.id);
+  assert.deepEqual(queuedJsonEnvelope, jsonEnvelope, 'emitted --json envelope matches the queued request');
+
+  const cliJsonExplicitFrom = relay([
+    'request',
+    'protocol-b',
+    '--from',
+    'protocol-a',
+    '--json',
+    '--',
+    'explicit from json request',
+  ]);
+  assert.equal(cliJsonExplicitFrom.status, 0, cliJsonExplicitFrom.stderr);
+  const explicitJsonEnvelope = JSON.parse(cliJsonExplicitFrom.stdout);
+  assertMessageV2(explicitJsonEnvelope, {
+    body: 'explicit from json request',
+    from_session_id: requesterId,
+    kind: 'request',
+    to_session_id: responderId,
+  });
+  assert.equal(cliJsonExplicitFrom.stdout, `${compactJcsObject(explicitJsonEnvelope)}\n`);
+
+  // A literal `--json` inside the message body must not flip the output mode.
+  const cliBodyJson = relay(['request', 'protocol-b', '--from', 'protocol-a', '--', 'pass', '--json', 'literally']);
+  const bodyJsonOutcome = assertCliOutcome(cliBodyJson, ['correlation_id', 'message_id', 'outcome'], {
+    outcome: 'enqueued',
+  });
+  const bodyJsonEnvelope = peek('protocol-b').messages.find(({ id }) => id === bodyJsonOutcome.message_id);
+  assert.equal(bodyJsonEnvelope.body, 'pass --json literally');
+
+  // Invalid identities: an unknown explicit --from and a cwd without a
+  // session marker both fail closed with protocol_store_error, enqueue nothing.
+  assertCliDomainError(
+    relay(['request', 'protocol-b', '--from', 'no-such-identity', '--', 'unknown sender']),
+    1,
+    'protocol_store_error',
+  );
+  const noMarkerDir = path.join(HOME, 'protocol-no-marker');
+  fs.mkdirSync(noMarkerDir);
+  const enqueuedBefore = peek('protocol-b').count;
+  assertCliDomainError(
+    relay(['request', 'protocol-b', '--', 'nobody home'], { cwd: noMarkerDir }),
+    1,
+    'protocol_store_error',
+  );
+  assertCliDomainError(
+    relay(['reply', selfRequestOutcome.correlation_id, '--status', 'completed', '--', 'nobody home'], {
+      cwd: noMarkerDir,
+    }),
+    1,
+    'protocol_store_error',
+  );
+  assert.equal(peek('protocol-b').count, enqueuedBefore, 'failed identity resolution must not enqueue');
+
   const malformed = runBus(requesterDir, [
     { jsonrpc: '2.0', id: 1, method: 'initialize', params: {} },
     {

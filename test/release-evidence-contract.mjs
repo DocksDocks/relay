@@ -52,9 +52,9 @@ const CURRENT_RELEASE_TAG = 'session-relay--v0.14.0';
 const CURRENT_PUBLIC_VERSION = '0.12.0';
 const CURRENT_PUBLIC_TAG = 'cli-v0.12.0';
 const CURRENT_GOAL_ID = '8b89aabf-7336-4352-bc11-225bab67f9aa';
-const CURRENT_DOCKS_RUN_ID = '9349cb79-232f-48fc-a7de-5da7eae64e84';
+const CURRENT_DOCKS_RUN_ID = 'a69dcd97-d1bd-46fc-9b6b-70e349e353fc';
 const CURRENT_PUBLIC_RUN_ID = '1f801952-705e-4c7e-a533-91026c013383';
-const CURRENT_DOCKS_PLAN_PATH = 'docs/plans/active/session-relay-correlated-results-release-continuation.md';
+const CURRENT_DOCKS_PLAN_PATH = 'docs/plans/active/session-relay-correlated-results-release-completion.md';
 const CURRENT_PUBLIC_PLAN_PATH = 'docs/plans/active/session-relay-0.14.0-docks-kit-0.12.0-release.md';
 const HISTORICAL_RELEASE_PLAN_PATH = 'docs/plans/active/session-relay-linux-workspace-publication.md';
 const HISTORICAL_RECEIPT_SHA256 = Object.freeze({
@@ -3118,6 +3118,35 @@ function testCurrentCompletionBinding(temp) {
     includeVersion: false,
   });
   assert.equal(pathSelected.result.receipt.type, 'SourcePreparationProofV2');
+
+  const completionLabeled = bindCurrentCompletionFixture(temp, {
+    name: 'completion-review-result-label',
+    transformPlan(plan, { completionReview }) {
+      const line = `Review-result: ${jcs(completionReview)}`;
+      assert.ok(plan.includes(line), 'fixture plan must embed the completion Review-result line');
+      const repair = structuredClone(completionReview);
+      repair.verdict = 'repair';
+      repair.findings = [
+        {
+          defect: 'release flow was not executable',
+          fix: 'bind the stable promotion receipt',
+          id: 'release-flow-unexecutable',
+          kind: 'release_safety',
+          locator: 'scripts/lib/session-relay-release-promotion.mjs',
+        },
+      ];
+      return plan.replace(
+        line,
+        `Completion-review-result: ${jcs(repair)}\nCompletion-review-result: ${jcs(completionReview)}`,
+      );
+    },
+  });
+  assert.equal(
+    completionLabeled.result.receipt.completion_review.result_sha256,
+    completionLabeled.completionReviewSha256,
+    'binder must select the exact Completion-review-result record bound by PlanRunV1',
+  );
+  assert.equal(completionLabeled.result.receipt.completion_review.verdict, 'pass');
 
   expectReject(
     'current binder rejects a legacy CLI version on the current active plan',

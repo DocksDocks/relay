@@ -23,10 +23,8 @@ const PUBLIC_REF = /^refs\/heads\/preflight\/session-relay-cli-0\.13\.0-[0-9a-f]
 const COMMIT = /^[0-9a-f]{40}$/;
 const CURRENT_RELEASE_VERSION = '0.14.0';
 const CURRENT_RELEASE_TAG = `session-relay--v${CURRENT_RELEASE_VERSION}`;
-const CURRENT_PUBLIC_VERSION = '0.12.0';
-const CURRENT_PUBLIC_TAG = `cli-v${CURRENT_PUBLIC_VERSION}`;
-const CURRENT_DOCKS_PLAN = 'docs/plans/active/session-relay-correlated-results-release-continuation.md';
-const CURRENT_DOCKS_RUN_ID = '9349cb79-232f-48fc-a7de-5da7eae64e84';
+const CURRENT_DOCKS_PLAN = 'docs/plans/active/session-relay-correlated-results-release-completion.md';
+const CURRENT_DOCKS_RUN_ID = 'a69dcd97-d1bd-46fc-9b6b-70e349e353fc';
 const CURRENT_PUBLIC_PLAN = 'docs/plans/active/session-relay-0.14.0-docks-kit-0.12.0-release.md';
 const HISTORICAL_RELEASE_PLAN = 'docs/plans/active/session-relay-linux-workspace-publication.md';
 const HISTORICAL_RECEIPT_SHA256 = Object.freeze([
@@ -1081,7 +1079,7 @@ function currentCorrelatedReleaseContract() {
   assert.match(currentPlan, new RegExp(`"run_id":"${CURRENT_DOCKS_RUN_ID}"`));
   assert.match(currentPlan, /"draft_review":\{[^}]*"state":"passed"/);
   assert.match(currentPlan, new RegExp(CURRENT_RELEASE_TAG.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
-  assert.match(currentPlan, new RegExp(CURRENT_PUBLIC_TAG.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  assert.match(currentPlan, /docks-kit[^\n]*0\.12\.0/);
   assert.match(currentPlan, new RegExp(CURRENT_PUBLIC_PLAN.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
   assert.match(currentPlan, /prerelease[\s\S]*public child[\s\S]*stable/i);
 }

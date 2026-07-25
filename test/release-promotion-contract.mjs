@@ -65,8 +65,8 @@ const CURRENT_RELEASE_TAG = 'session-relay--v0.14.0';
 const CURRENT_PUBLIC_VERSION = '0.12.0';
 const CURRENT_PUBLIC_TAG = 'cli-v0.12.0';
 const CURRENT_GOAL_ID = '8b89aabf-7336-4352-bc11-225bab67f9aa';
-const CURRENT_DOCKS_RUN_ID = '9349cb79-232f-48fc-a7de-5da7eae64e84';
-const CURRENT_DOCKS_PLAN_PATH = 'docs/plans/active/session-relay-correlated-results-release-continuation.md';
+const CURRENT_DOCKS_RUN_ID = 'a69dcd97-d1bd-46fc-9b6b-70e349e353fc';
+const CURRENT_DOCKS_PLAN_PATH = 'docs/plans/active/session-relay-correlated-results-release-completion.md';
 const CURRENT_PUBLIC_RUN_ID = '1f801952-705e-4c7e-a533-91026c013383';
 const CURRENT_PUBLIC_PLAN_PATH = 'docs/plans/finished/2026-07-25-session-relay-0.14.0-docks-kit-0.12.0-release.md';
 const HISTORICAL_RELEASE_PLAN_PATH = 'docs/plans/active/session-relay-linux-workspace-publication.md';
@@ -2084,6 +2084,65 @@ function makeCurrentPromotionAdapter({ byteDrift = false, refConflict = null, st
     canonicalize(result.receipt),
     'current promotion receipt output must be canonical',
   );
+}
+
+{
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'session-relay-current-production-adapter-'));
+  try {
+    const current = makeCurrentPromotionAdapter();
+    const production = releasePromotion.CURRENT_PRODUCTION_ADAPTER;
+    assert.deepEqual(
+      Object.keys(production).sort(),
+      [...releasePromotion.CURRENT_PROMOTION_ADAPTER_KEYS].sort(),
+      'current production promotion adapter surface changed',
+    );
+
+    const publicationFile = writeBoundaryValue(
+      directory,
+      'current-publication.json',
+      current.publicationEnvelope.value,
+    );
+    const publication = production.loadPublication(
+      new Map([
+        ['publication', publicationFile.file],
+        ['publication-sha256', current.publicationEnvelope.digest],
+      ]),
+    );
+    assert.deepEqual(publication.value, current.publicationEnvelope.value);
+    assert.equal(publication.digest, current.publicationEnvelope.digest);
+
+    const publicReleaseFile = writeBoundaryValue(
+      directory,
+      'current-public-release.json',
+      current.publicReleaseEnvelope.value,
+    );
+    const publicRelease = production.loadPublicRelease(
+      new Map([
+        ['public-release', publicReleaseFile.file],
+        ['public-release-sha256', current.publicReleaseEnvelope.digest],
+      ]),
+    );
+    assert.deepEqual(publicRelease.value, current.publicReleaseEnvelope.value);
+    assert.equal(publicRelease.digest, current.publicReleaseEnvelope.digest);
+
+    const legacyValue = structuredClone(current.publicationEnvelope.value);
+    legacyValue.schema = 1;
+    legacyValue.type = 'SessionRelayPublicationReceiptV1';
+    const legacyFile = writeBoundaryValue(directory, 'legacy-publication.json', legacyValue);
+    assert.throws(
+      () =>
+        production.loadPublication(
+          new Map([
+            ['publication', legacyFile.file],
+            ['publication-sha256', legacyFile.digest],
+          ]),
+        ),
+      /wrong schema or type/i,
+      'current production adapter must accept only the exact schema-2 V2 publication descriptor',
+    );
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
 }
 
 {

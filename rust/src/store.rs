@@ -1618,6 +1618,16 @@ impl DrainReceipt {
 
     pub fn rollback(self) -> Result<(), String> {
         with_lock_at(&self.root, || {
+            // Restore claim delivery before requeueing the raw bytes so the
+            // typed rows this drain consumed stay redeliverable. Both steps
+            // share this lock; if a crash splits them, an Enqueued claim
+            // without its row loses no more than the pre-existing
+            // crash-after-drain window, while the reverse order would leave
+            // requeued rows every later drain silently drops as consumed
+            // duplicates.
+            crate::protocol::ProtocolStore::new(self.root.clone())
+                .requeue_consumed_locked(&self.messages)
+                .map_err(|error| error.to_string())?;
             let current = fs::read_to_string(&self.path).unwrap_or_default();
             let mut restored = self.raw;
             restored.push_str(&current);

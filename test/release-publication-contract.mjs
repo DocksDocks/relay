@@ -18,7 +18,10 @@ import {
   TAG,
   VERSION,
 } from '../../../scripts/lib/session-relay-release-core.mjs';
-import { validatePromotionReceiptForFinalization } from '../../../scripts/lib/session-relay-release-promotion.mjs';
+import {
+  promoteReviewed,
+  validatePromotionReceiptForFinalization,
+} from '../../../scripts/lib/session-relay-release-promotion.mjs';
 import {
   finalizeReviewed,
   publishReviewed,
@@ -45,8 +48,8 @@ const CURRENT_PUBLIC_TAG = 'cli-v0.12.0';
 const HISTORICAL_PUBLICATION_SHA256 = '31d096d31702b66d7e97085a82d8b7da1b75155f828b1d2382a0ac8427ba7ea2';
 const HISTORICAL_RELEASE_PLAN_PATH = 'docs/plans/active/session-relay-linux-workspace-publication.md';
 const CURRENT_GOAL_ID = '8b89aabf-7336-4352-bc11-225bab67f9aa';
-const CURRENT_DOCKS_RUN_ID = '9349cb79-232f-48fc-a7de-5da7eae64e84';
-const CURRENT_DOCKS_PLAN_PATH = 'docs/plans/active/session-relay-correlated-results-release-continuation.md';
+const CURRENT_DOCKS_RUN_ID = 'a69dcd97-d1bd-46fc-9b6b-70e349e353fc';
+const CURRENT_DOCKS_PLAN_PATH = 'docs/plans/active/session-relay-correlated-results-release-completion.md';
 const CURRENT_PUBLIC_RUN_ID = '1f801952-705e-4c7e-a533-91026c013383';
 const CURRENT_PUBLIC_ACTIVE_PLAN_PATH = 'docs/plans/active/session-relay-0.14.0-docks-kit-0.12.0-release.md';
 const CURRENT_PUBLIC_FINISHED_PLAN_PATH =
@@ -1041,7 +1044,7 @@ function currentSourcePreparationProofV2(directory) {
   });
 }
 
-function currentFinalizationFixture(directory) {
+function currentFinalizationFixture(directory, { prerelease = false } = {}) {
   const sourceProof = currentSourcePreparationProofV2(directory);
   const publicationValue = structuredClone(currentPublicationReceiptV2().value);
   publicationValue.source_proof_sha256 = sourceProof.digest;
@@ -1239,9 +1242,9 @@ function currentFinalizationFixture(directory) {
     id: publicationValue.release_database_id,
     tag_name: CURRENT_TAG,
     target_commitish: sourceProof.value.tag_commit,
-    prerelease: true,
+    prerelease,
     draft: false,
-    body: PRERELEASE_BODY,
+    body: prerelease ? PRERELEASE_BODY : STABLE_BODY,
     created_at: '2026-07-25T14:55:00.000Z',
     published_at: '2026-07-25T15:01:00.000Z',
     author: GITHUB_ACTIONS_BOT,
@@ -2264,18 +2267,22 @@ try {
     assert.equal(stableReceipt.schema, 2);
     assert.equal(stableReceipt.type, 'SessionRelayPublicationReceiptV2');
     assert.equal(stableReceipt.release_state, 'stable');
-    assert.equal(stableReceipt.transition, 'finalized');
+    assert.equal(stableReceipt.transition, 'already_stable');
     assert.equal(stableReceipt.body_sha256, sha256(Buffer.from(STABLE_BODY)));
     assert.equal(stableReceipt.release_database_id, current.publication.value.release_database_id);
     assert.deepEqual(stableReceipt.assets, current.publication.value.assets);
-    assert.equal(current.fake.state.edited, 1);
+    assert.equal(
+      current.fake.state.edited,
+      0,
+      'current finalization must consume the promoted stable release without reopening the target',
+    );
 
     const resumedOptions = new Map(current.options);
     resumedOptions.set('receipt-out', path.join(directory, 'current-stable-finalization-resumed.json'));
     resumedOptions.set('resume-finalization', current.options.get('receipt-out'));
     resumedOptions.set('resume-finalization-sha256', sha256(stableBytes));
     finalizeReviewed(resumedOptions, current.fake.adapter, validatePromotionReceiptForFinalization);
-    assert.equal(current.fake.state.edited, 1, 'current finalization resume must not edit the stable release again');
+    assert.equal(current.fake.state.edited, 0, 'current finalization resume must not edit the stable release');
     assert.equal(
       fs.readFileSync(resumedOptions.get('receipt-out'), 'utf8'),
       stableBytes.toString('utf8'),
@@ -2285,13 +2292,98 @@ try {
   }
 
   {
-    const directory = fs.mkdtempSync(path.join(root, 'current-finalize-unbound-stable-'));
-    const current = currentFinalizationFixture(directory);
-    current.fake.state.release.prerelease = false;
-    current.fake.state.release.body = STABLE_BODY;
+    const directory = fs.mkdtempSync(path.join(root, 'current-promote-finalize-'));
+    const current = currentFinalizationFixture(directory, { prerelease: true });
+    const implementation = current.sourceProof.value.implementation_commit;
+    let promotions = 0;
+    const promotionAdapter = {
+      now: () => '2026-07-25T18:00:00.000Z',
+      loadProof: () => ({ value: structuredClone(current.sourceProof.value), digest: current.sourceProof.digest }),
+      loadPublication: () => ({
+        value: structuredClone(current.publication.value),
+        digest: current.publication.digest,
+      }),
+      loadPublicRelease: () => ({
+        value: structuredClone(current.publicRelease.value),
+        digest: current.publicRelease.digest,
+      }),
+      remoteRef: (ref) => (ref === 'refs/heads/main' ? implementation : null),
+      isAncestor: () => true,
+      isPublicAncestor: () => true,
+      currentReleaseState: () => ({
+        commit: current.fake.state.tagCommit,
+        release: structuredClone(current.fake.state.release),
+      }),
+      promoteStable: ({ tag, releaseDatabaseId, body }) => {
+        assert.equal(tag, TAG);
+        assert.equal(releaseDatabaseId, current.publication.value.release_database_id);
+        assert.equal(body, STABLE_BODY);
+        promotions += 1;
+        current.fake.state.release.prerelease = false;
+        current.fake.state.release.body = STABLE_BODY;
+      },
+      assertReceiptOutputAvailable: ({ path: output }) => {
+        assert.equal(fs.existsSync(output), false);
+      },
+      writeReceipt: ({ path: output, receipt, allowExisting }) => {
+        assert.equal(allowExisting, false);
+        const bytes = Buffer.from(canonicalize(receipt));
+        fs.writeFileSync(output, bytes, { mode: 0o600, flag: 'wx' });
+        return { bytes, digest: sha256(bytes), path: output };
+      },
+    };
+    const promotionOptions = new Map([
+      ['docks-kit-release', CURRENT_PUBLIC_TAG],
+      ['expected-origin-main', implementation],
+      ['receipt-out', path.join(directory, 'current-promotion-e2e.json')],
+    ]);
+    const promoted = promoteReviewed(promotionOptions, false, promotionAdapter);
+    assert.equal(promotions, 1, 'end-to-end current promotion must promote the staged release exactly once');
+    assert.equal(promoted.receipt.schema, 2);
+    assert.equal(promoted.receipt.type, 'PromotionReceiptV2');
+    assert.equal(promoted.receipt.publication_receipt_sha256, current.publication.digest);
+    assert.equal(promoted.receipt.public_release_receipt_sha256, current.publicRelease.digest);
+    assert.equal(current.fake.state.release.prerelease, false, 'promotion must leave the live release stable');
+
+    const promotionBytes = fs.readFileSync(promotionOptions.get('receipt-out'));
+    assert.equal(promotionBytes.toString('utf8'), canonicalize(promoted.receipt));
+    current.options.set('promotion', promotionOptions.get('receipt-out'));
+    current.options.set('promotion-sha256', sha256(promotionBytes));
+    finalizeReviewed(current.options, current.fake.adapter, validatePromotionReceiptForFinalization);
+    const finalReceipt = receiptAt(current.options.get('receipt-out'));
+    assert.equal(finalReceipt.release_state, 'stable');
+    assert.equal(finalReceipt.transition, 'already_stable');
+    assert.equal(finalReceipt.body_sha256, sha256(Buffer.from(STABLE_BODY)));
+    assert.equal(
+      current.fake.state.edited,
+      0,
+      'end-to-end finalization must bind the promoted stable receipt without a second stable edit',
+    );
+    checks += 2;
+  }
+
+  {
+    const directory = fs.mkdtempSync(path.join(root, 'current-finalize-unpromoted-'));
+    const current = currentFinalizationFixture(directory, { prerelease: true });
     expectConflict(
       () => finalizeReviewed(current.options, current.fake.adapter, validatePromotionReceiptForFinalization),
-      /already stable.*V2 finalization receipt|public child.*first/i,
+      /promoted stable release|stable promotion/i,
+    );
+    assert.equal(current.fake.state.edited, 0);
+    assert.equal(fs.existsSync(current.options.get('receipt-out')), false);
+  }
+
+  {
+    const directory = fs.mkdtempSync(path.join(root, 'current-finalize-snapshot-mismatch-'));
+    const current = currentFinalizationFixture(directory);
+    const tampered = JSON.parse(fs.readFileSync(current.promotion.file, 'utf8'));
+    tampered.stable_release.workflow_run_id += 1;
+    const tamperedReceipt = writeCanonical(directory, 'tampered-promotion.json', tampered);
+    current.options.set('promotion', tamperedReceipt.file);
+    current.options.set('promotion-sha256', tamperedReceipt.digest);
+    expectConflict(
+      () => finalizeReviewed(current.options, current.fake.adapter, acceptPromotionReceipt),
+      /stable promotion snapshot/i,
     );
     assert.equal(current.fake.state.edited, 0);
     assert.equal(fs.existsSync(current.options.get('receipt-out')), false);
@@ -2300,16 +2392,12 @@ try {
   {
     const directory = fs.mkdtempSync(path.join(root, 'current-finalize-byte-drift-'));
     const current = currentFinalizationFixture(directory);
-    const editStable = current.fake.adapter.editStable;
-    current.fake.adapter.editStable = () => {
-      editStable();
-      current.fake.state.release.assets[0].digest = `sha256:${'f'.repeat(64)}`;
-    };
+    current.fake.state.release.assets[0].digest = `sha256:${'f'.repeat(64)}`;
     expectConflict(
       () => finalizeReviewed(current.options, current.fake.adapter, validatePromotionReceiptForFinalization),
       /asset identities changed|digest/i,
     );
-    assert.equal(current.fake.state.edited, 1);
+    assert.equal(current.fake.state.edited, 0);
     assert.equal(fs.existsSync(current.options.get('receipt-out')), false);
   }
 

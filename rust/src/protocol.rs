@@ -917,12 +917,15 @@ pub enum ProtocolFailpoint {
     RequestBeforeMailboxAppend,
     RequestAfterMailboxAppend,
     RequestBeforeOpenMove,
+    RequestOpenMoveBeforeSourceUnlink,
     RequestAfterOpenMove,
     ReplyBeforePendingWrite,
+    ReplyPendingMoveBeforeSourceUnlink,
     ReplyAfterPendingWrite,
     ReplyBeforeMailboxAppend,
     ReplyAfterMailboxAppend,
     ReplyBeforeEnqueuedMove,
+    ReplyEnqueuedMoveBeforeSourceUnlink,
     ReplyAfterEnqueuedMove,
 }
 
@@ -977,6 +980,62 @@ impl ClaimDirectory {
             Self::Terminal => "terminal",
         }
     }
+}
+
+/// Identity fields that never change across a claim's lifetime. Two files for
+/// one correlation must agree on all of them before the earlier state may be
+/// treated as the stale source of an interrupted `move_claim`.
+fn same_claim_identity(a: &ClaimStatusV1, b: &ClaimStatusV1) -> bool {
+    a.schema == b.schema
+        && a.correlation_id == b.correlation_id
+        && a.origin == b.origin
+        && a.requester_session_id == b.requester_session_id
+        && a.responder_session_id == b.responder_session_id
+        && a.request == b.request
+        && a.request_sha256 == b.request_sha256
+        && a.created_at == b.created_at
+}
+
+/// pending/RequestPending is the stale source of an interrupted
+/// Pending -> Open request move whose destination `authoritative` survived.
+fn stale_request_pending_of_open(stale: &ClaimStatusV1, authoritative: &ClaimStatusV1) -> bool {
+    same_claim_identity(stale, authoritative)
+        && stale.state == ClaimState::RequestPending
+        && stale.request_delivery == DeliveryState::Pending
+        && stale.reply.is_none()
+        && authoritative.state == ClaimState::Open
+        && matches!(
+            authoritative.request_delivery,
+            DeliveryState::Enqueued | DeliveryState::Consumed
+        )
+        && authoritative.reply.is_none()
+}
+
+/// open/Open is the stale source of an interrupted Open -> Pending reply move.
+fn stale_open_of_reply_pending(stale: &ClaimStatusV1, authoritative: &ClaimStatusV1) -> bool {
+    same_claim_identity(stale, authoritative)
+        && stale.state == ClaimState::Open
+        && stale.reply.is_none()
+        && authoritative.state == ClaimState::ReplyPending
+        && authoritative.request_delivery == stale.request_delivery
+        && authoritative.reply.is_some()
+        && authoritative.reply_delivery == Some(DeliveryState::Pending)
+}
+
+/// pending/ReplyPending is the stale source of an interrupted
+/// Pending -> Terminal reply move whose destination `authoritative` survived.
+fn stale_reply_pending_of_terminal(stale: &ClaimStatusV1, authoritative: &ClaimStatusV1) -> bool {
+    same_claim_identity(stale, authoritative)
+        && stale.state == ClaimState::ReplyPending
+        && stale.reply.is_some()
+        && stale.reply_delivery == Some(DeliveryState::Pending)
+        && matches!(
+            authoritative.state,
+            ClaimState::ReplyEnqueued | ClaimState::ReplyConsumed
+        )
+        && authoritative.request_delivery == stale.request_delivery
+        && authoritative.reply == stale.reply
+        && authoritative.reply_sha256 == stale.reply_sha256
 }
 
 #[derive(Clone)]
@@ -1085,8 +1144,12 @@ impl ProtocolStore {
         from: ClaimDirectory,
         to: ClaimDirectory,
         claim: &ClaimStatusV1,
+        before_source_unlink: Option<ProtocolFailpoint>,
     ) -> Result<(), ProtocolError> {
         self.write_claim(to, claim)?;
+        if let Some(point) = before_source_unlink {
+            self.fault(point)?;
+        }
         let from_path = self.claim_path(from, &claim.correlation_id);
         if from_path != self.claim_path(to, &claim.correlation_id) {
             fs::remove_file(from_path).map_err(ProtocolError::store)?;
@@ -1128,20 +1191,35 @@ impl ProtocolStore {
         correlation_id: &str,
     ) -> Result<Option<ClaimStatusV1>, ProtocolError> {
         validate_uuid(correlation_id, "correlation id").map_err(ProtocolError::store)?;
-        let mut found = None;
-        for directory in [
-            ClaimDirectory::Pending,
-            ClaimDirectory::Open,
-            ClaimDirectory::Terminal,
-        ] {
-            if let Some(claim) = self.read_claim_in(directory, correlation_id)? {
-                if found.is_some() {
-                    return Err(ProtocolError::store("duplicate protocol claim"));
-                }
-                found = Some(claim);
+        let pending = self.read_claim_in(ClaimDirectory::Pending, correlation_id)?;
+        let open = self.read_claim_in(ClaimDirectory::Open, correlation_id)?;
+        let terminal = self.read_claim_in(ClaimDirectory::Terminal, correlation_id)?;
+        // A crash between move_claim's destination write and source unlink
+        // leaves one correlation in two directories. The later state is
+        // authoritative exactly when the earlier file is its consistent stale
+        // predecessor; recovery removes the stale file, and every other
+        // combination stays fail-closed.
+        match (pending, open, terminal) {
+            (None, None, None) => Ok(None),
+            (Some(claim), None, None) | (None, Some(claim), None) | (None, None, Some(claim)) => {
+                Ok(Some(claim))
             }
+            (Some(pending), Some(open), None) => {
+                if stale_request_pending_of_open(&pending, &open) {
+                    Ok(Some(open))
+                } else if stale_open_of_reply_pending(&open, &pending) {
+                    Ok(Some(pending))
+                } else {
+                    Err(ProtocolError::store("duplicate protocol claim"))
+                }
+            }
+            (Some(pending), None, Some(terminal))
+                if stale_reply_pending_of_terminal(&pending, &terminal) =>
+            {
+                Ok(Some(terminal))
+            }
+            _ => Err(ProtocolError::store("duplicate protocol claim")),
         }
-        Ok(found)
     }
 
     pub fn read_claim(&self, correlation_id: &str) -> Result<Option<ClaimStatusV1>, ProtocolError> {
@@ -1237,7 +1315,12 @@ impl ProtocolStore {
             claim.request_delivery = DeliveryState::Enqueued;
             claim.updated_at = store::iso_now();
             self.fault(ProtocolFailpoint::RequestBeforeOpenMove)?;
-            self.move_claim(ClaimDirectory::Pending, ClaimDirectory::Open, &claim)?;
+            self.move_claim(
+                ClaimDirectory::Pending,
+                ClaimDirectory::Open,
+                &claim,
+                Some(ProtocolFailpoint::RequestOpenMoveBeforeSourceUnlink),
+            )?;
             self.fault(ProtocolFailpoint::RequestAfterOpenMove)?;
             Ok(message)
         })
@@ -1358,7 +1441,12 @@ impl ProtocolStore {
         claim.reply_delivery = Some(DeliveryState::Pending);
         claim.updated_at = store::iso_now();
         self.fault(ProtocolFailpoint::ReplyBeforePendingWrite)?;
-        self.move_claim(ClaimDirectory::Open, ClaimDirectory::Pending, &claim)?;
+        self.move_claim(
+            ClaimDirectory::Open,
+            ClaimDirectory::Pending,
+            &claim,
+            Some(ProtocolFailpoint::ReplyPendingMoveBeforeSourceUnlink),
+        )?;
         self.fault(ProtocolFailpoint::ReplyAfterPendingWrite)?;
         self.fault(ProtocolFailpoint::ReplyBeforeMailboxAppend)?;
         self.append_message(&claim.requester_session_id, &message)?;
@@ -1367,7 +1455,12 @@ impl ProtocolStore {
         claim.reply_delivery = Some(DeliveryState::Enqueued);
         claim.updated_at = store::iso_now();
         self.fault(ProtocolFailpoint::ReplyBeforeEnqueuedMove)?;
-        self.move_claim(ClaimDirectory::Pending, ClaimDirectory::Terminal, &claim)?;
+        self.move_claim(
+            ClaimDirectory::Pending,
+            ClaimDirectory::Terminal,
+            &claim,
+            Some(ProtocolFailpoint::ReplyEnqueuedMoveBeforeSourceUnlink),
+        )?;
         self.fault(ProtocolFailpoint::ReplyAfterEnqueuedMove)?;
         Ok(ReplyOutcome {
             disposition: ReplyDisposition::Created,
@@ -1439,16 +1532,56 @@ impl ProtocolStore {
             if path.file_stem().and_then(|stem| stem.to_str()) != Some(&claim.correlation_id) {
                 return Err(ProtocolError::store("pending claim filename mismatch"));
             }
+            let open = self.read_claim_in(ClaimDirectory::Open, &claim.correlation_id)?;
+            let terminal = self.read_claim_in(ClaimDirectory::Terminal, &claim.correlation_id)?;
             match claim.state {
                 ClaimState::RequestPending => {
+                    if let Some(open) = open {
+                        // Interrupted Pending -> Open move: the destination is
+                        // already authoritative and its mailbox append happened
+                        // before that write, so only the stale source is
+                        // removed. Re-appending here could resurrect an
+                        // already-consumed delivery.
+                        if terminal.is_some() || !stale_request_pending_of_open(&claim, &open) {
+                            return Err(ProtocolError::store("duplicate protocol claim"));
+                        }
+                        fs::remove_file(&path).map_err(ProtocolError::store)?;
+                        continue;
+                    }
+                    if terminal.is_some() {
+                        return Err(ProtocolError::store("duplicate protocol claim"));
+                    }
                     self.append_message(&claim.responder_session_id, &claim.request)?;
                     let mut next = claim;
                     next.state = ClaimState::Open;
                     next.request_delivery = DeliveryState::Enqueued;
                     next.updated_at = store::iso_now();
-                    self.move_claim(ClaimDirectory::Pending, ClaimDirectory::Open, &next)?;
+                    self.move_claim(ClaimDirectory::Pending, ClaimDirectory::Open, &next, None)?;
                 }
                 ClaimState::ReplyPending => {
+                    if let Some(terminal) = terminal {
+                        // Interrupted Pending -> Terminal move: same rule as
+                        // the request move above.
+                        if open.is_some() || !stale_reply_pending_of_terminal(&claim, &terminal) {
+                            return Err(ProtocolError::store("duplicate protocol claim"));
+                        }
+                        fs::remove_file(&path).map_err(ProtocolError::store)?;
+                        continue;
+                    }
+                    if let Some(open) = open {
+                        // Interrupted Open -> Pending move: here the pending
+                        // file is the later authoritative claim. Remove the
+                        // stale source before replay so a crash later in this
+                        // pass cannot leave an open+terminal pair the pending
+                        // scan no longer sees.
+                        if !stale_open_of_reply_pending(&open, &claim) {
+                            return Err(ProtocolError::store("duplicate protocol claim"));
+                        }
+                        fs::remove_file(
+                            self.claim_path(ClaimDirectory::Open, &claim.correlation_id),
+                        )
+                        .map_err(ProtocolError::store)?;
+                    }
                     let reply = claim
                         .reply
                         .as_ref()
@@ -1459,7 +1592,12 @@ impl ProtocolStore {
                     next.state = ClaimState::ReplyEnqueued;
                     next.reply_delivery = Some(DeliveryState::Enqueued);
                     next.updated_at = store::iso_now();
-                    self.move_claim(ClaimDirectory::Pending, ClaimDirectory::Terminal, &next)?;
+                    self.move_claim(
+                        ClaimDirectory::Pending,
+                        ClaimDirectory::Terminal,
+                        &next,
+                        None,
+                    )?;
                 }
                 _ => {
                     return Err(ProtocolError::store(
@@ -1475,17 +1613,9 @@ impl ProtocolStore {
         self.locked(|| self.recover_pending_locked())
     }
 
-    fn consume_message_locked(
-        &self,
-        message: &MessageV2,
-        claim_required: bool,
-    ) -> Result<bool, ProtocolError> {
+    fn consume_message_locked(&self, message: &MessageV2) -> Result<bool, ProtocolError> {
         let Some(mut claim) = self.read_claim_locked(&message.correlation_id)? else {
-            return if claim_required {
-                Err(ProtocolError::store("typed mailbox row has no claim"))
-            } else {
-                Ok(true)
-            };
+            return Err(ProtocolError::store("typed mailbox row has no claim"));
         };
         match message.kind {
             MessageKind::Request
@@ -1545,7 +1675,7 @@ impl ProtocolStore {
                         "typed mailbox recipient binding mismatch",
                     ));
                 }
-                self.consume_message_locked(&message, false)?
+                self.consume_message_locked(&message)?
             } else {
                 true
             };
@@ -1588,7 +1718,48 @@ impl ProtocolStore {
     }
 
     pub fn peek_typed(&self, recipient_id: &str) -> Result<Vec<MessageV2>, ProtocolError> {
-        self.locked(|| self.typed_mailbox(recipient_id).map(|(typed, _)| typed))
+        self.locked(|| {
+            let (typed, _legacy) = self.typed_mailbox(recipient_id)?;
+            let mut deliverable = Vec::with_capacity(typed.len());
+            for message in typed {
+                if self.peek_message_locked(&message)? {
+                    deliverable.push(message);
+                }
+            }
+            Ok(deliverable)
+        })
+    }
+
+    /// Non-draining twin of `consume_message_locked`: every typed row must
+    /// bind to its authoritative claim before it is surfaced. Rows an
+    /// eventual drain would deliver are shown, already-consumed duplicates
+    /// are hidden, and unbound or mismatched rows fail closed. Pending states
+    /// stay visible: their mailbox append precedes the interrupted state
+    /// move, so the row is real and recovery converges the claim around it.
+    fn peek_message_locked(&self, message: &MessageV2) -> Result<bool, ProtocolError> {
+        let Some(claim) = self.read_claim_locked(&message.correlation_id)? else {
+            return Err(ProtocolError::store("typed mailbox row has no claim"));
+        };
+        match message.kind {
+            MessageKind::Request if claim.request == *message => {
+                match (claim.state, claim.request_delivery) {
+                    (ClaimState::RequestPending, DeliveryState::Pending)
+                    | (ClaimState::Open, DeliveryState::Enqueued) => Ok(true),
+                    (ClaimState::Open, DeliveryState::Consumed) => Ok(false),
+                    _ => Err(ProtocolError::store("typed mailbox claim binding mismatch")),
+                }
+            }
+            MessageKind::TerminalReply | MessageKind::WorkerResult
+                if claim.reply.as_ref() == Some(message) =>
+            {
+                match claim.state {
+                    ClaimState::ReplyPending | ClaimState::ReplyEnqueued => Ok(true),
+                    ClaimState::ReplyConsumed => Ok(false),
+                    _ => Err(ProtocolError::store("typed mailbox claim binding mismatch")),
+                }
+            }
+            _ => Err(ProtocolError::store("typed mailbox claim binding mismatch")),
+        }
     }
 
     pub fn drain_typed(&self, recipient_id: &str) -> Result<Vec<MessageV2>, ProtocolError> {
@@ -1597,7 +1768,7 @@ impl ProtocolStore {
             let (typed, legacy) = self.typed_mailbox(recipient_id)?;
             let mut delivered = Vec::with_capacity(typed.len());
             for message in typed {
-                if self.consume_message_locked(&message, true)? {
+                if self.consume_message_locked(&message)? {
                     delivered.push(message);
                 }
             }
@@ -1611,5 +1782,55 @@ impl ProtocolStore {
             }
             Ok(delivered)
         })
+    }
+
+    /// Restore claim delivery for typed rows a failed pre-inject delivery is
+    /// requeueing. `rows` are exactly the rows the interrupted drain
+    /// delivered, i.e. the ones it transitioned to Consumed. The caller holds
+    /// the store lock and rewrites the raw mailbox bytes after this returns:
+    /// restoring Enqueued first means a crash between the two steps leaves an
+    /// undelivered claim without its row (no worse than today's
+    /// crash-after-drain window), while the reverse order would leave
+    /// requeued rows every later drain silently drops as consumed duplicates.
+    pub(crate) fn requeue_consumed_locked(&self, rows: &[JsonValue]) -> Result<(), ProtocolError> {
+        for row in rows {
+            let is_typed = row
+                .get::<HashMap<String, JsonValue>>()
+                .is_some_and(|object| object.contains_key("schema"));
+            if !is_typed {
+                continue;
+            }
+            let message = MessageV2::from_tinyjson(row).map_err(ProtocolError::store)?;
+            let Some(mut claim) = self.read_claim_locked(&message.correlation_id)? else {
+                return Err(ProtocolError::store("requeued typed row has no claim"));
+            };
+            match message.kind {
+                MessageKind::Request if claim.request == message => {
+                    if claim.state == ClaimState::Open
+                        && claim.request_delivery == DeliveryState::Consumed
+                    {
+                        claim.request_delivery = DeliveryState::Enqueued;
+                        claim.updated_at = store::iso_now();
+                        self.write_claim(ClaimDirectory::Open, &claim)?;
+                    }
+                }
+                MessageKind::TerminalReply | MessageKind::WorkerResult
+                    if claim.reply.as_ref() == Some(&message) =>
+                {
+                    if claim.state == ClaimState::ReplyConsumed {
+                        claim.state = ClaimState::ReplyEnqueued;
+                        claim.reply_delivery = Some(DeliveryState::Enqueued);
+                        claim.updated_at = store::iso_now();
+                        self.write_claim(ClaimDirectory::Terminal, &claim)?;
+                    }
+                }
+                _ => {
+                    return Err(ProtocolError::store(
+                        "requeued typed row claim binding mismatch",
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 }
