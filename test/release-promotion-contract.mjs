@@ -12,6 +12,10 @@ import {
   VERSION,
 } from '../../../scripts/lib/session-relay-release-core.mjs';
 import { validateSourcePreparationProof } from '../../../scripts/lib/session-relay-release-preparation.mjs';
+import {
+  canonicalPlanView,
+  canonicalVerificationResults,
+} from '../../docks/skills/productivity/plan-manager/scripts/plan-run.mjs';
 import * as releasePromotion from '../../../scripts/lib/session-relay-release-promotion.mjs';
 import {
   fetchPromotionAuthoritativeRef,
@@ -1654,6 +1658,102 @@ function currentPublicReleaseEvidenceFixture(completionDigest) {
     },
   };
 }
+function currentPlanRunPublicFixture() {
+  const activePlanPath = 'docs/plans/active/session-relay-0.14.0-docks-kit-0.12.0-release.md';
+  const fileBytes = new Map([
+    ['SoT/toolchain.json', Buffer.from('{"tools":{"session-relay":{"verified":"0.14.0"}}}\n')],
+    ['package.json', Buffer.from('{"name":"docks-kit","version":"0.12.0"}\n')],
+  ]);
+  const affectedPaths = [...fileBytes.keys()].sort();
+  const manifestPaths = affectedPaths.map((filePath) => ({
+    path: filePath,
+    state: 'file',
+    kind: 'file',
+    mode: 0o664,
+    sha256: hash(fileBytes.get(filePath)),
+  }));
+  const sourceSha256 = hash({
+    schema: 1,
+    source_base: CURRENT_PUBLIC_IMPLEMENTATION_COMMIT,
+    paths: manifestPaths,
+  });
+  const completionDigest = DIGEST('8');
+  const run = {
+    acceptance: {
+      source_sha256: sourceSha256,
+      verification_sha256: DIGEST('0'),
+    },
+    blocker: null,
+    completion_review: {
+      input_sha256: DIGEST('7'),
+      invocations: 2,
+      result_sha256: completionDigest,
+      state: 'passed',
+    },
+    draft_review: {
+      input_sha256: DIGEST('6'),
+      invocations: 2,
+      result_sha256: DIGEST('5'),
+      state: 'passed',
+    },
+    execution_parent: CURRENT_PUBLIC_EXECUTION_PARENT,
+    goal_id: CURRENT_GOAL_ID,
+    implementation_commit: CURRENT_PUBLIC_IMPLEMENTATION_COMMIT,
+    plan_path: activePlanPath,
+    plan_sha256: DIGEST('0'),
+    repository_id: 'DocksDocks/public',
+    requested_effects: ['local', 'probe', 'push', 'release'],
+    risk: 'external',
+    run_id: CURRENT_PUBLIC_RUN_ID,
+    schema: 1,
+    source_base: CURRENT_PUBLIC_EXECUTION_PARENT,
+    source_sha256: DIGEST('4'),
+  };
+  const render = () =>
+    Buffer.from(
+      [
+        '---',
+        'title: Current public PlanRun fixture',
+        'status: finished',
+        'created: "2026-07-25T12:00:00.000Z"',
+        'updated: "2026-07-26T01:00:00.000Z"',
+        'started_at: "2026-07-25T13:00:00.000Z"',
+        'finished_at: "2026-07-26T01:00:00.000Z"',
+        'assignee: null',
+        'tags: [session-relay, release]',
+        'affected_paths:',
+        ...affectedPaths.map((filePath) => `  - ${filePath}`),
+        'related_plans: []',
+        '---',
+        '',
+        '# Current public PlanRun fixture',
+        '',
+        `Plan-run: ${canonicalize(run)}`,
+        '',
+        '## Goal',
+        '',
+        'Release the current public companion.',
+        '',
+        '## Review',
+        '',
+        'Passed.',
+        '',
+        '## Verification Results',
+        '',
+        '- Current public PlanRun fixture verified.',
+        '',
+      ].join('\n'),
+    );
+  run.acceptance.verification_sha256 = hash(canonicalVerificationResults(render()));
+  run.plan_sha256 = hash(canonicalPlanView(render()));
+  return {
+    completionDigest,
+    fileBytes,
+    planBytes: render(),
+    run: structuredClone(run),
+  };
+}
+
 
 function makeCurrentPublicReleaseAdapter(
   request,
@@ -1662,12 +1762,14 @@ function makeCurrentPublicReleaseAdapter(
     evidenceCopies = 1,
     evidenceMutation = null,
     npmState = 'published',
+    planRun = false,
     publishedAt = CURRENT_PUBLIC_RELEASED_AT,
   } = {},
 ) {
+  const planRunFixture = planRun ? currentPlanRunPublicFixture() : null;
   const completionReceipt = completionReceiptForReviewedHead(CURRENT_PUBLIC_IMPLEMENTATION_COMMIT);
   const completionReceiptText = canonicalize(completionReceipt);
-  const completionDigest = hash(completionReceiptText);
+  const completionDigest = planRunFixture?.completionDigest ?? hash(completionReceiptText);
   const evidence = currentPublicReleaseEvidenceFixture(completionDigest);
   evidenceMutation?.(evidence);
   const evidenceText = canonicalize(evidence);
@@ -1700,20 +1802,22 @@ function makeCurrentPublicReleaseAdapter(
     status: 'completed',
     conclusion: 'success',
   };
-  const finishedPlan = Buffer.from(
-    [
-      '---',
-      'status: finished',
-      'review_status: passed',
-      '---',
-      '',
-      '# Public release',
-      '',
-      `Completion-review-receipt: ${completionReceiptText}`,
-      ...Array.from({ length: evidenceCopies }, () => `Public-release-evidence: ${evidenceText}`),
-      '',
-    ].join('\n'),
-  );
+  const finishedPlan =
+    planRunFixture?.planBytes ??
+    Buffer.from(
+      [
+        '---',
+        'status: finished',
+        'review_status: passed',
+        '---',
+        '',
+        '# Public release',
+        '',
+        `Completion-review-receipt: ${completionReceiptText}`,
+        ...Array.from({ length: evidenceCopies }, () => `Public-release-evidence: ${evidenceText}`),
+        '',
+      ].join('\n'),
+    );
   const ancestryFlags = new Map([
     [`${CURRENT_PUBLIC_RED_COMMIT}...${CURRENT_PUBLIC_IMPLEMENTATION_COMMIT}`, 'red_to_implementation'],
     [
@@ -1732,6 +1836,11 @@ function makeCurrentPublicReleaseAdapter(
       return flag !== ancestryFailure;
     },
     getFinishedPlan: (commit, planPath) => {
+      if (planRunFixture && commit === CURRENT_PUBLIC_IMPLEMENTATION_COMMIT) {
+        const bytes = planRunFixture.fileBytes.get(planPath);
+        assert.ok(bytes, `unexpected current public implementation path: ${planPath}`);
+        return Buffer.from(bytes);
+      }
       assert.equal(commit, CURRENT_PUBLIC_ARCHIVE_COMMIT, 'current finished plan must be read from archive commit');
       assert.equal(planPath, CURRENT_PUBLIC_PLAN_PATH, 'current finished plan path identity');
       return finishedPlan;
@@ -1752,7 +1861,7 @@ function makeCurrentPublicReleaseAdapter(
       return npmState;
     },
   };
-  return { adapter, completionDigest, evidence };
+  return { adapter, completionDigest, evidence, planRunFixture };
 }
 
 function verifyCurrentPublicBoundary(directory, boundary, observation, output) {
@@ -1829,6 +1938,34 @@ function verifyCurrentPublicBoundary(directory, boundary, observation, output) {
       fs.readFileSync(path.join(directory, 'current-public-release.json'), 'utf8'),
       canonicalize(verified.receipt),
     );
+    const planRunSuccess = makeCurrentPublicReleaseAdapter(boundary.request, { planRun: true });
+    const planRunVerified = verifyCurrentPublicBoundary(
+      directory,
+      boundary,
+      planRunSuccess,
+      'current-public-planrun-release.json',
+    );
+    assert.equal(planRunVerified.receipt.schema, 3, 'PlanRun verifier must emit schema 3');
+    assert.equal(
+      planRunVerified.receipt.type,
+      'PublicReleaseReceiptV3',
+      'PlanRun verifier must emit PublicReleaseReceiptV3',
+    );
+    assert.deepEqual(planRunVerified.receipt.public_plan.plan_run, planRunSuccess.planRunFixture.run);
+    assert.equal(
+      planRunVerified.receipt.public_plan.plan_run.completion_review.result_sha256,
+      planRunSuccess.completionDigest,
+    );
+    assert.equal(
+      planRunVerified.receipt.public_plan.plan_run.acceptance.source_sha256,
+      planRunSuccess.planRunFixture.run.acceptance.source_sha256,
+    );
+    assert.equal(
+      planRunVerified.receipt.public_plan.finished_path,
+      CURRENT_PUBLIC_PLAN_PATH,
+      'PlanRun receipt must bind the observed finished archive path',
+    );
+
 
     for (const [name, observation, pattern] of [
       [
