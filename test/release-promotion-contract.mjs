@@ -12,10 +12,6 @@ import {
   VERSION,
 } from '../../../scripts/lib/session-relay-release-core.mjs';
 import { validateSourcePreparationProof } from '../../../scripts/lib/session-relay-release-preparation.mjs';
-import {
-  canonicalPlanView,
-  canonicalVerificationResults,
-} from '../../docks/skills/productivity/plan-manager/scripts/plan-run.mjs';
 import * as releasePromotion from '../../../scripts/lib/session-relay-release-promotion.mjs';
 import {
   fetchPromotionAuthoritativeRef,
@@ -26,6 +22,10 @@ import {
   validatePromotionReceipt,
   validatePromotionReceiptForFinalization,
 } from '../../../scripts/lib/session-relay-release-promotion.mjs';
+import {
+  canonicalPlanView,
+  canonicalVerificationResults,
+} from '../../docks/skills/productivity/plan-manager/scripts/plan-run.mjs';
 
 const OLD_MAIN = '1'.repeat(40);
 const TAG_COMMIT = '2'.repeat(40);
@@ -72,6 +72,9 @@ const CURRENT_GOAL_ID = '8b89aabf-7336-4352-bc11-225bab67f9aa';
 const CURRENT_DOCKS_RUN_ID = '88732ba0-ef06-411b-a31c-93705ccefb27';
 const CURRENT_DOCKS_PLAN_PATH = 'docs/plans/active/session-relay-correlated-results-release-remediation-v4.md';
 const CURRENT_DOCKS_SOURCE_BASE = '494881a0d973863d1ac8e233734c827eb6913ce8';
+const PLANRUN_DOCKS_RUN_ID = '1adc1590-49ee-42e6-93ab-8062e580d250';
+const PLANRUN_DOCKS_PLAN_PATH = 'docs/plans/active/session-relay-correlated-results-release-remediation-v6.md';
+const PLANRUN_DOCKS_SOURCE_BASE = '6d794a9d2380ea74c0b67a0b90e8f3825c9d0148';
 const CURRENT_PUBLIC_RUN_ID = '1f801952-705e-4c7e-a533-91026c013383';
 const CURRENT_PUBLIC_PLAN_PATH = 'docs/plans/finished/2026-07-25-session-relay-0.14.0-docks-kit-0.12.0-release.md';
 const HISTORICAL_RELEASE_PLAN_PATH = 'docs/plans/active/session-relay-linux-workspace-publication.md';
@@ -1754,7 +1757,6 @@ function currentPlanRunPublicFixture() {
   };
 }
 
-
 function makeCurrentPublicReleaseAdapter(
   request,
   {
@@ -1966,7 +1968,6 @@ function verifyCurrentPublicBoundary(directory, boundary, observation, output) {
       'PlanRun receipt must bind the observed finished archive path',
     );
 
-
     for (const [name, observation, pattern] of [
       [
         'wrong red-to-implementation order',
@@ -2112,9 +2113,31 @@ function currentPromotionProofV2() {
     created_at: '2026-07-25T14:00:00.000Z',
   };
 }
+function currentPromotionProofV3() {
+  const proof = structuredClone(currentPromotionProofV2());
+  proof.schema = 3;
+  proof.type = 'SourcePreparationProofV3';
+  proof.run_id = PLANRUN_DOCKS_RUN_ID;
+  proof.source_commit = PLANRUN_DOCKS_SOURCE_BASE;
+  proof.plan_run.run_id = PLANRUN_DOCKS_RUN_ID;
+  proof.plan_run.plan_path = PLANRUN_DOCKS_PLAN_PATH;
+  proof.plan_run.source_base = PLANRUN_DOCKS_SOURCE_BASE;
+  delete proof.tdd_red;
+  proof.ancestry = {
+    source_to_implementation: true,
+    implementation_to_reviewed: true,
+    reviewed_to_tag: true,
+  };
+  return proof;
+}
 
-function makeCurrentPromotionAdapter({ byteDrift = false, refConflict = null, stableInitially = false } = {}) {
-  const proofValue = currentPromotionProofV2();
+function makeCurrentPromotionAdapter({
+  byteDrift = false,
+  planRun = false,
+  refConflict = null,
+  stableInitially = false,
+} = {}) {
+  const proofValue = planRun ? currentPromotionProofV3() : currentPromotionProofV2();
   const proofEnvelope = { value: proofValue, digest: hash(proofValue) };
   const publicationValue = currentBoundaryPublicationValue();
   publicationValue.source_proof_sha256 = proofEnvelope.digest;
@@ -2125,6 +2148,29 @@ function makeCurrentPromotionAdapter({ byteDrift = false, refConflict = null, st
   publicationValue.workflow.head_sha = proofValue.tag_commit;
   const publicationEnvelope = { value: publicationValue, digest: hash(publicationValue) };
   const publicReleaseValue = structuredClone(currentReleaseChainV2().publicRelease.value);
+  if (planRun) {
+    const publicFixture = currentPlanRunPublicFixture();
+    publicReleaseValue.schema = 3;
+    publicReleaseValue.type = 'PublicReleaseReceiptV3';
+    publicReleaseValue.ancestry = {
+      execution_parent: CURRENT_PUBLIC_EXECUTION_PARENT,
+      implementation_commit: CURRENT_PUBLIC_IMPLEMENTATION_COMMIT,
+      release_commit: CURRENT_PUBLIC_RELEASE_COMMIT,
+      archive_commit: CURRENT_PUBLIC_ARCHIVE_COMMIT,
+      execution_parent_to_implementation: true,
+      implementation_to_release: true,
+      release_to_archive: true,
+    };
+    publicReleaseValue.public_plan = {
+      plan_run: publicFixture.run,
+      active_path: publicFixture.run.plan_path,
+      finished_path: CURRENT_PUBLIC_PLAN_PATH,
+      release_commit: CURRENT_PUBLIC_RELEASE_COMMIT,
+      archive_commit: CURRENT_PUBLIC_ARCHIVE_COMMIT,
+      remote_read_back: true,
+      finished_at: '2026-07-26T01:36:05.859Z',
+    };
+  }
   publicReleaseValue.pinned_assets = Object.fromEntries(
     PUBLIC_ASSET_TARGETS.map((target) => [
       target,
@@ -2155,7 +2201,7 @@ function makeCurrentPromotionAdapter({ byteDrift = false, refConflict = null, st
     },
   };
   const adapter = {
-    now: () => '2026-07-25T18:00:00.000Z',
+    now: () => (planRun ? '2026-07-26T02:00:00.000Z' : '2026-07-25T18:00:00.000Z'),
     loadProof: () => proofEnvelope,
     loadPublication: () => publicationEnvelope,
     loadPublicRelease: () => publicReleaseEnvelope,
@@ -2231,6 +2277,25 @@ function makeCurrentPromotionAdapter({ byteDrift = false, refConflict = null, st
     canonicalize(result.receipt),
     'current promotion receipt output must be canonical',
   );
+}
+{
+  const current = makeCurrentPromotionAdapter({ planRun: true });
+  validateSourcePreparationProof(current.adapter.loadProof().value);
+  const result = promoteReviewed(current.options, false, current.adapter);
+  validatePromotionReceipt(result.receipt);
+  validatePromotionReceiptForFinalization(result.receipt, {
+    proof: current.adapter.loadProof(),
+    publication: current.publicationEnvelope,
+    publicRelease: current.publicReleaseEnvelope,
+  });
+  assert.equal(result.receipt.schema, 3);
+  assert.equal(result.receipt.type, 'PromotionReceiptV3');
+  assert.equal(result.receipt.docks_plan.run_id, PLANRUN_DOCKS_RUN_ID);
+  assert.equal(result.receipt.docks_plan.plan_path, PLANRUN_DOCKS_PLAN_PATH);
+  assert.equal(result.receipt.public_child.planrun_verified, true);
+  assert.equal(result.receipt.public_release_receipt_sha256, current.publicReleaseEnvelope.digest);
+  assert.deepEqual(result.receipt.staged_release.assets, result.receipt.stable_release.assets);
+  assert.equal(current.state.promotions, 1, 'PlanRun release must be promoted exactly once');
 }
 
 {

@@ -3093,10 +3093,12 @@ function bindCurrentCompletionFixture(
   const runMatch = /^Plan-run: (\{.*\})$/m.exec(template);
   assert.ok(runMatch, 'active remediation v4 PlanRun fixture is absent');
   const templateRun = JSON.parse(runMatch[1]);
-  let plan = template.replace(
-    /## Verification Results\n[\s\S]*$/u,
-    `## Verification Results\n\nTDD-red-evidence: ${jcs(red)}\n- Focused current release evidence passed on the reviewed implementation.\n`,
-  );
+  let plan = template
+    .replace(/^status: blocked$/m, 'status: ongoing')
+    .replace(
+      /## Verification Results\n[\s\S]*$/u,
+      `## Verification Results\n\nTDD-red-evidence: ${jcs(red)}\n- Focused current release evidence passed on the reviewed implementation.\n`,
+    );
   plan = plan.replace(
     '\n## Verification Results\n',
     `\nCompletion-review-result: ${completionReviewJcs}\n\n## Verification Results\n`,
