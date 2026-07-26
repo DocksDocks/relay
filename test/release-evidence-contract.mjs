@@ -84,6 +84,19 @@ const CURRENT_AFFECTED_PATHS = [
   'scripts/lib/session-relay-release-promotion.mjs',
   'scripts/lib/session-relay-release-publication.mjs',
 ];
+const PLANRUN_DOCKS_RUN_ID = '5e00cc28-4e27-42cb-9cf9-c3630006d8c0';
+const PLANRUN_DOCKS_PLAN_PATH = 'docs/plans/active/session-relay-correlated-results-release-remediation-v9.md';
+const PLANRUN_DOCKS_SOURCE_BASE = 'de4f8305ac9351cbbea4549503f2684f67fbcde9';
+const PLANRUN_RELEASE_TAG_COMMIT = '7d9cbbbdf82210d396de744372eadb6c26655601';
+const PLANRUN_AFFECTED_PATHS = [
+  'plugins/session-relay/test/release-evidence-contract.mjs',
+  'plugins/session-relay/test/release-promotion-contract.mjs',
+  'plugins/session-relay/test/release-publication-contract.mjs',
+  'scripts/lib/session-relay-release-cli.mjs',
+  'scripts/lib/session-relay-release-preparation.mjs',
+  'scripts/lib/session-relay-release-promotion.mjs',
+  'scripts/lib/session-relay-release-publication.mjs',
+];
 const CURRENT_PUBLIC_PLAN_PATH = 'docs/plans/active/session-relay-0.14.0-docks-kit-0.12.0-release.md';
 const HISTORICAL_RELEASE_PLAN_PATH = 'docs/plans/active/session-relay-linux-workspace-publication.md';
 const HISTORICAL_RECEIPT_SHA256 = Object.freeze({
@@ -3468,6 +3481,362 @@ function testDefaultCompletionBindingRejectsUnauthorizedPostReviewPath(temp) {
   );
 }
 
+function bindPlanRunCompletionFixture(
+  temp,
+  { name, defaultDependencies = false, continuationPath = null, implementationExtraPath = null },
+) {
+  const clonePath = path.join(temp, `planrun-completion-${name}`);
+  const cloned = spawnSync('git', ['clone', '--quiet', '--no-hardlinks', REPO, clonePath], {
+    cwd: temp,
+    encoding: 'utf8',
+    shell: false,
+  });
+  assert.equal(cloned.status, 0, cloned.stderr);
+  const root = fs.realpathSync.native(clonePath);
+  const runGit = (args, { bytes = false, env = process.env } = {}) => {
+    const result = spawnSync('git', args, {
+      cwd: root,
+      encoding: bytes ? null : 'utf8',
+      env,
+      shell: false,
+      maxBuffer: Infinity,
+    });
+    if (result.error) throw result.error;
+    if (result.signal !== null || result.status !== 0) {
+      throw new Error(`git ${args.join(' ')} failed: ${String(result.stderr).trim()}`);
+    }
+    return bytes ? result.stdout : result.stdout.trim();
+  };
+  for (const args of [
+    ['config', 'user.name', 'Session Relay PlanRun Evidence Contract'],
+    ['config', 'user.email', 'relay-planrun-evidence@example.invalid'],
+    ['config', 'commit.gpgsign', 'false'],
+    ['checkout', '--quiet', '--detach', PLANRUN_DOCKS_SOURCE_BASE],
+  ]) {
+    runGit(args);
+  }
+  const commitFixture = (message, timestamp) => {
+    runGit(['commit', '--quiet', '-m', message], {
+      env: {
+        ...process.env,
+        GIT_AUTHOR_DATE: timestamp,
+        GIT_COMMITTER_DATE: timestamp,
+      },
+    });
+    return runGit(['rev-parse', 'HEAD^{commit}']);
+  };
+  const preparationLogical = 'scripts/lib/session-relay-release-preparation.mjs';
+  if (defaultDependencies) {
+    fs.copyFileSync(path.join(REPO, preparationLogical), path.join(root, preparationLogical));
+  }
+  for (const logical of PLANRUN_AFFECTED_PATHS) {
+    const target = path.join(root, ...logical.split('/'));
+    assert.ok(fs.statSync(target).isFile(), `successor affected-path fixture is absent: ${logical}`);
+    fs.appendFileSync(target, `\n// Successor implementation fixture: ${logical}\n`);
+  }
+  const implementationPaths = [...PLANRUN_AFFECTED_PATHS];
+  if (implementationExtraPath !== null) {
+    const target = path.join(root, ...implementationExtraPath.split('/'));
+    fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
+    fs.appendFileSync(target, '\nUnrelated successor implementation fixture.\n');
+    implementationPaths.push(implementationExtraPath);
+  }
+  runGit(['add', '--', ...implementationPaths]);
+  const implementationCommit = commitFixture(
+    'fix: bind successor release evidence fixture',
+    '2026-07-26T21:00:00.000Z',
+  );
+  const acceptanceManifest = createAffectedPathManifest({
+    repo: root,
+    paths: PLANRUN_AFFECTED_PATHS,
+    sourceBase: implementationCommit,
+  });
+  const completionDiffArgs = [
+    'diff',
+    '--binary',
+    '--full-index',
+    '--find-renames',
+    '--no-ext-diff',
+    '--no-textconv',
+    '--no-color',
+    PLANRUN_DOCKS_SOURCE_BASE,
+    implementationCommit,
+    '--',
+    ...PLANRUN_AFFECTED_PATHS,
+  ];
+  const completionDiffBytes = runGit(completionDiffArgs, { bytes: true });
+  const completionDiffSha256 = sha256(completionDiffBytes);
+  const implementationChangedPaths = runGit([
+    'diff',
+    '--name-only',
+    '--no-renames',
+    PLANRUN_DOCKS_SOURCE_BASE,
+    implementationCommit,
+    '--',
+  ])
+    .split('\n')
+    .filter(Boolean);
+  const completionReview = {
+    schema: 1,
+    run_id: PLANRUN_DOCKS_RUN_ID,
+    invocation: 1,
+    implementation_commit: implementationCommit,
+    diff_sha256: completionDiffSha256,
+    verdict: 'pass',
+    findings: [],
+  };
+  const completionReviewJcs = jcs(completionReview);
+  const completionReviewSha256 = sha256(Buffer.from(completionReviewJcs));
+  const planPath = path.join(root, PLANRUN_DOCKS_PLAN_PATH);
+  const activeTemplatePath = path.join(REPO, PLANRUN_DOCKS_PLAN_PATH);
+  let templatePath = activeTemplatePath;
+  if (!fs.existsSync(templatePath)) {
+    const finishedDirectory = path.join(REPO, 'docs/plans/finished');
+    const suffix = `-${path.basename(PLANRUN_DOCKS_PLAN_PATH)}`;
+    const candidates = fs.readdirSync(finishedDirectory).filter((entry) => entry.endsWith(suffix));
+    assert.equal(candidates.length, 1, 'fresh successor PlanRun archive fixture is not unique');
+    templatePath = path.join(finishedDirectory, candidates[0]);
+  }
+  fs.copyFileSync(templatePath, planPath);
+  const template = fs.readFileSync(planPath, 'utf8').replace(/^status: (?:blocked|finished)$/m, 'status: ongoing');
+  const runMatch = /^Plan-run: (\{.*\})$/m.exec(template);
+  assert.ok(runMatch, 'fresh successor PlanRun fixture is absent');
+  const templateRun = JSON.parse(runMatch[1]);
+  assert.equal(templateRun.run_id, PLANRUN_DOCKS_RUN_ID);
+  assert.equal(templateRun.source_base, PLANRUN_DOCKS_SOURCE_BASE);
+  assert.equal(templateRun.execution_parent, PLANRUN_DOCKS_SOURCE_BASE);
+  let plan = template.replace(
+    /## Verification Results\n[\s\S]*$/u,
+    '## Verification Results\n\n- Focused successor release evidence passed on the reviewed implementation.\n',
+  );
+  plan = plan.replace(
+    '\n## Verification Results\n',
+    `\nCompletion-review-result: ${completionReviewJcs}\n\n## Verification Results\n`,
+  );
+  const verificationSha256 = sha256(Buffer.from(canonicalVerificationResults(Buffer.from(plan))));
+  const completionInputSha256 = sha256(
+    Buffer.from(
+      jcs({
+        schema: 1,
+        type: 'PlanRunReleaseEvidenceCompletionBundleFixtureV1',
+        run_id: PLANRUN_DOCKS_RUN_ID,
+        implementation_commit: implementationCommit,
+        acceptance_source_sha256: acceptanceManifest.source_sha256,
+      }),
+    ),
+  );
+  const run = {
+    ...templateRun,
+    execution_parent: PLANRUN_DOCKS_SOURCE_BASE,
+    implementation_commit: implementationCommit,
+    completion_review: {
+      state: 'passed',
+      invocations: 1,
+      input_sha256: completionInputSha256,
+      result_sha256: completionReviewSha256,
+    },
+    acceptance: {
+      source_sha256: acceptanceManifest.source_sha256,
+      verification_sha256: verificationSha256,
+    },
+    blocker: null,
+    goal_id: CURRENT_GOAL_ID,
+    run_id: PLANRUN_DOCKS_RUN_ID,
+    plan_path: PLANRUN_DOCKS_PLAN_PATH,
+    source_base: PLANRUN_DOCKS_SOURCE_BASE,
+  };
+  plan = plan.replace(/^Plan-run: \{.*\}$/m, `Plan-run: ${jcs(run)}`);
+  assert.equal(
+    sha256(canonicalCurrentPlanView(Buffer.from(plan))),
+    templateRun.plan_sha256,
+    'successor fixture must preserve the immutable canonical PlanRun input',
+  );
+  fs.writeFileSync(planPath, plan);
+  runGit(['add', '--', PLANRUN_DOCKS_PLAN_PATH]);
+  let headCommit = commitFixture('docs: advance successor completion plan fixture', '2026-07-26T21:20:00.000Z');
+  if (continuationPath !== null) {
+    const target = path.join(root, ...continuationPath.split('/'));
+    fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
+    const continuation = continuationPath.endsWith('.mjs')
+      ? '\n// Post-implementation successor continuation fixture.\n'
+      : continuationPath.endsWith('.toml')
+        ? '\n# Post-implementation successor continuation fixture.\n'
+        : '\nPost-implementation successor continuation fixture.\n';
+    fs.appendFileSync(target, continuation);
+    runGit(['add', '--', continuationPath]);
+    headCommit = commitFixture('test: add successor continuation fixture', '2026-07-26T21:25:00.000Z');
+  }
+  const postImplementationPaths = runGit([
+    'diff',
+    '--name-only',
+    '--no-renames',
+    implementationCommit,
+    headCommit,
+    '--',
+  ])
+    .split('\n')
+    .filter(Boolean);
+  const receiptOut = path.join(root, `source-proof-v3-${name}.json`);
+  const calls = { git: [] };
+  const adapter = {
+    repoRoot: root,
+    git(args) {
+      calls.git.push([...args]);
+      return runGit(args, { bytes: true });
+    },
+    inspectPublic() {
+      assert.fail('successor source binding must not inspect or mutate public state');
+    },
+    run() {
+      assert.fail('successor source binding must not execute commands');
+    },
+    now() {
+      return '2026-07-26T21:30:00.000Z';
+    },
+    readFile(file) {
+      assert.equal(file, planPath);
+      return fs.readFileSync(file);
+    },
+  };
+  const result = defaultDependencies
+    ? bindDefaultCurrentCompletion(root, planPath, receiptOut)
+    : bindCompletion(
+        new Map([
+          ['finished-plan', planPath],
+          ['receipt-out', receiptOut],
+          ['version', CURRENT_RELEASE_VERSION],
+        ]),
+        adapter,
+      );
+  return {
+    acceptanceManifest,
+    calls,
+    completionDiffArgs,
+    completionDiffBytes,
+    completionDiffSha256,
+    completionReviewSha256,
+    headCommit,
+    implementationChangedPaths,
+    implementationCommit,
+    planPath,
+    postImplementationPaths,
+    receiptOut,
+    result,
+    run,
+  };
+}
+
+function testPlanRunCompletionBindingUsesFreshSourceAndPlanOnlyContinuation(temp) {
+  const generated = bindPlanRunCompletionFixture(temp, {
+    name: 'fresh-source-plan-only',
+    defaultDependencies: true,
+  });
+  const proof = generated.result.receipt;
+  assert.equal(proof.schema, 3);
+  assert.equal(proof.type, 'SourcePreparationProofV3');
+  assert.equal(proof.run_id, PLANRUN_DOCKS_RUN_ID);
+  assert.equal(proof.source_commit, PLANRUN_DOCKS_SOURCE_BASE);
+  assert.equal(proof.implementation_commit, generated.implementationCommit);
+  assert.equal(proof.tag_commit, PLANRUN_RELEASE_TAG_COMMIT);
+  assert.deepEqual(proof.plan_run, {
+    schema: 1,
+    repository_id: REPOSITORY_ID,
+    goal_id: CURRENT_GOAL_ID,
+    run_id: PLANRUN_DOCKS_RUN_ID,
+    plan_path: PLANRUN_DOCKS_PLAN_PATH,
+    source_base: PLANRUN_DOCKS_SOURCE_BASE,
+    implementation_commit: generated.implementationCommit,
+    status: 'ongoing',
+  });
+  assert.equal(proof.completion_review.reviewed_commit, generated.implementationCommit);
+  assert.equal(proof.completion_review.result_sha256, generated.completionReviewSha256);
+  assert.equal(proof.completion_review.diff_sha256, generated.completionDiffSha256);
+  assert.deepEqual(
+    proof.acceptance.manifest.paths.map(({ path: logical }) => logical),
+    PLANRUN_AFFECTED_PATHS,
+  );
+  assert.deepEqual(proof.acceptance.changed_paths, PLANRUN_AFFECTED_PATHS);
+  assert.deepEqual(generated.implementationChangedPaths, PLANRUN_AFFECTED_PATHS);
+  assert.deepEqual(generated.postImplementationPaths, [PLANRUN_DOCKS_PLAN_PATH]);
+  assert.notEqual(generated.headCommit, generated.implementationCommit);
+  assert.deepEqual(proof.ancestry, {
+    tag_to_source: true,
+    source_to_implementation: true,
+    implementation_to_reviewed: true,
+  });
+  assert.equal(generated.completionDiffBytes.at(-1), 0x0a, 'successor reviewed diff must retain its final byte');
+  const trimmedDiff = Buffer.from(generated.completionDiffBytes.toString('utf8').trim(), 'utf8');
+  assert.notEqual(sha256(trimmedDiff), generated.completionDiffSha256);
+  assert.equal(
+    proof.completion_review.diff_sha256,
+    sha256(generated.completionDiffBytes),
+    'V3 completion proof must hash exact raw diff bytes from its immutable source base',
+  );
+  validateSourcePreparationProof(proof);
+
+  const injectedPath = structuredClone(proof);
+  injectedPath.acceptance.changed_paths = [...injectedPath.acceptance.changed_paths, 'AGENTS.md'].sort();
+  expectReject(
+    'V3 proof rejects an injected unrelated changed_paths entry',
+    () => validateSourcePreparationProof(injectedPath),
+    /changed paths|scope|AGENTS/i,
+  );
+  const jointlyInjectedPath = structuredClone(proof);
+  jointlyInjectedPath.acceptance.manifest.paths = [
+    ...jointlyInjectedPath.acceptance.manifest.paths,
+    { path: 'AGENTS.md', state: 'missing', kind: null, mode: null, sha256: null },
+  ].sort((left, right) => left.path.localeCompare(right.path));
+  jointlyInjectedPath.acceptance.manifest.source_sha256 = sha256(
+    Buffer.from(
+      jcs({
+        schema: jointlyInjectedPath.acceptance.manifest.schema,
+        source_base: jointlyInjectedPath.acceptance.manifest.source_base,
+        paths: jointlyInjectedPath.acceptance.manifest.paths,
+      }),
+    ),
+  );
+  jointlyInjectedPath.acceptance.changed_paths = [...jointlyInjectedPath.acceptance.changed_paths, 'AGENTS.md'].sort();
+  expectReject(
+    'V3 proof rejects coordinated manifest and changed_paths injection',
+    () => validateSourcePreparationProof(jointlyInjectedPath),
+    /acceptance manifest|affected|path|AGENTS/i,
+  );
+}
+
+function testPlanRunCompletionBindingRejectsUnrelatedContinuation(temp) {
+  for (const [name, continuationPath, pattern] of [
+    [
+      'completion-document',
+      'docs/plans/active/session-relay-correlated-results-release-completion.md',
+      /post-review|unauthorized|completion\.md/i,
+    ],
+    ['codex-state', '.codex/agents/plan-reviewer.toml', /post-review|unauthorized|\.codex/i],
+    ['affected-drift', PLANRUN_AFFECTED_PATHS[0], /post-review|unauthorized|release-evidence-contract/i],
+  ]) {
+    expectReject(
+      `successor completion binder rejects ${name}`,
+      () =>
+        bindPlanRunCompletionFixture(temp, {
+          name: `reject-${name}`,
+          continuationPath,
+        }),
+      pattern,
+    );
+  }
+}
+
+function testPlanRunAffectedDiffCannotHideImplementationScopeDrift(temp) {
+  expectReject(
+    'successor affected-only review diff cannot hide an unrelated implementation path',
+    () =>
+      bindPlanRunCompletionFixture(temp, {
+        name: 'implementation-scope-drift',
+        implementationExtraPath: 'AGENTS.md',
+      }),
+    /reviewed diff|out-of-scope|AGENTS/i,
+  );
+}
+
 function testCurrentCorrelatedReleaseEvidence() {
   const historicalPlan = fs.readFileSync(path.resolve(HISTORICAL_RELEASE_PLAN_PATH), 'utf8');
   for (const [name, digest] of Object.entries(HISTORICAL_RECEIPT_SHA256)) {
@@ -3604,6 +3973,9 @@ function main() {
     testDefaultCompletionBindingReproducesImplementationManifestAfterPlanOnlyHead(temp);
     testDefaultCompletionBindingAllowsBoundedPostReviewTooling(temp);
     testDefaultCompletionBindingRejectsUnauthorizedPostReviewPath(temp);
+    testPlanRunCompletionBindingUsesFreshSourceAndPlanOnlyContinuation(temp);
+    testPlanRunCompletionBindingRejectsUnrelatedContinuation(temp);
+    testPlanRunAffectedDiffCannotHideImplementationScopeDrift(temp);
     testCurrentCorrelatedReleaseEvidence();
     console.log('release evidence contract: ok');
   } finally {

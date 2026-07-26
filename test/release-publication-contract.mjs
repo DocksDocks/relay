@@ -19,6 +19,7 @@ import {
   VERSION,
 } from '../../../scripts/lib/session-relay-release-core.mjs';
 import {
+  PROMOTION_EVIDENCE_REBIND_RECEIPT_DESCRIPTOR,
   promoteReviewed,
   validatePromotionReceiptForFinalization,
 } from '../../../scripts/lib/session-relay-release-promotion.mjs';
@@ -51,6 +52,19 @@ const CURRENT_GOAL_ID = '8b89aabf-7336-4352-bc11-225bab67f9aa';
 const CURRENT_DOCKS_RUN_ID = '88732ba0-ef06-411b-a31c-93705ccefb27';
 const CURRENT_DOCKS_PLAN_PATH = 'docs/plans/active/session-relay-correlated-results-release-remediation-v4.md';
 const CURRENT_DOCKS_SOURCE_BASE = '494881a0d973863d1ac8e233734c827eb6913ce8';
+const SUCCESSOR_DOCKS_RUN_ID = '5e00cc28-4e27-42cb-9cf9-c3630006d8c0';
+const SUCCESSOR_DOCKS_PLAN_PATH = 'docs/plans/active/session-relay-correlated-results-release-remediation-v9.md';
+const SUCCESSOR_DOCKS_SOURCE_BASE = 'de4f8305ac9351cbbea4549503f2684f67fbcde9';
+const IMMUTABLE_RELEASE_TAG_COMMIT = '7d9cbbbdf82210d396de744372eadb6c26655601';
+const SUCCESSOR_AFFECTED_PATHS = Object.freeze([
+  'plugins/session-relay/test/release-evidence-contract.mjs',
+  'plugins/session-relay/test/release-promotion-contract.mjs',
+  'plugins/session-relay/test/release-publication-contract.mjs',
+  'scripts/lib/session-relay-release-cli.mjs',
+  'scripts/lib/session-relay-release-preparation.mjs',
+  'scripts/lib/session-relay-release-promotion.mjs',
+  'scripts/lib/session-relay-release-publication.mjs',
+]);
 const CURRENT_PUBLIC_RUN_ID = '1f801952-705e-4c7e-a533-91026c013383';
 const CURRENT_PUBLIC_ACTIVE_PLAN_PATH = 'docs/plans/active/session-relay-0.14.0-docks-kit-0.12.0-release.md';
 const CURRENT_PUBLIC_FINISHED_PLAN_PATH =
@@ -854,7 +868,12 @@ function assertCurrentPublicationContract() {
   const publication = currentPublicationReceiptV2();
   const proof = {
     digest: publication.value.source_proof_sha256,
-    value: { tag_commit: publication.value.tag_commit },
+    value: {
+      schema: 2,
+      type: 'SourcePreparationProofV2',
+      implementation_commit: publication.value.source.implementation_commit,
+      tag_commit: publication.value.tag_commit,
+    },
   };
   assert.deepEqual(Object.keys(publication.value).sort(), [
     'assets',
@@ -938,6 +957,13 @@ function assertCurrentPublicationContract() {
         });
       },
       /asset|Windows|closed/i,
+    ],
+    [
+      'V2 reviewed and implementation commit split',
+      (value) => {
+        value.source.implementation_commit = 'c'.repeat(40);
+      },
+      /reviewed source commit ancestry|tag identity/i,
     ],
     [
       'historical publication receipt rewrite',
@@ -1056,15 +1082,118 @@ function currentSourcePreparationProofV2(directory) {
   });
 }
 
-function currentFinalizationFixture(directory, { prerelease = false } = {}) {
-  const sourceProof = currentSourcePreparationProofV2(directory);
+function currentSourcePreparationProofV3(directory) {
+  const prior = currentSourcePreparationProofV2(directory);
+  const value = structuredClone(prior.value);
+  value.schema = 3;
+  value.type = 'SourcePreparationProofV3';
+  value.run_id = SUCCESSOR_DOCKS_RUN_ID;
+  value.source_commit = SUCCESSOR_DOCKS_SOURCE_BASE;
+  value.tag_commit = IMMUTABLE_RELEASE_TAG_COMMIT;
+  value.plan_run = {
+    ...value.plan_run,
+    run_id: SUCCESSOR_DOCKS_RUN_ID,
+    plan_path: SUCCESSOR_DOCKS_PLAN_PATH,
+    source_base: SUCCESSOR_DOCKS_SOURCE_BASE,
+  };
+  const manifestPaths = SUCCESSOR_AFFECTED_PATHS.map((logical) => ({
+    path: logical,
+    state: 'missing',
+    kind: null,
+    mode: null,
+    sha256: null,
+  }));
+  value.acceptance.manifest = {
+    schema: 1,
+    source_base: value.implementation_commit,
+    source_sha256: sha256(
+      Buffer.from(
+        canonicalize({
+          schema: 1,
+          source_base: value.implementation_commit,
+          paths: manifestPaths,
+        }),
+      ),
+    ),
+    paths: manifestPaths,
+  };
+  value.acceptance.changed_paths = [...SUCCESSOR_AFFECTED_PATHS];
+  delete value.tdd_red;
+  value.ancestry = {
+    tag_to_source: true,
+    source_to_implementation: true,
+    implementation_to_reviewed: true,
+  };
+  return writeCanonical(directory, 'successor-source-proof.json', value);
+}
+
+function currentCompletedPublicationFixture(directory) {
+  const sourceProof = currentSourcePreparationProofV3(directory);
+  const template = currentPublicationReceiptV2().value;
+  const runAssets = template.assets.map(({ name, size, digest }) => ({
+    name,
+    size,
+    digest,
+    path: `/current-run/${name}`,
+  }));
+  const workflowRun = {
+    ...run(template.workflow.run_id),
+    run_attempt: template.workflow.attempt,
+    head_sha: sourceProof.value.tag_commit,
+    head_branch: CURRENT_TAG,
+    run_started_at: '2026-07-25T14:59:00.000Z',
+    updated_at: '2026-07-25T15:02:00.000Z',
+    actor: GITHUB_ACTIONS_BOT,
+  };
+  const releaseCreatedAt = '2026-07-25T14:55:00Z';
+  const release = {
+    id: template.release_database_id,
+    tag_name: CURRENT_TAG,
+    target_commitish: sourceProof.value.tag_commit,
+    prerelease: false,
+    draft: false,
+    body: STABLE_BODY,
+    created_at: releaseCreatedAt,
+    published_at: '2026-07-25T15:01:00.000Z',
+    author: GITHUB_ACTIONS_BOT,
+    assets: template.assets.map(({ name, database_id: databaseId, size, digest }) => ({
+      id: databaseId,
+      name,
+      size,
+      digest: `sha256:${digest}`,
+      created_at: '2026-07-25T15:00:30.000Z',
+      updated_at: '2026-07-25T15:01:00.000Z',
+      uploader: GITHUB_ACTIONS_BOT,
+    })),
+  };
+  const fake = fakeAdapter({
+    tagCommit: sourceProof.value.tag_commit,
+    runs: [workflowRun],
+    release,
+    runAssets,
+    liveReleaseAssets: runAssets,
+    checksumEntries: runAssets
+      .filter(({ name }) => name !== 'SHA256SUMS')
+      .map(({ name, digest }) => ({ name, digest })),
+  });
+  fake.adapter.now = () => '2026-07-26T12:00:00.000Z';
+  const options = optionsFor(directory, sourceProof, 'successor-publication.json');
+  options.set('rebind-complete-publication', true);
+  return { fake, options, releaseCreatedAt, sourceProof };
+}
+
+function currentFinalizationFixture(directory, { prerelease = false, sourceSchema = 2 } = {}) {
+  const sourceProof =
+    sourceSchema === 3 ? currentSourcePreparationProofV3(directory) : currentSourcePreparationProofV2(directory);
   const publicationValue = structuredClone(currentPublicationReceiptV2().value);
   publicationValue.source_proof_sha256 = sourceProof.digest;
-  publicationValue.source.reviewed_commit = sourceProof.value.implementation_commit;
+  publicationValue.source.reviewed_commit =
+    sourceProof.value.schema === 3 ? sourceProof.value.tag_commit : sourceProof.value.implementation_commit;
   publicationValue.source.implementation_commit = sourceProof.value.implementation_commit;
   publicationValue.tag_commit = sourceProof.value.tag_commit;
   publicationValue.workflow.workflow_sha = sourceProof.value.tag_commit;
   publicationValue.workflow.head_sha = sourceProof.value.tag_commit;
+  if (sourceProof.value.schema === 3) publicationValue.created_at = '2026-07-25T14:55:00.000Z';
   const publication = writeCanonical(directory, 'current-prerelease-publication.json', publicationValue);
   const relayPins = Object.fromEntries(
     ORDINARY_ASSETS.map((target) => [
@@ -1249,6 +1378,12 @@ function currentFinalizationFixture(directory, { prerelease = false } = {}) {
     run_attempt: publicationValue.workflow.attempt,
     head_sha: sourceProof.value.tag_commit,
     head_branch: CURRENT_TAG,
+    ...(sourceProof.value.schema === 3
+      ? {
+          run_started_at: '2026-07-25T14:50:00.000Z',
+          updated_at: '2026-07-25T15:02:00.000Z',
+        }
+      : {}),
   };
   const release = {
     id: publicationValue.release_database_id,
@@ -1288,6 +1423,76 @@ function currentFinalizationFixture(directory, { prerelease = false } = {}) {
     ['receipt-out', path.join(directory, 'current-stable-finalization.json')],
   ]);
   return { fake, options, promotion, publication, publicRelease, sourceProof };
+}
+
+function schema4FinalizationFixture(directory) {
+  const current = currentFinalizationFixture(directory, { sourceSchema: 3 });
+  current.fake.adapter.now = () => '2026-07-26T12:30:00.000Z';
+  const publicReleaseValue = structuredClone(current.publicRelease.value);
+  publicReleaseValue.schema = 3;
+  publicReleaseValue.type = 'PublicReleaseReceiptV3';
+  const publicRelease = writeCanonical(directory, 'successor-public-release.json', publicReleaseValue);
+  const retainedPromotion = structuredClone(current.promotion.value);
+  retainedPromotion.schema = 3;
+  retainedPromotion.type = 'PromotionReceiptV3';
+  retainedPromotion.public_child = {
+    ...retainedPromotion.public_child,
+    planrun_verified: true,
+  };
+  delete retainedPromotion.public_child.red_first_verified;
+  const publicChild = structuredClone(retainedPromotion.public_child);
+  const promotionValue = {
+    ...PROMOTION_EVIDENCE_REBIND_RECEIPT_DESCRIPTOR,
+    repository_id: REPOSITORY_ID,
+    version: CURRENT_VERSION,
+    tag: CURRENT_TAG,
+    retained_promotion_sha256: 'f'.repeat(64),
+    retained_promotion: retainedPromotion,
+    source_proof_sha256: current.sourceProof.digest,
+    reviewed_source_commit: current.sourceProof.value.implementation_commit,
+    reviewed_source_ancestry: true,
+    docks_plan: {
+      repository_id: REPOSITORY_ID,
+      goal_id: CURRENT_GOAL_ID,
+      run_id: SUCCESSOR_DOCKS_RUN_ID,
+      plan_path: SUCCESSOR_DOCKS_PLAN_PATH,
+      implementation_commit: current.sourceProof.value.implementation_commit,
+      completion_review_sha256: current.sourceProof.value.completion_review.result_sha256,
+      status: 'ongoing',
+    },
+    publication_receipt_sha256: current.publication.digest,
+    public_release_receipt_sha256: publicRelease.digest,
+    public_child: publicChild,
+    staged_release: structuredClone(current.promotion.value.staged_release),
+    stable_release: structuredClone(current.promotion.value.stable_release),
+    live_stable_release: {
+      repository_id: REPOSITORY_ID,
+      tag: CURRENT_TAG,
+      commit: current.sourceProof.value.tag_commit,
+      release_database_id: current.publication.value.release_database_id,
+      draft: false,
+      prerelease: false,
+      body_sha256: sha256(Buffer.from(STABLE_BODY)),
+      created_at: current.fake.state.release.created_at,
+      published_at: current.fake.state.release.published_at,
+      assets: structuredClone(current.promotion.value.stable_release.assets),
+    },
+    byte_identical_promotion: true,
+    historical_receipts: structuredClone(current.promotion.value.historical_receipts),
+    chronology: {
+      publication_workflow_completed_at: current.fake.state.runs[0].updated_at,
+      public_child_finished_at: publicChild.finished_at,
+      original_promotion_completed_at: retainedPromotion.completed_at,
+    },
+    outcome: 'success',
+    reconciled_at: '2026-07-26T12:00:00.000Z',
+  };
+  const promotion = writeCanonical(directory, 'successor-promotion-evidence.json', promotionValue);
+  current.options.set('public-release', publicRelease.file);
+  current.options.set('public-release-sha256', publicRelease.digest);
+  current.options.set('promotion', promotion.file);
+  current.options.set('promotion-sha256', promotion.digest);
+  return { ...current, promotion, publicRelease };
 }
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'session-relay-publication-contract-'));
@@ -1378,6 +1583,7 @@ try {
     const stable = fakeAdapter();
     stable.state.release.prerelease = false;
     stable.state.release.body = STABLE_BODY;
+    stable.adapter.now = () => '2026-07-26T12:00:00.000Z';
     const sourceProof = proof(directory);
     const options = optionsFor(directory, sourceProof);
     options.set('rebind-complete-publication', true);
@@ -1386,6 +1592,11 @@ try {
     assert.equal(receipt.transition, 'reconciled');
     assert.equal(receipt.release_state, 'prerelease');
     assert.equal(receipt.body_sha256, sha256(Buffer.from(PRERELEASE_BODY)));
+    assert.equal(
+      receipt.created_at,
+      new Date(stable.state.release.created_at).toISOString(),
+      'completed-publication rebind must bind the observed release creation instant',
+    );
     assertNoPublicationMutation(stable.state);
     assert.equal(stable.state.releaseDownloads, 1);
 
@@ -1402,6 +1613,66 @@ try {
   }
 
   {
+    const directory = fs.mkdtempSync(path.join(root, 'successor-completed-publication-rebind-'));
+    const current = currentCompletedPublicationFixture(directory);
+    publishReviewed(current.options, current.fake.adapter);
+    const receipt = receiptAt(current.options.get('receipt-out'));
+    assert.equal(receipt.schema, 2);
+    assert.equal(receipt.type, 'SessionRelayPublicationReceiptV2');
+    assert.equal(receipt.source.reviewed_commit, current.sourceProof.value.tag_commit);
+    assert.equal(receipt.source.implementation_commit, current.sourceProof.value.implementation_commit);
+    assert.notEqual(receipt.source.reviewed_commit, receipt.source.implementation_commit);
+    assert.equal(receipt.created_at, new Date(current.releaseCreatedAt).toISOString());
+    assert.notEqual(receipt.created_at, current.fake.adapter.now());
+    validatePublicationReceipt(
+      { value: receipt, digest: sha256(Buffer.from(canonicalize(receipt))) },
+      current.sourceProof,
+      'successor completed-publication rebind',
+    );
+    assertNoPublicationMutation(current.fake.state);
+    assert.equal(current.fake.state.edited, 0);
+
+    for (const [label, mutate] of [
+      [
+        'successor reviewed commit replaced by the implementation',
+        (value) => {
+          value.source.reviewed_commit = value.source.implementation_commit;
+        },
+      ],
+      [
+        'successor implementation replaced by the immutable tag',
+        (value) => {
+          value.source.implementation_commit = value.tag_commit;
+        },
+      ],
+    ]) {
+      const changed = structuredClone(receipt);
+      mutate(changed);
+      expectConflict(
+        () =>
+          validatePublicationReceipt(
+            { value: changed, digest: sha256(Buffer.from(canonicalize(changed))) },
+            current.sourceProof,
+            label,
+          ),
+        /reviewed source commit ancestry|tag identity/i,
+      );
+    }
+    checks += 1;
+
+    const ordinaryDirectory = fs.mkdtempSync(path.join(root, 'successor-stable-without-explicit-rebind-'));
+    const ordinary = currentCompletedPublicationFixture(ordinaryDirectory);
+    ordinary.options.delete('rebind-complete-publication');
+    expectConflict(
+      () => publishReviewed(ordinary.options, ordinary.fake.adapter),
+      /premature stable release conflict/i,
+    );
+    assertNoPublicationMutation(ordinary.fake.state);
+    assert.equal(ordinary.fake.state.edited, 0);
+    assert.equal(fs.existsSync(ordinary.options.get('receipt-out')), false);
+  }
+
+  {
     const directory = fs.mkdtempSync(path.join(root, 'captured-commit-time-release-created-at-'));
     const fake = capturedAdapter();
     const rebound = rebind(directory, fake);
@@ -1409,6 +1680,11 @@ try {
     assert.equal(rebound.receipt.release_database_id, CAPTURED_RELEASE_ID);
     assert.equal(rebound.receipt.workflow.run_id, CAPTURED_RUN_ID);
     assert.equal(rebound.receipt.workflow.attempt, 1);
+    assert.equal(
+      rebound.receipt.created_at,
+      new Date(fake.state.release.created_at).toISOString(),
+      'historical release created_at must be normalized without substituting adapter.now',
+    );
     assert.deepEqual(
       rebound.receipt.assets,
       CAPTURED_RELEASE_ASSETS.map(({ id, name, size, digest }) => ({
@@ -2329,6 +2605,119 @@ try {
       'current finalization resume must emit the byte-identical V2 stable receipt',
     );
     checks += 2;
+  }
+
+  {
+    const directory = fs.mkdtempSync(path.join(root, 'schema4-evidence-finalize-'));
+    const current = schema4FinalizationFixture(directory);
+    const injectedPromotionAdapter = Object.freeze({
+      getPublicationWorkflowRun(runId) {
+        const workflowRun = current.fake.state.runs.find(({ id }) => id === runId);
+        return {
+          id: workflowRun.id,
+          run_attempt: workflowRun.run_attempt,
+          head_sha: workflowRun.head_sha,
+          path: workflowRun.path,
+          event: workflowRun.event,
+          status: workflowRun.status,
+          conclusion: workflowRun.conclusion,
+          run_started_at: workflowRun.run_started_at,
+          updated_at: workflowRun.updated_at,
+        };
+      },
+    });
+    const releaseBefore = structuredClone(current.fake.state.release);
+    // Full schema 4 validation lives in the promotion contract; this spy locks the finalizer handoff.
+    let validationCalls = 0;
+    const validateSchema4Bindings = (receipt, context, adapter) => {
+      validationCalls += 1;
+      assert.equal(receipt.schema, PROMOTION_EVIDENCE_REBIND_RECEIPT_DESCRIPTOR.schema);
+      assert.equal(receipt.type, PROMOTION_EVIDENCE_REBIND_RECEIPT_DESCRIPTOR.type);
+      assert.equal(context.proof.digest, current.sourceProof.digest);
+      assert.equal(context.proof.value.schema, 3);
+      assert.equal(context.proof.value.type, 'SourcePreparationProofV3');
+      assert.equal(context.proof.value.run_id, SUCCESSOR_DOCKS_RUN_ID);
+      assert.equal(context.proof.value.source_commit, SUCCESSOR_DOCKS_SOURCE_BASE);
+      assert.equal(context.publication.digest, current.publication.digest);
+      assert.equal(context.publicRelease.digest, current.publicRelease.digest);
+      assert.equal(context.publicRelease.value.schema, 3);
+      assert.equal(context.publicRelease.value.type, 'PublicReleaseReceiptV3');
+      assert.equal(adapter, injectedPromotionAdapter);
+      const workflowRun = adapter.getPublicationWorkflowRun(context.publication.value.workflow.run_id);
+      assert.equal(workflowRun.id, context.publication.value.workflow.run_id);
+      assert.equal(workflowRun.updated_at, current.fake.state.runs[0].updated_at);
+      assert.equal(receipt.chronology.publication_workflow_completed_at, workflowRun.updated_at);
+      return receipt;
+    };
+    finalizeReviewed(current.options, current.fake.adapter, validateSchema4Bindings, injectedPromotionAdapter);
+    const stableBytes = fs.readFileSync(current.options.get('receipt-out'));
+    const stableReceipt = JSON.parse(stableBytes);
+    validatePublicationReceipt(
+      { value: stableReceipt, digest: sha256(stableBytes) },
+      current.sourceProof,
+      'schema4 stable finalization',
+    );
+    assert.equal(validationCalls, 1);
+    assert.equal(stableReceipt.schema, 2);
+    assert.equal(stableReceipt.type, 'SessionRelayPublicationReceiptV2');
+    assert.equal(stableReceipt.release_state, 'stable');
+    assert.equal(stableReceipt.transition, 'already_stable');
+    assert.equal(stableReceipt.source.reviewed_commit, current.sourceProof.value.tag_commit);
+    assert.equal(stableReceipt.source.implementation_commit, current.sourceProof.value.implementation_commit);
+    assertNoPublicationMutation(current.fake.state);
+    assert.equal(current.fake.state.edited, 0);
+    assert.deepEqual(current.fake.state.downloaded, []);
+    assert.deepEqual(
+      current.fake.state.release,
+      releaseBefore,
+      'schema4 finalization must not edit stable metadata or asset identities',
+    );
+    checks += 1;
+  }
+
+  {
+    const directory = fs.mkdtempSync(path.join(root, 'schema4-public-release-binding-mismatch-'));
+    const current = schema4FinalizationFixture(directory);
+    const changed = structuredClone(current.promotion.value);
+    changed.public_release_receipt_sha256 = '0'.repeat(64);
+    const promotion = writeCanonical(directory, 'mismatched-schema4-evidence.json', changed);
+    current.options.set('promotion', promotion.file);
+    current.options.set('promotion-sha256', promotion.digest);
+    expectConflict(
+      () =>
+        finalizeReviewed(current.options, current.fake.adapter, (receipt, context) => {
+          if (receipt.public_release_receipt_sha256 !== context.publicRelease.digest) {
+            throw new SessionRelayReleaseError('promotion evidence fresh public release binding mismatch');
+          }
+          return receipt;
+        }),
+      /fresh public release binding mismatch/i,
+    );
+    assertNoPublicationMutation(current.fake.state);
+    assert.equal(current.fake.state.edited, 0);
+    assert.equal(fs.existsSync(current.options.get('receipt-out')), false);
+  }
+
+  {
+    const directory = fs.mkdtempSync(path.join(root, 'schema4-descriptor-mismatch-'));
+    const current = schema4FinalizationFixture(directory);
+    const changed = structuredClone(current.promotion.value);
+    changed.type = 'PromotionEvidenceRebindReceiptV2';
+    const promotion = writeCanonical(directory, 'wrong-schema4-descriptor.json', changed);
+    current.options.set('promotion', promotion.file);
+    current.options.set('promotion-sha256', promotion.digest);
+    let validationCalls = 0;
+    expectConflict(
+      () =>
+        finalizeReviewed(current.options, current.fake.adapter, () => {
+          validationCalls += 1;
+        }),
+      /--promotion|schema|type/i,
+    );
+    assert.equal(validationCalls, 0);
+    assertNoPublicationMutation(current.fake.state);
+    assert.equal(current.fake.state.edited, 0);
+    assert.equal(fs.existsSync(current.options.get('receipt-out')), false);
   }
 
   {

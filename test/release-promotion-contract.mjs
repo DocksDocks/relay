@@ -72,15 +72,122 @@ const CURRENT_GOAL_ID = '8b89aabf-7336-4352-bc11-225bab67f9aa';
 const CURRENT_DOCKS_RUN_ID = '88732ba0-ef06-411b-a31c-93705ccefb27';
 const CURRENT_DOCKS_PLAN_PATH = 'docs/plans/active/session-relay-correlated-results-release-remediation-v4.md';
 const CURRENT_DOCKS_SOURCE_BASE = '494881a0d973863d1ac8e233734c827eb6913ce8';
-const PLANRUN_DOCKS_RUN_ID = 'e61586f3-78ce-46c2-b324-fa6b753864da';
+const PLANRUN_DOCKS_RUN_ID = '5e00cc28-4e27-42cb-9cf9-c3630006d8c0';
 const PLANRUN_DOCKS_PLAN_PATH = 'docs/plans/active/session-relay-correlated-results-release-remediation-v9.md';
-const PLANRUN_DOCKS_SOURCE_BASE = 'fc6d9c058379eaf4130f3a7dac7acf981306d10d';
+const PLANRUN_DOCKS_SOURCE_BASE = 'de4f8305ac9351cbbea4549503f2684f67fbcde9';
+const PLANRUN_DOCKS_AFFECTED_PATHS = Object.freeze([
+  'plugins/session-relay/test/release-evidence-contract.mjs',
+  'plugins/session-relay/test/release-promotion-contract.mjs',
+  'plugins/session-relay/test/release-publication-contract.mjs',
+  'scripts/lib/session-relay-release-cli.mjs',
+  'scripts/lib/session-relay-release-preparation.mjs',
+  'scripts/lib/session-relay-release-promotion.mjs',
+  'scripts/lib/session-relay-release-publication.mjs',
+]);
 const PLANRUN_RELEASE_TAG_COMMIT = '7d9cbbbdf82210d396de744372eadb6c26655601';
 const CURRENT_PUBLIC_RUN_ID = '1f801952-705e-4c7e-a533-91026c013383';
-const CURRENT_PUBLIC_PLAN_PATH = 'docs/plans/finished/2026-07-25-session-relay-0.14.0-docks-kit-0.12.0-release.md';
+const CURRENT_PUBLIC_PLAN_PATH = 'docs/plans/finished/2026-07-26-session-relay-0.14.0-docks-kit-0.12.0-release.md';
 const HISTORICAL_RELEASE_PLAN_PATH = 'docs/plans/active/session-relay-linux-workspace-publication.md';
 const HISTORICAL_PUBLICATION_SHA256 = '31d096d31702b66d7e97085a82d8b7da1b75155f828b1d2382a0ac8427ba7ea2';
 const HISTORICAL_PUBLIC_REQUEST_SHA256 = '7cf02781a2ed3c75423321492fb2cd4c4944f6da6d6d41290e26a5f3ca0cf902';
+const RETAINED_PROMOTION_SHA256 = '7ffaa7967d9ca8cc7c53c3ca22efe932d3028ad3caf210cec8157aec7bbd1670';
+const RETAINED_PROMOTION_SOURCE_PROOF_SHA256 = 'c853e528411b881b2c551fb3b549146679eb76b10e8d8dde55627121a16c98cd';
+const RETAINED_PROMOTION_PREDECESSOR_RUN_ID = CURRENT_DOCKS_RUN_ID;
+const BLOCKED_PLANRUN_RUN_ID = 'e61586f3-78ce-46c2-b324-fa6b753864da';
+
+const RETAINED_PROMOTION_ASSETS = Object.freeze([
+  {
+    database_id: 489889124,
+    digest: '92b4f823278853ed4b33dd2adc416ebef6ab1431e8cfe40623641dd5912bddd8',
+    name: 'SHA256SUMS',
+    size: 414,
+  },
+  {
+    database_id: 489889120,
+    digest: '9256e96d0757f1ffbb2c7ee8aafa1b8bf5de7ee782ab85c30377a5d836ccee87',
+    name: 'session-relay-aarch64-apple-darwin',
+    size: 1_754_816,
+  },
+  {
+    database_id: 489889123,
+    digest: '726aa5e4f112310a360ab0291600947404d885055844b2041d4f76b5fbeedd30',
+    name: 'session-relay-aarch64-unknown-linux-musl',
+    size: 2_295_608,
+  },
+  {
+    database_id: 489889122,
+    digest: '5cc8c7d77c5d93f2873841497171efd6ed3c981466625b0370817e094194e4f0',
+    name: 'session-relay-x86_64-apple-darwin',
+    size: 2_235_768,
+  },
+  {
+    database_id: 489889121,
+    digest: '140ea11b700b307c07219616ca6e9b3c4fe552916871af54c3bb15712efd4ee3',
+    name: 'session-relay-x86_64-unknown-linux-musl',
+    size: 3_000_640,
+  },
+]);
+
+function retainedPromotionV3() {
+  const releaseIdentity = {
+    assets: structuredClone(RETAINED_PROMOTION_ASSETS),
+    release_database_id: 359891507,
+    tag_commit: PLANRUN_RELEASE_TAG_COMMIT,
+    workflow_run_attempt: 1,
+    workflow_run_id: 30181238396,
+  };
+  return {
+    schema: 3,
+    type: 'PromotionReceiptV3',
+    repository_id: 'DocksDocks/docks',
+    version: CURRENT_RELEASE_VERSION,
+    tag: CURRENT_RELEASE_TAG,
+    source_proof_sha256: RETAINED_PROMOTION_SOURCE_PROOF_SHA256,
+    reviewed_source_commit: PLANRUN_RELEASE_TAG_COMMIT,
+    reviewed_source_ancestry: true,
+    docks_plan: {
+      repository_id: 'DocksDocks/docks',
+      goal_id: CURRENT_GOAL_ID,
+      run_id: RETAINED_PROMOTION_PREDECESSOR_RUN_ID,
+      plan_path: CURRENT_DOCKS_PLAN_PATH,
+      implementation_commit: PLANRUN_RELEASE_TAG_COMMIT,
+      completion_review_sha256: '491925513a94c7d2c1b86cfe0fcf71ad5b7f5d994724612295a2c2cfe465c7cc',
+      status: 'ongoing',
+    },
+    publication_receipt_sha256: '784ff59a2705884aae1de7fab9f21551a6872a54cfd047df3ba57b0f41e81588',
+    public_release_receipt_sha256: '05b08d34e62b58dcbbda214bbcef4cb0658ef6781ca3e696abdfa1b3f43f5091',
+    public_child: {
+      repository_id: 'DocksDocks/public',
+      goal_id: CURRENT_GOAL_ID,
+      run_id: CURRENT_PUBLIC_RUN_ID,
+      version: CURRENT_PUBLIC_VERSION,
+      tag: CURRENT_PUBLIC_TAG,
+      npm_package: 'docks-kit',
+      npm_version: CURRENT_PUBLIC_VERSION,
+      plan_path: CURRENT_PUBLIC_PLAN_PATH,
+      status: 'finished',
+      planrun_verified: true,
+      finished_at: '2026-07-26T01:36:05.859Z',
+    },
+    staged_release: { ...structuredClone(releaseIdentity), prerelease: true },
+    stable_release: { ...structuredClone(releaseIdentity), prerelease: false },
+    byte_identical_promotion: true,
+    historical_receipts: {
+      version: RELEASE_VERSION,
+      tag: RELEASE_TAG,
+      publication_sha256: HISTORICAL_PUBLICATION_SHA256,
+      public_request_sha256: HISTORICAL_PUBLIC_REQUEST_SHA256,
+    },
+    outcome: 'success',
+    completed_at: '2026-07-26T04:45:55.405Z',
+  };
+}
+
+assert.equal(
+  hash(retainedPromotionV3()),
+  RETAINED_PROMOTION_SHA256,
+  'retained promotion fixture must be the exact immutable 7ffaa receipt',
+);
 
 const candidate = {
   schema: 1,
@@ -2128,6 +2235,24 @@ function currentPromotionProofV3() {
     plan_path: PLANRUN_DOCKS_PLAN_PATH,
     source_base: PLANRUN_DOCKS_SOURCE_BASE,
   };
+  const manifestPaths = PLANRUN_DOCKS_AFFECTED_PATHS.map((affectedPath) => ({
+    path: affectedPath,
+    state: 'missing',
+    kind: null,
+    mode: null,
+    sha256: null,
+  }));
+  proof.acceptance.manifest = {
+    schema: 1,
+    source_base: proof.implementation_commit,
+    source_sha256: hash({
+      schema: 1,
+      source_base: proof.implementation_commit,
+      paths: manifestPaths,
+    }),
+    paths: manifestPaths,
+  };
+  proof.acceptance.changed_paths = [...PLANRUN_DOCKS_AFFECTED_PATHS];
   delete proof.tdd_red;
   proof.ancestry = {
     tag_to_source: true,
@@ -2149,7 +2274,7 @@ function makeCurrentPromotionAdapter({
   const publicationValue = currentBoundaryPublicationValue();
   publicationValue.source_proof_sha256 = proofEnvelope.digest;
   publicationValue.source.reviewed_commit = proofValue.tag_commit;
-  publicationValue.source.implementation_commit = proofValue.tag_commit;
+  publicationValue.source.implementation_commit = proofValue.implementation_commit;
   publicationValue.tag_commit = proofValue.tag_commit;
   publicationValue.workflow.workflow_sha = proofValue.tag_commit;
   publicationValue.workflow.head_sha = proofValue.tag_commit;
@@ -2268,6 +2393,572 @@ function makeCurrentPromotionAdapter({
     publicReleaseEnvelope,
     state,
   };
+}
+
+function makePromotionEvidenceRebindAdapter({
+  proofMutation = null,
+  publicationMutation = null,
+  publicReleaseMutation = null,
+  retainedMutation = null,
+  liveMutation = null,
+  workflowMutation = null,
+  custodyConflict = false,
+  reconciledAt = '2026-07-26T06:00:00.000Z',
+} = {}) {
+  const retainedPromotion = retainedPromotionV3();
+  retainedMutation?.(retainedPromotion);
+
+  const proofValue = currentPromotionProofV3();
+  proofMutation?.(proofValue);
+  const proofEnvelope = { value: proofValue, digest: hash(proofValue) };
+
+  const publicationValue = currentBoundaryPublicationValue();
+  publicationValue.source_proof_sha256 = proofEnvelope.digest;
+  publicationValue.source.reviewed_commit = proofValue.tag_commit;
+  publicationValue.source.implementation_commit = proofValue.implementation_commit;
+  publicationValue.tag_commit = proofValue.tag_commit;
+  publicationValue.workflow.workflow_sha = proofValue.tag_commit;
+  publicationValue.workflow.head_sha = proofValue.tag_commit;
+  publicationValue.workflow.run_id = retainedPromotion.stable_release.workflow_run_id;
+  publicationValue.workflow.attempt = retainedPromotion.stable_release.workflow_run_attempt;
+  publicationValue.release_database_id = retainedPromotion.stable_release.release_database_id;
+  publicationValue.assets = structuredClone(retainedPromotion.stable_release.assets);
+  const ordinaryDigestPins = Object.fromEntries(
+    publicationValue.assets.filter(({ name }) => name !== 'SHA256SUMS').map(({ name, digest }) => [name, digest]),
+  );
+  publicationValue.digest_evidence = {
+    workflow_run_id: publicationValue.workflow.run_id,
+    workflow_run_attempt: publicationValue.workflow.attempt,
+    artifact_sha256: structuredClone(ordinaryDigestPins),
+    release_download_sha256: structuredClone(ordinaryDigestPins),
+    checksum_rows: structuredClone(ordinaryDigestPins),
+  };
+  publicationValue.transition = 'tag_and_release_created';
+  publicationValue.created_at = '2026-07-25T14:00:00.000Z';
+  publicationMutation?.(publicationValue);
+  const publicationEnvelope = { value: publicationValue, digest: hash(publicationValue) };
+
+  const publicFixture = currentPlanRunPublicFixture();
+  const publicReleaseValue = structuredClone(currentReleaseChainV2().publicRelease.value);
+  publicReleaseValue.schema = 3;
+  publicReleaseValue.type = 'PublicReleaseReceiptV3';
+  publicReleaseValue.ancestry = {
+    execution_parent: CURRENT_PUBLIC_EXECUTION_PARENT,
+    implementation_commit: CURRENT_PUBLIC_IMPLEMENTATION_COMMIT,
+    release_commit: CURRENT_PUBLIC_RELEASE_COMMIT,
+    archive_commit: CURRENT_PUBLIC_ARCHIVE_COMMIT,
+    execution_parent_to_implementation: true,
+    implementation_to_release: true,
+    release_to_archive: true,
+  };
+  publicReleaseValue.public_plan = {
+    plan_run: publicFixture.run,
+    active_path: publicFixture.run.plan_path,
+    finished_path: CURRENT_PUBLIC_PLAN_PATH,
+    release_commit: CURRENT_PUBLIC_RELEASE_COMMIT,
+    archive_commit: CURRENT_PUBLIC_ARCHIVE_COMMIT,
+    remote_read_back: true,
+    finished_at: retainedPromotion.public_child.finished_at,
+  };
+  publicReleaseValue.pinned_assets = Object.fromEntries(
+    PUBLIC_ASSET_TARGETS.map((target) => [
+      target,
+      publicationValue.assets.find(({ name }) => name === `session-relay-${target}`).digest,
+    ]),
+  );
+  publicReleaseMutation?.(publicReleaseValue);
+  const publicReleaseEnvelope = { value: publicReleaseValue, digest: hash(publicReleaseValue) };
+
+  const stableBody =
+    'Session Relay 0.14.0 is available through docks-kit.\n\n## Install or update\n\n```\ndocks-kit sync\n```';
+  const state = {
+    calls: [],
+    outputs: new Map(),
+    release: {
+      id: publicationValue.release_database_id,
+      tag_name: CURRENT_RELEASE_TAG,
+      draft: false,
+      prerelease: false,
+      body: stableBody,
+      created_at: publicationValue.created_at,
+      published_at: '2026-07-25T15:00:00.000Z',
+      assets: publicationValue.assets.map(({ name, database_id: databaseId, size, digest }) => ({
+        id: databaseId,
+        name,
+        size,
+        digest: `sha256:${digest}`,
+      })),
+    },
+    workflow: {
+      id: publicationValue.workflow.run_id,
+      run_attempt: publicationValue.workflow.attempt,
+      head_sha: publicationValue.workflow.head_sha,
+      path: publicationValue.workflow.path,
+      event: publicationValue.workflow.event,
+      status: 'completed',
+      conclusion: 'success',
+      run_started_at: '2026-07-25T14:50:00.000Z',
+      updated_at: '2026-07-25T15:00:00.000Z',
+    },
+  };
+  workflowMutation?.(state.workflow);
+  liveMutation?.(state);
+  const output = '/receipts/promotion-evidence-rebind.json';
+  if (custodyConflict) state.outputs.set(output, 'occupied');
+  const recordCall = (operation) => state.calls.push(operation);
+  const adapter = {
+    now: () => {
+      recordCall('now');
+      return reconciledAt;
+    },
+    loadProof: () => {
+      recordCall('loadProof');
+      return proofEnvelope;
+    },
+    loadPublication: () => {
+      recordCall('loadPublication');
+      return publicationEnvelope;
+    },
+    loadPublicRelease: () => {
+      recordCall('loadPublicRelease');
+      return publicReleaseEnvelope;
+    },
+    loadRetainedPromotion: () => {
+      recordCall('loadRetainedPromotion');
+      return { value: retainedPromotion, digest: hash(retainedPromotion) };
+    },
+    isAncestor: () => {
+      recordCall('isAncestor');
+      return true;
+    },
+    isPublicAncestor: () => {
+      recordCall('isPublicAncestor');
+      return true;
+    },
+    currentReleaseState: () => {
+      recordCall('currentReleaseState');
+      return { commit: PLANRUN_RELEASE_TAG_COMMIT, release: structuredClone(state.release) };
+    },
+    getPublicationWorkflowRun: () => {
+      recordCall('getPublicationWorkflowRun');
+      return structuredClone(state.workflow);
+    },
+    assertReceiptOutputAvailable: ({ path: receiptOutput }) => {
+      recordCall('assertReceiptOutputAvailable');
+      if (state.outputs.has(receiptOutput)) throw new Error('receipt output conflict');
+    },
+    writeReceipt: ({ path: receiptOutput, receipt, allowExisting }) => {
+      recordCall('writeReceipt');
+      assert.equal(allowExisting, false);
+      if (state.outputs.has(receiptOutput)) throw new Error('receipt output conflict');
+      state.outputs.set(receiptOutput, canonicalize(receipt));
+      return { digest: hash(receipt) };
+    },
+  };
+  assert.deepEqual(
+    Object.keys(adapter).sort(),
+    [...releasePromotion.PROMOTION_EVIDENCE_REBIND_ADAPTER_KEYS].sort(),
+    'promotion evidence rebind adapter surface changed',
+  );
+  return {
+    adapter,
+    options: new Map([['receipt-out', output]]),
+    proofEnvelope,
+    publicationEnvelope,
+    publicReleaseEnvelope,
+    retainedPromotion,
+    state,
+  };
+}
+
+{
+  const evidence = makePromotionEvidenceRebindAdapter();
+  const result = releasePromotion.rebindPromotionEvidence(evidence.options, evidence.adapter);
+  const freshContext = {
+    proof: evidence.proofEnvelope,
+    publication: evidence.publicationEnvelope,
+    publicRelease: evidence.publicReleaseEnvelope,
+  };
+  const validateEvidenceReceipt = (receipt) =>
+    releasePromotion.validatePromotionEvidenceRebindReceipt(receipt, freshContext, evidence.adapter);
+  assert.equal(result.receipt.schema, 4);
+  assert.equal(result.receipt.type, 'PromotionEvidenceRebindReceiptV1');
+  assert.deepEqual(
+    { schema: result.receipt.schema, type: result.receipt.type },
+    releasePromotion.PROMOTION_EVIDENCE_REBIND_RECEIPT_DESCRIPTOR,
+  );
+  assert.equal(result.receipt.docks_plan.run_id, PLANRUN_DOCKS_RUN_ID);
+  assert.equal(result.receipt.retained_promotion.docks_plan.run_id, RETAINED_PROMOTION_PREDECESSOR_RUN_ID);
+  assert.equal(result.receipt.retained_promotion_sha256, RETAINED_PROMOTION_SHA256);
+  assert.equal(result.receipt.chronology.publication_workflow_completed_at, '2026-07-25T15:00:00.000Z');
+  assert.equal(result.receipt.chronology.public_child_finished_at, '2026-07-26T01:36:05.859Z');
+  assert.equal(result.receipt.chronology.original_promotion_completed_at, '2026-07-26T04:45:55.405Z');
+  assert.equal(result.receipt.reconciled_at, '2026-07-26T06:00:00.000Z');
+  assert.throws(
+    () => validatePromotionReceipt(result.receipt),
+    /promotion receipt.*keys|unknown or missing fields/i,
+    'schema4 evidence must not enter the ordinary promotion receipt validator',
+  );
+  assert.equal(validateEvidenceReceipt(result.receipt), result.receipt);
+  assert.equal(validatePromotionReceiptForFinalization(result.receipt, freshContext, evidence.adapter), result.receipt);
+  assert.equal(
+    evidence.state.outputs.get('/receipts/promotion-evidence-rebind.json'),
+    canonicalize(result.receipt),
+    'promotion evidence rebind must write one canonical local receipt',
+  );
+  const allowedCalls = new Set(releasePromotion.PROMOTION_EVIDENCE_REBIND_ADAPTER_KEYS);
+  assert.ok(
+    evidence.state.calls.every((operation) => allowedCalls.has(operation)),
+    'promotion evidence rebind must use only the closed read-only adapter surface',
+  );
+  assert.equal(
+    evidence.state.calls.filter((operation) => operation === 'now').length,
+    1,
+    'rebind may call now only once for reconciled_at',
+  );
+  assert.ok(
+    evidence.state.calls.indexOf('now') > evidence.state.calls.indexOf('currentReleaseState') &&
+      evidence.state.calls.indexOf('now') > evidence.state.calls.indexOf('getPublicationWorkflowRun'),
+    'rebind must observe immutable release/workflow event times before recording reconciled_at',
+  );
+  for (const forbidden of [
+    'promoteStable',
+    'editStable',
+    'pushMain',
+    'pushTag',
+    'remoteRef',
+    'dispatchWorkflow',
+    'retry',
+    'repair',
+  ]) {
+    assert.equal(evidence.state.calls.includes(forbidden), false, `promotion evidence rebind called ${forbidden}`);
+  }
+
+  const repeated = makePromotionEvidenceRebindAdapter();
+  const repeatedResult = releasePromotion.rebindPromotionEvidence(repeated.options, repeated.adapter);
+  assert.deepEqual(repeatedResult.receipt, result.receipt, 'promotion evidence rebind must be deterministic');
+
+  for (const key of Object.keys(result.receipt)) {
+    const missing = structuredClone(result.receipt);
+    delete missing[key];
+    assert.throws(
+      () => validateEvidenceReceipt(missing),
+      /keys|unknown|missing|schema|field/i,
+      `schema4 must reject missing top-level key ${key}`,
+    );
+  }
+  assert.throws(
+    () => validateEvidenceReceipt({ ...result.receipt, unknown: true }),
+    /keys|unknown|field/i,
+    'schema4 must reject unknown top-level keys',
+  );
+  const nestedUnknown = structuredClone(result.receipt);
+  nestedUnknown.live_stable_release.unknown = true;
+  assert.throws(
+    () => validateEvidenceReceipt(nestedUnknown),
+    /keys|unknown|field/i,
+    'schema4 must keep the live stable snapshot closed',
+  );
+
+  for (const [label, mutate] of [
+    ['wrong-schema', (receipt) => (receipt.schema = 3)],
+    ['wrong-type', (receipt) => (receipt.type = 'PromotionReceiptV3')],
+    ['wrong-repository', (receipt) => (receipt.repository_id = 'DocksDocks/public')],
+    ['wrong-version', (receipt) => (receipt.version = '0.13.0')],
+    ['wrong-tag', (receipt) => (receipt.tag = RELEASE_TAG)],
+    ['wrong-retained-digest', (receipt) => (receipt.retained_promotion_sha256 = DIGEST('e'))],
+    [
+      'blocked-v9-as-retained',
+      (receipt) => {
+        receipt.retained_promotion.docks_plan.run_id = BLOCKED_PLANRUN_RUN_ID;
+        receipt.retained_promotion.docks_plan.plan_path = PLANRUN_DOCKS_PLAN_PATH;
+      },
+    ],
+    ['wrong-fresh-run', (receipt) => (receipt.docks_plan.run_id = BLOCKED_PLANRUN_RUN_ID)],
+    ['wrong-reviewed-source', (receipt) => (receipt.reviewed_source_commit = 'f'.repeat(40))],
+    ['wrong-public-child', (receipt) => (receipt.public_child.run_id = BLOCKED_PLANRUN_RUN_ID)],
+    ['wrong-staged-workflow', (receipt) => (receipt.staged_release.workflow_run_id += 1)],
+    ['wrong-stable-database-id', (receipt) => (receipt.stable_release.release_database_id += 1)],
+    ['wrong-live-commit', (receipt) => (receipt.live_stable_release.commit = 'f'.repeat(40))],
+    ['wrong-live-body', (receipt) => (receipt.live_stable_release.body_sha256 = DIGEST('e'))],
+    ['wrong-live-asset', (receipt) => (receipt.live_stable_release.assets[0].digest = DIGEST('e'))],
+    ['wrong-byte-identity', (receipt) => (receipt.byte_identical_promotion = false)],
+    ['wrong-outcome', (receipt) => (receipt.outcome = 'failure')],
+    [
+      'publication-after-child',
+      (receipt) => (receipt.chronology.publication_workflow_completed_at = receipt.chronology.public_child_finished_at),
+    ],
+    [
+      'child-after-promotion',
+      (receipt) => (receipt.chronology.public_child_finished_at = receipt.chronology.original_promotion_completed_at),
+    ],
+    ['promotion-after-reconciliation', (receipt) => (receipt.reconciled_at = '2026-07-26T04:00:00.000Z')],
+    [
+      'promotion-equals-reconciliation',
+      (receipt) => (receipt.reconciled_at = receipt.chronology.original_promotion_completed_at),
+    ],
+    ['invalid-reconciliation-time', (receipt) => (receipt.reconciled_at = 'now')],
+  ]) {
+    const corrupted = structuredClone(result.receipt);
+    mutate(corrupted);
+    assert.throws(
+      () => validateEvidenceReceipt(corrupted),
+      /promotion evidence|retained|identity|digest|PlanRun|child|release|asset|byte|outcome|chronology|timestamp|keys/i,
+      `schema4 must reject ${label}`,
+    );
+  }
+}
+
+{
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'session-relay-rebind-production-adapter-'));
+  try {
+    const evidence = makePromotionEvidenceRebindAdapter();
+    const inputs = [
+      ['source-proof', 'loadProof', writeBoundaryValue(directory, 'source-proof.json', evidence.proofEnvelope.value)],
+      [
+        'publication',
+        'loadPublication',
+        writeBoundaryValue(directory, 'publication.json', evidence.publicationEnvelope.value),
+      ],
+      [
+        'public-release',
+        'loadPublicRelease',
+        writeBoundaryValue(directory, 'public-release.json', evidence.publicReleaseEnvelope.value),
+      ],
+      [
+        'promotion',
+        'loadRetainedPromotion',
+        writeBoundaryValue(directory, 'retained-promotion.json', evidence.retainedPromotion),
+      ],
+    ];
+    assert.deepEqual(
+      Object.keys(releasePromotion.PROMOTION_EVIDENCE_REBIND_PRODUCTION_ADAPTER).sort(),
+      [...releasePromotion.PROMOTION_EVIDENCE_REBIND_ADAPTER_KEYS].sort(),
+      'production rebind adapter must expose only the read-only surface',
+    );
+    for (const [name, loader, file] of inputs) {
+      const options = new Map([
+        [name, file.file],
+        [`${name}-sha256`, file.digest],
+      ]);
+      assert.equal(
+        releasePromotion.PROMOTION_EVIDENCE_REBIND_PRODUCTION_ADAPTER[loader](options).digest,
+        file.digest,
+        `production rebind adapter must load the exact --${name}/--${name}-sha256 pair`,
+      );
+      options.set(`${name}-sha256`, DIGEST('e'));
+      assert.throws(
+        () => releasePromotion.PROMOTION_EVIDENCE_REBIND_PRODUCTION_ADAPTER[loader](options),
+        /digest mismatch/i,
+        `production rebind adapter must reject a mismatched --${name}-sha256`,
+      );
+    }
+    for (const [name, loader, value, schema, type] of [
+      ['source-proof', 'loadProof', evidence.proofEnvelope.value, 2, 'SourcePreparationProofV2'],
+      ['publication', 'loadPublication', evidence.publicationEnvelope.value, 1, 'SessionRelayPublicationReceiptV1'],
+      ['public-release', 'loadPublicRelease', evidence.publicReleaseEnvelope.value, 2, 'PublicReleaseReceiptV2'],
+      ['promotion', 'loadRetainedPromotion', evidence.retainedPromotion, 2, 'PromotionReceiptV2'],
+    ]) {
+      const wrong = writeBoundaryValue(directory, `wrong-${name}.json`, {
+        ...structuredClone(value),
+        schema,
+        type,
+      });
+      const options = new Map([
+        [name, wrong.file],
+        [`${name}-sha256`, wrong.digest],
+      ]);
+      assert.throws(
+        () => releasePromotion.PROMOTION_EVIDENCE_REBIND_PRODUCTION_ADAPTER[loader](options),
+        /wrong schema or type/i,
+        `production rebind adapter must reject the wrong --${name} generation`,
+      );
+    }
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+}
+
+for (const [label, fixtureOptions, pattern] of [
+  [
+    'stale successor run',
+    { proofMutation: (proof) => (proof.run_id = BLOCKED_PLANRUN_RUN_ID) },
+    /fresh successor|source proof|identity|PlanRun|run/i,
+  ],
+  [
+    'stale successor source base',
+    {
+      proofMutation: (proof) => {
+        proof.source_commit = CURRENT_DOCKS_SOURCE_BASE;
+        proof.plan_run.source_base = CURRENT_DOCKS_SOURCE_BASE;
+      },
+    },
+    /fresh successor|source|PlanRun/i,
+  ],
+  [
+    'wrong immutable tag',
+    { proofMutation: (proof) => (proof.tag_commit = proof.implementation_commit) },
+    /immutable.*release|tag|source proof/i,
+  ],
+  [
+    'V3 publication reviewed implementation relabel',
+    {
+      publicationMutation: (publication) => {
+        publication.source.reviewed_commit = publication.source.implementation_commit;
+      },
+    },
+    /reviewed|tag|source|publication/i,
+  ],
+  [
+    'publication now substituted for event time',
+    { publicationMutation: (publication) => (publication.created_at = '2026-07-26T06:00:00.000Z') },
+    /chronology|created_at|live|publication/i,
+  ],
+  [
+    'publication workflow identity drift',
+    {
+      publicationMutation: (publication) => {
+        publication.workflow.run_id += 1;
+        publication.digest_evidence.workflow_run_id += 1;
+      },
+    },
+    /workflow|stable|publication|receipt/i,
+  ],
+  [
+    'wrong public child run',
+    { publicReleaseMutation: (publicRelease) => (publicRelease.public_plan.plan_run.run_id = BLOCKED_PLANRUN_RUN_ID) },
+    /PlanRun|public|run|receipt/i,
+  ],
+  [
+    'retained receipt mutation',
+    { retainedMutation: (promotion) => (promotion.docks_plan.run_id = BLOCKED_PLANRUN_RUN_ID) },
+    /retained|exact|digest|SHA-256/i,
+  ],
+  ['stable tag drift', { liveMutation: (state) => (state.release.tag_name = RELEASE_TAG) }, /stable|tag|release/i],
+  ['stable draft drift', { liveMutation: (state) => (state.release.draft = true) }, /stable|state|release|tag/i],
+  [
+    'stable prerelease drift',
+    { liveMutation: (state) => (state.release.prerelease = true) },
+    /stable|state|release|prerelease/i,
+  ],
+  [
+    'stable created-at drift',
+    { liveMutation: (state) => (state.release.created_at = '2026-07-25T14:00:00.001Z') },
+    /created_at|live|publication|receipt/i,
+  ],
+  ['stable body drift', { liveMutation: (state) => (state.release.body = 'drift') }, /stable|body|release/i],
+  ['stable database identity drift', { liveMutation: (state) => (state.release.id += 1) }, /stable|database|release/i],
+  [
+    'stable asset digest drift',
+    { liveMutation: (state) => (state.release.assets[0].digest = `sha256:${DIGEST('e')}`) },
+    /stable|asset|digest|drift/i,
+  ],
+  [
+    'stable release timestamp inversion',
+    { liveMutation: (state) => (state.release.published_at = '2026-07-25T13:00:00.000Z') },
+    /timestamp|inverted/i,
+  ],
+  [
+    'publication workflow identity drift',
+    { workflowMutation: (run) => (run.id += 1) },
+    /workflow.*identity|terminal state/i,
+  ],
+  [
+    'publication workflow no longer terminal',
+    { workflowMutation: (run) => (run.status = 'in_progress') },
+    /workflow.*identity|terminal state/i,
+  ],
+  [
+    'publication event outside workflow window',
+    { workflowMutation: (run) => (run.updated_at = '2026-07-25T14:59:59.999Z') },
+    /workflow.*timestamp|publication event/i,
+  ],
+  [
+    'publication workflow completion after public child',
+    { workflowMutation: (run) => (run.updated_at = '2026-07-26T02:00:00.000Z') },
+    /chronology|publication|public child/i,
+  ],
+  [
+    'reconciliation before promotion',
+    { reconciledAt: '2026-07-26T04:00:00.000Z' },
+    /chronology|timestamp|reconciliation/i,
+  ],
+  [
+    'reconciliation equals promotion',
+    { reconciledAt: '2026-07-26T04:45:55.405Z' },
+    /chronology|timestamp|reconciliation/i,
+  ],
+]) {
+  const evidence = makePromotionEvidenceRebindAdapter(fixtureOptions);
+  assert.throws(
+    () => releasePromotion.rebindPromotionEvidence(evidence.options, evidence.adapter),
+    pattern,
+    `promotion evidence rebind must reject ${label}`,
+  );
+  assert.equal(evidence.state.outputs.size, 0, `${label} must not write a receipt`);
+  assert.equal(evidence.state.calls.includes('writeReceipt'), false, `${label} must fail before receipt output`);
+}
+
+{
+  const evidence = makePromotionEvidenceRebindAdapter();
+  evidence.proofEnvelope.digest = DIGEST('e');
+  assert.throws(
+    () => releasePromotion.rebindPromotionEvidence(evidence.options, evidence.adapter),
+    /source proof digest mismatch/i,
+    'promotion evidence rebind must independently reject an envelope digest mismatch',
+  );
+  assert.equal(evidence.state.outputs.size, 0);
+}
+
+{
+  const evidence = makePromotionEvidenceRebindAdapter({ custodyConflict: true });
+  assert.throws(
+    () => releasePromotion.rebindPromotionEvidence(evidence.options, evidence.adapter),
+    /output conflict/i,
+    'promotion evidence rebind must fail closed on occupied output custody',
+  );
+  assert.deepEqual(
+    evidence.state.calls,
+    ['assertReceiptOutputAvailable'],
+    'occupied custody must fail before reading evidence, observing release/workflow state, or calling now',
+  );
+}
+
+for (const forbidden of [
+  'promoteStable',
+  'editStable',
+  'pushMain',
+  'pushTag',
+  'remoteRef',
+  'dispatchWorkflow',
+  'retry',
+  'repair',
+]) {
+  const evidence = makePromotionEvidenceRebindAdapter();
+  const adapter = { ...evidence.adapter, [forbidden]: () => assert.fail(`${forbidden} must not be callable`) };
+  assert.throws(
+    () => releasePromotion.rebindPromotionEvidence(evidence.options, adapter),
+    /adapter|unknown|keys|field/i,
+    `promotion evidence rebind adapter must reject mutation surface ${forbidden}`,
+  );
+  assert.deepEqual(evidence.state.calls, []);
+}
+
+{
+  const retained = retainedPromotionV3();
+  assert.throws(
+    () => validatePromotionReceipt(retained),
+    /PlanRun|identity|current promotion/i,
+    'ordinary promotion validation must not accept the frozen v4 receipt as a fresh successor promotion',
+  );
+  const blocked = retainedPromotionV3();
+  blocked.docks_plan.run_id = BLOCKED_PLANRUN_RUN_ID;
+  blocked.docks_plan.plan_path = PLANRUN_DOCKS_PLAN_PATH;
+  assert.throws(
+    () => validatePromotionReceipt(blocked),
+    /PlanRun|identity|current promotion/i,
+    'ordinary promotion validation must not accept the blocked v9 identity',
+  );
 }
 
 {
@@ -3554,6 +4245,134 @@ await assert.rejects(
   /repair-prepush.*repair-implementation-commit.*together/i,
   'repair-prepush CLI mode must require its committed repair identity',
 );
+
+await assert.rejects(
+  dispatchSessionRelayRelease(['--rebind-promotion-evidence', '--plugin', 'session-relay', CURRENT_RELEASE_VERSION]),
+  /missing required option: --source-proof/i,
+  'rebind-promotion-evidence CLI mode must be recognized',
+);
+
+const promotionEvidenceRebindArgv = [
+  '--rebind-promotion-evidence',
+  '--plugin',
+  'session-relay',
+  '--source-proof',
+  '/proof.json',
+  '--source-proof-sha256',
+  DIGEST('1'),
+  '--publication',
+  '/publication.json',
+  '--publication-sha256',
+  DIGEST('2'),
+  '--public-release',
+  '/public-release.json',
+  '--public-release-sha256',
+  DIGEST('3'),
+  '--promotion',
+  '/promotion.json',
+  '--promotion-sha256',
+  RETAINED_PROMOTION_SHA256,
+  '--receipt-out',
+  '/promotion-evidence-rebind.json',
+  CURRENT_RELEASE_VERSION,
+];
+
+for (const [pathName, digestName] of [
+  ['source-proof', 'source-proof-sha256'],
+  ['publication', 'publication-sha256'],
+  ['public-release', 'public-release-sha256'],
+  ['promotion', 'promotion-sha256'],
+]) {
+  const nonAdjacent = [...promotionEvidenceRebindArgv];
+  const digestIndex = nonAdjacent.indexOf(`--${digestName}`);
+  const digestPair = nonAdjacent.splice(digestIndex, 2);
+  nonAdjacent.splice(nonAdjacent.length - 1, 0, ...digestPair);
+  await assert.rejects(
+    dispatchSessionRelayRelease(nonAdjacent),
+    new RegExp(`${pathName}.*immediately followed|${pathName}.*adjacent`, 'i'),
+    `rebind CLI must keep --${pathName}/--${digestName} adjacent`,
+  );
+}
+
+await assert.rejects(
+  dispatchSessionRelayRelease([
+    ...promotionEvidenceRebindArgv.slice(0, -1),
+    '--publication',
+    '/duplicate.json',
+    CURRENT_RELEASE_VERSION,
+  ]),
+  /duplicate option: --publication/i,
+  'rebind CLI must reject duplicate options',
+);
+await assert.rejects(
+  dispatchSessionRelayRelease([
+    ...promotionEvidenceRebindArgv.slice(0, -1),
+    '--repair-prepush',
+    CURRENT_RELEASE_VERSION,
+  ]),
+  /unknown option.*repair-prepush/i,
+  'rebind CLI must reject mutation options',
+);
+await assert.rejects(
+  dispatchSessionRelayRelease([
+    ...promotionEvidenceRebindArgv.slice(0, -1),
+    '--version',
+    CURRENT_RELEASE_VERSION,
+    CURRENT_RELEASE_VERSION,
+  ]),
+  /unknown option.*--version/i,
+  'rebind CLI must keep the version positional-only',
+);
+await assert.rejects(
+  dispatchSessionRelayRelease([
+    '--rebind-promotion-evidence',
+    '--promote-reviewed',
+    ...promotionEvidenceRebindArgv.slice(1),
+  ]),
+  /exactly one release mode/i,
+  'rebind CLI must be exclusive from promotion mode',
+);
+await assert.rejects(
+  dispatchSessionRelayRelease([...promotionEvidenceRebindArgv.slice(0, -1), RELEASE_VERSION]),
+  /rebind-promotion-evidence.*only valid.*0\.14\.0/i,
+  'rebind CLI must reject the historical release generation',
+);
+
+{
+  const priorFixture = process.env.SESSION_RELAY_RELEASE_FIXTURE;
+  const priorReport = process.env.SESSION_RELAY_RELEASE_REPORT;
+  try {
+    process.env.SESSION_RELAY_RELEASE_FIXTURE = '/fixture-must-not-be-read.json';
+    process.env.SESSION_RELAY_RELEASE_REPORT = '/report-must-not-be-written.json';
+    await assert.rejects(
+      dispatchSessionRelayRelease(promotionEvidenceRebindArgv),
+      /unavailable in fixture mode|cannot be simulated/i,
+      'rebind CLI fixture interception must fail closed instead of silently dropping the receipt',
+    );
+  } finally {
+    if (priorFixture === undefined) delete process.env.SESSION_RELAY_RELEASE_FIXTURE;
+    else process.env.SESSION_RELAY_RELEASE_FIXTURE = priorFixture;
+    if (priorReport === undefined) delete process.env.SESSION_RELAY_RELEASE_REPORT;
+    else process.env.SESSION_RELAY_RELEASE_REPORT = priorReport;
+  }
+}
+
+{
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'session-relay-rebind-cli-custody-'));
+  const output = path.join(directory, 'promotion-evidence.json');
+  try {
+    fs.writeFileSync(output, '{}', { mode: 0o600 });
+    const argv = [...promotionEvidenceRebindArgv];
+    argv[argv.indexOf('/promotion-evidence-rebind.json')] = output;
+    await assert.rejects(
+      dispatchSessionRelayRelease(argv),
+      /output already exists/i,
+      'rebind CLI must reject occupied output custody before receipt reads',
+    );
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+}
 
 assertCurrentReleasePromotionContract();
 
