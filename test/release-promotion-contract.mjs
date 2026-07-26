@@ -72,9 +72,6 @@ const CURRENT_GOAL_ID = '8b89aabf-7336-4352-bc11-225bab67f9aa';
 const CURRENT_DOCKS_RUN_ID = '88732ba0-ef06-411b-a31c-93705ccefb27';
 const CURRENT_DOCKS_PLAN_PATH = 'docs/plans/active/session-relay-correlated-results-release-remediation-v4.md';
 const CURRENT_DOCKS_SOURCE_BASE = '494881a0d973863d1ac8e233734c827eb6913ce8';
-const PLANRUN_DOCKS_RUN_ID = '1adc1590-49ee-42e6-93ab-8062e580d250';
-const PLANRUN_DOCKS_PLAN_PATH = 'docs/plans/active/session-relay-correlated-results-release-remediation-v6.md';
-const PLANRUN_DOCKS_SOURCE_BASE = '6d794a9d2380ea74c0b67a0b90e8f3825c9d0148';
 const CURRENT_PUBLIC_RUN_ID = '1f801952-705e-4c7e-a533-91026c013383';
 const CURRENT_PUBLIC_PLAN_PATH = 'docs/plans/finished/2026-07-25-session-relay-0.14.0-docks-kit-0.12.0-release.md';
 const HISTORICAL_RELEASE_PLAN_PATH = 'docs/plans/active/session-relay-linux-workspace-publication.md';
@@ -2113,23 +2110,6 @@ function currentPromotionProofV2() {
     created_at: '2026-07-25T14:00:00.000Z',
   };
 }
-function currentPromotionProofV3() {
-  const proof = structuredClone(currentPromotionProofV2());
-  proof.schema = 3;
-  proof.type = 'SourcePreparationProofV3';
-  proof.run_id = PLANRUN_DOCKS_RUN_ID;
-  proof.source_commit = PLANRUN_DOCKS_SOURCE_BASE;
-  proof.plan_run.run_id = PLANRUN_DOCKS_RUN_ID;
-  proof.plan_run.plan_path = PLANRUN_DOCKS_PLAN_PATH;
-  proof.plan_run.source_base = PLANRUN_DOCKS_SOURCE_BASE;
-  delete proof.tdd_red;
-  proof.ancestry = {
-    source_to_implementation: true,
-    implementation_to_reviewed: true,
-    reviewed_to_tag: true,
-  };
-  return proof;
-}
 
 function makeCurrentPromotionAdapter({
   byteDrift = false,
@@ -2137,7 +2117,7 @@ function makeCurrentPromotionAdapter({
   refConflict = null,
   stableInitially = false,
 } = {}) {
-  const proofValue = planRun ? currentPromotionProofV3() : currentPromotionProofV2();
+  const proofValue = currentPromotionProofV2();
   const proofEnvelope = { value: proofValue, digest: hash(proofValue) };
   const publicationValue = currentBoundaryPublicationValue();
   publicationValue.source_proof_sha256 = proofEnvelope.digest;
@@ -2290,8 +2270,8 @@ function makeCurrentPromotionAdapter({
   });
   assert.equal(result.receipt.schema, 3);
   assert.equal(result.receipt.type, 'PromotionReceiptV3');
-  assert.equal(result.receipt.docks_plan.run_id, PLANRUN_DOCKS_RUN_ID);
-  assert.equal(result.receipt.docks_plan.plan_path, PLANRUN_DOCKS_PLAN_PATH);
+  assert.equal(result.receipt.docks_plan.run_id, CURRENT_DOCKS_RUN_ID);
+  assert.equal(result.receipt.docks_plan.plan_path, CURRENT_DOCKS_PLAN_PATH);
   assert.equal(result.receipt.public_child.planrun_verified, true);
   assert.equal(result.receipt.public_release_receipt_sha256, current.publicReleaseEnvelope.digest);
   assert.deepEqual(result.receipt.staged_release.assets, result.receipt.stable_release.assets);
