@@ -72,6 +72,10 @@ const CURRENT_GOAL_ID = '8b89aabf-7336-4352-bc11-225bab67f9aa';
 const CURRENT_DOCKS_RUN_ID = '88732ba0-ef06-411b-a31c-93705ccefb27';
 const CURRENT_DOCKS_PLAN_PATH = 'docs/plans/active/session-relay-correlated-results-release-remediation-v4.md';
 const CURRENT_DOCKS_SOURCE_BASE = '494881a0d973863d1ac8e233734c827eb6913ce8';
+const PLANRUN_DOCKS_RUN_ID = '1adc1590-49ee-42e6-93ab-8062e580d250';
+const PLANRUN_DOCKS_PLAN_PATH = 'docs/plans/active/session-relay-correlated-results-release-remediation-v6.md';
+const PLANRUN_DOCKS_SOURCE_BASE = '6d794a9d2380ea74c0b67a0b90e8f3825c9d0148';
+const PLANRUN_RELEASE_TAG_COMMIT = '7d9cbbbdf82210d396de744372eadb6c26655601';
 const CURRENT_PUBLIC_RUN_ID = '1f801952-705e-4c7e-a533-91026c013383';
 const CURRENT_PUBLIC_PLAN_PATH = 'docs/plans/finished/2026-07-25-session-relay-0.14.0-docks-kit-0.12.0-release.md';
 const HISTORICAL_RELEASE_PLAN_PATH = 'docs/plans/active/session-relay-linux-workspace-publication.md';
@@ -2111,18 +2115,41 @@ function currentPromotionProofV2() {
   };
 }
 
+function currentPromotionProofV3() {
+  const proof = currentPromotionProofV2();
+  proof.schema = 3;
+  proof.type = 'SourcePreparationProofV3';
+  proof.run_id = PLANRUN_DOCKS_RUN_ID;
+  proof.source_commit = PLANRUN_DOCKS_SOURCE_BASE;
+  proof.tag_commit = PLANRUN_RELEASE_TAG_COMMIT;
+  proof.plan_run = {
+    ...proof.plan_run,
+    run_id: PLANRUN_DOCKS_RUN_ID,
+    plan_path: PLANRUN_DOCKS_PLAN_PATH,
+    source_base: PLANRUN_DOCKS_SOURCE_BASE,
+  };
+  delete proof.tdd_red;
+  proof.ancestry = {
+    tag_to_source: true,
+    source_to_implementation: true,
+    implementation_to_reviewed: true,
+  };
+  return proof;
+}
+
 function makeCurrentPromotionAdapter({
   byteDrift = false,
   planRun = false,
+  sourcePlanRun = false,
   refConflict = null,
   stableInitially = false,
 } = {}) {
-  const proofValue = currentPromotionProofV2();
+  const proofValue = sourcePlanRun ? currentPromotionProofV3() : currentPromotionProofV2();
   const proofEnvelope = { value: proofValue, digest: hash(proofValue) };
   const publicationValue = currentBoundaryPublicationValue();
   publicationValue.source_proof_sha256 = proofEnvelope.digest;
-  publicationValue.source.reviewed_commit = proofValue.implementation_commit;
-  publicationValue.source.implementation_commit = proofValue.implementation_commit;
+  publicationValue.source.reviewed_commit = proofValue.tag_commit;
+  publicationValue.source.implementation_commit = proofValue.tag_commit;
   publicationValue.tag_commit = proofValue.tag_commit;
   publicationValue.workflow.workflow_sha = proofValue.tag_commit;
   publicationValue.workflow.head_sha = proofValue.tag_commit;
@@ -2165,6 +2192,7 @@ function makeCurrentPromotionAdapter({
   const state = {
     main: proofValue.implementation_commit,
     promotions: 0,
+    ancestryCalls: [],
     outputs: new Map(),
     release: {
       id: publicationValue.release_database_id,
@@ -2181,7 +2209,7 @@ function makeCurrentPromotionAdapter({
     },
   };
   const adapter = {
-    now: () => (planRun ? '2026-07-26T02:00:00.000Z' : '2026-07-25T18:00:00.000Z'),
+    now: () => (planRun || sourcePlanRun ? '2026-07-26T02:00:00.000Z' : '2026-07-25T18:00:00.000Z'),
     loadProof: () => proofEnvelope,
     loadPublication: () => publicationEnvelope,
     loadPublicRelease: () => publicReleaseEnvelope,
@@ -2195,7 +2223,10 @@ function makeCurrentPromotionAdapter({
       }
       return null;
     },
-    isAncestor: () => true,
+    isAncestor: (ancestor, descendant) => {
+      state.ancestryCalls.push([ancestor, descendant]);
+      return true;
+    },
     isPublicAncestor: () => true,
     currentReleaseState: () => ({
       commit: proofValue.tag_commit,
@@ -2259,7 +2290,7 @@ function makeCurrentPromotionAdapter({
   );
 }
 {
-  const current = makeCurrentPromotionAdapter({ planRun: true });
+  const current = makeCurrentPromotionAdapter({ planRun: true, sourcePlanRun: true });
   validateSourcePreparationProof(current.adapter.loadProof().value);
   const result = promoteReviewed(current.options, false, current.adapter);
   validatePromotionReceipt(result.receipt);
@@ -2270,12 +2301,40 @@ function makeCurrentPromotionAdapter({
   });
   assert.equal(result.receipt.schema, 3);
   assert.equal(result.receipt.type, 'PromotionReceiptV3');
-  assert.equal(result.receipt.docks_plan.run_id, CURRENT_DOCKS_RUN_ID);
-  assert.equal(result.receipt.docks_plan.plan_path, CURRENT_DOCKS_PLAN_PATH);
+  assert.equal(result.receipt.docks_plan.run_id, PLANRUN_DOCKS_RUN_ID);
+  assert.equal(result.receipt.docks_plan.plan_path, PLANRUN_DOCKS_PLAN_PATH);
+  assert.equal(current.adapter.loadProof().value.tag_commit, PLANRUN_RELEASE_TAG_COMMIT);
+  assert.deepEqual(current.adapter.loadProof().value.ancestry, {
+    tag_to_source: true,
+    source_to_implementation: true,
+    implementation_to_reviewed: true,
+  });
   assert.equal(result.receipt.public_child.planrun_verified, true);
   assert.equal(result.receipt.public_release_receipt_sha256, current.publicReleaseEnvelope.digest);
   assert.deepEqual(result.receipt.staged_release.assets, result.receipt.stable_release.assets);
   assert.equal(current.state.promotions, 1, 'PlanRun release must be promoted exactly once');
+  assert.deepEqual(current.state.ancestryCalls, [
+    [PLANRUN_RELEASE_TAG_COMMIT, PLANRUN_DOCKS_SOURCE_BASE],
+    [PLANRUN_DOCKS_SOURCE_BASE, current.adapter.loadProof().value.implementation_commit],
+  ]);
+  const wrongTag = currentPromotionProofV3();
+  wrongTag.tag_commit = wrongTag.implementation_commit;
+  assert.throws(
+    () => validateSourcePreparationProof(wrongTag),
+    /immutable Session Relay release commit/i,
+    'PlanRun source proof must not relabel the reviewed remediation commit as the release tag',
+  );
+  const backwardsAncestry = currentPromotionProofV3();
+  backwardsAncestry.ancestry = {
+    source_to_implementation: true,
+    implementation_to_reviewed: true,
+    reviewed_to_tag: true,
+  };
+  assert.throws(
+    () => validateSourcePreparationProof(backwardsAncestry),
+    /ancestry|tag_to_source/i,
+    'PlanRun source proof must bind immutable-tag-to-source ancestry',
+  );
 }
 
 {
