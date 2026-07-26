@@ -6,7 +6,7 @@ import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { deflateRawSync } from 'node:zlib';
 import { parse as parseYaml } from 'yaml';
 import {
@@ -2925,6 +2925,31 @@ function currentSourcePreparationProofV2() {
   };
 }
 
+function bindDefaultCurrentCompletion(root, planPath, receiptOut) {
+  const repositoryNodeModules = path.join(REPO, 'node_modules');
+  assert.ok(fs.statSync(repositoryNodeModules).isDirectory(), 'repository node_modules fixture is absent');
+  fs.appendFileSync(path.join(root, '.git', 'info', 'exclude'), '\n/node_modules/\n');
+  fs.symlinkSync(repositoryNodeModules, path.join(root, 'node_modules'), 'dir');
+  const binderUrl = pathToFileURL(path.join(root, 'scripts/lib/session-relay-release-preparation.mjs')).href;
+  const options = [
+    ['finished-plan', planPath],
+    ['receipt-out', receiptOut],
+    ['version', CURRENT_RELEASE_VERSION],
+  ];
+  const invocation = [
+    `const { bindCompletion } = await import(${JSON.stringify(binderUrl)});`,
+    `bindCompletion(new Map(${JSON.stringify(options)}));`,
+  ].join('\n');
+  const bound = spawnSync(process.execPath, ['--input-type=module', '--eval', invocation], {
+    cwd: root,
+    encoding: 'utf8',
+    shell: false,
+    maxBuffer: Infinity,
+  });
+  assert.equal(bound.status, 0, bound.stderr || bound.error?.message);
+  return { receipt: JSON.parse(fs.readFileSync(receiptOut, 'utf8')) };
+}
+
 function bindCurrentCompletionFixture(
   temp,
   {
@@ -2934,6 +2959,9 @@ function bindCurrentCompletionFixture(
     transformPlan = (plan) => plan,
     brokenAncestry = null,
     implementationBlob = null,
+    defaultDependencies = false,
+    planOnlyHead = false,
+    requireTrimSensitiveDiff = false,
   },
 ) {
   const clonePath = path.join(temp, `current-completion-${name}`);
@@ -3013,10 +3041,9 @@ function bindCurrentCompletionFixture(
   validateTddRedReceipt(red, { repositoryId: REPOSITORY_ID });
   assert.equal(red.exit_code, 17);
 
-  fs.appendFileSync(
-    path.join(root, 'scripts/lib/session-relay-release-preparation.mjs'),
-    '\n// Current release-evidence contract implementation fixture.\n',
-  );
+  const preparationPath = path.join(root, 'scripts/lib/session-relay-release-preparation.mjs');
+  if (defaultDependencies) copyFromRepository('scripts/lib/session-relay-release-preparation.mjs');
+  fs.appendFileSync(preparationPath, '\n// Current release-evidence contract implementation fixture.\n');
   runGit(['add', '--', 'scripts/lib/session-relay-release-preparation.mjs']);
   const implementationCommit = commitFixture('fix: bind current release evidence fixture', '2026-07-25T14:00:00.000Z');
   const sourceCommit = CURRENT_DOCKS_SOURCE_BASE;
@@ -3041,6 +3068,15 @@ function bindCurrentCompletionFixture(
     { bytes: true },
   );
   const completionDiffSha256 = sha256(completionDiffBytes);
+  if (requireTrimSensitiveDiff) {
+    assert.equal(completionDiffBytes.at(-1), 0x0a, 'reviewed Git diff fixture must retain its terminal newline');
+    const trimmedDiffBytes = Buffer.from(completionDiffBytes.toString('utf8').trim(), 'utf8');
+    assert.notEqual(
+      sha256(trimmedDiffBytes),
+      completionDiffSha256,
+      'reviewed raw diff and the trimming adapter output must have distinct identities',
+    );
+  }
   const completionReview = {
     schema: 1,
     run_id: CURRENT_DOCKS_RUN_ID,
@@ -3102,6 +3138,7 @@ function bindCurrentCompletionFixture(
   const fixtureContext = {
     acceptanceManifest,
     completionDiffSha256,
+    completionDiffBytes,
     red,
     run,
     completionReview,
@@ -3110,6 +3147,20 @@ function bindCurrentCompletionFixture(
   plan = transformPlan(plan, fixtureContext);
   const planPath = path.join(root, CURRENT_DOCKS_PLAN_PATH);
   fs.writeFileSync(planPath, plan);
+  let headCommit = implementationCommit;
+  if (planOnlyHead) {
+    runGit(['add', '--', CURRENT_DOCKS_PLAN_PATH]);
+    headCommit = commitFixture('docs: advance current completion plan fixture', '2026-07-25T14:20:00.000Z');
+    runGit(['merge-base', '--is-ancestor', implementationCommit, headCommit]);
+    runGit(['diff', '--quiet', implementationCommit, headCommit, '--', ...CURRENT_AFFECTED_PATHS]);
+    assert.deepEqual(
+      runGit(['diff', '--name-only', '--no-renames', implementationCommit, headCommit, '--'])
+        .split('\n')
+        .filter(Boolean),
+      [CURRENT_DOCKS_PLAN_PATH],
+      'implementation descendant fixture must contain exactly one plan-only commit',
+    );
+  }
   const receiptOut = path.join(root, 'source-proof-v2.json');
   const calls = { ancestry: [] };
   const ancestry = new Map([
@@ -3160,12 +3211,15 @@ function bindCurrentCompletionFixture(
     ['receipt-out', receiptOut],
   ];
   if (includeVersion) optionEntries.push(['version', version]);
-  const result = bindCompletion(new Map(optionEntries), adapter);
+  const result = defaultDependencies
+    ? bindDefaultCurrentCompletion(root, planPath, receiptOut)
+    : bindCompletion(new Map(optionEntries), adapter);
   return {
     ...fixtureContext,
     sourceCommit,
     redCommit,
     implementationCommit,
+    headCommit,
     testBlob: red.test_paths[0].blob_id,
     planPath,
     receiptOut,
@@ -3345,6 +3399,36 @@ function testCurrentCompletionBinding(temp) {
   );
 }
 
+function testDefaultCompletionBindingPreservesRawGitDiffBytes(temp) {
+  const generated = bindCurrentCompletionFixture(temp, {
+    name: 'default-raw-git-diff',
+    defaultDependencies: true,
+    requireTrimSensitiveDiff: true,
+  });
+  assert.equal(
+    generated.result.receipt.completion_review.diff_sha256,
+    sha256(generated.completionDiffBytes),
+    'default completion binding must preserve the exact reviewed raw Git diff identity',
+  );
+}
+
+function testDefaultCompletionBindingReproducesImplementationManifestAfterPlanOnlyHead(temp) {
+  const generated = bindCurrentCompletionFixture(temp, {
+    name: 'default-plan-only-head',
+    defaultDependencies: true,
+    planOnlyHead: true,
+  });
+  assert.notEqual(generated.headCommit, generated.implementationCommit);
+  assert.equal(generated.result.receipt.implementation_commit, generated.implementationCommit);
+  assert.deepEqual(
+    generated.result.receipt.acceptance.manifest,
+    generated.acceptanceManifest,
+    'default completion binding must reproduce the accepted implementation-time manifest',
+  );
+  assert.equal(generated.result.receipt.acceptance.manifest.source_base, generated.implementationCommit);
+  validateSourcePreparationProof(generated.result.receipt);
+}
+
 function testCurrentCorrelatedReleaseEvidence() {
   const historicalPlan = fs.readFileSync(path.resolve(HISTORICAL_RELEASE_PLAN_PATH), 'utf8');
   for (const [name, digest] of Object.entries(HISTORICAL_RECEIPT_SHA256)) {
@@ -3477,6 +3561,8 @@ function main() {
     testPrepareFixtureUsesFullCi(temp);
     testLiveSourceCiAndPrepareDryRun();
     testCurrentCompletionBinding(temp);
+    testDefaultCompletionBindingPreservesRawGitDiffBytes(temp);
+    testDefaultCompletionBindingReproducesImplementationManifestAfterPlanOnlyHead(temp);
     testCurrentCorrelatedReleaseEvidence();
     console.log('release evidence contract: ok');
   } finally {
