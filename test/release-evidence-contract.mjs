@@ -2962,6 +2962,7 @@ function bindCurrentCompletionFixture(
     defaultDependencies = false,
     planOnlyHead = false,
     requireTrimSensitiveDiff = false,
+    continuationPath = null,
   },
 ) {
   const clonePath = path.join(temp, `current-completion-${name}`);
@@ -3160,6 +3161,14 @@ function bindCurrentCompletionFixture(
       [CURRENT_DOCKS_PLAN_PATH],
       'implementation descendant fixture must contain exactly one plan-only commit',
     );
+  }
+  if (continuationPath !== null) {
+    const continuation = continuationPath.endsWith('.mjs')
+      ? '\n// Post-review continuation fixture.\n'
+      : '\nPost-review continuation fixture.\n';
+    fs.appendFileSync(path.join(root, ...continuationPath.split('/')), continuation);
+    runGit(['add', '--', continuationPath]);
+    headCommit = commitFixture('fix: add post-review continuation fixture', '2026-07-25T14:25:00.000Z');
   }
   const receiptOut = path.join(root, 'source-proof-v2.json');
   const calls = { ancestry: [] };
@@ -3429,6 +3438,32 @@ function testDefaultCompletionBindingReproducesImplementationManifestAfterPlanOn
   validateSourcePreparationProof(generated.result.receipt);
 }
 
+function testDefaultCompletionBindingAllowsBoundedPostReviewTooling(temp) {
+  const generated = bindCurrentCompletionFixture(temp, {
+    name: 'default-bounded-continuation',
+    defaultDependencies: true,
+    planOnlyHead: true,
+    continuationPath: 'scripts/lib/session-relay-release-preparation.mjs',
+  });
+  assert.notEqual(generated.headCommit, generated.implementationCommit);
+  assert.deepEqual(generated.result.receipt.acceptance.manifest, generated.acceptanceManifest);
+  validateSourcePreparationProof(generated.result.receipt);
+}
+
+function testDefaultCompletionBindingRejectsUnauthorizedPostReviewPath(temp) {
+  expectReject(
+    'default completion binder rejects an unauthorized post-review path',
+    () =>
+      bindCurrentCompletionFixture(temp, {
+        name: 'default-unauthorized-continuation',
+        defaultDependencies: true,
+        planOnlyHead: true,
+        continuationPath: 'plugins/session-relay/README.md',
+      }),
+    /post-review|unauthorized|README/i,
+  );
+}
+
 function testCurrentCorrelatedReleaseEvidence() {
   const historicalPlan = fs.readFileSync(path.resolve(HISTORICAL_RELEASE_PLAN_PATH), 'utf8');
   for (const [name, digest] of Object.entries(HISTORICAL_RECEIPT_SHA256)) {
@@ -3563,6 +3598,8 @@ function main() {
     testCurrentCompletionBinding(temp);
     testDefaultCompletionBindingPreservesRawGitDiffBytes(temp);
     testDefaultCompletionBindingReproducesImplementationManifestAfterPlanOnlyHead(temp);
+    testDefaultCompletionBindingAllowsBoundedPostReviewTooling(temp);
+    testDefaultCompletionBindingRejectsUnauthorizedPostReviewPath(temp);
     testCurrentCorrelatedReleaseEvidence();
     console.log('release evidence contract: ok');
   } finally {
