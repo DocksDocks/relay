@@ -61,6 +61,8 @@ const CURRENT_GOAL_ID = '8b89aabf-7336-4352-bc11-225bab67f9aa';
 const CURRENT_DOCKS_RUN_ID = '88732ba0-ef06-411b-a31c-93705ccefb27';
 const CURRENT_PUBLIC_RUN_ID = '1f801952-705e-4c7e-a533-91026c013383';
 const CURRENT_DOCKS_PLAN_PATH = 'docs/plans/active/session-relay-correlated-results-release-remediation-v4.md';
+const CURRENT_DOCKS_PLAN_TEMPLATE_PATH =
+  'docs/plans/finished/2026-07-26-session-relay-correlated-results-release-remediation-v4.md';
 const CURRENT_DOCKS_SOURCE_BASE = '494881a0d973863d1ac8e233734c827eb6913ce8';
 const CURRENT_RED_TEST_PATH = 'plugins/session-relay/test/release-evidence-contract.mjs';
 const CURRENT_RED_PRODUCER_PATH = 'scripts/capture-tdd-red.mjs';
@@ -3005,13 +3007,13 @@ function bindCurrentCompletionFixture(
     });
     return runGit(['rev-parse', 'HEAD^{commit}']);
   };
-  const copyFromRepository = (logical) => {
-    const target = path.join(root, ...logical.split('/'));
+  const copyFromRepository = (sourceLogical, targetLogical = sourceLogical) => {
+    const target = path.join(root, ...targetLogical.split('/'));
     fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
-    fs.copyFileSync(path.join(REPO, ...logical.split('/')), target);
+    fs.copyFileSync(path.join(REPO, ...sourceLogical.split('/')), target);
   };
 
-  copyFromRepository(CURRENT_DOCKS_PLAN_PATH);
+  copyFromRepository(CURRENT_DOCKS_PLAN_TEMPLATE_PATH, CURRENT_DOCKS_PLAN_PATH);
   copyFromRepository(CURRENT_RED_TEST_PATH);
   runGit(['add', '--', CURRENT_DOCKS_PLAN_PATH, CURRENT_RED_TEST_PATH]);
   const redCommit = commitFixture('test: bind current release evidence fixture', '2026-07-25T13:50:00.000Z');
@@ -3089,7 +3091,7 @@ function bindCurrentCompletionFixture(
   };
   const completionReviewJcs = jcs(completionReview);
   const completionReviewSha256 = sha256(Buffer.from(completionReviewJcs));
-  const template = fs.readFileSync(path.join(REPO, CURRENT_DOCKS_PLAN_PATH), 'utf8');
+  const template = fs.readFileSync(path.join(REPO, CURRENT_DOCKS_PLAN_TEMPLATE_PATH), 'utf8');
   const runMatch = /^Plan-run: (\{.*\})$/m.exec(template);
   assert.ok(runMatch, 'active remediation v4 PlanRun fixture is absent');
   const templateRun = JSON.parse(runMatch[1]);

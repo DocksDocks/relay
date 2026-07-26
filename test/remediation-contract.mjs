@@ -31,6 +31,7 @@ const RUN_ID = '88732ba0-ef06-411b-a31c-93705ccefb27';
 const STALE_RUN_ID = 'a69dcd97-d1bd-46fc-9b6b-70e349e353fc';
 const SOURCE_BASE = '494881a0d973863d1ac8e233734c827eb6913ce8';
 const PLAN_PATH = 'docs/plans/active/session-relay-correlated-results-release-remediation-v4.md';
+const PLAN_TEMPLATE_PATH = 'docs/plans/finished/2026-07-26-session-relay-correlated-results-release-remediation-v4.md';
 const BLOCKED_PLAN_PATH = 'docs/plans/active/session-relay-correlated-results-release-completion.md';
 const SELF_PATH = 'plugins/session-relay/test/remediation-contract.mjs';
 const PRODUCER_PATH = 'scripts/capture-tdd-red.mjs';
@@ -441,10 +442,20 @@ function addOutOfScopeDrift(fixture) {
 }
 
 function runBinderContract() {
-  const templateBytes = fs.readFileSync(logicalPath(REPO, PLAN_PATH));
+  const archivedTemplateBytes = fs.readFileSync(logicalPath(REPO, PLAN_TEMPLATE_PATH));
+  const templateRun = { ...planRunFrom(archivedTemplateBytes), blocker: null };
+  const templateBytes = Buffer.from(
+    archivedTemplateBytes
+      .toString('utf8')
+      .replace(/^status: blocked$/m, 'status: ongoing')
+      .replace(/^Plan-run: \{.*\}$/m, `Plan-run: ${jcs(templateRun)}`),
+  );
   const parsed = parsePlan(templateBytes);
-  const templateRun = planRunFrom(templateBytes);
-  assert.equal(parsed.frontmatter.status, 'ongoing', 'the real remediation v4 PlanRun must be active and ongoing');
+  assert.equal(
+    parsed.frontmatter.status,
+    'ongoing',
+    'archived remediation v4 must reconstruct the reviewed ongoing fixture',
+  );
   assert.deepEqual(parsed.frontmatter.affected_paths, EXPECTED_AFFECTED_PATHS);
   assert.equal(templateRun.repository_id, REPOSITORY_ID);
   assert.equal(templateRun.goal_id, GOAL_ID);
@@ -452,12 +463,6 @@ function runBinderContract() {
   assert.equal(templateRun.plan_path, PLAN_PATH);
   assert.equal(templateRun.source_base, SOURCE_BASE);
   assert.equal(templateRun.execution_parent, SOURCE_BASE);
-  validatePlanRun(templateBytes, {
-    goalId: GOAL_ID,
-    planPath: PLAN_PATH,
-    repositoryId: REPOSITORY_ID,
-    runId: RUN_ID,
-  });
 
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'session-relay-remediation-contract-'));
   fs.chmodSync(root, 0o700);

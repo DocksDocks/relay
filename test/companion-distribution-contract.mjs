@@ -24,6 +24,8 @@ const CURRENT_PUBLIC_VERSION = '0.12.0';
 const CURRENT_PUBLIC_TAG = `cli-v${CURRENT_PUBLIC_VERSION}`;
 const CURRENT_PUBLIC_PLAN = 'docs/plans/active/session-relay-0.14.0-docks-kit-0.12.0-release.md';
 const CURRENT_DOCKS_PLAN = 'docs/plans/active/session-relay-correlated-results-release-completion.md';
+const CURRENT_DOCKS_PLAN_TEMPLATE =
+  'docs/plans/finished/2026-07-26-session-relay-correlated-results-release-completion.md';
 const CURRENT_DOCKS_RUN_ID = 'a69dcd97-d1bd-46fc-9b6b-70e349e353fc';
 const CURRENT_GOAL_ID = '8b89aabf-7336-4352-bc11-225bab67f9aa';
 const HISTORICAL_PUBLIC_PLAN_SHA256 = 'e0b1d183122def14a3f4bd6f05605c6aa7de3fb2dccf4330e8956acc3e0db9ff';
@@ -145,7 +147,10 @@ function verifyCurrentPublicMain(directory, cli) {
   const currentPlanRelative = path.relative(directory, currentPlanPath).split(path.sep).join('/');
   const currentPlan = fs.readFileSync(currentPlanPath, 'utf8');
   const currentRun = planRun(currentPlan, 'current public child');
-  const docksRun = planRun(fs.readFileSync(path.join(REPO, CURRENT_DOCKS_PLAN), 'utf8'), 'current Docks child');
+  const docksRun = planRun(
+    fs.readFileSync(path.join(REPO, CURRENT_DOCKS_PLAN_TEMPLATE), 'utf8'),
+    'current Docks child',
+  );
 
   const toolchainBytes = fs.readFileSync(path.join(directory, 'SoT/toolchain.json'), 'utf8');
   const toolchain = JSON.parse(toolchainBytes);
