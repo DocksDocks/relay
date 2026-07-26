@@ -1374,6 +1374,34 @@ try {
   }
 
   {
+    const directory = fs.mkdtempSync(path.join(root, 'explicit-stable-rebind-'));
+    const stable = fakeAdapter();
+    stable.state.release.prerelease = false;
+    stable.state.release.body = STABLE_BODY;
+    const sourceProof = proof(directory);
+    const options = optionsFor(directory, sourceProof);
+    options.set('rebind-complete-publication', true);
+    publishReviewed(options, stable.adapter);
+    const receipt = receiptAt(options.get('receipt-out'));
+    assert.equal(receipt.transition, 'reconciled');
+    assert.equal(receipt.release_state, 'prerelease');
+    assert.equal(receipt.body_sha256, sha256(Buffer.from(PRERELEASE_BODY)));
+    assertNoPublicationMutation(stable.state);
+    assert.equal(stable.state.releaseDownloads, 1);
+
+    const ordinaryDirectory = fs.mkdtempSync(path.join(root, 'stable-without-explicit-rebind-'));
+    const ordinary = fakeAdapter();
+    ordinary.state.release.prerelease = false;
+    ordinary.state.release.body = STABLE_BODY;
+    const ordinaryProof = proof(ordinaryDirectory);
+    const ordinaryOptions = optionsFor(ordinaryDirectory, ordinaryProof);
+    expectConflict(() => publishReviewed(ordinaryOptions, ordinary.adapter), /premature stable release conflict/i);
+    assertNoPublicationMutation(ordinary.state);
+    assert.equal(fs.existsSync(ordinaryOptions.get('receipt-out')), false);
+    checks += 1;
+  }
+
+  {
     const directory = fs.mkdtempSync(path.join(root, 'captured-commit-time-release-created-at-'));
     const fake = capturedAdapter();
     const rebound = rebind(directory, fake);
