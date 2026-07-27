@@ -5075,7 +5075,7 @@ impl ProcessObservation {
         JsonValue::from(object)
     }
 
-    fn from_json(value: &JsonValue) -> Option<Self> {
+    pub(crate) fn from_json(value: &JsonValue) -> Option<Self> {
         let object = value.get::<HashMap<String, JsonValue>>()?;
         let start = object.get("start")?.get::<HashMap<String, JsonValue>>()?;
         let start = match string(start, "kind")?.as_str() {
@@ -6077,7 +6077,7 @@ fn json_contains_string(value: &JsonValue, needle: &str) -> bool {
     })
 }
 
-fn process_observation_is_live(observation: &ProcessObservation) -> bool {
+pub(crate) fn process_observation_is_live(observation: &ProcessObservation) -> bool {
     #[cfg(target_os = "linux")]
     {
         let current = fs::read_to_string(format!("/proc/{}/stat", observation.pid))

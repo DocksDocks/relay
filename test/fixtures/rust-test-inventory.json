@@ -111,6 +111,16 @@
         "worktree_merge_conflict_aborts_cleanly_and_retries_after_parent_repair"
       ]
     },
+    "fanout_reap": {
+      "tests": [
+        "abandoned_reservation_past_window_removes_worktree_and_reports_retained_branch",
+        "live_worker_reservation_is_untouched",
+        "lost_authority_without_observation_is_untouched",
+        "managed_workspace_gate_refusal_skips_only_that_reservation",
+        "reservation_inside_window_keeps_worktree_and_branch",
+        "reservation_with_uncollected_commits_keeps_worktree_and_reports_branch"
+      ]
+    },
     "lifecycle_supervisor": {
       "tests": [
         "lifecycle_supervisor_disconnect_linearizes_unmanaged_cancel_and_reap",

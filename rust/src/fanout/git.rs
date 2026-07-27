@@ -217,6 +217,21 @@ pub(super) fn remove_merged_worktree(
     Ok(())
 }
 
+/// Commits on `branch` that are absent from `base_sha`. Routed through `run_git`
+/// like every other git call in this module: spawning the git binary directly
+/// here would register a new direct-git site, which the frozen reentry inventory
+/// classifies separately from the sanctioned git-API category.
+pub(super) fn uncollected_commit_count(
+    worktree: &Path,
+    base_sha: &str,
+    branch: &str,
+) -> Result<u64, String> {
+    let range = format!("{base_sha}..{branch}");
+    run_git(worktree, &["rev-list", "--count", &range])?
+        .parse()
+        .map_err(|_| format!("git rev-list count for {branch} was not an integer"))
+}
+
 fn run_git(cwd: &Path, args: &[&str]) -> Result<String, String> {
     String::from_utf8(run_git_bytes(cwd, args)?)
         .map(|output| output.trim().to_string())

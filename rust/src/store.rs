@@ -117,7 +117,14 @@ pub fn sanitize(s: &str) -> String {
 }
 
 fn ensure_dirs_at(root: &Path) -> Result<(), String> {
-    for d in ["mailbox", "markers", "watchers", "locks", "hook-state"] {
+    for d in [
+        "mailbox",
+        "markers",
+        "watchers",
+        "locks",
+        "hook-state",
+        "worktrees",
+    ] {
         let path = root.join(d);
         fs::create_dir_all(&path).map_err(|e| format!("mkdir {d}: {e}"))?;
         if matches!(d, "watchers" | "locks" | "hook-state") {
@@ -728,9 +735,9 @@ struct GcCandidate {
     surfaces: Vec<GcSurface>,
 }
 
-struct GcSurfaceDir {
-    name: &'static str,
-    fd: OwnedFd,
+pub(crate) struct GcSurfaceDir {
+    pub(crate) name: &'static str,
+    pub(crate) fd: OwnedFd,
 }
 
 #[derive(Clone)]
@@ -845,6 +852,7 @@ fn open_gc_surface_dirs(root_fd: &OwnedFd) -> Result<Vec<GcSurfaceDir>, String> 
         "locks",
         "hook-state",
         "spawn-logs",
+        "worktrees",
     ] {
         match openat(
             root_fd,
@@ -1295,7 +1303,20 @@ impl LegacyGc {
             .min(i64::MAX as u128) as i64;
         let cutoff_iso = iso_from_unix_ms(cutoff_ms);
 
-        with_gc_lock(&self.root_fd, || {
+        let fanout_report = match gc_surface_dir(&self.surface_dirs, "worktrees") {
+            Some(worktrees) => crate::fanout::reap_abandoned_worktrees(
+                &crate::fanout::FanoutStore::new(self.root.clone()),
+                worktrees,
+                cutoff,
+            )?,
+            None => crate::fanout::FanoutGcReport::default(),
+        };
+        for branch in &fanout_report.retained_branches {
+            eprintln!("[session-relay/gc] retained fanout branch {branch}");
+        }
+        let removed_worktrees = fanout_report.removed_worktrees;
+
+        let removed_legacy = with_gc_lock(&self.root_fd, || {
             let Some(_current_root_fd) = self.reopen_validated_root()? else {
                 return Ok(0);
             };
@@ -1423,7 +1444,8 @@ impl LegacyGc {
             }
             atomic_write_at(&self.root_fd, "gc-stamp", &format!("{}\n", iso_now()))?;
             Ok(removed_files + removed_registry_ids.len())
-        })
+        })?;
+        Ok(removed_worktrees + removed_legacy)
     }
 }
 

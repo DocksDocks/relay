@@ -16,7 +16,7 @@ const workspaceTargets = [
   'workspace_coordination_process',
   'workspace_resources',
 ];
-const featureTargets = ['protocol', 'fanout', 'lifecycle_supervisor'];
+const featureTargets = ['protocol', 'fanout', 'fanout_reap', 'lifecycle_supervisor'];
 const runnableTargets = [...featureTargets, ...workspaceTargets];
 const acceptanceOwners = {
   A01: 'workspace_lease_process::two_writers_same_worktree_exactly_one_lease',

@@ -10,7 +10,7 @@ mod git;
 
 pub use authority::{CollectionPhase, FanoutMode, FanoutRecord, FanoutState, FanoutStore};
 
-use crate::lifecycle::LifecycleStore;
+use crate::lifecycle::{LifecycleStore, ProcessObservation, process_observation_is_live};
 use crate::protocol::{TerminalStatus, WorkerResultV1};
 use crate::store;
 use crate::workspace::authority::{
@@ -26,9 +26,14 @@ use authority::{
 use git::{
     PreparedMergeOutcome, add_worktree, canonicalize_repository, changed_paths, ensure_clean,
     ensure_worktree_root, merge_prepared_handback, remove_merged_worktree,
-    remove_unstarted_worktree, repo_identity, repository_head, validate_sha,
+    remove_unstarted_worktree, repo_identity, repository_head, uncollected_commit_count,
+    validate_sha,
 };
+use rustix::fs::{AtFlags, FileType, statat};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tinyjson::JsonValue;
 
 fn acquire_legacy_gate(
     identity: &git::RepoIdentity,
@@ -38,6 +43,327 @@ fn acquire_legacy_gate(
     let gate = RepositoryGate::acquire(&roots, identity.workspace_identity())?;
     gate.refuse_legacy_if_managed(&roots, identity.workspace_identity())?;
     Ok((gate, roots))
+}
+
+#[derive(Default)]
+pub(crate) struct FanoutGcReport {
+    pub(crate) removed_worktrees: usize,
+    pub(crate) retained_branches: Vec<String>,
+}
+
+enum FanoutGcOutcome {
+    Skipped,
+    Retained(String),
+    Removed(String),
+}
+
+// `FanoutRecord` dwarfs the other variants (≈968 vs 24 bytes), so the candidate
+// payload is boxed: every `Skipped`/`Retained` in the reap loop would otherwise
+// carry the full record's footprint.
+struct FanoutGcCandidate {
+    record: FanoutRecord,
+    worktree_snapshot: WorktreeSnapshot,
+}
+
+enum FanoutGcDecision {
+    Skipped,
+    Retained(String),
+    Candidate(Box<FanoutGcCandidate>),
+}
+
+struct ReapContext<'a> {
+    fanout: &'a FanoutStore,
+    worktrees: &'a store::GcSurfaceDir,
+    identity: &'a git::RepoIdentity,
+    cutoff: SystemTime,
+}
+
+#[derive(Clone, Copy)]
+struct WorktreeSnapshot {
+    dev: i128,
+    ino: i128,
+    mtime: i128,
+    mtime_nsec: i128,
+}
+
+impl WorktreeSnapshot {
+    fn is_old(self, cutoff: SystemTime) -> bool {
+        let cutoff = cutoff.duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO);
+        let cutoff_secs = i128::from(cutoff.as_secs());
+        self.mtime < cutoff_secs
+            || (self.mtime == cutoff_secs && self.mtime_nsec <= i128::from(cutoff.subsec_nanos()))
+    }
+}
+
+fn old_worktree_snapshot(
+    worktrees: &store::GcSurfaceDir,
+    reservation_id: &str,
+    cutoff: SystemTime,
+) -> Result<Option<WorktreeSnapshot>, String> {
+    let stat = match statat(&worktrees.fd, reservation_id, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat) => stat,
+        Err(error) if error == rustix::io::Errno::NOENT => return Ok(None),
+        Err(error) => return Err(format!("stat fanout worktree {reservation_id}: {error}")),
+    };
+    if !FileType::from_raw_mode(stat.st_mode).is_dir() {
+        return Ok(None);
+    }
+    let snapshot = WorktreeSnapshot {
+        dev: i128::from(stat.st_dev),
+        ino: i128::from(stat.st_ino),
+        mtime: i128::from(stat.st_mtime),
+        mtime_nsec: i128::from(stat.st_mtime_nsec),
+    };
+    Ok(snapshot.is_old(cutoff).then_some(snapshot))
+}
+
+fn worktree_matches_snapshot(
+    worktrees: &store::GcSurfaceDir,
+    reservation_id: &str,
+    snapshot: WorktreeSnapshot,
+) -> Result<bool, String> {
+    let stat = match statat(&worktrees.fd, reservation_id, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat) => stat,
+        Err(error) if error == rustix::io::Errno::NOENT => return Ok(false),
+        Err(error) => return Err(format!("stat fanout worktree {reservation_id}: {error}")),
+    };
+    Ok(FileType::from_raw_mode(stat.st_mode).is_dir()
+        && i128::from(stat.st_dev) == snapshot.dev
+        && i128::from(stat.st_ino) == snapshot.ino
+        && i128::from(stat.st_mtime) == snapshot.mtime
+        && i128::from(stat.st_mtime_nsec) == snapshot.mtime_nsec)
+}
+
+// Liveness gates worktree DELETION, so it must not drift from the rest of the
+// crate: the start-token comparison inside `process_observation_is_live` is the
+// anti-pid-recycling guard, and a divergent copy that reported a live worker as
+// dead would delete that worker's worktree. Reuse the lifecycle adapter rather
+// than re-parsing the same JSON shape here.
+fn process_value_is_live(value: &JsonValue) -> Option<bool> {
+    Some(process_observation_is_live(&ProcessObservation::from_json(
+        value,
+    )?))
+}
+
+fn operation_may_have_live_process(
+    operation: &JsonValue,
+    worker_id: &str,
+    generation: &str,
+) -> bool {
+    let Some(operation) = operation.get::<HashMap<String, JsonValue>>() else {
+        return true;
+    };
+    if optional_string(operation, "worker_id").as_deref() != Some(worker_id) {
+        return false;
+    }
+    if optional_string(operation, "generation").as_deref() != Some(generation) {
+        return false;
+    }
+    let Some(custody) = operation
+        .get("custody")
+        .and_then(JsonValue::get::<HashMap<String, JsonValue>>)
+    else {
+        return true;
+    };
+    match optional_string(custody, "kind").as_deref() {
+        Some("None" | "ChildReaped") => false,
+        Some("ChildStarting") => true,
+        Some("ChildOwned" | "ChildCancelRequested") => custody
+            .get("process")
+            .and_then(process_value_is_live)
+            .unwrap_or(true),
+        Some("LostAuthority") => {
+            // Unknown liveness must retain the worktree; treating lost custody
+            // as dead could delete a child that is still running.
+            custody
+                .get("last_observation")
+                .filter(|value| value.get::<()>().is_none())
+                .map(|value| process_value_is_live(value).unwrap_or(true))
+                .unwrap_or(true)
+        }
+        _ => true,
+    }
+}
+
+fn worker_process_is_present(
+    record: &FanoutRecord,
+    lifecycle: &HashMap<String, JsonValue>,
+) -> bool {
+    let (Some(worker_id), Some(generation)) =
+        (record.worker_id.as_deref(), record.generation.as_deref())
+    else {
+        return false;
+    };
+    let Some(operations) = lifecycle
+        .get("active_operations")
+        .and_then(JsonValue::get::<HashMap<String, JsonValue>>)
+    else {
+        return false;
+    };
+    operations
+        .values()
+        .any(|operation| operation_may_have_live_process(operation, worker_id, generation))
+}
+
+fn abandoned_worktree_decision(
+    ctx: &ReapContext<'_>,
+    reservation_id: &str,
+    expected_record: &FanoutRecord,
+    expected_worktree_snapshot: Option<WorktreeSnapshot>,
+    records: &HashMap<String, FanoutRecord>,
+    lifecycle: &HashMap<String, JsonValue>,
+) -> Result<FanoutGcDecision, String> {
+    let Some(current) = records.get(reservation_id) else {
+        return Ok(FanoutGcDecision::Skipped);
+    };
+    let expected_worktree = ctx
+        .fanout
+        .root()
+        .join("worktrees")
+        .join(&current.reservation_id);
+    let worktree_snapshot = match expected_worktree_snapshot {
+        Some(snapshot) => snapshot,
+        None => {
+            let Some(snapshot) = old_worktree_snapshot(ctx.worktrees, reservation_id, ctx.cutoff)?
+            else {
+                return Ok(FanoutGcDecision::Skipped);
+            };
+            snapshot
+        }
+    };
+    if current != expected_record
+        || current.collection_phase.is_some()
+        || current.state == FanoutState::Collected
+        || Path::new(&current.worktree) != expected_worktree
+        || worker_process_is_present(current, lifecycle)
+    {
+        return Ok(FanoutGcDecision::Skipped);
+    }
+
+    // Branch refs are never deleted by GC. Reporting the ref happens for every
+    // old, process-free reservation whether its worktree is removed or retained.
+    let branch = current.branch.clone();
+    if !ctx.identity.matches_record(current) {
+        return Ok(FanoutGcDecision::Retained(branch));
+    }
+    if expected_worktree_snapshot.is_some()
+        && !worktree_matches_snapshot(ctx.worktrees, reservation_id, worktree_snapshot)?
+    {
+        return Ok(FanoutGcDecision::Retained(branch));
+    }
+    Ok(FanoutGcDecision::Candidate(Box::new(FanoutGcCandidate {
+        record: current.clone(),
+        worktree_snapshot,
+    })))
+}
+
+pub(crate) fn reap_abandoned_worktrees(
+    fanout: &FanoutStore,
+    worktrees: &store::GcSurfaceDir,
+    cutoff: SystemTime,
+) -> Result<FanoutGcReport, String> {
+    let mut reservation_ids =
+        fanout.read_transaction(|records, _| Ok(records.keys().cloned().collect::<Vec<_>>()))?;
+    reservation_ids.sort();
+    let mut report = FanoutGcReport::default();
+
+    for reservation_id in reservation_ids {
+        let Some(snapshot) = fanout.read(&reservation_id)? else {
+            continue;
+        };
+        if snapshot.collection_phase.is_some()
+            || snapshot.state == FanoutState::Collected
+            || Path::new(&snapshot.worktree)
+                != fanout
+                    .root()
+                    .join("worktrees")
+                    .join(&snapshot.reservation_id)
+            || old_worktree_snapshot(worktrees, &reservation_id, cutoff)?.is_none()
+        {
+            continue;
+        }
+        let _collection_lock = match acquire_collection_lock(fanout.root(), &reservation_id) {
+            Ok(lock) => lock,
+            Err(error) if error == "fanout collection already in progress" => continue,
+            Err(error) => return Err(error),
+        };
+        let identity = match repo_identity(Path::new(&snapshot.worktree)) {
+            Ok(identity) if identity.matches_record(&snapshot) => identity,
+            Ok(_) | Err(_) => continue,
+        };
+        let Ok((_repository_gate, _roots)) = acquire_legacy_gate(&identity) else {
+            continue;
+        };
+        let ctx = ReapContext {
+            fanout,
+            worktrees,
+            identity: &identity,
+            cutoff,
+        };
+
+        let decision = fanout.read_transaction(|records, lifecycle| {
+            abandoned_worktree_decision(&ctx, &reservation_id, &snapshot, None, records, lifecycle)
+        })?;
+        let outcome = match decision {
+            FanoutGcDecision::Skipped => FanoutGcOutcome::Skipped,
+            FanoutGcDecision::Retained(branch) => FanoutGcOutcome::Retained(branch),
+            FanoutGcDecision::Candidate(candidate) => {
+                let FanoutGcCandidate {
+                    record,
+                    worktree_snapshot,
+                } = *candidate;
+                let branch = record.branch.clone();
+                if !matches!(
+                    uncollected_commit_count(
+                        Path::new(&record.worktree),
+                        &record.base_sha,
+                        &record.branch,
+                    ),
+                    Ok(0)
+                ) || ensure_clean(Path::new(&record.worktree), "abandoned fanout worktree")
+                    .is_err()
+                {
+                    FanoutGcOutcome::Retained(branch)
+                } else {
+                    let revalidated = fanout.read_transaction(|records, lifecycle| {
+                        abandoned_worktree_decision(
+                            &ctx,
+                            &reservation_id,
+                            &record,
+                            Some(worktree_snapshot),
+                            records,
+                            lifecycle,
+                        )
+                    })?;
+                    match revalidated {
+                        FanoutGcDecision::Skipped => FanoutGcOutcome::Skipped,
+                        FanoutGcDecision::Retained(branch) => FanoutGcOutcome::Retained(branch),
+                        FanoutGcDecision::Candidate(candidate) => {
+                            let record = candidate.record;
+                            let branch = record.branch.clone();
+                            match remove_unstarted_worktree(
+                                Path::new(&record.repo_common_dir),
+                                Path::new(&record.worktree),
+                            ) {
+                                Ok(()) => FanoutGcOutcome::Removed(branch),
+                                Err(_) => FanoutGcOutcome::Retained(branch),
+                            }
+                        }
+                    }
+                }
+            }
+        };
+
+        match outcome {
+            FanoutGcOutcome::Skipped => {}
+            FanoutGcOutcome::Retained(branch) => report.retained_branches.push(branch),
+            FanoutGcOutcome::Removed(branch) => {
+                report.removed_worktrees += 1;
+                report.retained_branches.push(branch);
+            }
+        }
+    }
+    Ok(report)
 }
 
 pub fn prepare_worktree(

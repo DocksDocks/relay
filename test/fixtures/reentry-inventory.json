@@ -294,6 +294,14 @@
       "anchor": "run_git_bytes("
     },
     {
+      "id": "git:plugins/session-relay/rust/src/fanout/git.rs:uncollected_commit_count:git_api:1",
+      "file": "plugins/session-relay/rust/src/fanout/git.rs",
+      "function": "uncollected_commit_count",
+      "category": "git",
+      "operation": "git_api",
+      "anchor": "run_git("
+    },
+    {
       "id": "git:plugins/session-relay/rust/src/workspace.rs:broker_git_commit:git_api:1",
       "file": "plugins/session-relay/rust/src/workspace.rs",
       "function": "broker_git_commit",
