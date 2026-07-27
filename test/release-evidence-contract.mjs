@@ -890,8 +890,8 @@ function testSourceCi(temp) {
     /workflow|validation-shards|definition|command/i,
   );
   const joinDependencyOverride = authoritativeCiWorkflow().replace(
-    'needs: validation-shards',
-    'needs: substituted-job',
+    'needs: [validation-shards, targeting-contracts]',
+    'needs: [substituted-job, targeting-contracts]',
   );
   expectReject(
     'source-CI validate join dependency override',
