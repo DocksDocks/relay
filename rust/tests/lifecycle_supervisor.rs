@@ -201,6 +201,11 @@ fn lifecycle_supervisor_preserves_codex_fast_and_default_tiers_in_exact_argv() {
         .args(["wake", session, "--service-tier", "fast", "doorbell"])
         .env("AGENT_RELAY_HOME", &home)
         .env("RELAY_WAKE_CMD_CODEX", &stub)
+        .env(
+            "RELAY_TEST_SUPERVISOR_STARTUP_DELAY",
+            "before:ControlAuthenticated",
+        )
+        .env("RELAY_TEST_SUPERVISOR_STARTUP_DELAY_MS", "750")
         .output()
         .unwrap();
     assert!(
@@ -244,6 +249,11 @@ fn lifecycle_supervisor_preserves_codex_fast_and_default_tiers_in_exact_argv() {
         .args(["wake", session, "standard doorbell"])
         .env("AGENT_RELAY_HOME", &home)
         .env("RELAY_WAKE_CMD_CODEX", &stub)
+        .env(
+            "RELAY_TEST_SUPERVISOR_STARTUP_DELAY",
+            "before:AcceptorsReady",
+        )
+        .env("RELAY_TEST_SUPERVISOR_STARTUP_DELAY_MS", "750")
         .output()
         .unwrap();
     assert!(

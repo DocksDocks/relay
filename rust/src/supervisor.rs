@@ -1034,6 +1034,13 @@ fn startup_checkpoint(phase: SupervisorStartupPhase, edge: &str) -> Result<(), S
             phase.as_str()
         ));
     }
+    if std::env::var("RELAY_TEST_SUPERVISOR_STARTUP_DELAY").as_deref() == Ok(expected.as_str()) {
+        let delay_ms = std::env::var("RELAY_TEST_SUPERVISOR_STARTUP_DELAY_MS")
+            .map_err(|_| "supervisor startup delay requires milliseconds".to_string())?
+            .parse::<u64>()
+            .map_err(|_| "supervisor startup delay milliseconds are invalid".to_string())?;
+        thread::sleep(Duration::from_millis(delay_ms.min(5_000)));
+    }
     Ok(())
 }
 
@@ -1073,8 +1080,9 @@ pub fn run_child_with_guard(
     let start_gate = Arc::new(AtomicBool::new(false));
     start_input_proxy(&profile, Arc::clone(&writer), Arc::clone(&start_gate))?;
     start_resize_proxy(&profile, Arc::clone(&writer), Arc::clone(&start_gate))?;
+    let control_ready_deadline = Instant::now() + CONTROL_BIND_DEADLINE;
     send_simple(&writer, "control_go")?;
-    wait_control_ready(&mut stream, &prepared)?;
+    wait_control_ready(&mut stream, &prepared, control_ready_deadline)?;
     start_gate.store(true, Ordering::Release);
 
     let mut stdout = Vec::new();
@@ -1381,7 +1389,7 @@ pub fn run_supervisor(argv: &[String]) -> Result<(), String> {
     stream
         .set_read_timeout(Some(Duration::from_millis(500)))
         .map_err(|error| format!("configure control GO timeout: {error}"))?;
-    let go = match read_frame_unbuffered(&mut stream) {
+    let go = match read_frame_until(&mut stream, Instant::now() + CONTROL_BIND_DEADLINE) {
         Ok(go) => go,
         Err(_) => {
             store.record_child_start_abandoned(
@@ -1406,6 +1414,9 @@ pub fn run_supervisor(argv: &[String]) -> Result<(), String> {
     }
     startup_checkpoint(SupervisorStartupPhase::OperationQueuesReady, "before")?;
     let (control_tx, control_rx) = mpsc::sync_channel(QUEUE_FRAMES);
+    stream
+        .set_read_timeout(None)
+        .map_err(|error| format!("clear lifecycle control timeout: {error}"))?;
     let control_stream = stream
         .try_clone()
         .map_err(|error| format!("clone lifecycle control socket: {error}"))?;
@@ -1430,7 +1441,6 @@ pub fn run_supervisor(argv: &[String]) -> Result<(), String> {
         heartbeat_at: store::iso_now(),
         heartbeat_at_ms: store::now_ms(),
     })?;
-    stream.set_read_timeout(None).ok();
     if write_frame(&mut stream, identity_frame("control_bound", &args)).is_err() {
         store.record_child_start_abandoned(
             &args.operation_id,
@@ -1601,7 +1611,7 @@ fn connect_control(
                     .map_err(|error| {
                         format!("configure control authentication timeout: {error}")
                     })?;
-                let response = read_frame_unbuffered(&mut stream)?;
+                let response = read_frame_until(&mut stream, deadline)?;
                 validate_identity_frame(&response, "control_authenticated", prepared)?;
                 return Ok(stream);
             }
@@ -1617,8 +1627,9 @@ fn connect_control(
 fn wait_control_ready(
     stream: &mut UnixStream,
     prepared: &PreparedSupervisorLaunch,
+    deadline: Instant,
 ) -> Result<(), String> {
-    let response = read_frame_unbuffered(stream)?;
+    let response = read_frame_until(stream, deadline)?;
     validate_identity_frame(&response, "control_bound", prepared)?;
     let metadata = fs::metadata(supervisor_socket_path(&prepared.operation_id))
         .map_err(|error| format!("stat lifecycle supervisor socket: {error}"))?;
@@ -2626,12 +2637,45 @@ fn write_frame(stream: &mut UnixStream, frame: HashMap<String, JsonValue>) -> Re
 }
 
 fn read_frame_unbuffered(stream: &mut UnixStream) -> Result<HashMap<String, JsonValue>, String> {
+    read_frame(stream, None)
+}
+
+fn read_frame_until(
+    stream: &mut UnixStream,
+    deadline: Instant,
+) -> Result<HashMap<String, JsonValue>, String> {
+    read_frame(stream, Some(deadline))
+}
+
+fn read_frame(
+    stream: &mut UnixStream,
+    deadline: Option<Instant>,
+) -> Result<HashMap<String, JsonValue>, String> {
     let mut bytes = Vec::new();
     let mut byte = [0_u8; 1];
     while bytes.len() <= FRAME_BYTES * 2 + 4096 {
-        stream
-            .read_exact(&mut byte)
-            .map_err(|error| format!("read supervisor frame: {error}"))?;
+        match stream.read_exact(&mut byte) {
+            Ok(()) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                let Some(deadline) = deadline else {
+                    return Err(format!("read supervisor frame: {error}"));
+                };
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(format!(
+                        "read supervisor frame: control deadline elapsed after {error}"
+                    ));
+                }
+                thread::sleep(CONTROL_POLL.min(remaining));
+                continue;
+            }
+            Err(error) => return Err(format!("read supervisor frame: {error}")),
+        }
         if byte[0] == b'\n' {
             let line = String::from_utf8(bytes)
                 .map_err(|_| "supervisor frame is not UTF-8".to_string())?;
