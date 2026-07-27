@@ -21,6 +21,8 @@ const TERMINATE_GRACE_MS = 300;
 const TERMINATE_KILL_MS = 1000;
 const RESULT_CLOCK_TOLERANCE_MS = 1000;
 const RESULT_KEYS = ['count', 'labels', 'scenario', 'schema', 'status'];
+const SUN_PATH_LIMIT_BYTES = 108;
+const LONGEST_SOCKET_BASENAME = 'custody-command-v1.sock';
 
 export const PRE_SPLIT_STDOUT_SHA256 = '8eaa9ecfdc3e5a9ceb72d65cbf2062c0495746a4a31ae7a0ce14c73b9cb5c44f';
 
@@ -534,6 +536,18 @@ function assertScenarioSuccess(spec, rawOutcome) {
   };
 }
 
+export function socketPathBudget(resolvedRoot, scenarios) {
+  const longestPath = scenarios
+    .map((definition, index) =>
+      path.join(resolvedRoot, 'homes', `${String(index).padStart(2, '0')}-${definition.name}`, LONGEST_SOCKET_BASENAME),
+    )
+    .reduce((longest, candidate) => (Buffer.byteLength(candidate) > Buffer.byteLength(longest) ? candidate : longest));
+  return {
+    longestPath,
+    headroom: SUN_PATH_LIMIT_BYTES - Buffer.byteLength(longestPath) - 1,
+  };
+}
+
 export async function runScenarioScheduler({
   scenarios,
   jobs,
@@ -553,6 +567,18 @@ export async function runScenarioScheduler({
   if (typeof launchScenario !== 'function') throw new TypeError('launchScenario must be a function');
   const bin = requireTestBinary(configuredBin);
   const root = fs.mkdtempSync(path.join(path.resolve(rootParent), 'session-relay-selftest-'));
+  // Only the production catalog launches scenarios that bind unix sockets
+  // beneath the root. Suites drive this scheduler with synthetic catalogs (and
+  // sometimes a fake launcher) to exercise scheduling alone; holding those to
+  // the sun_path budget would fail runs that cannot possibly overflow it.
+  const { headroom } = socketPathBudget(root, scenarios);
+  if (scenarios === SCENARIOS && headroom < 0) {
+    fs.rmSync(root, { recursive: true, force: true });
+    const socketPathBytes = SUN_PATH_LIMIT_BYTES - headroom;
+    throw new Error(
+      `temp root too long: ${root} yields a ${socketPathBytes}-byte socket path against the ${SUN_PATH_LIMIT_BYTES}-byte sun_path limit — set TMPDIR to a shorter path (e.g. /tmp)`,
+    );
+  }
   fs.chmodSync(root, 0o700);
   onOwnedRoot?.(root);
   const homeDirectory = path.join(root, 'homes');
