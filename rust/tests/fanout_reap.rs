@@ -13,7 +13,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, SystemTime};
-use support::fanout::{activate_worker, seed_entry};
+use support::fanout::{activate_worker, mutate_fanout_record, seed_entry};
 use support::fresh_home;
 use tinyjson::JsonValue;
 
@@ -102,22 +102,33 @@ impl Fixture {
     }
 
     fn run_gc(&self) -> Output {
+        self.run_gc_with_days(Some(GC_DAYS))
+    }
+
+    fn run_gc_with_default_retention(&self) -> Output {
+        self.run_gc_with_days(None)
+    }
+
+    fn run_gc_with_days(&self, gc_days: Option<u64>) -> Output {
         let session_id = store::uuid_v4();
         let input = format!(
             r#"{{"session_id":"{session_id}","cwd":"{}","source":"startup"}}"#,
             self.repo.display()
         );
-        let mut child = Command::new(env!("CARGO_BIN_EXE_relay"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_relay"));
+        command
             .arg("hook")
             .env("AGENT_RELAY_HOME", &self.home)
             .env_remove("SESSION_RELAY_HOME")
-            .env("AGENT_RELAY_GC_DAYS", GC_DAYS.to_string())
+            .env_remove("AGENT_RELAY_GC_DAYS")
             .env("RELAY_NO_WATCH", "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("run relay hook");
+            .stderr(Stdio::piped());
+        if let Some(days) = gc_days {
+            command.env("AGENT_RELAY_GC_DAYS", days.to_string());
+        }
+        let mut child = command.spawn().expect("run relay hook");
         child
             .stdin
             .as_mut()
@@ -339,4 +350,94 @@ fn managed_workspace_gate_refusal_skips_only_that_reservation() {
     assert!(fixture.worktree().is_dir());
     assert!(fixture.branch_exists());
     assert!(!report.contains(&fixture.reservation.branch), "{report}");
+}
+
+#[test]
+fn legacy_flat_worktree_past_fanout_cutoff_is_reaped() {
+    let mut fixture = Fixture::new("fanout-reap-legacy-flat");
+    let nested_worktree = fixture.worktree().to_path_buf();
+    let legacy_worktree = fixture
+        .home
+        .join("worktrees")
+        .join(&fixture.reservation.reservation_id);
+    git(
+        &fixture.repo,
+        &[
+            "worktree",
+            "move",
+            nested_worktree.to_str().expect("nested worktree is UTF-8"),
+            legacy_worktree.to_str().expect("legacy worktree is UTF-8"),
+        ],
+    );
+    mutate_fanout_record(
+        &fixture.home,
+        &fixture.reservation.reservation_id,
+        |record| {
+            record.insert(
+                "worktree".into(),
+                JsonValue::from(legacy_worktree.to_string_lossy().into_owned()),
+            );
+        },
+    );
+    fixture.reservation.worktree = legacy_worktree.to_string_lossy().into_owned();
+    fixture.age_past_gc_window();
+
+    fixture.run_gc();
+
+    assert!(
+        !legacy_worktree.exists(),
+        "legacy one-component worktree was not reaped"
+    );
+}
+
+#[test]
+fn nested_worktree_past_fanout_cutoff_is_reaped() {
+    let fixture = Fixture::new("fanout-reap-nested");
+    let worktree = fixture.worktree().to_path_buf();
+    let relative = worktree
+        .strip_prefix(fixture.home.join("worktrees"))
+        .expect("worktree is beneath worktrees root");
+    let components = relative.components().collect::<Vec<_>>();
+    assert_eq!(
+        components.len(),
+        2,
+        "fixture must create repo-key/reservation-id"
+    );
+    assert_eq!(
+        components.last().expect("reservation leaf").as_os_str(),
+        fixture.reservation.reservation_id.as_str()
+    );
+    fixture.age_past_gc_window();
+
+    fixture.run_gc();
+
+    assert!(!worktree.exists(), "nested worktree was not reaped");
+}
+
+#[test]
+fn two_day_fanout_worktree_is_reaped_while_shared_mailbox_is_retained() {
+    let fixture = Fixture::new("fanout-reap-split-cutoff");
+    let shared_mailbox = fixture
+        .home
+        .join("mailbox")
+        .join("44444444-4444-4444-8444-444444444444.jsonl");
+    fs::write(&shared_mailbox, "{\"body\":\"retain\"}\n").expect("write shared mailbox");
+    let old = SystemTime::now() - Duration::from_secs((GC_DAYS + 1) * 24 * 60 * 60);
+    let times = FileTimes::new().set_accessed(old).set_modified(old);
+    fs::File::open(&shared_mailbox)
+        .expect("open shared mailbox")
+        .set_times(times)
+        .expect("backdate shared mailbox");
+    fixture.age_past_gc_window();
+
+    fixture.run_gc_with_default_retention();
+
+    assert!(
+        !fixture.worktree().exists(),
+        "two-day-old fanout worktree must cross the one-day cutoff"
+    );
+    assert!(
+        shared_mailbox.is_file(),
+        "two-day-old shared mailbox must remain inside the fourteen-day window"
+    );
 }

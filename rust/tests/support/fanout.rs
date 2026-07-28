@@ -108,3 +108,51 @@ pub fn force_terminal_releasable(home: &Path, worker: &str) {
     authority.insert("state".into(), JsonValue::from(state));
     fs::write(path, JsonValue::from(authority).format().unwrap()).unwrap();
 }
+
+pub fn mutate_fanout_record(
+    home: &Path,
+    reservation_id: &str,
+    mutate: impl FnOnce(&mut HashMap<String, JsonValue>),
+) {
+    let path = home.join("fanout-v1.json");
+    let value: JsonValue = fs::read_to_string(&path).unwrap().parse().unwrap();
+    let mut authority = value.get::<HashMap<String, JsonValue>>().unwrap().clone();
+    let mut records = authority["records"]
+        .get::<HashMap<String, JsonValue>>()
+        .unwrap()
+        .clone();
+    let mut record = records[reservation_id]
+        .get::<HashMap<String, JsonValue>>()
+        .unwrap()
+        .clone();
+    mutate(&mut record);
+    records.insert(reservation_id.to_string(), JsonValue::from(record));
+    authority.insert("records".into(), JsonValue::from(records));
+    fs::write(path, JsonValue::from(authority).format().unwrap()).unwrap();
+}
+
+pub fn count_reservation_leaves(worktrees: &Path) -> usize {
+    let entries = match fs::read_dir(worktrees) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return 0,
+        Err(error) => panic!("read worktrees tree {}: {error}", worktrees.display()),
+    };
+
+    entries
+        .map(|entry| entry.unwrap())
+        .filter_map(|entry| {
+            let file_type = entry.file_type().unwrap();
+            if !file_type.is_dir() {
+                return None;
+            }
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_str().unwrap_or_default();
+            Some(if store::is_uuid(name) {
+                1
+            } else {
+                count_reservation_leaves(&path)
+            })
+        })
+        .sum()
+}

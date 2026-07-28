@@ -26,10 +26,11 @@ use authority::{
 use git::{
     PreparedMergeOutcome, add_worktree, canonicalize_repository, changed_paths, ensure_clean,
     ensure_worktree_root, merge_prepared_handback, remove_merged_worktree,
-    remove_unstarted_worktree, repo_identity, repository_head, uncollected_commit_count,
-    validate_sha,
+    remove_unstarted_worktree, repo_identity, repo_key_from_repo, repository_head,
+    uncollected_commit_count, validate_sha,
 };
-use rustix::fs::{AtFlags, FileType, statat};
+use rustix::fd::{AsFd, BorrowedFd, OwnedFd};
+use rustix::fs::{AtFlags, FileType, Mode, OFlags, open, openat, statat};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -95,15 +96,149 @@ impl WorktreeSnapshot {
     }
 }
 
+// Every rejection carries its own message so each rule is separately observable:
+// several inputs trip more than one rule, so a boolean assertion would survive
+// deleting the rule under test.
+const WORKTREE_PATH_OUTSIDE: &str = "fanout worktree path is outside the worktrees root";
+const WORKTREE_PATH_EMPTY: &str = "fanout worktree path has an empty component";
+const WORKTREE_PATH_RELATIVE: &str = "fanout worktree path has a relative component";
+const WORKTREE_PATH_CHARSET: &str = "fanout worktree path component is not permitted";
+const WORKTREE_PATH_DEPTH: &str = "fanout worktree path depth is out of range";
+const WORKTREE_PATH_LEAF: &str = "fanout worktree path leaf is not the reservation id";
+const WORKTREE_PATH_ABSENT: &str = "fanout worktree path is absent";
+const WORKTREE_PATH_NOT_DIRECTORY: &str =
+    "fanout worktree path component is a symlink or not a directory";
+
+/// Split the persisted worktree path into its components below `worktrees_root`.
+///
+/// The prefix test is `Path::strip_prefix`, never `str::starts_with`: a textual
+/// prefix would admit `<root>/worktreesEVIL/<id>`, which shares the prefix but is a
+/// different directory. `worktrees_root` is derived from the store root by the
+/// caller and never read from the record, which is what makes it a boundary.
+///
+/// Accepts one component (the legacy flat shape) through three (`owner/repo` plus
+/// the reservation), because the derivation emits at most two key segments.
+fn worktree_path_components(
+    worktrees_root: &Path,
+    persisted: &str,
+    reservation_id: &str,
+) -> Result<Vec<String>, String> {
+    let relative = Path::new(persisted)
+        .strip_prefix(worktrees_root)
+        .map_err(|_| WORKTREE_PATH_OUTSIDE.to_string())?;
+    let raw = relative
+        .to_str()
+        .ok_or_else(|| WORKTREE_PATH_OUTSIDE.to_string())?;
+    // Split manually rather than through `Path::components`, which silently
+    // normalises empty components away and would make that rule unobservable.
+    let parts: Vec<&str> = raw.split('/').collect();
+    for part in &parts {
+        if part.is_empty() {
+            return Err(WORKTREE_PATH_EMPTY.to_string());
+        }
+        if *part == "." || *part == ".." {
+            return Err(WORKTREE_PATH_RELATIVE.to_string());
+        }
+        if !part.bytes().all(|byte| {
+            byte.is_ascii_lowercase()
+                || byte.is_ascii_digit()
+                || byte == b'.'
+                || byte == b'-'
+                || byte == b'_'
+        }) {
+            return Err(WORKTREE_PATH_CHARSET.to_string());
+        }
+    }
+    if parts.is_empty() || parts.len() > 3 {
+        return Err(WORKTREE_PATH_DEPTH.to_string());
+    }
+    if parts[parts.len() - 1] != reservation_id {
+        return Err(WORKTREE_PATH_LEAF.to_string());
+    }
+    Ok(parts.into_iter().map(str::to_string).collect())
+}
+
+/// Walk the validated components from the `worktrees` directory descriptor,
+/// refusing a symlink at EVERY component rather than only the leaf.
+///
+/// `Ok(None)` means absent, which the snapshot helpers surface as "no worktree";
+/// a symlinked or non-directory component is an error, never an absence.
+fn resolve_worktree_leaf(
+    worktrees_fd: BorrowedFd<'_>,
+    components: &[String],
+) -> Result<Option<rustix::fs::Stat>, String> {
+    let (leaf, parents) = components
+        .split_last()
+        .ok_or_else(|| WORKTREE_PATH_DEPTH.to_string())?;
+    let mut held: Option<OwnedFd> = None;
+    for parent in parents {
+        let at = held.as_ref().map_or(worktrees_fd, |fd| fd.as_fd());
+        match openat(
+            at,
+            parent.as_str(),
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(fd) => held = Some(fd),
+            Err(error) if error == rustix::io::Errno::NOENT => return Ok(None),
+            Err(error)
+                if error == rustix::io::Errno::LOOP || error == rustix::io::Errno::NOTDIR =>
+            {
+                return Err(WORKTREE_PATH_NOT_DIRECTORY.to_string());
+            }
+            Err(error) => {
+                return Err(format!("open fanout worktree component {parent}: {error}"));
+            }
+        }
+    }
+    let at = held.as_ref().map_or(worktrees_fd, |fd| fd.as_fd());
+    match statat(at, leaf.as_str(), AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat) => Ok(Some(stat)),
+        Err(error) if error == rustix::io::Errno::NOENT => Ok(None),
+        Err(error) => Err(format!("stat fanout worktree {leaf}: {error}")),
+    }
+}
+
+/// Validate a record-supplied worktree path and resolve it symlink-safely.
+///
+/// This replaces the exact-equality check the flat layout allowed: once the path is
+/// repo-keyed there is no independently recomputable expectation, so containment
+/// comes from the `worktrees_root` prefix plus a bounded per-component walk. It is
+/// a defence-in-depth layer, not the primary gate - `repo_identity(..)
+/// .matches_record(..)` remains that and is untouched.
+pub fn resolve_worktree_path(
+    worktrees_root: &Path,
+    worktrees_fd: BorrowedFd<'_>,
+    persisted: &str,
+    reservation_id: &str,
+) -> Result<PathBuf, String> {
+    let components = worktree_path_components(worktrees_root, persisted, reservation_id)?;
+    if resolve_worktree_leaf(worktrees_fd, &components)?.is_none() {
+        return Err(WORKTREE_PATH_ABSENT.to_string());
+    }
+    let mut resolved = worktrees_root.to_path_buf();
+    for component in &components {
+        resolved.push(component);
+    }
+    Ok(resolved)
+}
+
+// Both helpers resolve the record's persisted path through step 1's primitives
+// rather than recomputing a flat one. They deliberately use
+// `worktree_path_components` + `resolve_worktree_leaf` and NOT
+// `resolve_worktree_path`: the composed form collapses absence into an error,
+// while these two must keep absence and structural failure distinct. Reporting a
+// malformed path as "no worktree" would silently widen what the reaper deletes.
 fn old_worktree_snapshot(
+    worktrees_root: &Path,
     worktrees: &store::GcSurfaceDir,
+    persisted: &str,
     reservation_id: &str,
     cutoff: SystemTime,
 ) -> Result<Option<WorktreeSnapshot>, String> {
-    let stat = match statat(&worktrees.fd, reservation_id, AtFlags::SYMLINK_NOFOLLOW) {
-        Ok(stat) => stat,
-        Err(error) if error == rustix::io::Errno::NOENT => return Ok(None),
-        Err(error) => return Err(format!("stat fanout worktree {reservation_id}: {error}")),
+    let components = worktree_path_components(worktrees_root, persisted, reservation_id)?;
+    let Some(stat) = resolve_worktree_leaf(worktrees.fd.as_fd(), &components)? else {
+        return Ok(None);
     };
     if !FileType::from_raw_mode(stat.st_mode).is_dir() {
         return Ok(None);
@@ -118,14 +253,15 @@ fn old_worktree_snapshot(
 }
 
 fn worktree_matches_snapshot(
+    worktrees_root: &Path,
     worktrees: &store::GcSurfaceDir,
+    persisted: &str,
     reservation_id: &str,
     snapshot: WorktreeSnapshot,
 ) -> Result<bool, String> {
-    let stat = match statat(&worktrees.fd, reservation_id, AtFlags::SYMLINK_NOFOLLOW) {
-        Ok(stat) => stat,
-        Err(error) if error == rustix::io::Errno::NOENT => return Ok(false),
-        Err(error) => return Err(format!("stat fanout worktree {reservation_id}: {error}")),
+    let components = worktree_path_components(worktrees_root, persisted, reservation_id)?;
+    let Some(stat) = resolve_worktree_leaf(worktrees.fd.as_fd(), &components)? else {
+        return Ok(false);
     };
     Ok(FileType::from_raw_mode(stat.st_mode).is_dir()
         && i128::from(stat.st_dev) == snapshot.dev
@@ -216,15 +352,26 @@ fn abandoned_worktree_decision(
     let Some(current) = records.get(reservation_id) else {
         return Ok(FanoutGcDecision::Skipped);
     };
-    let expected_worktree = ctx
-        .fanout
-        .root()
-        .join("worktrees")
-        .join(&current.reservation_id);
+    let worktrees_root = ctx.fanout.root().join("worktrees");
+    // A structurally invalid persisted path is skipped, exactly as a flat-path
+    // mismatch was skipped before. This check precedes the snapshot lookup on
+    // purpose: `old_worktree_snapshot` reports a malformed path as `Err`, and
+    // reaching it first would turn today's skip into a hard failure.
+    if worktree_path_components(&worktrees_root, &current.worktree, &current.reservation_id)
+        .is_err()
+    {
+        return Ok(FanoutGcDecision::Skipped);
+    }
     let worktree_snapshot = match expected_worktree_snapshot {
         Some(snapshot) => snapshot,
         None => {
-            let Some(snapshot) = old_worktree_snapshot(ctx.worktrees, reservation_id, ctx.cutoff)?
+            let Some(snapshot) = old_worktree_snapshot(
+                &worktrees_root,
+                ctx.worktrees,
+                &current.worktree,
+                reservation_id,
+                ctx.cutoff,
+            )?
             else {
                 return Ok(FanoutGcDecision::Skipped);
             };
@@ -234,7 +381,6 @@ fn abandoned_worktree_decision(
     if current != expected_record
         || current.collection_phase.is_some()
         || current.state == FanoutState::Collected
-        || Path::new(&current.worktree) != expected_worktree
         || worker_process_is_present(current, lifecycle)
     {
         return Ok(FanoutGcDecision::Skipped);
@@ -247,7 +393,13 @@ fn abandoned_worktree_decision(
         return Ok(FanoutGcDecision::Retained(branch));
     }
     if expected_worktree_snapshot.is_some()
-        && !worktree_matches_snapshot(ctx.worktrees, reservation_id, worktree_snapshot)?
+        && !worktree_matches_snapshot(
+            &worktrees_root,
+            ctx.worktrees,
+            &current.worktree,
+            reservation_id,
+            worktree_snapshot,
+        )?
     {
         return Ok(FanoutGcDecision::Retained(branch));
     }
@@ -271,14 +423,25 @@ pub(crate) fn reap_abandoned_worktrees(
         let Some(snapshot) = fanout.read(&reservation_id)? else {
             continue;
         };
+        let worktrees_root = fanout.root().join("worktrees");
+        // `||` short-circuits, so a structurally invalid path never reaches the
+        // snapshot lookup that would report it as an error rather than a skip.
         if snapshot.collection_phase.is_some()
             || snapshot.state == FanoutState::Collected
-            || Path::new(&snapshot.worktree)
-                != fanout
-                    .root()
-                    .join("worktrees")
-                    .join(&snapshot.reservation_id)
-            || old_worktree_snapshot(worktrees, &reservation_id, cutoff)?.is_none()
+            || worktree_path_components(
+                &worktrees_root,
+                &snapshot.worktree,
+                &snapshot.reservation_id,
+            )
+            .is_err()
+            || old_worktree_snapshot(
+                &worktrees_root,
+                worktrees,
+                &snapshot.worktree,
+                &reservation_id,
+                cutoff,
+            )?
+            .is_none()
         {
             continue;
         }
@@ -391,8 +554,13 @@ pub fn prepare_worktree(
     let reservation_id = store::uuid_v4();
     let branch = format!("relay/fanout-{reservation_id}");
     let worktrees = fanout.root().join("worktrees");
-    ensure_worktree_root(&worktrees)?;
-    let worktree = worktrees.join(&reservation_id);
+    // Derived exactly once, before the reservation, so the record and the directory
+    // that gets created cannot disagree. This runs while the repository gate is held
+    // but outside the store transaction, which is deliberate: `repository_head`
+    // above already runs git at this point, so no new lock is taken.
+    let repo_key = repo_key_from_repo(&repo)?;
+    ensure_worktree_root(&worktrees, &repo_key)?;
+    let worktree = worktrees.join(&repo_key).join(&reservation_id);
     let record = fanout.reserve(ReservationRequest {
         parent_session_id,
         mode,
@@ -442,10 +610,25 @@ pub(crate) fn rollback_before_process_start(
         }
         Ok(record)
     })?;
-    let expected_worktree = fanout.root().join("worktrees").join(reservation_id);
-    if Path::new(&snapshot.worktree) != expected_worktree {
-        return Err("fanout worktree path is not the exact reserved path".to_string());
-    }
+    // The flat expectation this replaced was the only containment in front of the
+    // `remove_unstarted_worktree` call below. It cannot become a `config.cwd`
+    // comparison: both callers run inside `run_fanout_supervisor`, a separate
+    // process whose whole config arrives on stdin with the `cwd` unvalidated, so
+    // the caller would supply both sides of the equality. `worktrees_root` here is
+    // derived from the store root instead, and never read from the record.
+    let worktrees_root = fanout.root().join("worktrees");
+    let worktrees_fd = open(
+        &worktrees_root,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| format!("open fanout worktrees root: {error}"))?;
+    resolve_worktree_path(
+        &worktrees_root,
+        worktrees_fd.as_fd(),
+        &snapshot.worktree,
+        reservation_id,
+    )?;
     let worktree = Path::new(&snapshot.worktree);
     let worktree_identity = repo_identity(worktree)?;
     let (_repository_gate, _roots) = acquire_legacy_gate(&worktree_identity)?;

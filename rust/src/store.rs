@@ -32,6 +32,7 @@ use tinyjson::JsonValue;
 
 const WATCH_LOCK_RETRY: Duration = Duration::from_secs(2);
 const DEFAULT_GC_DAYS: u64 = 14;
+const DEFAULT_FANOUT_WORKTREE_GC_DAYS: u64 = 1;
 const GC_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
 const SESSION_START_IDENTITY_DEBOUNCE_MS: i64 = 1_000;
@@ -1296,6 +1297,12 @@ impl LegacyGc {
                 .ok_or_else(|| "AGENT_RELAY_GC_DAYS is too large".to_string())?,
         );
         let cutoff = now.checked_sub(age).unwrap_or(UNIX_EPOCH);
+        let fanout_worktree_age = Duration::from_secs(
+            DEFAULT_FANOUT_WORKTREE_GC_DAYS
+                .checked_mul(SECONDS_PER_DAY)
+                .ok_or_else(|| "DEFAULT_FANOUT_WORKTREE_GC_DAYS is too large".to_string())?,
+        );
+        let fanout_worktree_cutoff = now.checked_sub(fanout_worktree_age).unwrap_or(UNIX_EPOCH);
         let cutoff_ms = cutoff
             .duration_since(UNIX_EPOCH)
             .unwrap_or(Duration::ZERO)
@@ -1307,7 +1314,7 @@ impl LegacyGc {
             Some(worktrees) => crate::fanout::reap_abandoned_worktrees(
                 &crate::fanout::FanoutStore::new(self.root.clone()),
                 worktrees,
-                cutoff,
+                fanout_worktree_cutoff,
             )?,
             None => crate::fanout::FanoutGcReport::default(),
         };

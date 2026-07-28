@@ -25,7 +25,7 @@ For every future check, choose exactly one owning scenario, update that scenario
 
 ## Store hygiene
 
-The shared store defaults to `~/.agent-relay` (`AGENT_RELAY_HOME`, then legacy `SESSION_RELAY_HOME`, override it). `relay hook` and `relay bus` run a six-hour-throttled sweep: the default inactivity threshold is 14 days, `AGENT_RELAY_GC_DAYS=<days>` overrides it, and `0` disables GC. Collection is all-surfaces-old and held-lock-safe; it enumerates only relay-owned mailbox/marker/watcher/resume-lock/spawn-log files, never the invoking id, and removes registry/name entries last. Spawn stderr is pumped independently of the short-lived parent and compacted from just over 4 MiB to the newest 3 MiB; `File::create` still truncates the new target before child launch.
+The shared store defaults to `~/.agent-relay` (`AGENT_RELAY_HOME`, then legacy `SESSION_RELAY_HOME`, override it). `relay hook` and `relay bus` run a six-hour-throttled sweep: abandoned fan-out worktrees are swept after one day, while the shared-store inactivity threshold defaults to 14 days; `AGENT_RELAY_GC_DAYS=<days>` overrides the shared-store threshold, and `0` disables GC. Collection is all-surfaces-old and held-lock-safe; it enumerates only relay-owned mailbox/marker/watcher/resume-lock/spawn-log files, never the invoking id, and removes registry/name entries last. Spawn stderr is pumped independently of the short-lived parent and compacted from just over 4 MiB to the newest 3 MiB; `File::create` still truncates the new target before child launch.
 
 ## Correlated protocol boundary
 

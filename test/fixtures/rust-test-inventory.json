@@ -96,11 +96,15 @@
         "depth_zero_handback_waits_for_depth_one_collection_then_publishes_its_result",
         "duplicate_handback_is_exactly_idempotent_and_changed_retry_conflicts",
         "handback_publishes_exact_completed_and_failed_worker_results_with_sorted_paths",
+        "invalid_remote_component_falls_back_to_portable_digest_key",
+        "nested_record_round_trips_with_unchanged_serialized_key_set",
         "non_utf8_changed_path_is_refused_before_handback_authority_mutation",
         "pre_upgrade_record_without_result_fields_retains_legacy_handback_and_collect",
         "repository_gate_refuses_legacy_mode_before_fanout_mutation",
         "repository_identity_accepts_reported_sha1_and_sha256_oid_widths",
+        "repository_key_walk_refuses_intermediate_symlink",
         "restart_replays_embedded_result_bytes_once_for_handback_and_collect",
+        "rollback_retains_capacity_for_out_of_tree_record",
         "supervisor_release_gate_requires_exact_terminal_result_delivery",
         "worktree_collect_recovers_when_removal_preceded_the_phase_write",
         "worktree_collection_lock_refuses_a_concurrent_collector_before_git_changes",
@@ -108,17 +112,21 @@
         "worktree_dirty_parent_blocks_collection_until_the_same_checkout_is_clean",
         "worktree_handback_and_collect_merge_once_then_remove_exact_tree",
         "worktree_head_changed_after_handback_is_refused_without_removal",
-        "worktree_merge_conflict_aborts_cleanly_and_retries_after_parent_repair"
+        "worktree_merge_conflict_aborts_cleanly_and_retries_after_parent_repair",
+        "worktree_path_parser_rejects_each_invalid_shape_with_distinct_error"
       ]
     },
     "fanout_reap": {
       "tests": [
         "abandoned_reservation_past_window_removes_worktree_and_reports_retained_branch",
+        "legacy_flat_worktree_past_fanout_cutoff_is_reaped",
         "live_worker_reservation_is_untouched",
         "lost_authority_without_observation_is_untouched",
         "managed_workspace_gate_refusal_skips_only_that_reservation",
+        "nested_worktree_past_fanout_cutoff_is_reaped",
         "reservation_inside_window_keeps_worktree_and_branch",
-        "reservation_with_uncollected_commits_keeps_worktree_and_reports_branch"
+        "reservation_with_uncollected_commits_keeps_worktree_and_reports_branch",
+        "two_day_fanout_worktree_is_reaped_while_shared_mailbox_is_retained"
       ]
     },
     "lifecycle_supervisor": {

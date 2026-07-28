@@ -17,7 +17,9 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::{Arc, Barrier};
 use std::thread;
-use support::fanout::{activate_worker, force_terminal_releasable, seed_entry};
+use support::fanout::{
+    activate_worker, count_reservation_leaves, force_terminal_releasable, seed_entry,
+};
 use support::workspace::{
     TestRepository, abort_started_workspace, commit_workspace, finish_prepared_workspace,
     finish_started_workspace, git_ok, git_output, git_stdout, handback_started_workspace,
@@ -970,10 +972,7 @@ fn workspace_and_legacy_fanout_share_repository_gate() {
         "old-mode refusal mutated repository"
     );
     assert!(
-        fs::read_dir(legacy_home.join("worktrees"))
-            .map(|entries| entries.count())
-            .unwrap_or(0)
-            == 0,
+        count_reservation_leaves(&legacy_home.join("worktrees")) == 0,
         "old-mode refusal provisioned a legacy worktree"
     );
 }

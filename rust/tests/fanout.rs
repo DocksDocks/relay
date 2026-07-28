@@ -19,12 +19,15 @@ use rustix::fs::{FlockOperation, flock};
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs;
+use std::io::Write;
+use std::os::fd::AsFd;
 use std::os::unix::ffi::OsStringExt;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Barrier};
 use std::thread;
+use support::fanout::{count_reservation_leaves, mutate_fanout_record};
 use support::fresh_home;
 use tinyjson::JsonValue;
 
@@ -321,7 +324,7 @@ fn authority_child_depth_and_root_are_not_caller_forgeable() {
     let (home, repo, store, root, _root_session) = setup_root("derived-ancestry");
     let invoker = "11111111-1111-4111-8111-111111111111";
     let branches_before = git(&repo, &["branch", "--list", "relay/fanout-*"]);
-    let worktrees_before = fs::read_dir(home.join("worktrees")).unwrap().count();
+    assert_eq!(count_reservation_leaves(&home.join("worktrees")), 1);
 
     let error = fanout::prepare_worktree(&store, &repo, invoker, FanoutMode::Child).unwrap_err();
 
@@ -330,10 +333,7 @@ fn authority_child_depth_and_root_are_not_caller_forgeable() {
         git(&repo, &["branch", "--list", "relay/fanout-*"]),
         branches_before
     );
-    assert_eq!(
-        fs::read_dir(home.join("worktrees")).unwrap().count(),
-        worktrees_before
-    );
+    assert_eq!(count_reservation_leaves(&home.join("worktrees")), 1);
     assert_eq!(store.active_leaf_count(&root.reservation_id).unwrap(), 0);
     fs::remove_dir_all(home).ok();
 }
@@ -342,7 +342,7 @@ fn authority_child_depth_and_root_are_not_caller_forgeable() {
 fn authority_managed_worker_cannot_create_a_nested_root() {
     let (home, repo, store, root, root_session) = setup_root("nested-root");
     let branches_before = git(&repo, &["branch", "--list", "relay/fanout-*"]);
-    let worktrees_before = fs::read_dir(home.join("worktrees")).unwrap().count();
+    assert_eq!(count_reservation_leaves(&home.join("worktrees")), 1);
 
     let error =
         fanout::prepare_worktree(&store, &repo, &root_session, FanoutMode::Root).unwrap_err();
@@ -352,10 +352,7 @@ fn authority_managed_worker_cannot_create_a_nested_root() {
         git(&repo, &["branch", "--list", "relay/fanout-*"]),
         branches_before
     );
-    assert_eq!(
-        fs::read_dir(home.join("worktrees")).unwrap().count(),
-        worktrees_before
-    );
+    assert_eq!(count_reservation_leaves(&home.join("worktrees")), 1);
     assert_eq!(store.active_leaf_count(&root.reservation_id).unwrap(), 0);
     fs::remove_dir_all(home).ok();
 }
@@ -371,7 +368,7 @@ fn authority_terminal_root_cannot_admit_a_new_leaf() {
         .unwrap();
     force_terminal_releasable_via_authority_edit_for_test(&home, &root_worker);
     let branches_before = git(&repo, &["branch", "--list", "relay/fanout-*"]);
-    let worktrees_before = fs::read_dir(home.join("worktrees")).unwrap().count();
+    assert_eq!(count_reservation_leaves(&home.join("worktrees")), 1);
 
     let error =
         fanout::prepare_worktree(&store, &repo, &root_session, FanoutMode::Child).unwrap_err();
@@ -384,10 +381,7 @@ fn authority_terminal_root_cannot_admit_a_new_leaf() {
         git(&repo, &["branch", "--list", "relay/fanout-*"]),
         branches_before
     );
-    assert_eq!(
-        fs::read_dir(home.join("worktrees")).unwrap().count(),
-        worktrees_before
-    );
+    assert_eq!(count_reservation_leaves(&home.join("worktrees")), 1);
     fs::remove_dir_all(home).ok();
 }
 
@@ -469,7 +463,17 @@ fn authority_proven_no_launch_rollback_removes_only_the_pristine_worktree() {
         failed["state"].get::<String>().map(String::as_str),
         Some("FailedNoProcess")
     );
-    assert!(!Path::new(failed["worktree"].get::<String>().unwrap()).exists());
+    let failed_worktree = Path::new(failed["worktree"].get::<String>().unwrap());
+    assert_eq!(
+        failed_worktree
+            .strip_prefix(home.join("worktrees"))
+            .unwrap()
+            .components()
+            .count(),
+        2,
+        "failed reservation must use the nested repository-key layout"
+    );
+    assert!(!failed_worktree.exists());
     assert_eq!(store.active_leaf_count(&root.reservation_id).unwrap(), 0);
     assert_eq!(
         git(&root_dir, &["branch", "--list", "relay/fanout-*"])
@@ -1162,28 +1166,6 @@ fn fanout_record_object(home: &Path, reservation_id: &str) -> HashMap<String, Js
         .clone()
 }
 
-fn mutate_fanout_record(
-    home: &Path,
-    reservation_id: &str,
-    mutate: impl FnOnce(&mut HashMap<String, JsonValue>),
-) {
-    let path = home.join("fanout-v1.json");
-    let value: JsonValue = fs::read_to_string(&path).unwrap().parse().unwrap();
-    let mut authority = value.get::<HashMap<String, JsonValue>>().unwrap().clone();
-    let mut records = authority["records"]
-        .get::<HashMap<String, JsonValue>>()
-        .unwrap()
-        .clone();
-    let mut record = records[reservation_id]
-        .get::<HashMap<String, JsonValue>>()
-        .unwrap()
-        .clone();
-    mutate(&mut record);
-    records.insert(reservation_id.to_string(), JsonValue::from(record));
-    authority.insert("records".into(), JsonValue::from(records));
-    fs::write(path, JsonValue::from(authority).format().unwrap()).unwrap();
-}
-
 fn replace_worker_result(home: &Path, reservation_id: &str, worker_result: &WorkerResultV1) {
     let encoded = String::from_utf8(worker_result.canonical_bytes()).unwrap();
     let value: JsonValue = encoded.parse().unwrap();
@@ -1794,9 +1776,10 @@ fn corrupt_result_never_self_heals_merges_or_releases_capacity() {
         assert!(Path::new(&second.worktree).is_dir());
 
         let branches_before = git(parent, &["branch", "--list", "relay/fanout-*"]);
-        let worktrees_before = fs::read_dir(fixture.root.home.join("worktrees"))
-            .unwrap()
-            .count();
+        assert_eq!(
+            count_reservation_leaves(&fixture.root.home.join("worktrees")),
+            3
+        );
         let capacity_error = fanout::prepare_worktree(
             &fixture.root.fanout,
             parent,
@@ -1810,12 +1793,9 @@ fn corrupt_result_never_self_heals_merges_or_releases_capacity() {
             branches_before
         );
         assert_eq!(
-            fs::read_dir(fixture.root.home.join("worktrees"))
-                .unwrap()
-                .count(),
-            worktrees_before
+            count_reservation_leaves(&fixture.root.home.join("worktrees")),
+            3
         );
-        fs::remove_dir_all(fixture.root.home).ok();
     }
 }
 
@@ -2329,4 +2309,283 @@ fn depth_zero_handback_accepts_failed_no_process_child_without_fabricated_result
             .unwrap()
     );
     fs::remove_dir_all(root.home).ok();
+}
+
+#[test]
+fn nested_record_round_trips_with_unchanged_serialized_key_set() {
+    let home = fresh_home("nested-record-round-trip");
+    let repo = init_repo(&home);
+    let invoker = "a1111111-1111-4111-8111-111111111111";
+    seed_entry(&home, invoker, &repo);
+    let store = FanoutStore::new(home.clone());
+
+    let reserved = fanout::prepare_worktree(&store, &repo, invoker, FanoutMode::Root).unwrap();
+    let worktrees = home.join("worktrees");
+    assert_eq!(
+        Path::new(&reserved.worktree)
+            .strip_prefix(&worktrees)
+            .unwrap()
+            .components()
+            .count(),
+        2,
+        "a repository key must sit between worktrees and the reservation"
+    );
+
+    let authority: JsonValue = fs::read_to_string(home.join("fanout-v1.json"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    let records = authority.get::<HashMap<String, JsonValue>>().unwrap()["records"]
+        .get::<HashMap<String, JsonValue>>()
+        .unwrap();
+    let serialized = records[&reserved.reservation_id]
+        .get::<HashMap<String, JsonValue>>()
+        .unwrap();
+    let mut serialized_keys: Vec<&str> = serialized.keys().map(String::as_str).collect();
+    serialized_keys.sort_unstable();
+    let mut expected_keys = [
+        "base_sha",
+        "branch",
+        "collection_phase",
+        "correlation_id",
+        "depth",
+        "generation",
+        "handback_head",
+        "handback_note",
+        "handback_status",
+        "last_error",
+        "object_format",
+        "parent_session_id",
+        "repo_common_dir",
+        "repo_dev",
+        "repo_ino",
+        "request_message_id",
+        "reservation_id",
+        "root_reservation_id",
+        "runtime_session_id",
+        "state",
+        "version",
+        "worker_id",
+        "worker_result",
+        "worker_result_sha256",
+        "worktree",
+    ];
+    expected_keys.sort_unstable();
+    assert_eq!(serialized_keys, expected_keys);
+    assert_eq!(
+        serialized["worktree"].get::<String>(),
+        Some(&reserved.worktree)
+    );
+
+    let reparsed = store.read(&reserved.reservation_id).unwrap().unwrap();
+    assert_eq!(reparsed.worktree, reserved.worktree);
+    fs::remove_dir_all(home).ok();
+}
+
+#[test]
+fn worktree_path_parser_rejects_each_invalid_shape_with_distinct_error() {
+    let home = fresh_home("worktree-path-parser");
+    let worktrees = home.join("worktrees");
+    fs::create_dir_all(&worktrees).unwrap();
+    let worktrees_dir = fs::File::open(&worktrees).unwrap();
+    let reservation_id = "b1111111-1111-4111-8111-111111111111";
+    let other_id = "b2222222-2222-4222-8222-222222222222";
+    let cases = [
+        (
+            format!("/etc/{reservation_id}"),
+            "fanout worktree path is outside the worktrees root",
+        ),
+        (
+            format!("{}EVIL/{reservation_id}", worktrees.display()),
+            "fanout worktree path is outside the worktrees root",
+        ),
+        (
+            format!("{}/../{reservation_id}", worktrees.display()),
+            "fanout worktree path has a relative component",
+        ),
+        (
+            format!("{}/a//{reservation_id}", worktrees.display()),
+            "fanout worktree path has an empty component",
+        ),
+        (
+            format!("{}/A/{reservation_id}", worktrees.display()),
+            "fanout worktree path component is not permitted",
+        ),
+        (
+            format!("{}/a/b/c/{reservation_id}", worktrees.display()),
+            "fanout worktree path depth is out of range",
+        ),
+        (
+            format!("{}/key/{other_id}", worktrees.display()),
+            "fanout worktree path leaf is not the reservation id",
+        ),
+    ];
+
+    for (persisted, expected) in cases {
+        let error = fanout::resolve_worktree_path(
+            &worktrees,
+            worktrees_dir.as_fd(),
+            &persisted,
+            reservation_id,
+        )
+        .unwrap_err();
+        assert_eq!(error, expected, "persisted path: {persisted}");
+    }
+    fs::remove_dir_all(home).ok();
+}
+
+#[test]
+fn repository_key_walk_refuses_intermediate_symlink() {
+    let home = fresh_home("repo-key-intermediate-symlink");
+    let repo = init_repo(&home);
+    git(
+        &repo,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "git@example.test:owner/repository.git",
+        ],
+    );
+    let invoker = "c1111111-1111-4111-8111-111111111111";
+    seed_entry(&home, invoker, &repo);
+    let store = FanoutStore::new(home.clone());
+    let outside = fresh_home("repo-key-symlink-target");
+    let worktrees = home.join("worktrees");
+    fs::create_dir_all(&worktrees).unwrap();
+    symlink(&outside, worktrees.join("owner")).unwrap();
+
+    let error = fanout::prepare_worktree(&store, &repo, invoker, FanoutMode::Root).unwrap_err();
+
+    assert_eq!(
+        error,
+        "fanout worktree root component is a symlink or not a directory"
+    );
+    assert_eq!(count_reservation_leaves(&outside), 0);
+    fs::remove_dir_all(home).ok();
+    fs::remove_dir_all(outside).ok();
+}
+
+#[test]
+fn rollback_retains_capacity_for_out_of_tree_record() {
+    let home = fresh_home("rollback-out-of-tree");
+    let repo = init_repo(&home);
+    let invoker = "d1111111-1111-4111-8111-111111111111";
+    seed_entry(&home, invoker, &repo);
+    let store = FanoutStore::new(home.clone());
+    let reserved = fanout::prepare_worktree(&store, &repo, invoker, FanoutMode::Root).unwrap();
+    let outside = fresh_home("rollback-out-of-tree-cwd");
+    mutate_fanout_record(&home, &reserved.reservation_id, |record| {
+        record.insert(
+            "worktree".into(),
+            JsonValue::from(outside.to_string_lossy().into_owned()),
+        );
+    });
+
+    let missing_command = home.join("missing-supervisor-command");
+    let mut config = HashMap::new();
+    config.insert(
+        "reservation_id".into(),
+        JsonValue::from(reserved.reservation_id.clone()),
+    );
+    config.insert(
+        "cwd".into(),
+        JsonValue::from(outside.to_string_lossy().into_owned()),
+    );
+    config.insert("tool".into(), JsonValue::from("claude".to_string()));
+    config.insert(
+        "command".into(),
+        JsonValue::from(missing_command.to_string_lossy().into_owned()),
+    );
+    config.insert("arguments".into(), JsonValue::from(Vec::<JsonValue>::new()));
+    config.insert("timeout_secs".into(), JsonValue::from(2.0));
+    let encoded = JsonValue::from(config).stringify().unwrap();
+
+    let mut supervisor = Command::new(env!("CARGO_BIN_EXE_relay"))
+        .arg("__fanout-supervisor")
+        .env("AGENT_RELAY_HOME", &home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    supervisor
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(encoded.as_bytes())
+        .unwrap();
+    let output = supervisor.wait_with_output().unwrap();
+    assert!(!output.status.success());
+    let report: JsonValue = String::from_utf8(output.stdout)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let error = report.get::<HashMap<String, JsonValue>>().unwrap()["error"]
+        .get::<String>()
+        .unwrap();
+    let (_, rollback_error) = error
+        .rsplit_once("; rollback retained capacity: ")
+        .expect("supervisor error must report retained rollback capacity");
+    assert_eq!(
+        rollback_error,
+        "fanout worktree path is outside the worktrees root"
+    );
+    assert!(outside.is_dir());
+    assert_eq!(
+        store.read(&reserved.reservation_id).unwrap().unwrap().state,
+        FanoutState::Reserved
+    );
+    fs::remove_dir_all(home).ok();
+    fs::remove_dir_all(outside).ok();
+}
+
+#[test]
+fn invalid_remote_component_falls_back_to_portable_digest_key() {
+    let home = fresh_home("invalid-remote-digest-fallback");
+    let repo = init_repo(&home);
+    git(
+        &repo,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "git@example.test:~user/repository.git",
+        ],
+    );
+    let invoker = "e1111111-1111-4111-8111-111111111111";
+    seed_entry(&home, invoker, &repo);
+    let store = FanoutStore::new(home.clone());
+
+    let reserved = fanout::prepare_worktree(&store, &repo, invoker, FanoutMode::Root).unwrap();
+
+    let relative = Path::new(&reserved.worktree)
+        .strip_prefix(home.join("worktrees"))
+        .unwrap();
+    let components: Vec<&str> = relative
+        .components()
+        .map(|component| component.as_os_str().to_str().unwrap())
+        .collect();
+    assert_eq!(
+        components.last().copied(),
+        Some(reserved.reservation_id.as_str())
+    );
+    let key_components = &components[..components.len() - 1];
+    assert!(!key_components.is_empty());
+    assert!(key_components.iter().all(|component| {
+        !component.is_empty()
+            && component.bytes().all(|byte| {
+                byte.is_ascii_lowercase()
+                    || byte.is_ascii_digit()
+                    || matches!(byte, b'.' | b'-' | b'_')
+            })
+    }));
+    assert_eq!(key_components.len(), 1);
+    assert_eq!(key_components[0].len(), 64);
+    assert!(
+        key_components[0]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    );
+    fs::remove_dir_all(home).ok();
 }

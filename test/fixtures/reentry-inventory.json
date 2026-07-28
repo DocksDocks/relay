@@ -270,6 +270,22 @@
       "anchor": "run_git("
     },
     {
+      "id": "git:plugins/session-relay/rust/src/fanout/git.rs:repo_key_from_repo:git_api:1",
+      "file": "plugins/session-relay/rust/src/fanout/git.rs",
+      "function": "repo_key_from_repo",
+      "category": "git",
+      "operation": "git_api",
+      "anchor": "run_git("
+    },
+    {
+      "id": "git:plugins/session-relay/rust/src/fanout/git.rs:repo_key_from_repo:git_api:2",
+      "file": "plugins/session-relay/rust/src/fanout/git.rs",
+      "function": "repo_key_from_repo",
+      "category": "git",
+      "operation": "git_api",
+      "anchor": "run_git("
+    },
+    {
       "id": "git:plugins/session-relay/rust/src/fanout/git.rs:repository_head:git_api:1",
       "file": "plugins/session-relay/rust/src/fanout/git.rs",
       "function": "repository_head",

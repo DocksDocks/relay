@@ -1,6 +1,8 @@
 use super::authority::FanoutRecord;
+use crate::sha256;
 use crate::workspace::git::OpenedRepository;
 use crate::workspace::schema::{ObjectFormat, RepositoryIdentityV1};
+use rustix::fs::{CWD, Mode, OFlags, mkdirat, openat};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -53,16 +55,147 @@ pub(super) fn repo_identity(repo: &Path) -> Result<RepoIdentity, String> {
     })
 }
 
-pub(super) fn ensure_worktree_root(path: &Path) -> Result<(), String> {
-    if fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
-        return Err("fanout worktree root must not be a symlink".to_string());
+const EMPTY_REPOSITORY_KEY: &str = "no-commits";
+const INVALID_WORKTREE_ROOT_COMPONENT: &str =
+    "fanout worktree root component is a symlink or not a directory";
+
+/// Return a repo-key containing at most two slash-separated components.
+///
+/// A usable remote contributes its final `owner/repo` components. Remotes whose
+/// path cannot be represented unchanged in the worktree-component charset fall
+/// back to a SHA-256 digest of the repository's sorted root commits.
+pub(super) fn repo_key_from_repo(repo: &Path) -> Result<String, String> {
+    if let Ok(remote) = run_git(repo, &["remote", "get-url", "origin"]) {
+        if let Some(key) = repo_key_from_remote(&remote) {
+            return Ok(key);
+        }
     }
-    fs::create_dir_all(path)
-        .map_err(|error| format!("create fanout worktree root {}: {error}", path.display()))?;
-    let metadata = fs::symlink_metadata(path)
-        .map_err(|error| format!("stat fanout worktree root {}: {error}", path.display()))?;
-    if !metadata.is_dir() || metadata.file_type().is_symlink() {
-        return Err("fanout worktree root is not a real directory".to_string());
+
+    let roots = run_git(
+        repo,
+        &["rev-list", "--max-parents=0", "--ignore-missing", "HEAD"],
+    )?;
+    let mut roots: Vec<&str> = roots
+        .lines()
+        .map(str::trim)
+        .filter(|oid| !oid.is_empty())
+        .collect();
+    if roots.is_empty() {
+        return Ok(EMPTY_REPOSITORY_KEY.to_string());
+    }
+    roots.sort_unstable();
+    Ok(sha256::hex_digest(roots.join("\n").as_bytes()))
+}
+
+fn repo_key_from_remote(remote: &str) -> Option<String> {
+    let remote = remote.trim();
+    let path = if let Some((scheme, remainder)) = remote.split_once("://") {
+        if scheme.is_empty() || scheme.eq_ignore_ascii_case("file") {
+            return None;
+        }
+        let (authority, path) = remainder.split_once('/')?;
+        if authority.is_empty() {
+            return None;
+        }
+        path
+    } else {
+        let separator = scp_path_separator(remote)?;
+        if separator == 0 {
+            return None;
+        }
+        &remote[separator + 1..]
+    };
+
+    let path = path.trim_end_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    let mut segments: Vec<String> = path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .rev()
+        .take(2)
+        .map(str::to_ascii_lowercase)
+        .collect();
+    segments.reverse();
+    if segments.is_empty()
+        || segments
+            .iter()
+            .any(|segment| !valid_repo_key_segment(segment))
+    {
+        return None;
+    }
+    Some(segments.join("/"))
+}
+
+fn scp_path_separator(remote: &str) -> Option<usize> {
+    let mut bracketed_host = false;
+    for (index, character) in remote.char_indices() {
+        match character {
+            '[' => bracketed_host = true,
+            ']' => bracketed_host = false,
+            ':' if !bracketed_host => return Some(index),
+            '/' if !bracketed_host => return None,
+            _ => {}
+        }
+    }
+    None
+}
+
+fn valid_repo_key_segment(segment: &str) -> bool {
+    !segment.is_empty()
+        && segment != "."
+        && segment != ".."
+        && !segment.contains('/')
+        && !segment.contains('\\')
+        && segment.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'-' | b'_')
+        })
+}
+
+fn open_worktree_directory<Fd: rustix::fd::AsFd>(
+    parent: Fd,
+    component: &Path,
+) -> Result<rustix::fd::OwnedFd, String> {
+    match openat(
+        parent,
+        component,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(directory) => Ok(directory),
+        Err(error) if error == rustix::io::Errno::LOOP || error == rustix::io::Errno::NOTDIR => {
+            Err(INVALID_WORKTREE_ROOT_COMPONENT.to_string())
+        }
+        Err(error) => Err(format!(
+            "open fanout worktree root component {}: {error}",
+            component.display()
+        )),
+    }
+}
+
+fn create_worktree_directory<Fd: rustix::fd::AsFd>(
+    parent: Fd,
+    component: &Path,
+) -> Result<(), String> {
+    match mkdirat(parent, component, Mode::from(0o777)) {
+        Ok(()) => Ok(()),
+        Err(error) if error == rustix::io::Errno::EXIST => Ok(()),
+        Err(error) => Err(format!(
+            "create fanout worktree root component {}: {error}",
+            component.display()
+        )),
+    }
+}
+
+pub(super) fn ensure_worktree_root(worktrees: &Path, repo_key: &str) -> Result<(), String> {
+    create_worktree_directory(CWD, worktrees)?;
+    let mut directory = open_worktree_directory(CWD, worktrees)?;
+    for component in repo_key.split('/') {
+        if !valid_repo_key_segment(component) {
+            return Err("fanout repo key component is not permitted".to_string());
+        }
+        let component = Path::new(component);
+        create_worktree_directory(&directory, component)?;
+        directory = open_worktree_directory(&directory, component)?;
     }
     Ok(())
 }
