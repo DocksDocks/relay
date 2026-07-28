@@ -8,6 +8,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parse as parseYaml } from 'yaml';
+import { resolveHistoricalPublicationPlanPath } from './historical-plan-path.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO = path.resolve(HERE, '../../..');
@@ -27,7 +28,7 @@ const CURRENT_DOCKS_PLAN_TEMPLATE =
   'docs/plans/finished/2026-07-26-session-relay-correlated-results-release-completion.md';
 const CURRENT_DOCKS_RUN_ID = 'a69dcd97-d1bd-46fc-9b6b-70e349e353fc';
 const CURRENT_PUBLIC_PLAN = 'docs/plans/active/session-relay-0.14.0-docks-kit-0.12.0-release.md';
-const HISTORICAL_RELEASE_PLAN = 'docs/plans/active/session-relay-linux-workspace-publication.md';
+const HISTORICAL_RELEASE_PLAN = resolveHistoricalPublicationPlanPath(REPO);
 const HISTORICAL_RECEIPT_SHA256 = Object.freeze([
   '419b23ccdcf0ca21672e81c05ae9d22c55bc67781839ffb6a29e7eecc2b59396',
   '87a6260ae20280712ebb2d76d39667b128c8f6cf687141ebd779d8eca16c2262',

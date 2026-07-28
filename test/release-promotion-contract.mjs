@@ -7,6 +7,7 @@ import path from 'node:path';
 import { dispatchSessionRelayRelease } from '../../../scripts/lib/session-relay-release-cli.mjs';
 import {
   canonicalize,
+  REPO,
   SessionRelayReleaseError,
   TAG,
   VERSION,
@@ -26,6 +27,7 @@ import {
   canonicalPlanView,
   canonicalVerificationResults,
 } from '../../docks/skills/productivity/plan-manager/scripts/plan-run.mjs';
+import { resolveHistoricalPublicationPlanPath } from './historical-plan-path.mjs';
 
 const OLD_MAIN = '1'.repeat(40);
 const TAG_COMMIT = '2'.repeat(40);
@@ -87,7 +89,7 @@ const PLANRUN_DOCKS_AFFECTED_PATHS = Object.freeze([
 const PLANRUN_RELEASE_TAG_COMMIT = '7d9cbbbdf82210d396de744372eadb6c26655601';
 const CURRENT_PUBLIC_RUN_ID = '1f801952-705e-4c7e-a533-91026c013383';
 const CURRENT_PUBLIC_PLAN_PATH = 'docs/plans/finished/2026-07-26-session-relay-0.14.0-docks-kit-0.12.0-release.md';
-const HISTORICAL_RELEASE_PLAN_PATH = 'docs/plans/active/session-relay-linux-workspace-publication.md';
+const HISTORICAL_RELEASE_PLAN_PATH = resolveHistoricalPublicationPlanPath(REPO);
 const HISTORICAL_PUBLICATION_SHA256 = '31d096d31702b66d7e97085a82d8b7da1b75155f828b1d2382a0ac8427ba7ea2';
 const HISTORICAL_PUBLIC_REQUEST_SHA256 = '7cf02781a2ed3c75423321492fb2cd4c4944f6da6d6d41290e26a5f3ca0cf902';
 const RETAINED_PROMOTION_SHA256 = '7ffaa7967d9ca8cc7c53c3ca22efe932d3028ad3caf210cec8157aec7bbd1670';

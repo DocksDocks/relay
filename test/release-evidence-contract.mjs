@@ -34,6 +34,7 @@ import {
   verifySourceCi,
 } from '../../../scripts/lib/session-relay-release-preparation.mjs';
 import { verifyPreflight } from '../../../scripts/verify-session-relay-preflight.mjs';
+import { resolveHistoricalPublicationPlanPath } from './historical-plan-path.mjs';
 
 const REPO = fs.realpathSync.native(path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..'));
 const REPOSITORY_ID = 'DocksDocks/docks';
@@ -98,7 +99,7 @@ const PLANRUN_AFFECTED_PATHS = [
   'scripts/lib/session-relay-release-publication.mjs',
 ];
 const CURRENT_PUBLIC_PLAN_PATH = 'docs/plans/active/session-relay-0.14.0-docks-kit-0.12.0-release.md';
-const HISTORICAL_RELEASE_PLAN_PATH = 'docs/plans/active/session-relay-linux-workspace-publication.md';
+const HISTORICAL_RELEASE_PLAN_PATH = resolveHistoricalPublicationPlanPath(REPO);
 const HISTORICAL_RECEIPT_SHA256 = Object.freeze({
   source_proof_v1: '419b23ccdcf0ca21672e81c05ae9d22c55bc67781839ffb6a29e7eecc2b59396',
   source_proof_v2: '87a6260ae20280712ebb2d76d39667b128c8f6cf687141ebd779d8eca16c2262',
@@ -1283,20 +1284,13 @@ function capturePublicRed(temp) {
 }
 
 function publicDraftReviewFixture() {
-  const activePath = 'docs/plans/active/session-relay-linux-workspace-publication.md';
-  let templatePath = activePath;
-  if (!fs.existsSync(templatePath)) {
-    const finishedMatches = fs
-      .readdirSync('docs/plans/finished')
-      .filter((name) => /^\d{4}-\d{2}-\d{2}-session-relay-linux-workspace-publication\.md$/.test(name));
-    assert.equal(
-      finishedMatches.length,
-      1,
-      'exactly one finished publication plan is available as the review template',
-    );
-    templatePath = path.join('docs/plans/finished', finishedMatches[0]);
-  }
-  const source = fs.readFileSync(templatePath, 'utf8');
+  // Two different things that used to share one constant: where the file LIVES
+  // now (it was retired out of active/), and the plan_path RECORDED inside the
+  // historical receipt. Retiring the file does not rewrite that recorded value,
+  // so the substitution key below stays the literal active path.
+  const recordedPlanPath = 'docs/plans/active/session-relay-linux-workspace-publication.md';
+  const templatePath = resolveHistoricalPublicationPlanPath(REPO);
+  const source = fs.readFileSync(path.join(REPO, templatePath), 'utf8');
   const match = source.match(/^Review-receipt: (\{.*\})$/m);
   assert.ok(match, 'a real Review-receipt is available as the public review template');
   const templateReceipt = JSON.parse(match[1]);
@@ -1322,7 +1316,7 @@ function publicDraftReviewFixture() {
     [templateReceipt.input_sha256, inputSha256],
     [templateReceipt.reviewed_commit, PUBLIC_COMMIT],
     [templateReceipt.policy_sha256, runtimePolicySha256],
-    [activePath, PUBLIC_PLAN_PATH],
+    [recordedPlanPath, PUBLIC_PLAN_PATH],
   ]);
   const receipt = replaceReceiptPolicy(
     replaceReceiptIdentity(templateReceipt, replacements),

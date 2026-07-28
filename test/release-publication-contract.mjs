@@ -6,11 +6,11 @@ import os from 'node:os';
 import path from 'node:path';
 
 import { parse as parseYaml } from 'yaml';
-
 import {
   ASSETS,
   canonicalize,
   PRERELEASE_BODY,
+  REPO,
   REPOSITORY_ID,
   SessionRelayReleaseError,
   STABLE_BODY,
@@ -28,6 +28,7 @@ import {
   publishReviewed,
   validatePublicationReceipt,
 } from '../../../scripts/lib/session-relay-release-publication.mjs';
+import { resolveHistoricalPublicationPlanPath } from './historical-plan-path.mjs';
 
 const SOURCE = '3fb9211f3309977f24853a10714d4b7a82b38c8f';
 const EXPECTED_VERSION = '0.13.0';
@@ -47,7 +48,7 @@ const CURRENT_TAG = 'session-relay--v0.14.0';
 const CURRENT_PUBLIC_VERSION = '0.12.0';
 const CURRENT_PUBLIC_TAG = 'cli-v0.12.0';
 const HISTORICAL_PUBLICATION_SHA256 = '31d096d31702b66d7e97085a82d8b7da1b75155f828b1d2382a0ac8427ba7ea2';
-const HISTORICAL_RELEASE_PLAN_PATH = 'docs/plans/active/session-relay-linux-workspace-publication.md';
+const HISTORICAL_RELEASE_PLAN_PATH = resolveHistoricalPublicationPlanPath(REPO);
 const CURRENT_GOAL_ID = '8b89aabf-7336-4352-bc11-225bab67f9aa';
 const CURRENT_DOCKS_RUN_ID = '88732ba0-ef06-411b-a31c-93705ccefb27';
 const CURRENT_DOCKS_PLAN_PATH = 'docs/plans/active/session-relay-correlated-results-release-remediation-v4.md';
