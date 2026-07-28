@@ -12,7 +12,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
-use support::{fresh_home, write_executable};
+use support::{SupervisorGroupReaper, fresh_home, write_executable};
 use tinyjson::JsonValue;
 
 fn seed_entry(home: &Path, id: &str, tool: &str, cwd: &Path) {
@@ -479,6 +479,12 @@ fn lifecycle_supervisor_watchdog_marks_managed_worker_on_supervisor_death() {
             supervisor_pid.is_some()
         },
     );
+    // The managed stub is setsid'd into the supervisor's own group, so it
+    // survives the SIGKILL below and the deliberate LostAuthority state that
+    // follows - the lifecycle correctly refuses to claim a reap it did not do.
+    // Take ownership of the group while its leader is still alive; Drop covers
+    // the panicking paths through the assertions between here and cleanup.
+    let mut reaper = SupervisorGroupReaper::arm(supervisor_pid.unwrap() as libc::pid_t);
     let status = Command::new("kill")
         .args(["-KILL", &supervisor_pid.unwrap().to_string()])
         .status()
@@ -505,6 +511,7 @@ fn lifecycle_supervisor_watchdog_marks_managed_worker_on_supervisor_death() {
     ));
     attach.kill().ok();
     attach.wait().ok();
+    reaper.reap();
     fs::remove_dir_all(home).ok();
 }
 
@@ -742,6 +749,26 @@ fn lifecycle_supervisor_watchdog_first_loss_refuses_next_reentry() {
             watchdog_pid.is_some()
         },
     );
+    // Killing the watchdog below drives the supervisor to LostAuthority, and it
+    // then drops its live child without claiming a reap. The stub sits in the
+    // supervisor's group, so own that group first. Wait for Ready rather than
+    // mere record existence: arming before the child's setsid would silently
+    // register our own group and clean up nothing.
+    let mut supervisor_pid = None;
+    wait_until(
+        Duration::from_secs(3),
+        "supervisor never became Ready",
+        || {
+            supervisor_pid = store
+                .read_supervisor_for_session(session)
+                .ok()
+                .flatten()
+                .filter(|record| record.state == SupervisorState::Ready)
+                .map(|record| record.process.pid);
+            supervisor_pid.is_some()
+        },
+    );
+    let mut reaper = SupervisorGroupReaper::arm(supervisor_pid.unwrap() as libc::pid_t);
     assert!(
         Command::new("kill")
             .args(["-KILL", &watchdog_pid.unwrap().to_string()])
@@ -761,5 +788,6 @@ fn lifecycle_supervisor_watchdog_first_loss_refuses_next_reentry() {
         ManagedState::FencingUnconfirmed
     );
     attach.wait().ok();
+    reaper.reap();
     fs::remove_dir_all(home).ok();
 }
