@@ -29,6 +29,7 @@ import {
   validatePublicationReceipt,
 } from '../../../scripts/lib/session-relay-release-publication.mjs';
 import { resolveHistoricalPublicationPlanPath } from './historical-plan-path.mjs';
+import { resolveShippedRelayVersion } from './version.mjs';
 
 const SOURCE = '3fb9211f3309977f24853a10714d4b7a82b38c8f';
 const EXPECTED_VERSION = '0.13.0';
@@ -43,8 +44,7 @@ const ORDINARY_ASSETS = Object.freeze([
   'session-relay-x86_64-unknown-linux-musl',
 ]);
 const EXPECTED_ASSETS = Object.freeze([...ORDINARY_ASSETS, 'SHA256SUMS']);
-const CURRENT_VERSION = '0.14.0';
-const CURRENT_TAG = 'session-relay--v0.14.0';
+const { version: CURRENT_VERSION, tag: CURRENT_TAG } = resolveShippedRelayVersion(REPO);
 const CURRENT_PUBLIC_VERSION = '0.12.0';
 const CURRENT_PUBLIC_TAG = 'cli-v0.12.0';
 const HISTORICAL_PUBLICATION_SHA256 = '31d096d31702b66d7e97085a82d8b7da1b75155f828b1d2382a0ac8427ba7ea2';

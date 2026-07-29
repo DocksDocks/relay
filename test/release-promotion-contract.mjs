@@ -28,6 +28,7 @@ import {
   canonicalVerificationResults,
 } from '../../docks/skills/productivity/plan-manager/scripts/plan-run.mjs';
 import { resolveHistoricalPublicationPlanPath } from './historical-plan-path.mjs';
+import { resolveShippedRelayVersion } from './version.mjs';
 
 const OLD_MAIN = '1'.repeat(40);
 const TAG_COMMIT = '2'.repeat(40);
@@ -66,8 +67,7 @@ const ORDINARY_ASSET_NAMES = Object.freeze([
   'session-relay-x86_64-unknown-linux-musl',
 ]);
 const PUBLICATION_ASSET_NAMES = Object.freeze(['SHA256SUMS', ...ORDINARY_ASSET_NAMES]);
-const CURRENT_RELEASE_VERSION = '0.14.0';
-const CURRENT_RELEASE_TAG = 'session-relay--v0.14.0';
+const { version: CURRENT_RELEASE_VERSION, tag: CURRENT_RELEASE_TAG } = resolveShippedRelayVersion(REPO);
 const CURRENT_PUBLIC_VERSION = '0.12.0';
 const CURRENT_PUBLIC_TAG = 'cli-v0.12.0';
 const CURRENT_GOAL_ID = '8b89aabf-7336-4352-bc11-225bab67f9aa';

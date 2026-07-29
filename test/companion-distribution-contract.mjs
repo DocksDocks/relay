@@ -7,6 +7,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { resolveShippedRelayVersion } from './version.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO = path.resolve(HERE, '../../..');
@@ -18,8 +19,7 @@ const DOCKS_PLAN = 'docs/plans/finished/2026-07-23-session-relay-linux-workspace
 const PUBLIC_VERSION = '0.13.0';
 const PRODUCTION_VERSION = '0.12.0';
 const BLOCKED_REASON = 'Awaiting the four independently hashed `session-relay--v0.13.0` production asset digests.';
-const CURRENT_RELAY_VERSION = '0.14.0';
-const CURRENT_RELAY_TAG = `session-relay--v${CURRENT_RELAY_VERSION}`;
+const { version: CURRENT_RELAY_VERSION, tag: CURRENT_RELAY_TAG } = resolveShippedRelayVersion(REPO);
 const CURRENT_PUBLIC_VERSION = '0.12.0';
 const CURRENT_PUBLIC_TAG = `cli-v${CURRENT_PUBLIC_VERSION}`;
 const CURRENT_PUBLIC_PLAN = 'docs/plans/active/session-relay-0.14.0-docks-kit-0.12.0-release.md';

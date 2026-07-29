@@ -9,6 +9,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parse as parseYaml } from 'yaml';
 import { resolveHistoricalPublicationPlanPath } from './historical-plan-path.mjs';
+import { resolveShippedRelayVersion } from './version.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO = path.resolve(HERE, '../../..');
@@ -22,8 +23,7 @@ const RELEASE_VERSION = '0.13.0';
 const RELEASE_TAG = `session-relay--v${RELEASE_VERSION}`;
 const PUBLIC_REF = /^refs\/heads\/preflight\/session-relay-cli-0\.13\.0-[0-9a-f]{12}$/;
 const COMMIT = /^[0-9a-f]{40}$/;
-const CURRENT_RELEASE_VERSION = '0.14.0';
-const CURRENT_RELEASE_TAG = `session-relay--v${CURRENT_RELEASE_VERSION}`;
+const { version: CURRENT_RELEASE_VERSION, tag: CURRENT_RELEASE_TAG } = resolveShippedRelayVersion(REPO);
 const CURRENT_DOCKS_PLAN_TEMPLATE =
   'docs/plans/finished/2026-07-26-session-relay-correlated-results-release-completion.md';
 const CURRENT_DOCKS_RUN_ID = 'a69dcd97-d1bd-46fc-9b6b-70e349e353fc';

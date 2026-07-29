@@ -35,6 +35,7 @@ import {
 } from '../../../scripts/lib/session-relay-release-preparation.mjs';
 import { verifyPreflight } from '../../../scripts/verify-session-relay-preflight.mjs';
 import { resolveHistoricalPublicationPlanPath } from './historical-plan-path.mjs';
+import { resolveShippedRelayVersion } from './version.mjs';
 
 const REPO = fs.realpathSync.native(path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..'));
 const REPOSITORY_ID = 'DocksDocks/docks';
@@ -54,8 +55,7 @@ const TARGETS = [
   ['x86_64-apple-darwin', 'macOS', 'X64'],
   ['aarch64-apple-darwin', 'macOS', 'ARM64'],
 ];
-const CURRENT_RELEASE_VERSION = '0.14.0';
-const CURRENT_RELEASE_TAG = 'session-relay--v0.14.0';
+const { version: CURRENT_RELEASE_VERSION, tag: CURRENT_RELEASE_TAG } = resolveShippedRelayVersion(REPO);
 const CURRENT_PUBLIC_VERSION = '0.12.0';
 const CURRENT_PUBLIC_TAG = 'cli-v0.12.0';
 const CURRENT_GOAL_ID = '8b89aabf-7336-4352-bc11-225bab67f9aa';
