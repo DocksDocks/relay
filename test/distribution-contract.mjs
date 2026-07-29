@@ -1041,13 +1041,13 @@ function currentCorrelatedReleaseContract() {
 
   const coreSource = fs.readFileSync(path.join(REPO, 'scripts/lib/session-relay-release-core.mjs'), 'utf8');
   assert.match(coreSource, /export const VERSION = '0\.14\.0';/);
-  assert.match(coreSource, /Session Relay 0\.14\.0 is staged for compatibility validation/);
-  assert.match(coreSource, /Session Relay 0\.14\.0 is available through docks-kit/);
+  assert.match(coreSource, /Session Relay \$\{VERSION\} is staged for compatibility validation/);
+  assert.match(coreSource, /Session Relay \$\{VERSION\} is available through docks-kit/);
   const promotionSource = fs.readFileSync(path.join(REPO, 'scripts/lib/session-relay-release-promotion.mjs'), 'utf8');
   assert.match(promotionSource, /const PUBLIC_VERSION = '0\.12\.0';/);
   assert.match(promotionSource, /const PUBLIC_TAG = `cli-v\$\{PUBLIC_VERSION\}`;/);
   assert.match(promotionSource, /const CURRENT_DOCKS_KIT_RELEASE = 'cli-v0\.12\.0';/);
-  assert.match(promotionSource, /session-relay-0\.14\.0-docks-kit-0\.12\.0-release/);
+  assert.match(promotionSource, /session-relay-\$\{CURRENT_VERSION\}-docks-kit-\$\{PUBLIC_VERSION\}-release/);
 
   const document = parseYaml(fs.readFileSync(WORKFLOW, 'utf8'));
   const matrixAssets = document.jobs.build.strategy.matrix.include.map(({ asset }) => asset);
