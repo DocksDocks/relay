@@ -281,6 +281,73 @@ fn lifecycle_supervisor_preserves_codex_fast_and_default_tiers_in_exact_argv() {
 }
 
 #[test]
+fn lifecycle_supervisor_handshake_survives_a_retired_socket_path() {
+    // The supervisor unlinks its socket once it has served the connection, so a client
+    // that inspects that path afterwards can find it already gone. The latch blocks the
+    // client until the supervisor signals that exact unlink, reproducing the ordering a
+    // loaded runner produces without depending on a tuned sleep.
+    let home = fresh_home("retired-socket");
+    let cwd = home.join("project");
+    let session = "23111111-1111-4111-8111-111111111111";
+    seed_entry(&home, session, "claude", &cwd);
+    let stub = home.join("wake-stub");
+    write_executable(&stub, "#!/bin/sh\nprintf woken\n");
+    let latch = home.join("socket-retired");
+
+    let woken = Command::new(env!("CARGO_BIN_EXE_relay"))
+        .args(["wake", session, "doorbell"])
+        .env("AGENT_RELAY_HOME", &home)
+        .env("RELAY_WAKE_CMD_CLAUDE", &stub)
+        .env("RELAY_TEST_CONTROL_READY_LATCH", &latch)
+        .output()
+        .unwrap();
+    assert!(
+        woken.status.success(),
+        "the handshake must not require the socket path to outlive it: {}",
+        String::from_utf8_lossy(&woken.stderr)
+    );
+    // Without this the case could pass by never reaching the window at all.
+    assert!(
+        latch.exists(),
+        "the supervisor never signalled the unlink, so the ordering was not exercised"
+    );
+    fs::remove_dir_all(home).ok();
+}
+
+#[test]
+fn lifecycle_supervisor_refuses_a_mismatched_supervisor_identity() {
+    // Removing the socket path comparison left the frame check as the sole authority on
+    // which supervisor answered, so that check must still reject a mismatch.
+    let home = fresh_home("frame-identity");
+    let cwd = home.join("project");
+    let session = "24111111-1111-4111-8111-111111111111";
+    seed_entry(&home, session, "claude", &cwd);
+    let stub = home.join("wake-stub");
+    write_executable(&stub, "#!/bin/sh\nprintf woken\n");
+
+    let woken = Command::new(env!("CARGO_BIN_EXE_relay"))
+        .args(["wake", session, "doorbell"])
+        .env("AGENT_RELAY_HOME", &home)
+        .env("RELAY_WAKE_CMD_CLAUDE", &stub)
+        .env(
+            "RELAY_TEST_CORRUPT_CONTROL_FRAME",
+            "99999999-9999-4999-8999-999999999999",
+        )
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&woken.stderr);
+    assert!(
+        !woken.status.success(),
+        "a mismatched supervisor identity must not be accepted: {stderr}"
+    );
+    assert!(
+        stderr.contains("supervisor control_bound identity changed"),
+        "the frame check must be what rejects it, not an incidental failure: {stderr}"
+    );
+    fs::remove_dir_all(home).ok();
+}
+
+#[test]
 fn watchdog_retires_bootstrap_when_the_caller_disconnects_before_reply() {
     let home = fresh_home("bootstrap-disconnect");
     let cwd = home.join("project");

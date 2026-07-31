@@ -35,7 +35,7 @@ use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::*;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, ExitStatus, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
@@ -1056,6 +1056,39 @@ fn bootstrap_disconnect_test_delay(multiplier: u64) {
     ));
 }
 
+/// Suspend the client between validating the `control_bound` frame and the checks that
+/// follow it, until the supervisor has retired the socket.
+///
+/// Tests set this to reproduce the ordering a loaded runner produces, where the
+/// supervised child finishes and the supervisor unlinks the socket before the client is
+/// next scheduled. It waits for the signal `run_supervisor` writes immediately after
+/// that unlink, so the ordering is exact at any load rather than a tuned sleep. An unset
+/// variable leaves timing unchanged.
+fn control_ready_test_latch() -> Result<(), String> {
+    let Ok(signal) = std::env::var("RELAY_TEST_CONTROL_READY_LATCH") else {
+        return Ok(());
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if Path::new(&signal).exists() {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    // Never degrade into a silent pass: a test that asked for this ordering and did not
+    // get it has not exercised the window, so say so instead of proceeding.
+    Err(format!(
+        "lifecycle supervisor socket-retired latch never fired: {signal}"
+    ))
+}
+
+/// Announce that the socket has been unlinked, for `control_ready_test_latch`.
+fn signal_socket_retired_for_tests() {
+    if let Ok(signal) = std::env::var("RELAY_TEST_CONTROL_READY_LATCH") {
+        fs::write(signal, b"retired").ok();
+    }
+}
+
 pub fn run_child_with_guard(
     guard: &mut ReentryGuard,
     spec: ChildLaunchSpec,
@@ -1319,11 +1352,16 @@ pub fn run_supervisor(argv: &[String]) -> Result<(), String> {
     // It has to remain. An fstat on the listener would remove the lookup entirely, and it is wrong
     // here - measured. A Unix domain socket's descriptor names a `sockfs` inode, unrelated to the
     // `S_IFSOCK` directory entry at `socket_path`, so `fstat` and `stat` report different dev/ino
-    // spaces. `socket_dev`/`socket_ino` are deliberately the PATH's identity, which is what lets
-    // the peer verifier in `wait_control_ready` compare them against its own `fs::metadata(path)`
-    // and what lets a reader confirm the socket file on disk is the one this supervisor bound.
-    // Substituting an fstat failed six lifecycle tests with "lifecycle supervisor socket identity
-    // changed"; do not reintroduce it.
+    // spaces. `socket_dev`/`socket_ino` are deliberately the PATH's identity, which is what lets a
+    // reader confirm the socket file on disk is the one this supervisor bound. That reader is
+    // `ping_supervisor` (`lifecycle.rs:6106-6110`), which stats the path of a supervisor it expects
+    // to still be serving. `wait_control_ready` no longer compares them: it inspected a path the
+    // protocol may already have retired, and the frame it validates over the held connection binds
+    // strictly more identity than the path could.
+    //
+    // Back when `wait_control_ready` did compare them, substituting an fstat failed six lifecycle
+    // tests with "lifecycle supervisor socket identity changed". The identity-space argument above
+    // is the durable reason; do not reintroduce it.
     let socket_identity = fs::metadata(&socket_path)
         .map_err(|error| format!("stat lifecycle supervisor socket: {error}"))?;
     startup_checkpoint(SupervisorStartupPhase::ListenerBound, "after")?;
@@ -1470,6 +1508,7 @@ pub fn run_supervisor(argv: &[String]) -> Result<(), String> {
     }
     let outcome = supervise_connected(&store, &args, resolved, stream, control_rx);
     fs::remove_file(socket_path).ok();
+    signal_socket_retired_for_tests();
     outcome
 }
 
@@ -1648,14 +1687,17 @@ fn wait_control_ready(
 ) -> Result<(), String> {
     let response = read_frame_until(stream, deadline)?;
     validate_identity_frame(&response, "control_bound", prepared)?;
-    let metadata = fs::metadata(supervisor_socket_path(&prepared.operation_id))
-        .map_err(|error| format!("stat lifecycle supervisor socket: {error}"))?;
+    control_ready_test_latch()?;
+    // No socket path stat here. `validate_identity_frame` above already bound the kind,
+    // supervisor instance id, operation id, operation version and control epoch over the
+    // connection this client holds - strictly more identity than the path could supply,
+    // since dev/ino were read after connecting and never compared against the connected
+    // descriptor. The path is also allowed to be gone by now: the supervisor unlinks it
+    // once it has served the connection. The record read stays for the ready state.
     let record = LifecycleStore::new(prepared.root.clone())
         .read_supervisor_for_session_from_operation(&prepared.operation_id)?
         .ok_or_else(|| "lifecycle supervisor ready record is missing".to_string())?;
     if record.supervisor_instance_id != prepared.supervisor_instance_id
-        || record.socket_dev != metadata.dev()
-        || record.socket_ino != metadata.ino()
         || record.state != SupervisorState::Ready
         || record.control_epoch != prepared.control_epoch
     {
@@ -2706,9 +2748,17 @@ fn read_frame(
 fn identity_frame(kind: &str, args: &HiddenArgs) -> HashMap<String, JsonValue> {
     let mut frame = HashMap::new();
     frame.insert("kind".into(), JsonValue::from(kind.to_string()));
+    // Tests set this to prove the client still refuses a supervisor whose identity does
+    // not match the launch it prepared. It applies only to `control_bound`, the frame the
+    // client validates as its sole identity authority; corrupting the earlier `hello` or
+    // `control_authenticated` frames would abort the handshake before that check runs.
+    let instance_id = match std::env::var("RELAY_TEST_CORRUPT_CONTROL_FRAME") {
+        Ok(substitute) if !substitute.is_empty() && kind == "control_bound" => substitute,
+        _ => args.supervisor_instance_id.clone(),
+    };
     frame.insert(
         "supervisor_instance_id".into(),
-        JsonValue::from(args.supervisor_instance_id.clone()),
+        JsonValue::from(instance_id),
     );
     frame.insert(
         "operation_id".into(),
