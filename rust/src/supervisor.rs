@@ -1309,6 +1309,23 @@ pub fn run_supervisor(argv: &[String]) -> Result<(), String> {
     listener
         .set_nonblocking(true)
         .map_err(|error| format!("configure lifecycle supervisor listener: {error}"))?;
+    // Stat the socket PATH immediately after binding it, instead of after the acceptor handoff.
+    // The old call site sat below two startup checkpoints, and `AcceptorsReady/before` is a
+    // fault-injection point the lifecycle tests delay by 750 ms. Anything that unlinked or replaced
+    // the path inside that window made a healthy supervisor fail with "stat lifecycle supervisor
+    // socket: No such file or directory" - seen on GitHub runners while passing on this host. That
+    // 750 ms window is now gone; the path-lookup dependency remains, by design.
+    //
+    // It has to remain. An fstat on the listener would remove the lookup entirely, and it is wrong
+    // here - measured. A Unix domain socket's descriptor names a `sockfs` inode, unrelated to the
+    // `S_IFSOCK` directory entry at `socket_path`, so `fstat` and `stat` report different dev/ino
+    // spaces. `socket_dev`/`socket_ino` are deliberately the PATH's identity, which is what lets
+    // the peer verifier in `wait_control_ready` compare them against its own `fs::metadata(path)`
+    // and what lets a reader confirm the socket file on disk is the one this supervisor bound.
+    // Substituting an fstat failed six lifecycle tests with "lifecycle supervisor socket identity
+    // changed"; do not reintroduce it.
+    let socket_identity = fs::metadata(&socket_path)
+        .map_err(|error| format!("stat lifecycle supervisor socket: {error}"))?;
     startup_checkpoint(SupervisorStartupPhase::ListenerBound, "after")?;
     startup_checkpoint(SupervisorStartupPhase::GlobalQueuesReady, "before")?;
     startup_checkpoint(SupervisorStartupPhase::GlobalQueuesReady, "after")?;
@@ -1425,8 +1442,8 @@ pub fn run_supervisor(argv: &[String]) -> Result<(), String> {
     start_health_listener(listener, args.supervisor_instance_id.clone())?;
     startup_checkpoint(SupervisorStartupPhase::AcceptorsReady, "after")?;
     startup_checkpoint(SupervisorStartupPhase::OperationQueuesReady, "after")?;
-    let metadata = fs::metadata(&socket_path)
-        .map_err(|error| format!("stat lifecycle supervisor socket: {error}"))?;
+    // `socket_identity` was captured at bind time; see the comment there. Re-stat'ing the path
+    // here is what made a healthy supervisor fail under load.
     store.record_supervisor_ready(SupervisorRecord {
         supervisor_instance_id: args.supervisor_instance_id.clone(),
         control_epoch: args.control_epoch.clone(),
@@ -1434,8 +1451,8 @@ pub fn run_supervisor(argv: &[String]) -> Result<(), String> {
         operation_id: args.operation_id.clone(),
         process: observe_process(std::process::id()),
         socket_path: socket_path.clone(),
-        socket_dev: metadata.dev(),
-        socket_ino: metadata.ino(),
+        socket_dev: socket_identity.dev(),
+        socket_ino: socket_identity.ino(),
         version: "1".to_string(),
         state: SupervisorState::Ready,
         heartbeat_at: store::iso_now(),
