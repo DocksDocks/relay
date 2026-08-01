@@ -67,6 +67,25 @@ const CURRENT_DOCKS_PLAN_TEMPLATE_PATH =
 const CURRENT_DOCKS_SOURCE_BASE = '494881a0d973863d1ac8e233734c827eb6913ce8';
 const CURRENT_RED_TEST_PATH = 'plugins/session-relay/test/release-evidence-contract.mjs';
 const CURRENT_RED_PRODUCER_PATH = 'scripts/capture-tdd-red.mjs';
+// The binder reads release identity through `loadReleaseInstance` in the lane core, which
+// resolves a per-version instance file. A fixture that copies the current binder into a
+// synthetic tree without those siblings fails at import rather than at the assertion under
+// test, so they travel together. No historical expectation moves: the fixture already
+// overlays the current binder deliberately, and this only completes what it now needs.
+const PREPARATION_RUNTIME_DEPENDENCIES = [
+  'scripts/lib/session-relay-release-preparation.mjs',
+  'scripts/lib/session-relay-release-core.mjs',
+  'scripts/lib/session-relay-release-instances/schema.mjs',
+  'scripts/lib/session-relay-release-instances/0.13.0.json',
+  'scripts/lib/session-relay-release-instances/0.14.0.json',
+];
+const copyPreparationRuntime = (root) => {
+  for (const logical of PREPARATION_RUNTIME_DEPENDENCIES) {
+    const target = path.join(root, ...logical.split('/'));
+    fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
+    fs.copyFileSync(path.join(REPO, ...logical.split('/')), target);
+  }
+};
 const CURRENT_AFFECTED_PATHS = [
   'plugins/session-relay/README.md',
   'plugins/session-relay/rust/src/cli.rs',
@@ -3052,7 +3071,7 @@ function bindCurrentCompletionFixture(
   assert.equal(red.exit_code, 17);
 
   const preparationPath = path.join(root, 'scripts/lib/session-relay-release-preparation.mjs');
-  if (defaultDependencies) copyFromRepository('scripts/lib/session-relay-release-preparation.mjs');
+  if (defaultDependencies) copyPreparationRuntime(root);
   fs.appendFileSync(preparationPath, '\n// Current release-evidence contract implementation fixture.\n');
   runGit(['add', '--', 'scripts/lib/session-relay-release-preparation.mjs']);
   const implementationCommit = commitFixture('fix: bind current release evidence fixture', '2026-07-25T14:00:00.000Z');
@@ -3521,7 +3540,7 @@ function bindPlanRunCompletionFixture(
   };
   const preparationLogical = 'scripts/lib/session-relay-release-preparation.mjs';
   if (defaultDependencies) {
-    fs.copyFileSync(path.join(REPO, preparationLogical), path.join(root, preparationLogical));
+    copyPreparationRuntime(root);
   }
   for (const logical of PLANRUN_AFFECTED_PATHS) {
     const target = path.join(root, ...logical.split('/'));
