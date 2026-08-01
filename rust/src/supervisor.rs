@@ -2771,10 +2771,19 @@ fn identity_frame(kind: &str, args: &HiddenArgs) -> HashMap<String, JsonValue> {
     // not match the launch it prepared. It applies only to `control_bound`, the frame the
     // client validates as its sole identity authority; corrupting the earlier `hello` or
     // `control_authenticated` frames would abort the handshake before that check runs.
+    //
+    // It exists only under debug assertions, which the test profile enables and `--release`
+    // does not, so it cannot reach a distributed binary. A switch whose whole purpose is to
+    // falsify an identity assertion has no business in a shipped artifact, even one that can
+    // only provoke a refusal. The timing latches nearby are deliberately not gated: they
+    // delay a client between steps it already performs and assert nothing.
+    #[cfg(debug_assertions)]
     let instance_id = match std::env::var("RELAY_TEST_CORRUPT_CONTROL_FRAME") {
         Ok(substitute) if !substitute.is_empty() && kind == "control_bound" => substitute,
         _ => args.supervisor_instance_id.clone(),
     };
+    #[cfg(not(debug_assertions))]
+    let instance_id = args.supervisor_instance_id.clone();
     frame.insert(
         "supervisor_instance_id".into(),
         JsonValue::from(instance_id),
