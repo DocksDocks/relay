@@ -315,6 +315,41 @@ fn lifecycle_supervisor_handshake_survives_a_retired_socket_path() {
 }
 
 #[test]
+fn lifecycle_supervisor_handshake_survives_a_retired_ready_record() {
+    // The ready record outlives the socket, but not by much and not in this process: the
+    // watchdog removes it once it observes the supervisor exit, on a 250 ms poll. A client
+    // that reads the record after the handshake frame therefore races another process.
+    // This latch holds the client until that removal has happened, which is the window a
+    // loaded runner reaches on its own.
+    let home = fresh_home("retired-record");
+    let cwd = home.join("project");
+    let session = "25111111-1111-4111-8111-111111111111";
+    seed_entry(&home, session, "claude", &cwd);
+    let stub = home.join("wake-stub");
+    write_executable(&stub, "#!/bin/sh\nprintf woken\n");
+    let latch = home.join("record-retired");
+
+    let woken = Command::new(env!("CARGO_BIN_EXE_relay"))
+        .args(["wake", session, "doorbell"])
+        .env("AGENT_RELAY_HOME", &home)
+        .env("RELAY_WAKE_CMD_CLAUDE", &stub)
+        .env("RELAY_TEST_CONTROL_READY_LATCH_RECORD", &latch)
+        .output()
+        .unwrap();
+    assert!(
+        woken.status.success(),
+        "the handshake must not require the ready record to outlive it: {}",
+        String::from_utf8_lossy(&woken.stderr)
+    );
+    // Without this the case could pass by never reaching the window at all.
+    assert!(
+        latch.exists(),
+        "the watchdog never signalled the retirement, so the ordering was not exercised"
+    );
+    fs::remove_dir_all(home).ok();
+}
+
+#[test]
 fn lifecycle_supervisor_refuses_a_mismatched_supervisor_identity() {
     // Removing the socket path comparison left the frame check as the sole authority on
     // which supervisor answered, so that check must still reject a mismatch.

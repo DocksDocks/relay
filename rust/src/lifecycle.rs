@@ -3094,18 +3094,6 @@ impl LifecycleStore {
         Err("lifecycle supervisor/watchdog authority is unavailable".to_string())
     }
 
-    pub(crate) fn read_supervisor_for_session_from_operation(
-        &self,
-        operation_id: &str,
-    ) -> Result<Option<SupervisorRecord>, String> {
-        self.read_transaction(|registry| {
-            Ok(object_map(registry, SUPERVISORS_KEY)?
-                .into_values()
-                .filter_map(|value| SupervisorRecord::from_json(&value))
-                .find(|record| record.operation_id == operation_id))
-        })
-    }
-
     pub fn lifecycle_audit_contains(
         &self,
         event: &str,

@@ -1057,16 +1057,24 @@ fn bootstrap_disconnect_test_delay(multiplier: u64) {
 }
 
 /// Suspend the client between validating the `control_bound` frame and the checks that
-/// follow it, until the supervisor has retired the socket.
+/// follow it, until the named teardown step has happened.
 ///
-/// Tests set this to reproduce the ordering a loaded runner produces, where the
-/// supervised child finishes and the supervisor unlinks the socket before the client is
-/// next scheduled. It waits for the signal `run_supervisor` writes immediately after
-/// that unlink, so the ordering is exact at any load rather than a tuned sleep. An unset
-/// variable leaves timing unchanged.
+/// Tests set exactly one of these to reproduce the ordering a loaded runner produces:
+///
+/// * `RELAY_TEST_CONTROL_READY_LATCH` waits for the supervisor to unlink its socket.
+/// * `RELAY_TEST_CONTROL_READY_LATCH_RECORD` waits for the watchdog to retire the ready
+///   record, which happens later and in a different process.
+///
+/// The record signal wins when both are set, because it is the later of the two. Waiting
+/// on a signal makes the ordering exact at any load rather than a tuned sleep, and an
+/// unset variable leaves timing unchanged.
 fn control_ready_test_latch() -> Result<(), String> {
-    let Ok(signal) = std::env::var("RELAY_TEST_CONTROL_READY_LATCH") else {
-        return Ok(());
+    let (signal, what) = match std::env::var("RELAY_TEST_CONTROL_READY_LATCH_RECORD") {
+        Ok(signal) => (signal, "ready-record-retired"),
+        Err(_) => match std::env::var("RELAY_TEST_CONTROL_READY_LATCH") {
+            Ok(signal) => (signal, "socket-retired"),
+            Err(_) => return Ok(()),
+        },
     };
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
@@ -1078,13 +1086,20 @@ fn control_ready_test_latch() -> Result<(), String> {
     // Never degrade into a silent pass: a test that asked for this ordering and did not
     // get it has not exercised the window, so say so instead of proceeding.
     Err(format!(
-        "lifecycle supervisor socket-retired latch never fired: {signal}"
+        "lifecycle supervisor {what} latch never fired: {signal}"
     ))
 }
 
 /// Announce that the socket has been unlinked, for `control_ready_test_latch`.
 fn signal_socket_retired_for_tests() {
     if let Ok(signal) = std::env::var("RELAY_TEST_CONTROL_READY_LATCH") {
+        fs::write(signal, b"retired").ok();
+    }
+}
+
+/// Announce that the watchdog has retired the ready record, for `control_ready_test_latch`.
+fn signal_record_retired_for_tests() {
+    if let Ok(signal) = std::env::var("RELAY_TEST_CONTROL_READY_LATCH_RECORD") {
         fs::write(signal, b"retired").ok();
     }
 }
@@ -1298,7 +1313,11 @@ pub fn run_watchdog(argv: &[String]) -> Result<(), String> {
         thread::sleep(HEARTBEAT_INTERVAL);
     };
     if status.success() {
-        store.finish_supervisor_service(&args.supervisor_instance_id, &watchdog_instance_id)
+        store.finish_supervisor_service(&args.supervisor_instance_id, &watchdog_instance_id)?;
+        // The record is gone as of this point. Tests latch on that edge, which is the one
+        // the client used to race.
+        signal_record_retired_for_tests();
+        Ok(())
     } else {
         store.mark_supervisor_lost(
             &args.supervisor_instance_id,
@@ -1688,21 +1707,21 @@ fn wait_control_ready(
     let response = read_frame_until(stream, deadline)?;
     validate_identity_frame(&response, "control_bound", prepared)?;
     control_ready_test_latch()?;
-    // No socket path stat here. `validate_identity_frame` above already bound the kind,
-    // supervisor instance id, operation id, operation version and control epoch over the
-    // connection this client holds - strictly more identity than the path could supply,
-    // since dev/ino were read after connecting and never compared against the connected
-    // descriptor. The path is also allowed to be gone by now: the supervisor unlinks it
-    // once it has served the connection. The record read stays for the ready state.
-    let record = LifecycleStore::new(prepared.root.clone())
-        .read_supervisor_for_session_from_operation(&prepared.operation_id)?
-        .ok_or_else(|| "lifecycle supervisor ready record is missing".to_string())?;
-    if record.supervisor_instance_id != prepared.supervisor_instance_id
-        || record.state != SupervisorState::Ready
-        || record.control_epoch != prepared.control_epoch
-    {
-        return Err("lifecycle supervisor socket identity changed".to_string());
-    }
+    // Nothing is read back from the filesystem or the registry here, deliberately.
+    //
+    // `validate_identity_frame` above ran over the connection this client holds and bound
+    // the kind, supervisor instance id, operation id, operation version and control epoch.
+    // The ready record could only have added three comparisons, and all three are already
+    // settled by that frame: the instance id and the control epoch are fields the frame
+    // carries, and the ready state is implied by ordering, because `run_supervisor` writes
+    // the ready record before it sends `control_bound` on this same path. A frame that
+    // validates therefore proves the record was written.
+    //
+    // Reading it back could only add a dependency on it still existing, and it does not:
+    // the supervisor unlinks its socket and exits, then the watchdog observes that exit on
+    // a 250 ms poll and calls `finish_supervisor_service`, which removes the entry. Both
+    // ends of the protocol are done by then. Depending on either the socket path or the
+    // record made a correct handshake fail whenever the client was scheduled late.
     stream
         .set_read_timeout(Some(Duration::from_millis(100)))
         .ok();

@@ -132,6 +132,7 @@
     "lifecycle_supervisor": {
       "tests": [
         "lifecycle_supervisor_disconnect_linearizes_unmanaged_cancel_and_reap",
+        "lifecycle_supervisor_handshake_survives_a_retired_ready_record",
         "lifecycle_supervisor_handshake_survives_a_retired_socket_path",
         "lifecycle_supervisor_pipe_preserves_bytes_eof_streams_and_reap_custody",
         "lifecycle_supervisor_preserves_codex_fast_and_default_tiers_in_exact_argv",
