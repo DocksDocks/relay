@@ -6,6 +6,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { dispatchSessionRelayRelease } from '../../../scripts/lib/session-relay-release-cli.mjs';
 import {
+  LOCK_REF as CURRENT_LOCK_REF,
+  TRANSACTION_REF as CURRENT_TRANSACTION_REF,
   canonicalize,
   loadReleaseInstance,
   PRERELEASE_BODY,
@@ -95,6 +97,8 @@ const RETAINED_V2_PUBLIC_PLAN_PATH =
   `docs/plans/active/session-relay-${RETAINED_V2_RELEASE_VERSION}-` +
   `docks-kit-${RETAINED_V2_INSTANCE.public_child.version}-release.md`;
 const PLANRUN_RELEASE_TAG_COMMIT = releaseTagCommit(CURRENT_RELEASE_INSTANCE);
+const NOT_PLANRUN_RELEASE_TAG_COMMIT =
+  PLANRUN_RELEASE_TAG_COMMIT === null ? null : differentHex(PLANRUN_RELEASE_TAG_COMMIT);
 // The validated instance value is the only branch selector: null exercises exact
 // unborn-tag refusals; a real commit exercises the preserved happy-path contracts.
 const CURRENT_PUBLIC_VERSION = CURRENT_RELEASE_INSTANCE.public_child.version;
@@ -144,7 +148,11 @@ const HISTORICAL_RELEASE_PLAN_PATH = resolveHistoricalPublicationPlanPath(REPO);
 const HISTORICAL_PUBLICATION_SHA256 = '31d096d31702b66d7e97085a82d8b7da1b75155f828b1d2382a0ac8427ba7ea2';
 const HISTORICAL_PUBLIC_REQUEST_SHA256 = '7cf02781a2ed3c75423321492fb2cd4c4944f6da6d6d41290e26a5f3ca0cf902';
 const RETAINED_PROMOTION_SHA256 = '7ffaa7967d9ca8cc7c53c3ca22efe932d3028ad3caf210cec8157aec7bbd1670';
-const RETAINED_PROMOTION_SOURCE_PROOF_SHA256 = 'c853e528411b881b2c551fb3b549146679eb76b10e8d8dde55627121a16c98cd';
+const RETAINED_PROMOTION_SOURCE_PROOF_SHA256 = hash({
+  kind: 'retained-source-proof',
+  release_tag_commit: PLANRUN_RELEASE_TAG_COMMIT,
+  version: CURRENT_RELEASE_VERSION,
+});
 const NOT_CURRENT_DOCKS_RUN_ID = differentHex(CURRENT_DOCKS_RUN_ID);
 const NOT_PLANRUN_DOCKS_RUN_ID = differentHex(PLANRUN_DOCKS_RUN_ID);
 const NOT_CURRENT_PUBLIC_RUN_ID = differentHex(CURRENT_PUBLIC_RUN_ID);
@@ -152,11 +160,13 @@ const NOT_CURRENT_PUBLIC_RUN_ID = differentHex(CURRENT_PUBLIC_RUN_ID);
 // across a re-attempt - not a previous release. The validators compare its version,
 // tag, goal and run against the current module identity, so its child half must be
 // the current child too.
-// The prior-attempt promotion's own digests. Single-sourced here so the injected
-// expectation below cannot drift from the fixture it is supposed to describe.
-const RETAINED_PROMOTION_COMPLETION_REVIEW_SHA256 = '491925513a94c7d2c1b86cfe0fcf71ad5b7f5d994724612295a2c2cfe465c7cc';
-const RETAINED_PROMOTION_PUBLICATION_SHA256 = '784ff59a2705884aae1de7fab9f21551a6872a54cfd047df3ba57b0f41e81588';
-const RETAINED_PROMOTION_PUBLIC_RELEASE_SHA256 = '05b08d34e62b58dcbbda214bbcef4cb0658ef6781ca3e696abdfa1b3f43f5091';
+// The synthetic prior-attempt digests bind the current release identity instead of
+// borrowing historical receipt identities from a different release.
+const retainedFixtureDigest = (kind) =>
+  hash({ kind, release_tag_commit: PLANRUN_RELEASE_TAG_COMMIT, version: CURRENT_RELEASE_VERSION });
+const RETAINED_PROMOTION_COMPLETION_REVIEW_SHA256 = retainedFixtureDigest('completion-review');
+const RETAINED_PROMOTION_PUBLICATION_SHA256 = retainedFixtureDigest('publication');
+const RETAINED_PROMOTION_PUBLIC_RELEASE_SHA256 = retainedFixtureDigest('public-release');
 // 0.15.0 is a first attempt, so it declares no retained promotion and the module
 // default refuses one. The rebind suite therefore injects a retained promotion
 // through the validators' defaulted `expected` seam. It describes a PRIOR ATTEMPT AT
@@ -165,46 +175,14 @@ const RETAINED_PROMOTION_PUBLIC_RELEASE_SHA256 = '05b08d34e62b58dcbbda214bbcef4c
 // receipt can never satisfy a 0.15.0 module. Defined below the fixture because it
 // digests it.
 
-const RETAINED_PROMOTION_ASSETS = Object.freeze([
-  {
-    database_id: 489889124,
-    digest: '92b4f823278853ed4b33dd2adc416ebef6ab1431e8cfe40623641dd5912bddd8',
-    name: 'SHA256SUMS',
-    size: 414,
-  },
-  {
-    database_id: 489889120,
-    digest: '9256e96d0757f1ffbb2c7ee8aafa1b8bf5de7ee782ab85c30377a5d836ccee87',
-    name: 'session-relay-aarch64-apple-darwin',
-    size: 1_754_816,
-  },
-  {
-    database_id: 489889123,
-    digest: '726aa5e4f112310a360ab0291600947404d885055844b2041d4f76b5fbeedd30',
-    name: 'session-relay-aarch64-unknown-linux-musl',
-    size: 2_295_608,
-  },
-  {
-    database_id: 489889122,
-    digest: '5cc8c7d77c5d93f2873841497171efd6ed3c981466625b0370817e094194e4f0',
-    name: 'session-relay-x86_64-apple-darwin',
-    size: 2_235_768,
-  },
-  {
-    database_id: 489889121,
-    digest: '140ea11b700b307c07219616ca6e9b3c4fe552916871af54c3bb15712efd4ee3',
-    name: 'session-relay-x86_64-unknown-linux-musl',
-    size: 3_000_640,
-  },
-]);
-
 function retainedPromotionV3() {
+  const publication = currentBoundaryPublicationValue();
   const releaseIdentity = {
-    assets: structuredClone(RETAINED_PROMOTION_ASSETS),
-    release_database_id: 359891507,
+    assets: structuredClone(publication.assets),
+    release_database_id: publication.release_database_id,
     tag_commit: PLANRUN_RELEASE_TAG_COMMIT,
-    workflow_run_attempt: 1,
-    workflow_run_id: 30181238396,
+    workflow_run_attempt: publication.workflow.attempt,
+    workflow_run_id: publication.workflow.run_id,
   };
   return {
     schema: 3,
@@ -888,6 +866,7 @@ function expectInterrupted(fn) {
 
 function currentReleaseChainV2() {
   const relayImplementationCommit = 'a'.repeat(40);
+  const relayTagCommit = PLANRUN_RELEASE_TAG_COMMIT ?? relayImplementationCommit;
   const publicExecutionParent = 'b'.repeat(40);
   const publicRedCommit = 'c'.repeat(40);
   const publicImplementationCommit = 'd'.repeat(40);
@@ -913,7 +892,7 @@ function currentReleaseChainV2() {
     repository_id: 'DocksDocks/docks',
     version: CURRENT_RELEASE_VERSION,
     tag: CURRENT_RELEASE_TAG,
-    tag_commit: relayImplementationCommit,
+    tag_commit: relayTagCommit,
     release_state: 'prerelease',
     release_database_id: 2_100,
     workflow: { run_id: 2_101, attempt: 1 },
@@ -2354,8 +2333,8 @@ function currentPromotionProofV3() {
   proof.acceptance.changed_paths = [...PLANRUN_DOCKS_AFFECTED_PATHS];
   delete proof.tdd_red;
   proof.ancestry = {
-    tag_to_source: true,
-    source_to_implementation: true,
+    source_to_tag: true,
+    tag_to_implementation: true,
     implementation_to_reviewed: true,
   };
   return proof;
@@ -2437,10 +2416,7 @@ function makeCurrentPromotionAdapter({
     loadPublicRelease: () => publicReleaseEnvelope,
     remoteRef: (ref) => {
       if (ref === 'refs/heads/main') return state.main;
-      if (
-        refConflict !== null &&
-        ['refs/heads/transactions/session-relay-0.14.0', 'refs/heads/locks/session-relay-0.14.0'].includes(ref)
-      ) {
+      if (refConflict !== null && [CURRENT_TRANSACTION_REF, CURRENT_LOCK_REF].includes(ref)) {
         return refConflict;
       }
       return null;
@@ -3158,8 +3134,8 @@ if (PLANRUN_RELEASE_TAG_COMMIT !== null) {
     assert.equal(result.receipt.docks_plan.plan_path, PLANRUN_DOCKS_PLAN_PATH);
     assert.equal(current.adapter.loadProof().value.tag_commit, PLANRUN_RELEASE_TAG_COMMIT);
     assert.deepEqual(current.adapter.loadProof().value.ancestry, {
-      tag_to_source: true,
-      source_to_implementation: true,
+      source_to_tag: true,
+      tag_to_implementation: true,
       implementation_to_reviewed: true,
     });
     assert.equal(result.receipt.public_child.planrun_verified, true);
@@ -3176,8 +3152,8 @@ if (PLANRUN_RELEASE_TAG_COMMIT !== null) {
       'current PlanRun promotion receipt output must be canonical',
     );
     assert.deepEqual(current.state.ancestryCalls, [
-      [PLANRUN_RELEASE_TAG_COMMIT, PLANRUN_DOCKS_SOURCE_BASE],
-      [PLANRUN_DOCKS_SOURCE_BASE, current.adapter.loadProof().value.implementation_commit],
+      [PLANRUN_DOCKS_SOURCE_BASE, PLANRUN_RELEASE_TAG_COMMIT],
+      [PLANRUN_RELEASE_TAG_COMMIT, current.adapter.loadProof().value.implementation_commit],
     ]);
     const wrongTag = currentPromotionProofV3();
     wrongTag.tag_commit = wrongTag.implementation_commit;
@@ -3188,14 +3164,14 @@ if (PLANRUN_RELEASE_TAG_COMMIT !== null) {
     );
     const backwardsAncestry = currentPromotionProofV3();
     backwardsAncestry.ancestry = {
+      tag_to_source: true,
       source_to_implementation: true,
       implementation_to_reviewed: true,
-      reviewed_to_tag: true,
     };
     assert.throws(
       () => validateSourcePreparationProof(backwardsAncestry),
-      /ancestry|tag_to_source/i,
-      'PlanRun source proof must bind immutable-tag-to-source ancestry',
+      /ancestry|source_to_tag/i,
+      'PlanRun source proof must bind source-to-tag-to-implementation ancestry',
     );
   }
 
@@ -3281,7 +3257,7 @@ if (PLANRUN_RELEASE_TAG_COMMIT !== null) {
   }
 
   {
-    const current = makeCurrentPromotionAdapter({ refConflict: '9'.repeat(40) });
+    const current = makeCurrentPromotionAdapter({ refConflict: NOT_PLANRUN_RELEASE_TAG_COMMIT });
     assert.throws(
       () => promoteReviewed(current.options, false, current.adapter),
       /authority ref|retries.*not permitted/i,

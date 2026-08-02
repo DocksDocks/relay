@@ -110,33 +110,14 @@ const CURRENT_AFFECTED_PATHS = [
   'scripts/lib/session-relay-release-promotion.mjs',
   'scripts/lib/session-relay-release-publication.mjs',
 ];
-// Derived, never pinned: these four are the LIVE 0.15.0 identity, so a literal would
-// silently disagree the moment the instance moves - a rebase changing the source
-// base, or a replacement run changing the run id. The frozen 0.14 constants above
-// may stay literal because that instance is closed history; these may not.
+// Derived, never pinned: these values are the LIVE release identity, so literals
+// would silently disagree after a rebase, replacement run, or affected-path change.
+// Frozen predecessor constants may stay literal because those instances are closed.
 const PLANRUN_GOAL_ID = CURRENT_RELEASE_INSTANCE.current_attempt.goal_id;
 const PLANRUN_DOCKS_RUN_ID = CURRENT_RELEASE_INSTANCE.planrun_attempt.docks_run_id;
 const PLANRUN_DOCKS_PLAN_PATH = CURRENT_RELEASE_INSTANCE.planrun_attempt.docks_plan_path;
 const PLANRUN_DOCKS_SOURCE_BASE = CURRENT_RELEASE_INSTANCE.planrun_attempt.docks_source_base;
-const PLANRUN_AFFECTED_PATHS = [
-  'plugins/session-relay/.claude-plugin/plugin.json',
-  'plugins/session-relay/.codex-plugin/plugin.json',
-  'plugins/session-relay/rust/Cargo.lock',
-  'plugins/session-relay/rust/Cargo.toml',
-  'plugins/session-relay/test/companion-distribution-contract.mjs',
-  'plugins/session-relay/test/distribution-contract.mjs',
-  'plugins/session-relay/test/fixtures/release-identity-inventory.json',
-  'plugins/session-relay/test/release-evidence-contract.mjs',
-  'plugins/session-relay/test/release-instance-contract.mjs',
-  'plugins/session-relay/test/release-promotion-contract.mjs',
-  'plugins/session-relay/test/release-publication-contract.mjs',
-  'plugins/session-relay/test/remediation-contract.mjs',
-  'scripts/lib/session-relay-release-core.mjs',
-  CURRENT_RELEASE_INSTANCE_PATH,
-  'scripts/lib/session-relay-release-promotion.mjs',
-  'scripts/lib/session-relay-release-publication.mjs',
-  '.claude-plugin/marketplace.json',
-];
+const PLANRUN_AFFECTED_PATHS = [...CURRENT_RELEASE_INSTANCE.planrun_attempt.docks_affected_paths];
 const CURRENT_PUBLIC_PLAN_PATH = 'docs/plans/active/session-relay-0.14.0-docks-kit-0.12.0-release.md';
 const RETAINED_RELEASE_VERSION = CURRENT_PUBLIC_PLAN_PATH.match(/session-relay-(\d+\.\d+\.\d+)/u)[1];
 const RETAINED_RELEASE_TAG = `session-relay--v${RETAINED_RELEASE_VERSION}`;
@@ -3539,13 +3520,20 @@ function bindPlanRunCompletionFixture(
     }
     return bytes ? result.stdout : result.stdout.trim();
   };
+  const releaseCommit = releaseTagCommit(CURRENT_RELEASE_INSTANCE);
   for (const args of [
     ['config', 'user.name', 'Session Relay PlanRun Evidence Contract'],
     ['config', 'user.email', 'relay-planrun-evidence@example.invalid'],
     ['config', 'commit.gpgsign', 'false'],
-    ['checkout', '--quiet', '--detach', PLANRUN_DOCKS_SOURCE_BASE],
+    ['checkout', '--quiet', '--detach', releaseCommit ?? PLANRUN_DOCKS_SOURCE_BASE],
   ]) {
     runGit(args);
+  }
+  if (releaseCommit !== null) {
+    // The real tag contains unrelated commits after this PlanRun's source base.
+    // Keep its ancestry while rebuilding the synthetic implementation tree from
+    // the accepted source, so the fixture's reviewed diff remains scope-pure.
+    runGit(['read-tree', '--reset', '-u', PLANRUN_DOCKS_SOURCE_BASE]);
   }
   const commitFixture = (message, timestamp) => {
     runGit(['commit', '--quiet', '-m', message], {
@@ -3845,8 +3833,8 @@ function unbornPlanRunSourcePreparationProofV3() {
       changed_paths: [...PLANRUN_AFFECTED_PATHS],
     },
     ancestry: {
-      tag_to_source: true,
-      source_to_implementation: true,
+      source_to_tag: true,
+      tag_to_implementation: true,
       implementation_to_reviewed: true,
     },
     companion: {

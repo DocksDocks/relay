@@ -1119,8 +1119,8 @@ function currentSourcePreparationProofV3(directory) {
   value.acceptance.changed_paths = [...SUCCESSOR_AFFECTED_PATHS];
   delete value.tdd_red;
   value.ancestry = {
-    tag_to_source: true,
-    source_to_implementation: true,
+    source_to_tag: true,
+    tag_to_implementation: true,
     implementation_to_reviewed: true,
   };
   return writeCanonical(directory, 'successor-source-proof.json', value);
