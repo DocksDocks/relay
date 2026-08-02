@@ -8,7 +8,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parse as parseYaml } from 'yaml';
-import { resolveHistoricalPublicationPlanPath } from './historical-plan-path.mjs';
+import { resolveHistoricalPublicationPlanPath, resolveReleasePlanPath } from './historical-plan-path.mjs';
 import { resolveShippedRelayVersion } from './version.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -31,7 +31,7 @@ const { version: CURRENT_RELEASE_VERSION, tag: CURRENT_RELEASE_TAG } = resolveSh
 // are the last independent oracle for that, so an unintended edit to the 0.15.0
 // instance fails here. Update them by hand, as a deliberate act, when the release
 // identity legitimately changes.
-const CURRENT_DOCKS_PLAN_TEMPLATE = 'docs/plans/active/session-relay-0.15.0-release.md';
+const CURRENT_DOCKS_PLAN_TEMPLATE = resolveReleasePlanPath(REPO, CURRENT_RELEASE_VERSION);
 const CURRENT_DOCKS_RUN_ID = '887eaf82-ffac-4d78-9368-b62cb64dda19';
 const CURRENT_PUBLIC_PLAN = 'docs/plans/active/session-relay-0.15.0-docks-kit-0.13.0-release.md';
 const HISTORICAL_RELEASE_PLAN = resolveHistoricalPublicationPlanPath(REPO);

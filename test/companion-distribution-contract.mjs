@@ -7,6 +7,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { resolveReleasePlanPath } from './historical-plan-path.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO = path.resolve(HERE, '../../..');
@@ -28,8 +29,10 @@ const CURRENT_PUBLIC_PLAN = 'docs/plans/active/session-relay-0.15.0-docks-kit-0.
 const CURRENT_PUBLIC_RUN_ID = 'ad7f3b75-dfff-4bcd-8d1f-c8c11555b119';
 const CURRENT_PUBLIC_EXECUTION_PARENT = '3e4eddec347e51189f1a13b3a48c0ca737520d94';
 const CURRENT_PUBLIC_IMPLEMENTATION_COMMIT = '7ea0611958b85cd98123a8131189ddf950ce6fb9';
+// The Docks release plan for this generation. It starts under `docs/plans/active/` and moves to a
+// dated path under `docs/plans/finished/` when the release finishes; `currentDocksPlanFile()`
+// accepts exactly one of the two.
 const CURRENT_DOCKS_PLAN = 'docs/plans/active/session-relay-0.15.0-release.md';
-const CURRENT_DOCKS_PLAN_TEMPLATE = 'docs/plans/active/session-relay-0.15.0-release.md';
 const CURRENT_DOCKS_RUN_ID = '887eaf82-ffac-4d78-9368-b62cb64dda19';
 const CURRENT_GOAL_ID = '258b44c2-c3b2-4902-862c-7461724ca078';
 const HISTORICAL_PUBLIC_PLAN_SHA256 = 'e0b1d183122def14a3f4bd6f05605c6aa7de3fb2dccf4330e8956acc3e0db9ff';
@@ -179,7 +182,7 @@ function verifyCurrentPublicMain(directory, cli) {
   const currentPlan = fs.readFileSync(currentPlanPath, 'utf8');
   const currentRun = planRun(currentPlan, 'current public child');
   const docksRun = planRun(
-    fs.readFileSync(path.join(REPO, CURRENT_DOCKS_PLAN_TEMPLATE), 'utf8'),
+    fs.readFileSync(path.join(REPO, resolveReleasePlanPath(REPO, CURRENT_PUBLIC_RELAY_VERSION)), 'utf8'),
     'current Docks child',
   );
 
