@@ -1733,6 +1733,9 @@ function verifyPublicBoundary(
 }
 
 const CURRENT_PUBLIC_EXECUTION_PARENT = 'b'.repeat(40);
+// A PlanRun run's implementation commit is deliberately later than the tag it publishes, so this
+// fixture value must differ from the publication's tag commit.
+const CURRENT_DOCKS_IMPLEMENTATION_FIXTURE_COMMIT = '9'.repeat(40);
 const CURRENT_PUBLIC_RED_COMMIT = 'c'.repeat(40);
 const CURRENT_PUBLIC_IMPLEMENTATION_COMMIT = 'd'.repeat(40);
 const CURRENT_PUBLIC_RELEASE_COMMIT = 'e'.repeat(40);
@@ -2086,6 +2089,57 @@ function verifyCurrentPublicBoundary(directory, boundary, observation, output) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'session-relay-current-public-boundary-'));
   try {
     const boundary = currentPublicBoundaryFixture(directory);
+
+    // A PlanRun publication records an implementation commit LATER than the tag it publishes, so
+    // `reviewed_commit === implementation_commit === tag_commit` can never hold for it. The
+    // standalone validators carry no source proof and must classify the receipt from its own shape;
+    // when that classification was missing, every PlanRun publication fell down the legacy branch
+    // and `emit-public-request` refused a receipt its own `publish-reviewed` had just emitted.
+    // Both directions are asserted so neither the classification nor the binding can be dropped.
+    {
+      const planRunValue = currentBoundaryPublicationValue();
+      planRunValue.source = {
+        ...planRunValue.source,
+        implementation_commit: CURRENT_DOCKS_IMPLEMENTATION_FIXTURE_COMMIT,
+      };
+      const planRunPublication = writeBoundaryValue(directory, 'planrun-publication.json', planRunValue);
+      const emitted = captureDigest(() =>
+        releasePromotion.emitPublicRequest(
+          new Map([
+            ['publication', planRunPublication.file],
+            ['publication-sha256', planRunPublication.digest],
+            ['public-execution-parent', CURRENT_PUBLIC_EXECUTION_PARENT],
+            ['receipt-out', path.join(directory, 'planrun-public-request.json')],
+          ]),
+        ),
+      );
+      assert.equal(
+        emitted.receipt.session_relay.publication_receipt_sha256,
+        planRunPublication.digest,
+        'emit-public-request must accept a PlanRun publication whose implementation commit follows the tag',
+      );
+
+      const skewedValue = currentBoundaryPublicationValue();
+      skewedValue.source = {
+        ...skewedValue.source,
+        reviewed_commit: differentHex(skewedValue.tag_commit),
+        implementation_commit: CURRENT_DOCKS_IMPLEMENTATION_FIXTURE_COMMIT,
+      };
+      const skewed = writeBoundaryValue(directory, 'skewed-publication.json', skewedValue);
+      assert.throws(
+        () =>
+          releasePromotion.emitPublicRequest(
+            new Map([
+              ['publication', skewed.file],
+              ['publication-sha256', skewed.digest],
+              ['public-execution-parent', CURRENT_PUBLIC_EXECUTION_PARENT],
+              ['receipt-out', path.join(directory, 'skewed-public-request.json')],
+            ]),
+          ),
+        /reviewed source commit ancestry or tag identity conflict/,
+        'a PlanRun publication whose reviewed commit is not the tag commit must still be refused',
+      );
+    }
     const success = makeCurrentPublicReleaseAdapter(boundary.request);
     const verified = verifyCurrentPublicBoundary(directory, boundary, success, 'current-public-release.json');
     assert.equal(verified.receipt.schema, 2, 'current verifier must emit schema 2');
