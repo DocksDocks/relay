@@ -58,6 +58,7 @@ const CURRENT_PUBLIC_TAG = INSTANCE.public_child.tag;
 const HISTORICAL_PUBLICATION_SHA256 = '31d096d31702b66d7e97085a82d8b7da1b75155f828b1d2382a0ac8427ba7ea2';
 const HISTORICAL_RELEASE_PLAN_PATH = resolveHistoricalPublicationPlanPath(REPO);
 const CURRENT_GOAL_ID = INSTANCE.current_attempt.goal_id;
+const PLANRUN_DOCKS_REPOSITORY_ID = INSTANCE.planrun_attempt.docks_repository_id;
 const CURRENT_DOCKS_RUN_ID = INSTANCE.current_attempt.docks_run_id;
 const CURRENT_DOCKS_PLAN_PATH = INSTANCE.current_attempt.docks_plan_path;
 const CURRENT_DOCKS_SOURCE_BASE = INSTANCE.current_attempt.docks_source_base;
@@ -1008,7 +1009,7 @@ function currentSourcePreparationProofV2(directory) {
     tag_commit: implementationCommit,
     plan_run: {
       schema: 1,
-      repository_id: REPOSITORY_ID,
+      repository_id: PLANRUN_DOCKS_REPOSITORY_ID,
       goal_id: CURRENT_GOAL_ID,
       run_id: CURRENT_DOCKS_RUN_ID,
       plan_path: CURRENT_DOCKS_PLAN_PATH,

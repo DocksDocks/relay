@@ -107,6 +107,7 @@ const CURRENT_GOAL_ID = CURRENT_RELEASE_INSTANCE.current_attempt.goal_id;
 const CURRENT_DOCKS_RUN_ID = CURRENT_RELEASE_INSTANCE.current_attempt.docks_run_id;
 const CURRENT_DOCKS_PLAN_PATH = CURRENT_RELEASE_INSTANCE.current_attempt.docks_plan_path;
 const CURRENT_DOCKS_SOURCE_BASE = CURRENT_RELEASE_INSTANCE.current_attempt.docks_source_base;
+const PLANRUN_DOCKS_REPOSITORY_ID = CURRENT_RELEASE_INSTANCE.planrun_attempt.docks_repository_id;
 const PLANRUN_DOCKS_RUN_ID = CURRENT_RELEASE_INSTANCE.planrun_attempt.docks_run_id;
 const PLANRUN_DOCKS_PLAN_PATH = CURRENT_RELEASE_INSTANCE.planrun_attempt.docks_plan_path;
 const PLANRUN_DOCKS_SOURCE_BASE = CURRENT_RELEASE_INSTANCE.planrun_attempt.docks_source_base;
@@ -131,10 +132,14 @@ const PLANRUN_DOCKS_AFFECTED_PATHS = Object.freeze([
   'plugins/session-relay/test/release-promotion-contract.mjs',
   'plugins/session-relay/test/release-publication-contract.mjs',
   'plugins/session-relay/test/remediation-contract.mjs',
+  'scripts/lib/plugins.mjs',
   'scripts/lib/session-relay-release-core.mjs',
   'scripts/lib/session-relay-release-instances/0.15.0.json',
+  'scripts/lib/session-relay-release-instances/schema.mjs',
+  'scripts/lib/session-relay-release-preparation.mjs',
   'scripts/lib/session-relay-release-promotion.mjs',
   'scripts/lib/session-relay-release-publication.mjs',
+  'scripts/verify-session-relay-preflight.mjs',
 ]);
 const CURRENT_PUBLIC_RUN_ID = CURRENT_RELEASE_INSTANCE.current_attempt.public_run_id;
 // The child's ACTIVE plan, which preparation.mjs:84 derives the same way. Its
@@ -1876,7 +1881,7 @@ function currentPlanRunPublicFixture() {
     plan_path: activePlanPath,
     plan_sha256: DIGEST('0'),
     repository_id: 'DocksDocks/public',
-    requested_effects: ['local', 'probe', 'push', 'release'],
+    requested_effects: ['local', 'probe', 'publish', 'push', 'release'],
     risk: 'external',
     run_id: CURRENT_PUBLIC_RUN_ID,
     schema: 1,
@@ -2297,6 +2302,7 @@ function currentPromotionProofV3() {
   proof.tag_commit = PLANRUN_RELEASE_TAG_COMMIT;
   proof.plan_run = {
     ...proof.plan_run,
+    repository_id: PLANRUN_DOCKS_REPOSITORY_ID,
     goal_id: CURRENT_GOAL_ID,
     run_id: PLANRUN_DOCKS_RUN_ID,
     plan_path: PLANRUN_DOCKS_PLAN_PATH,

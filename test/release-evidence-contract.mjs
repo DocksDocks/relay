@@ -114,12 +114,21 @@ const CURRENT_AFFECTED_PATHS = [
 // would silently disagree after a rebase, replacement run, or affected-path change.
 // Frozen predecessor constants may stay literal because those instances are closed.
 const PLANRUN_GOAL_ID = CURRENT_RELEASE_INSTANCE.current_attempt.goal_id;
+// The plan lineage's own recorded repository identity, derived like the run id and
+// source base beside it. NOT the GitHub repo identity: proof and receipt fields keep
+// REPOSITORY_ID. The 0.15.0 lineage records a local-form id and cannot be migrated,
+// because attempt history is immutable and plan-run.mjs:1740 preserves repository_id
+// across replacement.
+const PLANRUN_DOCKS_REPOSITORY_ID = CURRENT_RELEASE_INSTANCE.planrun_attempt.docks_repository_id;
 const PLANRUN_DOCKS_RUN_ID = CURRENT_RELEASE_INSTANCE.planrun_attempt.docks_run_id;
 const PLANRUN_DOCKS_PLAN_PATH = CURRENT_RELEASE_INSTANCE.planrun_attempt.docks_plan_path;
 const PLANRUN_DOCKS_SOURCE_BASE = CURRENT_RELEASE_INSTANCE.planrun_attempt.docks_source_base;
 const PLANRUN_AFFECTED_PATHS = [...CURRENT_RELEASE_INSTANCE.planrun_attempt.docks_affected_paths];
 const CURRENT_PUBLIC_PLAN_PATH = 'docs/plans/active/session-relay-0.14.0-docks-kit-0.12.0-release.md';
 const RETAINED_RELEASE_VERSION = CURRENT_PUBLIC_PLAN_PATH.match(/session-relay-(\d+\.\d+\.\d+)/u)[1];
+const RETAINED_DOCKS_REPOSITORY_ID = loadReleaseInstance(RETAINED_RELEASE_VERSION, {
+  require: ['current_attempt'],
+}).current_attempt.docks_repository_id;
 const RETAINED_RELEASE_TAG = `session-relay--v${RETAINED_RELEASE_VERSION}`;
 const HISTORICAL_RELEASE_PLAN_PATH = resolveHistoricalPublicationPlanPath(REPO);
 const HISTORICAL_RECEIPT_SHA256 = Object.freeze({
@@ -2885,7 +2894,7 @@ function currentSourcePreparationProofV2() {
     tag_commit: implementationCommit,
     plan_run: {
       schema: 1,
-      repository_id: REPOSITORY_ID,
+      repository_id: RETAINED_DOCKS_REPOSITORY_ID,
       goal_id: CURRENT_GOAL_ID,
       run_id: CURRENT_DOCKS_RUN_ID,
       plan_path: CURRENT_DOCKS_PLAN_PATH,
@@ -3288,7 +3297,7 @@ function testCurrentCompletionBinding(temp) {
   assert.deepEqual(generated.result.receipt.tdd_red, generated.red);
   assert.deepEqual(generated.result.receipt.plan_run, {
     schema: 1,
-    repository_id: REPOSITORY_ID,
+    repository_id: RETAINED_DOCKS_REPOSITORY_ID,
     goal_id: CURRENT_GOAL_ID,
     run_id: CURRENT_DOCKS_RUN_ID,
     plan_path: CURRENT_DOCKS_PLAN_PATH,
@@ -3629,10 +3638,12 @@ function bindPlanRunCompletionFixture(
   const rawTemplate = fs.readFileSync(planPath, 'utf8');
   const templateStatus = /^status: (\S+)$/m.exec(rawTemplate)?.[1];
   assert.ok(templateStatus, 'fresh successor PlanRun fixture has no status');
-  // `ongoing` belongs in this alternation: without it the substitution is a silent
-  // no-op whenever the live plan has already started, and the fixture only gets the
-  // bytes it wants by coincidence.
-  const template = rawTemplate.replace(/^status: (?:planned|ongoing|blocked|finished)$/m, 'status: ongoing');
+  // Match any status rather than enumerating them. This alternation has now
+  // silently no-opped twice - first missing `ongoing`, then `drafting` - each time
+  // leaving the fixture with bytes it only appeared to have rewritten. The status
+  // is already captured and asserted non-empty above, so `\S+` cannot no-op and a
+  // future lifecycle state cannot reintroduce the bug.
+  const template = rawTemplate.replace(/^status: \S+$/m, 'status: ongoing');
   const runMatch = /^Plan-run: (\{.*\})$/m.exec(template);
   assert.ok(runMatch, 'fresh successor PlanRun fixture is absent');
   const templateRun = JSON.parse(runMatch[1]);
@@ -3677,8 +3688,35 @@ function bindPlanRunCompletionFixture(
       }),
     ),
   );
+  const draftReview = {
+    state: 'passed',
+    invocations: 1,
+    input_sha256: sha256(
+      Buffer.from(
+        jcs({
+          schema: 1,
+          type: 'PlanRunReleaseEvidenceDraftReviewInputFixtureV1',
+          run_id: PLANRUN_DOCKS_RUN_ID,
+          plan_sha256: templateRun.plan_sha256,
+          source_sha256: templateRun.source_sha256,
+        }),
+      ),
+    ),
+    result_sha256: sha256(
+      Buffer.from(
+        jcs({
+          schema: 1,
+          type: 'PlanRunReleaseEvidenceDraftReviewResultFixtureV1',
+          run_id: PLANRUN_DOCKS_RUN_ID,
+          invocation: 1,
+          verdict: 'pass',
+        }),
+      ),
+    ),
+  };
   const run = {
     ...templateRun,
+    draft_review: draftReview,
     execution_parent: PLANRUN_DOCKS_SOURCE_BASE,
     implementation_commit: implementationCommit,
     completion_review: {
@@ -3692,12 +3730,17 @@ function bindPlanRunCompletionFixture(
       verification_sha256: verificationSha256,
     },
     blocker: null,
-    repository_id: REPOSITORY_ID,
+    repository_id: PLANRUN_DOCKS_REPOSITORY_ID,
     goal_id: PLANRUN_GOAL_ID,
     run_id: PLANRUN_DOCKS_RUN_ID,
     plan_path: PLANRUN_DOCKS_PLAN_PATH,
     source_base: PLANRUN_DOCKS_SOURCE_BASE,
   };
+  assert.deepEqual(
+    run.draft_review,
+    draftReview,
+    'successor completion fixture must normalize its ongoing prerequisite to a passed draft review',
+  );
   plan = plan.replace(/^Plan-run: \{.*\}$/m, `Plan-run: ${jcs(run)}`);
   assert.equal(
     sha256(canonicalCurrentPlanView(Buffer.from(plan))),
@@ -3811,7 +3854,7 @@ function unbornPlanRunSourcePreparationProofV3() {
     tag_commit: PLANRUN_DOCKS_SOURCE_BASE,
     plan_run: {
       schema: 1,
-      repository_id: REPOSITORY_ID,
+      repository_id: PLANRUN_DOCKS_REPOSITORY_ID,
       goal_id: CURRENT_RELEASE_INSTANCE.current_attempt.goal_id,
       run_id: CURRENT_RELEASE_INSTANCE.planrun_attempt.docks_run_id,
       plan_path: PLANRUN_DOCKS_PLAN_PATH,

@@ -316,6 +316,31 @@ function caseCoverage() {
   }
   console.log('release instance contract: every scanned identity literal maps to a declared field');
 }
+// Intentional pinned oracle: do not "unify" these literals into instance-derived
+// expectations. The 0.15.0 local-form value is an anomaly retained because its
+// immutable plan lineage cannot be migrated.
+assert.deepEqual(
+  Object.fromEntries(
+    ['0.14.0', '0.15.0'].map((version) => {
+      const instance = loadReleaseInstance(version, { require: ['current_attempt', 'planrun_attempt'] });
+      return [
+        version,
+        {
+          current_attempt: instance.current_attempt.docks_repository_id,
+          planrun_attempt: instance.planrun_attempt.docks_repository_id,
+        },
+      ];
+    }),
+  ),
+  {
+    '0.14.0': { current_attempt: 'DocksDocks/docks', planrun_attempt: 'DocksDocks/docks' },
+    '0.15.0': {
+      current_attempt: 'docks:/home/vagrant/projects/docks',
+      planrun_attempt: 'docks:/home/vagrant/projects/docks',
+    },
+  },
+  'release-instance repository-id lineage oracle changed',
+);
 
 const args = process.argv.slice(2);
 const caseIndex = args.indexOf('--case');
