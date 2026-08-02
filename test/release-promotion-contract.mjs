@@ -134,6 +134,7 @@ const PLANRUN_DOCKS_AFFECTED_PATHS = Object.freeze([
   'plugins/session-relay/test/remediation-contract.mjs',
   'scripts/lib/plugins.mjs',
   'scripts/lib/session-relay-release-core.mjs',
+  'scripts/lib/session-relay-release-instances/0.14.0.json',
   'scripts/lib/session-relay-release-instances/0.15.0.json',
   'scripts/lib/session-relay-release-instances/schema.mjs',
   'scripts/lib/session-relay-release-preparation.mjs',
