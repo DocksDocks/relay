@@ -34,8 +34,8 @@ import { resolveShippedRelayVersion } from './version.mjs';
 const SOURCE = '3fb9211f3309977f24853a10714d4b7a82b38c8f';
 const EXPECTED_VERSION = '0.13.0';
 const EXPECTED_TAG = 'session-relay--v0.13.0';
-const DOCKS_PLAN_PATH = 'docs/plans/active/session-relay-linux-workspace-recertification.md';
-const DOCKS_FINISHED_PLAN_PATH = 'docs/plans/finished/2026-07-23-session-relay-linux-workspace-recertification.md';
+const DOCKS_PLAN_PATH = 'docs/plans/active/session-relay-0.15.0-release.md';
+const DOCKS_FINISHED_PLAN_PATH = 'docs/plans/finished/2026-07-23-session-relay-0.15.0-release.md';
 const PUBLIC_PLAN_PATH = 'docs/plans/active/session-relay-cli-0.13.0-release-preparation.md';
 const ORDINARY_ASSETS = Object.freeze([
   'session-relay-aarch64-apple-darwin',
@@ -45,31 +45,41 @@ const ORDINARY_ASSETS = Object.freeze([
 ]);
 const EXPECTED_ASSETS = Object.freeze([...ORDINARY_ASSETS, 'SHA256SUMS']);
 const { version: CURRENT_VERSION, tag: CURRENT_TAG } = resolveShippedRelayVersion(REPO);
-const CURRENT_PUBLIC_VERSION = '0.12.0';
-const CURRENT_PUBLIC_TAG = 'cli-v0.12.0';
+const CURRENT_PUBLIC_VERSION = '0.13.0';
+const CURRENT_PUBLIC_TAG = 'cli-v0.13.0';
 const HISTORICAL_PUBLICATION_SHA256 = '31d096d31702b66d7e97085a82d8b7da1b75155f828b1d2382a0ac8427ba7ea2';
 const HISTORICAL_RELEASE_PLAN_PATH = resolveHistoricalPublicationPlanPath(REPO);
-const CURRENT_GOAL_ID = '8b89aabf-7336-4352-bc11-225bab67f9aa';
-const CURRENT_DOCKS_RUN_ID = '88732ba0-ef06-411b-a31c-93705ccefb27';
-const CURRENT_DOCKS_PLAN_PATH = 'docs/plans/active/session-relay-correlated-results-release-remediation-v4.md';
-const CURRENT_DOCKS_SOURCE_BASE = '494881a0d973863d1ac8e233734c827eb6913ce8';
-const SUCCESSOR_DOCKS_RUN_ID = '5e00cc28-4e27-42cb-9cf9-c3630006d8c0';
-const SUCCESSOR_DOCKS_PLAN_PATH = 'docs/plans/active/session-relay-correlated-results-release-remediation-v9.md';
-const SUCCESSOR_DOCKS_SOURCE_BASE = 'de4f8305ac9351cbbea4549503f2684f67fbcde9';
-const IMMUTABLE_RELEASE_TAG_COMMIT = '7d9cbbbdf82210d396de744372eadb6c26655601';
+const CURRENT_GOAL_ID = '258b44c2-c3b2-4902-862c-7461724ca078';
+const CURRENT_DOCKS_RUN_ID = '12a460e2-af44-4bc8-bc7d-d7aaec2c991b';
+const CURRENT_DOCKS_PLAN_PATH = 'docs/plans/active/session-relay-0.15.0-release.md';
+const CURRENT_DOCKS_SOURCE_BASE = 'c5c29cec073f1c6734a8f9b6b98ce8bf7ac4029f';
+const SUCCESSOR_DOCKS_RUN_ID = '12a460e2-af44-4bc8-bc7d-d7aaec2c991b';
+const SUCCESSOR_DOCKS_PLAN_PATH = 'docs/plans/active/session-relay-0.15.0-release.md';
+const SUCCESSOR_DOCKS_SOURCE_BASE = 'c5c29cec073f1c6734a8f9b6b98ce8bf7ac4029f';
+const IMMUTABLE_RELEASE_TAG_COMMIT = 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef';
 const SUCCESSOR_AFFECTED_PATHS = Object.freeze([
+  '.claude-plugin/marketplace.json',
+  'plugins/session-relay/.claude-plugin/plugin.json',
+  'plugins/session-relay/.codex-plugin/plugin.json',
+  'plugins/session-relay/rust/Cargo.lock',
+  'plugins/session-relay/rust/Cargo.toml',
+  'plugins/session-relay/test/companion-distribution-contract.mjs',
+  'plugins/session-relay/test/distribution-contract.mjs',
+  'plugins/session-relay/test/fixtures/release-identity-inventory.json',
   'plugins/session-relay/test/release-evidence-contract.mjs',
+  'plugins/session-relay/test/release-instance-contract.mjs',
   'plugins/session-relay/test/release-promotion-contract.mjs',
   'plugins/session-relay/test/release-publication-contract.mjs',
-  'scripts/lib/session-relay-release-cli.mjs',
-  'scripts/lib/session-relay-release-preparation.mjs',
+  'plugins/session-relay/test/remediation-contract.mjs',
+  'scripts/lib/session-relay-release-core.mjs',
+  'scripts/lib/session-relay-release-instances/0.15.0.json',
   'scripts/lib/session-relay-release-promotion.mjs',
   'scripts/lib/session-relay-release-publication.mjs',
 ]);
-const CURRENT_PUBLIC_RUN_ID = '1f801952-705e-4c7e-a533-91026c013383';
-const CURRENT_PUBLIC_ACTIVE_PLAN_PATH = 'docs/plans/active/session-relay-0.14.0-docks-kit-0.12.0-release.md';
+const CURRENT_PUBLIC_RUN_ID = 'ad7f3b75-dfff-4bcd-8d1f-c8c11555b119';
+const CURRENT_PUBLIC_ACTIVE_PLAN_PATH = 'docs/plans/active/session-relay-0.15.0-docks-kit-0.13.0-release.md';
 const CURRENT_PUBLIC_FINISHED_PLAN_PATH =
-  'docs/plans/finished/2026-07-25-session-relay-0.14.0-docks-kit-0.12.0-release.md';
+  'docs/plans/finished/2026-07-26-session-relay-0.15.0-docks-kit-0.13.0-release.md';
 const HISTORICAL_SOURCE_PROOF_V1_SHA256 = '419b23ccdcf0ca21672e81c05ae9d22c55bc67781839ffb6a29e7eecc2b59396';
 const HISTORICAL_SOURCE_PROOF_V2_SHA256 = '87a6260ae20280712ebb2d76d39667b128c8f6cf687141ebd779d8eca16c2262';
 const HISTORICAL_PUBLIC_REQUEST_SHA256 = '7cf02781a2ed3c75423321492fb2cd4c4944f6da6d6d41290e26a5f3ca0cf902';
@@ -827,11 +837,7 @@ function currentPublicationReceiptV2() {
     },
     release_database_id: 9002,
     release_state: 'prerelease',
-    body_sha256: sha256(
-      Buffer.from(
-        'Session Relay 0.14.0 is staged for compatibility validation. Do not install it directly or advertise installation instructions. Wait for the stable release.',
-      ),
-    ),
+    body_sha256: sha256(Buffer.from(PRERELEASE_BODY)),
     assets,
     digest_evidence: {
       workflow_run_id: 9001,
@@ -902,12 +908,12 @@ function assertCurrentPublicationContract() {
   assert.deepEqual(
     publication.value.assets.map(({ name }) => name),
     [...EXPECTED_ASSETS].sort(),
-    '0.14 publication must contain exactly four native binaries plus SHA256SUMS',
+    '0.15 publication must contain exactly four native binaries plus SHA256SUMS',
   );
   assert.equal(
     publication.value.assets.some(({ name }) => /windows|win32|\.exe$/i.test(name)),
     false,
-    '0.14 publication must not contain a Windows asset',
+    '0.15 publication must not contain a Windows asset',
   );
   const evidence = publication.value.digest_evidence;
   assert.equal(evidence.workflow_run_id, publication.value.workflow.run_id);
@@ -923,7 +929,7 @@ function assertCurrentPublicationContract() {
     npm_version: CURRENT_PUBLIC_VERSION,
   });
 
-  validatePublicationReceipt(publication, proof, 'current Session Relay 0.14.0 publication');
+  validatePublicationReceipt(publication, proof, 'current Session Relay 0.15.0 publication');
 
   for (const [label, mutate, pattern] of [
     [
@@ -1297,7 +1303,7 @@ function currentFinalizationFixture(directory, { prerelease = false, sourceSchem
         schema: 1,
         type: 'PublicRedFirstEvidenceV1',
         receipt_sha256: publicRedReceiptSha256,
-        expected_failure_signature: 'Relay 0.14.0 and docks-kit 0.12.0 bindings are absent',
+        expected_failure_signature: 'Relay 0.15.0 and docks-kit 0.13.0 bindings are absent',
         ordered_before_implementation: true,
         receipt: publicRedReceipt,
       },
@@ -1498,10 +1504,10 @@ function schema4FinalizationFixture(directory) {
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'session-relay-publication-contract-'));
 try {
-  assert.equal(VERSION, CURRENT_VERSION, 'Session Relay production version must be 0.14.0');
-  assert.equal(TAG, CURRENT_TAG, 'Session Relay production tag must be session-relay--v0.14.0');
-  assert.match(PRERELEASE_BODY, /Session Relay 0\.14\.0/, 'prerelease body must announce Session Relay 0.14.0');
-  assert.match(STABLE_BODY, /Session Relay 0\.14\.0/, 'stable body must announce Session Relay 0.14.0');
+  assert.equal(VERSION, CURRENT_VERSION, 'Session Relay production version must be 0.15.0');
+  assert.equal(TAG, CURRENT_TAG, 'Session Relay production tag must be session-relay--v0.15.0');
+  assert.match(PRERELEASE_BODY, /Session Relay 0\.15\.0/, 'prerelease body must announce Session Relay 0.15.0');
+  assert.match(STABLE_BODY, /Session Relay 0\.15\.0/, 'stable body must announce Session Relay 0.15.0');
   assert.deepEqual(ASSETS, EXPECTED_ASSETS, 'publication must bind SHA256SUMS and exactly four ordinary native assets');
   assert.deepEqual(
     ASSETS.filter((name) => name !== 'SHA256SUMS'),

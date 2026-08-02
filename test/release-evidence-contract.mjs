@@ -56,6 +56,7 @@ const TARGETS = [
   ['aarch64-apple-darwin', 'macOS', 'ARM64'],
 ];
 const { version: CURRENT_RELEASE_VERSION, tag: CURRENT_RELEASE_TAG } = resolveShippedRelayVersion(REPO);
+const CURRENT_RELEASE_INSTANCE_PATH = `scripts/lib/session-relay-release-instances/${CURRENT_RELEASE_VERSION}.json`;
 const CURRENT_PUBLIC_VERSION = '0.12.0';
 const CURRENT_PUBLIC_TAG = 'cli-v0.12.0';
 const CURRENT_GOAL_ID = '8b89aabf-7336-4352-bc11-225bab67f9aa';
@@ -78,6 +79,7 @@ const PREPARATION_RUNTIME_DEPENDENCIES = [
   'scripts/lib/session-relay-release-instances/schema.mjs',
   'scripts/lib/session-relay-release-instances/0.13.0.json',
   'scripts/lib/session-relay-release-instances/0.14.0.json',
+  CURRENT_RELEASE_INSTANCE_PATH,
 ];
 const copyPreparationRuntime = (root) => {
   for (const logical of PREPARATION_RUNTIME_DEPENDENCIES) {
@@ -104,20 +106,33 @@ const CURRENT_AFFECTED_PATHS = [
   'scripts/lib/session-relay-release-promotion.mjs',
   'scripts/lib/session-relay-release-publication.mjs',
 ];
-const PLANRUN_DOCKS_RUN_ID = '5e00cc28-4e27-42cb-9cf9-c3630006d8c0';
-const PLANRUN_DOCKS_PLAN_PATH = 'docs/plans/active/session-relay-correlated-results-release-remediation-v9.md';
-const PLANRUN_DOCKS_SOURCE_BASE = 'de4f8305ac9351cbbea4549503f2684f67fbcde9';
-const PLANRUN_RELEASE_TAG_COMMIT = '7d9cbbbdf82210d396de744372eadb6c26655601';
+const PLANRUN_GOAL_ID = '258b44c2-c3b2-4902-862c-7461724ca078';
+const PLANRUN_DOCKS_RUN_ID = '12a460e2-af44-4bc8-bc7d-d7aaec2c991b';
+const PLANRUN_DOCKS_PLAN_PATH = 'docs/plans/active/session-relay-0.15.0-release.md';
+const PLANRUN_DOCKS_SOURCE_BASE = 'c5c29cec073f1c6734a8f9b6b98ce8bf7ac4029f';
+const PLANRUN_RELEASE_TAG_COMMIT = 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef';
 const PLANRUN_AFFECTED_PATHS = [
+  'plugins/session-relay/.claude-plugin/plugin.json',
+  'plugins/session-relay/.codex-plugin/plugin.json',
+  'plugins/session-relay/rust/Cargo.lock',
+  'plugins/session-relay/rust/Cargo.toml',
+  'plugins/session-relay/test/companion-distribution-contract.mjs',
+  'plugins/session-relay/test/distribution-contract.mjs',
+  'plugins/session-relay/test/fixtures/release-identity-inventory.json',
   'plugins/session-relay/test/release-evidence-contract.mjs',
+  'plugins/session-relay/test/release-instance-contract.mjs',
   'plugins/session-relay/test/release-promotion-contract.mjs',
   'plugins/session-relay/test/release-publication-contract.mjs',
-  'scripts/lib/session-relay-release-cli.mjs',
-  'scripts/lib/session-relay-release-preparation.mjs',
+  'plugins/session-relay/test/remediation-contract.mjs',
+  'scripts/lib/session-relay-release-core.mjs',
+  CURRENT_RELEASE_INSTANCE_PATH,
   'scripts/lib/session-relay-release-promotion.mjs',
   'scripts/lib/session-relay-release-publication.mjs',
+  '.claude-plugin/marketplace.json',
 ];
 const CURRENT_PUBLIC_PLAN_PATH = 'docs/plans/active/session-relay-0.14.0-docks-kit-0.12.0-release.md';
+const RETAINED_RELEASE_VERSION = CURRENT_PUBLIC_PLAN_PATH.match(/session-relay-(\d+\.\d+\.\d+)/u)[1];
+const RETAINED_RELEASE_TAG = `session-relay--v${RETAINED_RELEASE_VERSION}`;
 const HISTORICAL_RELEASE_PLAN_PATH = resolveHistoricalPublicationPlanPath(REPO);
 const HISTORICAL_RECEIPT_SHA256 = Object.freeze({
   source_proof_v1: '419b23ccdcf0ca21672e81c05ae9d22c55bc67781839ffb6a29e7eecc2b59396',
@@ -293,7 +308,7 @@ function nativeProducerJobs() {
   }));
 }
 
-function artifactFixture({ mutateArchive, releaseVersion = CURRENT_RELEASE_VERSION } = {}) {
+function artifactFixture({ mutateArchive, releaseVersion = RETAINED_RELEASE_VERSION } = {}) {
   const archives = new Map();
   const artifacts = [];
   const binaryDigests = new Map();
@@ -340,7 +355,7 @@ function artifactFixture({ mutateArchive, releaseVersion = CURRENT_RELEASE_VERSI
   return { archives, artifacts, jobs: nativeProducerJobs(), releaseVersion };
 }
 
-function artifactRecord(id, name, archive, releaseVersion = CURRENT_RELEASE_VERSION) {
+function artifactRecord(id, name, archive, releaseVersion = RETAINED_RELEASE_VERSION) {
   return {
     id,
     name,
@@ -2876,8 +2891,8 @@ function currentSourcePreparationProofV2() {
     schema: 2,
     type: 'SourcePreparationProofV2',
     repository_id: REPOSITORY_ID,
-    version: CURRENT_RELEASE_VERSION,
-    tag: CURRENT_RELEASE_TAG,
+    version: RETAINED_RELEASE_VERSION,
+    tag: RETAINED_RELEASE_TAG,
     goal_id: CURRENT_GOAL_ID,
     run_id: CURRENT_DOCKS_RUN_ID,
     source_commit: sourceCommit,
@@ -2939,8 +2954,8 @@ function currentSourcePreparationProofV2() {
       plan_path: CURRENT_PUBLIC_PLAN_PATH,
       version: CURRENT_PUBLIC_VERSION,
       tag: CURRENT_PUBLIC_TAG,
-      session_relay_version: CURRENT_RELEASE_VERSION,
-      session_relay_tag: CURRENT_RELEASE_TAG,
+      session_relay_version: RETAINED_RELEASE_VERSION,
+      session_relay_tag: RETAINED_RELEASE_TAG,
       package: 'docks-kit',
       npm_version: CURRENT_PUBLIC_VERSION,
     },
@@ -2953,7 +2968,7 @@ function currentSourcePreparationProofV2() {
   };
 }
 
-function bindDefaultCurrentCompletion(root, planPath, receiptOut) {
+function bindDefaultCurrentCompletion(root, planPath, receiptOut, version) {
   const repositoryNodeModules = path.join(REPO, 'node_modules');
   assert.ok(fs.statSync(repositoryNodeModules).isDirectory(), 'repository node_modules fixture is absent');
   fs.appendFileSync(path.join(root, '.git', 'info', 'exclude'), '\n/node_modules/\n');
@@ -2962,7 +2977,7 @@ function bindDefaultCurrentCompletion(root, planPath, receiptOut) {
   const options = [
     ['finished-plan', planPath],
     ['receipt-out', receiptOut],
-    ['version', CURRENT_RELEASE_VERSION],
+    ['version', version],
   ];
   const invocation = [
     `const { bindCompletion } = await import(${JSON.stringify(binderUrl)});`,
@@ -2983,7 +2998,7 @@ function bindCurrentCompletionFixture(
   {
     name,
     includeVersion = true,
-    version = CURRENT_RELEASE_VERSION,
+    version = RETAINED_RELEASE_VERSION,
     transformPlan = (plan) => plan,
     brokenAncestry = null,
     implementationBlob = null,
@@ -3251,7 +3266,7 @@ function bindCurrentCompletionFixture(
   ];
   if (includeVersion) optionEntries.push(['version', version]);
   const result = defaultDependencies
-    ? bindDefaultCurrentCompletion(root, planPath, receiptOut)
+    ? bindDefaultCurrentCompletion(root, planPath, receiptOut, RETAINED_RELEASE_VERSION)
     : bindCompletion(new Map(optionEntries), adapter);
   return {
     ...fixtureContext,
@@ -3303,8 +3318,8 @@ function testCurrentCompletionBinding(temp) {
     plan_path: CURRENT_PUBLIC_PLAN_PATH,
     version: CURRENT_PUBLIC_VERSION,
     tag: CURRENT_PUBLIC_TAG,
-    session_relay_version: CURRENT_RELEASE_VERSION,
-    session_relay_tag: CURRENT_RELEASE_TAG,
+    session_relay_version: RETAINED_RELEASE_VERSION,
+    session_relay_tag: RETAINED_RELEASE_TAG,
     package: 'docks-kit',
     npm_version: CURRENT_PUBLIC_VERSION,
   });
@@ -3544,8 +3559,18 @@ function bindPlanRunCompletionFixture(
   }
   for (const logical of PLANRUN_AFFECTED_PATHS) {
     const target = path.join(root, ...logical.split('/'));
+    if (!fs.existsSync(target) && logical === CURRENT_RELEASE_INSTANCE_PATH) {
+      fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
+      fs.copyFileSync(path.join(REPO, ...logical.split('/')), target);
+    }
     assert.ok(fs.statSync(target).isFile(), `successor affected-path fixture is absent: ${logical}`);
-    fs.appendFileSync(target, `\n// Successor implementation fixture: ${logical}\n`);
+    const marker =
+      logical.endsWith('.json')
+        ? '\n'
+        : logical.endsWith('.toml') || logical.endsWith('.lock')
+          ? `\n# Successor implementation fixture: ${logical}\n`
+          : `\n// Successor implementation fixture: ${logical}\n`;
+    fs.appendFileSync(target, marker);
   }
   const implementationPaths = [...PLANRUN_AFFECTED_PATHS];
   if (implementationExtraPath !== null) {
@@ -3611,13 +3636,15 @@ function bindPlanRunCompletionFixture(
     templatePath = path.join(finishedDirectory, candidates[0]);
   }
   fs.copyFileSync(templatePath, planPath);
-  const template = fs.readFileSync(planPath, 'utf8').replace(/^status: (?:blocked|finished)$/m, 'status: ongoing');
+  const template = fs
+    .readFileSync(planPath, 'utf8')
+    .replace(/^status: (?:planned|blocked|finished)$/m, 'status: ongoing');
   const runMatch = /^Plan-run: (\{.*\})$/m.exec(template);
   assert.ok(runMatch, 'fresh successor PlanRun fixture is absent');
   const templateRun = JSON.parse(runMatch[1]);
   assert.equal(templateRun.run_id, PLANRUN_DOCKS_RUN_ID);
   assert.equal(templateRun.source_base, PLANRUN_DOCKS_SOURCE_BASE);
-  assert.equal(templateRun.execution_parent, PLANRUN_DOCKS_SOURCE_BASE);
+  assert.equal(templateRun.execution_parent, null);
   let plan = template.replace(
     /## Verification Results\n[\s\S]*$/u,
     '## Verification Results\n\n- Focused successor release evidence passed on the reviewed implementation.\n',
@@ -3653,7 +3680,8 @@ function bindPlanRunCompletionFixture(
       verification_sha256: verificationSha256,
     },
     blocker: null,
-    goal_id: CURRENT_GOAL_ID,
+    repository_id: REPOSITORY_ID,
+    goal_id: PLANRUN_GOAL_ID,
     run_id: PLANRUN_DOCKS_RUN_ID,
     plan_path: PLANRUN_DOCKS_PLAN_PATH,
     source_base: PLANRUN_DOCKS_SOURCE_BASE,
@@ -3712,7 +3740,7 @@ function bindPlanRunCompletionFixture(
     },
   };
   const result = defaultDependencies
-    ? bindDefaultCurrentCompletion(root, planPath, receiptOut)
+    ? bindDefaultCurrentCompletion(root, planPath, receiptOut, CURRENT_RELEASE_VERSION)
     : bindCompletion(
         new Map([
           ['finished-plan', planPath],
@@ -3754,7 +3782,7 @@ function testPlanRunCompletionBindingUsesFreshSourceAndPlanOnlyContinuation(temp
   assert.deepEqual(proof.plan_run, {
     schema: 1,
     repository_id: REPOSITORY_ID,
-    goal_id: CURRENT_GOAL_ID,
+    goal_id: PLANRUN_GOAL_ID,
     run_id: PLANRUN_DOCKS_RUN_ID,
     plan_path: PLANRUN_DOCKS_PLAN_PATH,
     source_base: PLANRUN_DOCKS_SOURCE_BASE,
@@ -3881,8 +3909,8 @@ function testCurrentCorrelatedReleaseEvidence() {
     'type',
     'version',
   ]);
-  assert.equal(proof.version, CURRENT_RELEASE_VERSION);
-  assert.equal(proof.tag, CURRENT_RELEASE_TAG);
+  assert.equal(proof.version, RETAINED_RELEASE_VERSION);
+  assert.equal(proof.tag, RETAINED_RELEASE_TAG);
   assert.equal(proof.companion.version, CURRENT_PUBLIC_VERSION);
   assert.equal(proof.companion.tag, CURRENT_PUBLIC_TAG);
   assert.equal(proof.companion.package, 'docks-kit');

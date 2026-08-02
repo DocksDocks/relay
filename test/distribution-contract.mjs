@@ -24,10 +24,9 @@ const RELEASE_TAG = `session-relay--v${RELEASE_VERSION}`;
 const PUBLIC_REF = /^refs\/heads\/preflight\/session-relay-cli-0\.13\.0-[0-9a-f]{12}$/;
 const COMMIT = /^[0-9a-f]{40}$/;
 const { version: CURRENT_RELEASE_VERSION, tag: CURRENT_RELEASE_TAG } = resolveShippedRelayVersion(REPO);
-const CURRENT_DOCKS_PLAN_TEMPLATE =
-  'docs/plans/finished/2026-07-26-session-relay-correlated-results-release-completion.md';
-const CURRENT_DOCKS_RUN_ID = 'a69dcd97-d1bd-46fc-9b6b-70e349e353fc';
-const CURRENT_PUBLIC_PLAN = 'docs/plans/active/session-relay-0.14.0-docks-kit-0.12.0-release.md';
+const CURRENT_DOCKS_PLAN_TEMPLATE = 'docs/plans/active/session-relay-0.15.0-release.md';
+const CURRENT_DOCKS_RUN_ID = '12a460e2-af44-4bc8-bc7d-d7aaec2c991b';
+const CURRENT_PUBLIC_PLAN = 'docs/plans/active/session-relay-0.15.0-docks-kit-0.13.0-release.md';
 const HISTORICAL_RELEASE_PLAN = resolveHistoricalPublicationPlanPath(REPO);
 const HISTORICAL_RECEIPT_SHA256 = Object.freeze([
   '419b23ccdcf0ca21672e81c05ae9d22c55bc67781839ffb6a29e7eecc2b59396',
@@ -1030,28 +1029,28 @@ function currentCorrelatedReleaseContract() {
   assert.deepEqual(
     [cargo, claude, codex, claudeMarket],
     Array(4).fill(CURRENT_RELEASE_VERSION),
-    'all version-bearing current Session Relay manifests must bind 0.14.0',
+    'all version-bearing current Session Relay manifests must bind 0.15.0',
   );
   assert.deepEqual(agentsRelay.source, { source: 'local', path: './plugins/session-relay' });
   assert.match(
     fs.readFileSync(path.join(REPO, 'plugins/session-relay/rust/Cargo.lock'), 'utf8'),
-    /\[\[package\]\]\nname = "session-relay"\nversion = "0\.14\.0"/,
-    'Cargo.lock must bind Session Relay 0.14.0',
+    /\[\[package\]\]\nname = "session-relay"\nversion = "0\.15\.0"/,
+    'Cargo.lock must bind Session Relay 0.15.0',
   );
 
   const coreSource = fs.readFileSync(path.join(REPO, 'scripts/lib/session-relay-release-core.mjs'), 'utf8');
-  assert.match(coreSource, /export const VERSION = '0\.14\.0';/);
+  assert.match(coreSource, /export const VERSION = '0\.15\.0';/);
   assert.match(coreSource, /Session Relay \$\{VERSION\} is staged for compatibility validation/);
   assert.match(coreSource, /Session Relay \$\{VERSION\} is available through docks-kit/);
   const promotionSource = fs.readFileSync(path.join(REPO, 'scripts/lib/session-relay-release-promotion.mjs'), 'utf8');
-  assert.match(promotionSource, /const PUBLIC_VERSION = '0\.12\.0';/);
+  assert.match(promotionSource, /const PUBLIC_VERSION = '0\.13\.0';/);
   assert.match(promotionSource, /const PUBLIC_TAG = `cli-v\$\{PUBLIC_VERSION\}`;/);
-  assert.match(promotionSource, /const CURRENT_DOCKS_KIT_RELEASE = 'cli-v0\.12\.0';/);
+  assert.match(promotionSource, /const CURRENT_DOCKS_KIT_RELEASE = 'cli-v0\.13\.0';/);
   assert.match(promotionSource, /session-relay-\$\{CURRENT_VERSION\}-docks-kit-\$\{PUBLIC_VERSION\}-release/);
 
   const document = parseYaml(fs.readFileSync(WORKFLOW, 'utf8'));
   const matrixAssets = document.jobs.build.strategy.matrix.include.map(({ asset }) => asset);
-  assert.deepEqual(matrixAssets.sort(), [...ASSETS].sort(), '0.14 producer must retain exactly four native binaries');
+  assert.deepEqual(matrixAssets.sort(), [...ASSETS].sort(), '0.15 producer must retain exactly four native binaries');
   assert.equal(
     matrixAssets.some((name) => /windows|win32|\.exe$/i.test(name)),
     false,
@@ -1081,9 +1080,9 @@ function currentCorrelatedReleaseContract() {
   assert.match(currentPlan, new RegExp(`"run_id":"${CURRENT_DOCKS_RUN_ID}"`));
   assert.match(currentPlan, /"draft_review":\{[^}]*"state":"passed"/);
   assert.match(currentPlan, new RegExp(CURRENT_RELEASE_TAG.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
-  assert.match(currentPlan, /docks-kit[^\n]*0\.12\.0/);
+  assert.match(currentPlan, /docks-kit[^\n]*0\.13\.0/);
   assert.match(currentPlan, new RegExp(CURRENT_PUBLIC_PLAN.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
-  assert.match(currentPlan, /prerelease[\s\S]*public child[\s\S]*stable/i);
+  assert.match(currentPlan, /stage the Relay prerelease[\s\S]*child's completed release[\s\S]*stable, non-prerelease release/i);
 }
 
 function verifyCompanion() {
@@ -1109,7 +1108,7 @@ function verifyCompanion() {
 }
 check('companion validation ref is a clean detached, receipt-bound installer contract', verifyCompanion);
 check(
-  'current Relay 0.14.0 and docks-kit 0.12.0 release chain is exact while 0.13 receipts stay immutable',
+  'current Relay 0.15.0 and docks-kit 0.13.0 release chain is exact while 0.13 receipts stay immutable',
   currentCorrelatedReleaseContract,
 );
 

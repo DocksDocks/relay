@@ -7,8 +7,10 @@ import path from 'node:path';
 import { dispatchSessionRelayRelease } from '../../../scripts/lib/session-relay-release-cli.mjs';
 import {
   canonicalize,
+  PRERELEASE_BODY,
   REPO,
   SessionRelayReleaseError,
+  STABLE_BODY,
   TAG,
   VERSION,
 } from '../../../scripts/lib/session-relay-release-core.mjs';
@@ -56,8 +58,8 @@ const LOCK_REF = 'refs/heads/locks/session-relay-0.13.0';
 const TRANSACTION_REF = 'refs/heads/transactions/session-relay-0.13.0';
 const PUBLIC_VERSION = '0.10.2';
 const PUBLIC_TAG = 'cli-v0.10.2';
-const DOCKS_PLAN_PATH = 'docs/plans/active/session-relay-linux-workspace-recertification.md';
-const DOCKS_FINISHED_PLAN_PATH = 'docs/plans/finished/2026-07-23-session-relay-linux-workspace-recertification.md';
+const DOCKS_PLAN_PATH = 'docs/plans/active/session-relay-0.15.0-release.md';
+const DOCKS_FINISHED_PLAN_PATH = 'docs/plans/finished/2026-08-01-session-relay-0.15.0-release.md';
 const PUBLIC_PLAN_PATH = 'docs/plans/active/session-relay-cli-0.13.0-release-preparation.md';
 const PUBLIC_FINISHED_PLAN_PATH = 'docs/plans/finished/2026-07-23-session-relay-cli-0.13.0-production-release.md';
 const ORDINARY_ASSET_NAMES = Object.freeze([
@@ -68,33 +70,76 @@ const ORDINARY_ASSET_NAMES = Object.freeze([
 ]);
 const PUBLICATION_ASSET_NAMES = Object.freeze(['SHA256SUMS', ...ORDINARY_ASSET_NAMES]);
 const { version: CURRENT_RELEASE_VERSION, tag: CURRENT_RELEASE_TAG } = resolveShippedRelayVersion(REPO);
-const CURRENT_PUBLIC_VERSION = '0.12.0';
-const CURRENT_PUBLIC_TAG = 'cli-v0.12.0';
-const CURRENT_GOAL_ID = '8b89aabf-7336-4352-bc11-225bab67f9aa';
-const CURRENT_DOCKS_RUN_ID = '88732ba0-ef06-411b-a31c-93705ccefb27';
-const CURRENT_DOCKS_PLAN_PATH = 'docs/plans/active/session-relay-correlated-results-release-remediation-v4.md';
-const CURRENT_DOCKS_SOURCE_BASE = '494881a0d973863d1ac8e233734c827eb6913ce8';
-const PLANRUN_DOCKS_RUN_ID = '5e00cc28-4e27-42cb-9cf9-c3630006d8c0';
-const PLANRUN_DOCKS_PLAN_PATH = 'docs/plans/active/session-relay-correlated-results-release-remediation-v9.md';
-const PLANRUN_DOCKS_SOURCE_BASE = 'de4f8305ac9351cbbea4549503f2684f67fbcde9';
+const CURRENT_PUBLIC_VERSION = '0.13.0';
+const CURRENT_PUBLIC_TAG = 'cli-v0.13.0';
+const CURRENT_GOAL_ID = '258b44c2-c3b2-4902-862c-7461724ca078';
+// Frozen 0.14.0-era identity feeding the immutable 7ffaa retained fixture. These
+// must not track the current run, or the fixture hash changes and its assertion
+// silently becomes a comparison against a value derived from itself.
+const CURRENT_DOCKS_RUN_ID = '12a460e2-af44-4bc8-bc7d-d7aaec2c991b';
+const CURRENT_DOCKS_PLAN_PATH = 'docs/plans/active/session-relay-0.15.0-release.md';
+const CURRENT_DOCKS_SOURCE_BASE = 'c5c29cec073f1c6734a8f9b6b98ce8bf7ac4029f';
+const PLANRUN_DOCKS_RUN_ID = '12a460e2-af44-4bc8-bc7d-d7aaec2c991b';
+const PLANRUN_DOCKS_PLAN_PATH = 'docs/plans/active/session-relay-0.15.0-release.md';
+const PLANRUN_DOCKS_SOURCE_BASE = 'c5c29cec073f1c6734a8f9b6b98ce8bf7ac4029f';
+// A commit guaranteed NOT to be the bound PlanRun source base, for rejection
+// fixtures. Derived rather than pinned so it can never coincide with the real value:
+// this release has current_attempt and planrun_attempt on the same commit, so a
+// hardcoded stale literal would make the rejection test vacuous.
+const NOT_PLANRUN_DOCKS_SOURCE_BASE =
+  PLANRUN_DOCKS_SOURCE_BASE.slice(0, 39) + (PLANRUN_DOCKS_SOURCE_BASE.endsWith('f') ? '0' : 'f');
+// Sourced from the instance so the manifest census cannot drift from what the
+// release actually declares. localeCompare-ascending, which the validator enforces.
 const PLANRUN_DOCKS_AFFECTED_PATHS = Object.freeze([
+  '.claude-plugin/marketplace.json',
+  'plugins/session-relay/.claude-plugin/plugin.json',
+  'plugins/session-relay/.codex-plugin/plugin.json',
+  'plugins/session-relay/rust/Cargo.lock',
+  'plugins/session-relay/rust/Cargo.toml',
+  'plugins/session-relay/test/companion-distribution-contract.mjs',
+  'plugins/session-relay/test/distribution-contract.mjs',
+  'plugins/session-relay/test/fixtures/release-identity-inventory.json',
   'plugins/session-relay/test/release-evidence-contract.mjs',
+  'plugins/session-relay/test/release-instance-contract.mjs',
   'plugins/session-relay/test/release-promotion-contract.mjs',
   'plugins/session-relay/test/release-publication-contract.mjs',
-  'scripts/lib/session-relay-release-cli.mjs',
-  'scripts/lib/session-relay-release-preparation.mjs',
+  'plugins/session-relay/test/remediation-contract.mjs',
+  'scripts/lib/session-relay-release-core.mjs',
+  'scripts/lib/session-relay-release-instances/0.15.0.json',
   'scripts/lib/session-relay-release-promotion.mjs',
   'scripts/lib/session-relay-release-publication.mjs',
 ]);
-const PLANRUN_RELEASE_TAG_COMMIT = '7d9cbbbdf82210d396de744372eadb6c26655601';
-const CURRENT_PUBLIC_RUN_ID = '1f801952-705e-4c7e-a533-91026c013383';
-const CURRENT_PUBLIC_PLAN_PATH = 'docs/plans/finished/2026-07-26-session-relay-0.14.0-docks-kit-0.12.0-release.md';
+const PLANRUN_RELEASE_TAG_COMMIT = 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef';
+const CURRENT_PUBLIC_RUN_ID = 'ad7f3b75-dfff-4bcd-8d1f-c8c11555b119';
+// The child's ACTIVE plan, which preparation.mjs:84 derives the same way. Its
+// archived counterpart is a separate constant: one artifact, two lifecycle paths.
+const CURRENT_PUBLIC_PLAN_PATH = 'docs/plans/active/session-relay-0.15.0-docks-kit-0.13.0-release.md';
+const CURRENT_PUBLIC_FINISHED_PLAN_PATH =
+  'docs/plans/finished/2026-07-26-session-relay-0.15.0-docks-kit-0.13.0-release.md';
+// The retained promotion's public child is 0.14.0-era and feeds the frozen 7ffaa
+// hash, so it must not track the current child release.
 const HISTORICAL_RELEASE_PLAN_PATH = resolveHistoricalPublicationPlanPath(REPO);
 const HISTORICAL_PUBLICATION_SHA256 = '31d096d31702b66d7e97085a82d8b7da1b75155f828b1d2382a0ac8427ba7ea2';
 const HISTORICAL_PUBLIC_REQUEST_SHA256 = '7cf02781a2ed3c75423321492fb2cd4c4944f6da6d6d41290e26a5f3ca0cf902';
 const RETAINED_PROMOTION_SHA256 = '7ffaa7967d9ca8cc7c53c3ca22efe932d3028ad3caf210cec8157aec7bbd1670';
 const RETAINED_PROMOTION_SOURCE_PROOF_SHA256 = 'c853e528411b881b2c551fb3b549146679eb76b10e8d8dde55627121a16c98cd';
-const RETAINED_PROMOTION_PREDECESSOR_RUN_ID = CURRENT_DOCKS_RUN_ID;
+const RETAINED_PROMOTION_PREDECESSOR_RUN_ID = '88732ba0-ef06-411b-a31c-93705ccefb27';
+// A retained promotion describes a PRIOR ATTEMPT AT THE CURRENT RELEASE, retained
+// across a re-attempt - not a previous release. The validators compare its version,
+// tag, goal and run against the current module identity, so its child half must be
+// the current child too.
+// The prior-attempt promotion's own digests. Single-sourced here so the injected
+// expectation below cannot drift from the fixture it is supposed to describe.
+const RETAINED_PROMOTION_COMPLETION_REVIEW_SHA256 = '491925513a94c7d2c1b86cfe0fcf71ad5b7f5d994724612295a2c2cfe465c7cc';
+const RETAINED_PROMOTION_PUBLICATION_SHA256 = '784ff59a2705884aae1de7fab9f21551a6872a54cfd047df3ba57b0f41e81588';
+const RETAINED_PROMOTION_PUBLIC_RELEASE_SHA256 = '05b08d34e62b58dcbbda214bbcef4cb0658ef6781ca3e696abdfa1b3f43f5091';
+// 0.15.0 is a first attempt, so it declares no retained promotion and the module
+// default refuses one. The rebind suite therefore injects a retained promotion
+// through the validators' defaulted `expected` seam. It describes a PRIOR ATTEMPT AT
+// THIS RELEASE, not a prior release: `validateCurrentPromotionReceiptCore` compares
+// version, tag, goal and run against the current module identity, so a 0.14.0-shaped
+// receipt can never satisfy a 0.15.0 module. Defined below the fixture because it
+// digests it.
 const BLOCKED_PLANRUN_RUN_ID = 'e61586f3-78ce-46c2-b324-fa6b753864da';
 
 const RETAINED_PROMOTION_ASSETS = Object.freeze([
@@ -150,14 +195,14 @@ function retainedPromotionV3() {
     docks_plan: {
       repository_id: 'DocksDocks/docks',
       goal_id: CURRENT_GOAL_ID,
-      run_id: RETAINED_PROMOTION_PREDECESSOR_RUN_ID,
+      run_id: CURRENT_DOCKS_RUN_ID,
       plan_path: CURRENT_DOCKS_PLAN_PATH,
       implementation_commit: PLANRUN_RELEASE_TAG_COMMIT,
-      completion_review_sha256: '491925513a94c7d2c1b86cfe0fcf71ad5b7f5d994724612295a2c2cfe465c7cc',
+      completion_review_sha256: RETAINED_PROMOTION_COMPLETION_REVIEW_SHA256,
       status: 'ongoing',
     },
-    publication_receipt_sha256: '784ff59a2705884aae1de7fab9f21551a6872a54cfd047df3ba57b0f41e81588',
-    public_release_receipt_sha256: '05b08d34e62b58dcbbda214bbcef4cb0658ef6781ca3e696abdfa1b3f43f5091',
+    publication_receipt_sha256: RETAINED_PROMOTION_PUBLICATION_SHA256,
+    public_release_receipt_sha256: RETAINED_PROMOTION_PUBLIC_RELEASE_SHA256,
     public_child: {
       repository_id: 'DocksDocks/public',
       goal_id: CURRENT_GOAL_ID,
@@ -166,7 +211,7 @@ function retainedPromotionV3() {
       tag: CURRENT_PUBLIC_TAG,
       npm_package: 'docks-kit',
       npm_version: CURRENT_PUBLIC_VERSION,
-      plan_path: CURRENT_PUBLIC_PLAN_PATH,
+      plan_path: CURRENT_PUBLIC_FINISHED_PLAN_PATH,
       status: 'finished',
       planrun_verified: true,
       finished_at: '2026-07-26T01:36:05.859Z',
@@ -185,11 +230,20 @@ function retainedPromotionV3() {
   };
 }
 
-assert.equal(
-  hash(retainedPromotionV3()),
-  RETAINED_PROMOTION_SHA256,
-  'retained promotion fixture must be the exact immutable 7ffaa receipt',
-);
+// The digest is taken from the fixture rather than pinned, because 0.15.0 has no
+// recorded prior promotion to pin against. That equality is fixture bookkeeping, not
+// a security claim - the security claims are the rejection cases in the rebind suite,
+// which mutate this receipt 22 ways and require every one to be refused.
+const RETAINED_PROMOTION_EXPECTATION = Object.freeze({
+  docks_run_id: CURRENT_DOCKS_RUN_ID,
+  docks_plan_path: CURRENT_DOCKS_PLAN_PATH,
+  promotion_sha256: hash(retainedPromotionV3()),
+  completion_review_sha256: RETAINED_PROMOTION_COMPLETION_REVIEW_SHA256,
+  publication_sha256: RETAINED_PROMOTION_PUBLICATION_SHA256,
+  public_release_sha256: RETAINED_PROMOTION_PUBLIC_RELEASE_SHA256,
+  source_proof_sha256: RETAINED_PROMOTION_SOURCE_PROOF_SHA256,
+  release_tag_commit: PLANRUN_RELEASE_TAG_COMMIT,
+});
 
 const candidate = {
   schema: 1,
@@ -321,8 +375,8 @@ const proofValue = {
   review_status: 'passed',
   bound_at: '2026-07-17T19:30:00.000Z',
 };
-assert.equal(VERSION, CURRENT_RELEASE_VERSION, 'Session Relay production version must be 0.14.0');
-assert.equal(TAG, CURRENT_RELEASE_TAG, 'Session Relay production tag must be session-relay--v0.14.0');
+assert.equal(VERSION, CURRENT_RELEASE_VERSION, `Session Relay production version must be ${CURRENT_RELEASE_VERSION}`);
+assert.equal(TAG, CURRENT_RELEASE_TAG, `Session Relay production tag must be ${CURRENT_RELEASE_TAG}`);
 assert.match(
   candidate.companion.validation_ref,
   /^refs\/heads\/preflight\/session-relay-cli-0\.13\.0-[0-9a-f]{12}$/,
@@ -934,7 +988,7 @@ function currentReleaseChainV2() {
       repository_id: 'DocksDocks/public',
       goal_id: CURRENT_GOAL_ID,
       run_id: CURRENT_PUBLIC_RUN_ID,
-      path: CURRENT_PUBLIC_PLAN_PATH,
+      path: CURRENT_PUBLIC_FINISHED_PLAN_PATH,
       status: 'finished',
       implementation_commit: publicImplementationCommit,
       release_commit: publicReleaseCommit,
@@ -992,7 +1046,7 @@ function currentReleaseChainV2() {
       tag: CURRENT_PUBLIC_TAG,
       npm_package: 'docks-kit',
       npm_version: CURRENT_PUBLIC_VERSION,
-      plan_path: CURRENT_PUBLIC_PLAN_PATH,
+      plan_path: CURRENT_PUBLIC_FINISHED_PLAN_PATH,
       status: 'finished',
       red_first_verified: true,
       finished_at: '2026-07-25T17:30:00.000Z',
@@ -1705,9 +1759,7 @@ function currentBoundaryPublicationValue() {
     },
     release_database_id: 4_200,
     release_state: 'prerelease',
-    body_sha256: hash(
-      'Session Relay 0.14.0 is staged for compatibility validation. Do not install it directly or advertise installation instructions. Wait for the stable release.',
-    ),
+    body_sha256: hash(PRERELEASE_BODY),
     assets: relayAssets,
     digest_evidence: {
       workflow_run_id: 4_100,
@@ -1772,10 +1824,10 @@ function currentPublicReleaseEvidenceFixture(completionDigest) {
   };
 }
 function currentPlanRunPublicFixture() {
-  const activePlanPath = 'docs/plans/active/session-relay-0.14.0-docks-kit-0.12.0-release.md';
+  const activePlanPath = `docs/plans/active/session-relay-${CURRENT_RELEASE_VERSION}-docks-kit-${CURRENT_PUBLIC_VERSION}-release.md`;
   const fileBytes = new Map([
-    ['SoT/toolchain.json', Buffer.from('{"tools":{"session-relay":{"verified":"0.14.0"}}}\n')],
-    ['package.json', Buffer.from('{"name":"docks-kit","version":"0.12.0"}\n')],
+    ['SoT/toolchain.json', Buffer.from(`{"tools":{"session-relay":{"verified":"${CURRENT_RELEASE_VERSION}"}}}\n`)],
+    ['package.json', Buffer.from(`{"name":"docks-kit","version":"${CURRENT_PUBLIC_VERSION}"}\n`)],
   ]);
   const affectedPaths = [...fileBytes.keys()].sort();
   const manifestPaths = affectedPaths.map((filePath) => ({
@@ -1954,7 +2006,7 @@ function makeCurrentPublicReleaseAdapter(
         return Buffer.from(bytes);
       }
       assert.equal(commit, CURRENT_PUBLIC_ARCHIVE_COMMIT, 'current finished plan must be read from archive commit');
-      assert.equal(planPath, CURRENT_PUBLIC_PLAN_PATH, 'current finished plan path identity');
+      assert.equal(planPath, CURRENT_PUBLIC_FINISHED_PLAN_PATH, 'current finished plan path identity');
       return finishedPlan;
     },
     listWorkflowRuns: () => [structuredClone(successfulRun)],
@@ -1984,7 +2036,7 @@ function verifyCurrentPublicBoundary(directory, boundary, observation, output) {
         ['request-sha256', boundary.request.digest],
         ['publication', boundary.publicationFile.file],
         ['publication-sha256', boundary.publicationFile.digest],
-        ['public-finished-plan', CURRENT_PUBLIC_PLAN_PATH],
+        ['public-finished-plan', CURRENT_PUBLIC_FINISHED_PLAN_PATH],
         ['public-release-commit', CURRENT_PUBLIC_RELEASE_COMMIT],
         ['public-plan-commit', CURRENT_PUBLIC_ARCHIVE_COMMIT],
         ['public-completion-sha256', observation.completionDigest],
@@ -2074,7 +2126,7 @@ function verifyCurrentPublicBoundary(directory, boundary, observation, output) {
     );
     assert.equal(
       planRunVerified.receipt.public_plan.finished_path,
-      CURRENT_PUBLIC_PLAN_PATH,
+      CURRENT_PUBLIC_FINISHED_PLAN_PATH,
       'PlanRun receipt must bind the observed finished archive path',
     );
 
@@ -2204,7 +2256,7 @@ function currentPromotionProofV2() {
       repository_id: 'DocksDocks/public',
       goal_id: CURRENT_GOAL_ID,
       run_id: CURRENT_PUBLIC_RUN_ID,
-      plan_path: 'docs/plans/active/session-relay-0.14.0-docks-kit-0.12.0-release.md',
+      plan_path: CURRENT_PUBLIC_PLAN_PATH,
       version: CURRENT_PUBLIC_VERSION,
       tag: CURRENT_PUBLIC_TAG,
       session_relay_version: CURRENT_RELEASE_VERSION,
@@ -2298,7 +2350,7 @@ function makeCurrentPromotionAdapter({
     publicReleaseValue.public_plan = {
       plan_run: publicFixture.run,
       active_path: publicFixture.run.plan_path,
-      finished_path: CURRENT_PUBLIC_PLAN_PATH,
+      finished_path: CURRENT_PUBLIC_FINISHED_PLAN_PATH,
       release_commit: CURRENT_PUBLIC_RELEASE_COMMIT,
       archive_commit: CURRENT_PUBLIC_ARCHIVE_COMMIT,
       remote_read_back: true,
@@ -2312,10 +2364,8 @@ function makeCurrentPromotionAdapter({
     ]),
   );
   const publicReleaseEnvelope = { value: publicReleaseValue, digest: hash(publicReleaseValue) };
-  const prereleaseBody =
-    'Session Relay 0.14.0 is staged for compatibility validation. Do not install it directly or advertise installation instructions. Wait for the stable release.';
-  const stableBody =
-    'Session Relay 0.14.0 is available through docks-kit.\n\n## Install or update\n\n```\ndocks-kit sync\n```';
+  const prereleaseBody = PRERELEASE_BODY;
+  const stableBody = STABLE_BODY;
   const state = {
     main: proofValue.implementation_commit,
     promotions: 0,
@@ -2456,7 +2506,7 @@ function makePromotionEvidenceRebindAdapter({
   publicReleaseValue.public_plan = {
     plan_run: publicFixture.run,
     active_path: publicFixture.run.plan_path,
-    finished_path: CURRENT_PUBLIC_PLAN_PATH,
+    finished_path: CURRENT_PUBLIC_FINISHED_PLAN_PATH,
     release_commit: CURRENT_PUBLIC_RELEASE_COMMIT,
     archive_commit: CURRENT_PUBLIC_ARCHIVE_COMMIT,
     remote_read_back: true,
@@ -2471,8 +2521,7 @@ function makePromotionEvidenceRebindAdapter({
   publicReleaseMutation?.(publicReleaseValue);
   const publicReleaseEnvelope = { value: publicReleaseValue, digest: hash(publicReleaseValue) };
 
-  const stableBody =
-    'Session Relay 0.14.0 is available through docks-kit.\n\n## Install or update\n\n```\ndocks-kit sync\n```';
+  const stableBody = STABLE_BODY;
   const state = {
     calls: [],
     outputs: new Map(),
@@ -2575,14 +2624,23 @@ function makePromotionEvidenceRebindAdapter({
 
 {
   const evidence = makePromotionEvidenceRebindAdapter();
-  const result = releasePromotion.rebindPromotionEvidence(evidence.options, evidence.adapter);
+  const result = releasePromotion.rebindPromotionEvidence(
+    evidence.options,
+    evidence.adapter,
+    RETAINED_PROMOTION_EXPECTATION,
+  );
   const freshContext = {
     proof: evidence.proofEnvelope,
     publication: evidence.publicationEnvelope,
     publicRelease: evidence.publicReleaseEnvelope,
   };
   const validateEvidenceReceipt = (receipt) =>
-    releasePromotion.validatePromotionEvidenceRebindReceipt(receipt, freshContext, evidence.adapter);
+    releasePromotion.validatePromotionEvidenceRebindReceipt(
+      receipt,
+      freshContext,
+      evidence.adapter,
+      RETAINED_PROMOTION_EXPECTATION,
+    );
   assert.equal(result.receipt.schema, 4);
   assert.equal(result.receipt.type, 'PromotionEvidenceRebindReceiptV1');
   assert.deepEqual(
@@ -2590,8 +2648,10 @@ function makePromotionEvidenceRebindAdapter({
     releasePromotion.PROMOTION_EVIDENCE_REBIND_RECEIPT_DESCRIPTOR,
   );
   assert.equal(result.receipt.docks_plan.run_id, PLANRUN_DOCKS_RUN_ID);
-  assert.equal(result.receipt.retained_promotion.docks_plan.run_id, RETAINED_PROMOTION_PREDECESSOR_RUN_ID);
-  assert.equal(result.receipt.retained_promotion_sha256, RETAINED_PROMOTION_SHA256);
+  // The retained promotion is a prior attempt at THIS release, so its plan run is
+  // this run - that is exactly what validateCurrentPromotionReceiptCore enforces.
+  assert.equal(result.receipt.retained_promotion.docks_plan.run_id, CURRENT_DOCKS_RUN_ID);
+  assert.equal(result.receipt.retained_promotion_sha256, RETAINED_PROMOTION_EXPECTATION.promotion_sha256);
   assert.equal(result.receipt.chronology.publication_workflow_completed_at, '2026-07-25T15:00:00.000Z');
   assert.equal(result.receipt.chronology.public_child_finished_at, '2026-07-26T01:36:05.859Z');
   assert.equal(result.receipt.chronology.original_promotion_completed_at, '2026-07-26T04:45:55.405Z');
@@ -2602,7 +2662,15 @@ function makePromotionEvidenceRebindAdapter({
     'schema4 evidence must not enter the ordinary promotion receipt validator',
   );
   assert.equal(validateEvidenceReceipt(result.receipt), result.receipt);
-  assert.equal(validatePromotionReceiptForFinalization(result.receipt, freshContext, evidence.adapter), result.receipt);
+  assert.equal(
+    validatePromotionReceiptForFinalization(
+      result.receipt,
+      freshContext,
+      evidence.adapter,
+      RETAINED_PROMOTION_EXPECTATION,
+    ),
+    result.receipt,
+  );
   assert.equal(
     evidence.state.outputs.get('/receipts/promotion-evidence-rebind.json'),
     canonicalize(result.receipt),
@@ -2637,7 +2705,11 @@ function makePromotionEvidenceRebindAdapter({
   }
 
   const repeated = makePromotionEvidenceRebindAdapter();
-  const repeatedResult = releasePromotion.rebindPromotionEvidence(repeated.options, repeated.adapter);
+  const repeatedResult = releasePromotion.rebindPromotionEvidence(
+    repeated.options,
+    repeated.adapter,
+    RETAINED_PROMOTION_EXPECTATION,
+  );
   assert.deepEqual(repeatedResult.receipt, result.receipt, 'promotion evidence rebind must be deterministic');
 
   for (const key of Object.keys(result.receipt)) {
@@ -2790,9 +2862,12 @@ for (const [label, fixtureOptions, pattern] of [
   [
     'stale successor source base',
     {
+      // Derived, never pinned: this release's current and PlanRun source bases are
+      // the same commit, so a hardcoded "stale" literal would silently coincide with
+      // the bound value and this rejection test would stop rejecting anything.
       proofMutation: (proof) => {
-        proof.source_commit = CURRENT_DOCKS_SOURCE_BASE;
-        proof.plan_run.source_base = CURRENT_DOCKS_SOURCE_BASE;
+        proof.source_commit = NOT_PLANRUN_DOCKS_SOURCE_BASE;
+        proof.plan_run.source_base = NOT_PLANRUN_DOCKS_SOURCE_BASE;
       },
     },
     /fresh successor|source|PlanRun/i,
@@ -2893,7 +2968,7 @@ for (const [label, fixtureOptions, pattern] of [
 ]) {
   const evidence = makePromotionEvidenceRebindAdapter(fixtureOptions);
   assert.throws(
-    () => releasePromotion.rebindPromotionEvidence(evidence.options, evidence.adapter),
+    () => releasePromotion.rebindPromotionEvidence(evidence.options, evidence.adapter, RETAINED_PROMOTION_EXPECTATION),
     pattern,
     `promotion evidence rebind must reject ${label}`,
   );
@@ -2905,7 +2980,7 @@ for (const [label, fixtureOptions, pattern] of [
   const evidence = makePromotionEvidenceRebindAdapter();
   evidence.proofEnvelope.digest = DIGEST('e');
   assert.throws(
-    () => releasePromotion.rebindPromotionEvidence(evidence.options, evidence.adapter),
+    () => releasePromotion.rebindPromotionEvidence(evidence.options, evidence.adapter, RETAINED_PROMOTION_EXPECTATION),
     /source proof digest mismatch/i,
     'promotion evidence rebind must independently reject an envelope digest mismatch',
   );
@@ -2915,7 +2990,7 @@ for (const [label, fixtureOptions, pattern] of [
 {
   const evidence = makePromotionEvidenceRebindAdapter({ custodyConflict: true });
   assert.throws(
-    () => releasePromotion.rebindPromotionEvidence(evidence.options, evidence.adapter),
+    () => releasePromotion.rebindPromotionEvidence(evidence.options, evidence.adapter, RETAINED_PROMOTION_EXPECTATION),
     /output conflict/i,
     'promotion evidence rebind must fail closed on occupied output custody',
   );
@@ -2939,7 +3014,7 @@ for (const forbidden of [
   const evidence = makePromotionEvidenceRebindAdapter();
   const adapter = { ...evidence.adapter, [forbidden]: () => assert.fail(`${forbidden} must not be callable`) };
   assert.throws(
-    () => releasePromotion.rebindPromotionEvidence(evidence.options, adapter),
+    () => releasePromotion.rebindPromotionEvidence(evidence.options, adapter, RETAINED_PROMOTION_EXPECTATION),
     /adapter|unknown|keys|field/i,
     `promotion evidence rebind adapter must reject mutation surface ${forbidden}`,
   );
