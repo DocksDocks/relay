@@ -46,16 +46,126 @@ fn acquire_legacy_gate(
     Ok((gate, roots))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FanoutGcReason {
+    LegacyShape,
+    RepositoryIdentityChanged,
+    WorktreeChanged,
+    UncollectedCommits,
+    CommitInspectionFailed,
+    WorktreeNotClean,
+    RemovalFailed,
+    WorktreesSurfaceUnavailable,
+}
+
+impl FanoutGcReason {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::LegacyShape => "legacy_shape",
+            Self::RepositoryIdentityChanged => "repository_identity_changed",
+            Self::WorktreeChanged => "worktree_changed",
+            Self::UncollectedCommits => "uncollected_commits",
+            Self::CommitInspectionFailed => "commit_inspection_failed",
+            Self::WorktreeNotClean => "worktree_not_clean",
+            Self::RemovalFailed => "removal_failed",
+            Self::WorktreesSurfaceUnavailable => "worktrees_surface_unavailable",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct FanoutGcReportEntry {
+    pub(crate) branch: Option<String>,
+    pub(crate) reason: FanoutGcReason,
+}
+
 #[derive(Default)]
 pub(crate) struct FanoutGcReport {
     pub(crate) removed_worktrees: usize,
     pub(crate) retained_branches: Vec<String>,
+    pub(crate) entries: Vec<FanoutGcReportEntry>,
+}
+
+impl FanoutGcReport {
+    pub(crate) fn worktrees_surface_unavailable() -> Self {
+        Self {
+            entries: vec![FanoutGcReportEntry {
+                branch: None,
+                reason: FanoutGcReason::WorktreesSurfaceUnavailable,
+            }],
+            ..Self::default()
+        }
+    }
+
+    fn record(&mut self, outcome: FanoutGcOutcome) {
+        match outcome {
+            FanoutGcOutcome::Skipped => {}
+            FanoutGcOutcome::Retained { branch, reason } => {
+                self.retained_branches.push(branch.clone());
+                self.entries.push(FanoutGcReportEntry {
+                    branch: Some(branch),
+                    reason,
+                });
+            }
+            FanoutGcOutcome::Removed(branch) => {
+                self.removed_worktrees += 1;
+                self.retained_branches.push(branch);
+            }
+        }
+    }
 }
 
 enum FanoutGcOutcome {
     Skipped,
-    Retained(String),
+    Retained {
+        branch: String,
+        reason: FanoutGcReason,
+    },
     Removed(String),
+}
+
+impl FanoutGcOutcome {
+    fn retained(branch: String, reason: FanoutGcReason) -> Self {
+        Self::Retained { branch, reason }
+    }
+}
+
+fn commit_inspection_reason(uncollected_commits: Result<u64, String>) -> Option<FanoutGcReason> {
+    match uncollected_commits {
+        Err(_) => Some(FanoutGcReason::CommitInspectionFailed),
+        Ok(count) if count != 0 => Some(FanoutGcReason::UncollectedCommits),
+        Ok(_) => None,
+    }
+}
+
+fn cleanliness_reason(cleanliness: Result<(), String>) -> Option<FanoutGcReason> {
+    cleanliness
+        .is_err()
+        .then_some(FanoutGcReason::WorktreeNotClean)
+}
+
+fn removal_outcome(branch: String, removal: Result<(), String>) -> FanoutGcOutcome {
+    match removal {
+        Ok(()) => FanoutGcOutcome::Removed(branch),
+        Err(_) => FanoutGcOutcome::retained(branch, FanoutGcReason::RemovalFailed),
+    }
+}
+
+fn changed_candidate_reason(
+    repository_identity_matches: bool,
+    worktree_snapshot_matches: Option<bool>,
+) -> Option<FanoutGcReason> {
+    if !repository_identity_matches {
+        Some(FanoutGcReason::RepositoryIdentityChanged)
+    } else if worktree_snapshot_matches == Some(false) {
+        Some(FanoutGcReason::WorktreeChanged)
+    } else {
+        None
+    }
+}
+
+fn legacy_shape_reason(components: &[String]) -> Option<FanoutGcReason> {
+    (components.len() == 1).then_some(FanoutGcReason::LegacyShape)
 }
 
 // `FanoutRecord` dwarfs the other variants (≈968 vs 24 bytes), so the candidate
@@ -68,8 +178,17 @@ struct FanoutGcCandidate {
 
 enum FanoutGcDecision {
     Skipped,
-    Retained(String),
+    Retained {
+        branch: String,
+        reason: FanoutGcReason,
+    },
     Candidate(Box<FanoutGcCandidate>),
+}
+
+impl FanoutGcDecision {
+    fn retained(branch: String, reason: FanoutGcReason) -> Self {
+        Self::Retained { branch, reason }
+    }
 }
 
 struct ReapContext<'a> {
@@ -357,10 +476,15 @@ fn abandoned_worktree_decision(
     // mismatch was skipped before. This check precedes the snapshot lookup on
     // purpose: `old_worktree_snapshot` reports a malformed path as `Err`, and
     // reaching it first would turn today's skip into a hard failure.
-    if worktree_path_components(&worktrees_root, &current.worktree, &current.reservation_id)
-        .is_err()
-    {
-        return Ok(FanoutGcDecision::Skipped);
+    let components =
+        match worktree_path_components(&worktrees_root, &current.worktree, &current.reservation_id)
+        {
+            Ok(components) => components,
+            Err(_) => return Ok(FanoutGcDecision::Skipped),
+        };
+    let branch = current.branch.clone();
+    if let Some(reason) = legacy_shape_reason(&components) {
+        return Ok(FanoutGcDecision::retained(branch, reason));
     }
     let worktree_snapshot = match expected_worktree_snapshot {
         Some(snapshot) => snapshot,
@@ -388,20 +512,22 @@ fn abandoned_worktree_decision(
 
     // Branch refs are never deleted by GC. Reporting the ref happens for every
     // old, process-free reservation whether its worktree is removed or retained.
-    let branch = current.branch.clone();
-    if !ctx.identity.matches_record(current) {
-        return Ok(FanoutGcDecision::Retained(branch));
-    }
-    if expected_worktree_snapshot.is_some()
-        && !worktree_matches_snapshot(
+    let worktree_snapshot_matches = if expected_worktree_snapshot.is_some() {
+        Some(worktree_matches_snapshot(
             &worktrees_root,
             ctx.worktrees,
             &current.worktree,
             reservation_id,
             worktree_snapshot,
-        )?
-    {
-        return Ok(FanoutGcDecision::Retained(branch));
+        )?)
+    } else {
+        None
+    };
+    if let Some(reason) = changed_candidate_reason(
+        ctx.identity.matches_record(current),
+        worktree_snapshot_matches,
+    ) {
+        return Ok(FanoutGcDecision::retained(branch, reason));
     }
     Ok(FanoutGcDecision::Candidate(Box::new(FanoutGcCandidate {
         record: current.clone(),
@@ -424,25 +550,30 @@ pub(crate) fn reap_abandoned_worktrees(
             continue;
         };
         let worktrees_root = fanout.root().join("worktrees");
-        // `||` short-circuits, so a structurally invalid path never reaches the
-        // snapshot lookup that would report it as an error rather than a skip.
-        if snapshot.collection_phase.is_some()
-            || snapshot.state == FanoutState::Collected
-            || worktree_path_components(
-                &worktrees_root,
-                &snapshot.worktree,
-                &snapshot.reservation_id,
-            )
-            .is_err()
-            || old_worktree_snapshot(
-                &worktrees_root,
-                worktrees,
-                &snapshot.worktree,
-                &reservation_id,
-                cutoff,
-            )?
-            .is_none()
+        if snapshot.collection_phase.is_some() || snapshot.state == FanoutState::Collected {
+            continue;
+        }
+        let components = match worktree_path_components(
+            &worktrees_root,
+            &snapshot.worktree,
+            &snapshot.reservation_id,
+        ) {
+            Ok(components) => components,
+            Err(_) => continue,
+        };
+        if old_worktree_snapshot(
+            &worktrees_root,
+            worktrees,
+            &snapshot.worktree,
+            &reservation_id,
+            cutoff,
+        )?
+        .is_none()
         {
+            continue;
+        }
+        if let Some(reason) = legacy_shape_reason(&components) {
+            report.record(FanoutGcOutcome::retained(snapshot.branch, reason));
             continue;
         }
         let _collection_lock = match acquire_collection_lock(fanout.root(), &reservation_id) {
@@ -469,24 +600,26 @@ pub(crate) fn reap_abandoned_worktrees(
         })?;
         let outcome = match decision {
             FanoutGcDecision::Skipped => FanoutGcOutcome::Skipped,
-            FanoutGcDecision::Retained(branch) => FanoutGcOutcome::Retained(branch),
+            FanoutGcDecision::Retained { branch, reason } => {
+                FanoutGcOutcome::retained(branch, reason)
+            }
             FanoutGcDecision::Candidate(candidate) => {
                 let FanoutGcCandidate {
                     record,
                     worktree_snapshot,
                 } = *candidate;
                 let branch = record.branch.clone();
-                if !matches!(
-                    uncollected_commit_count(
-                        Path::new(&record.worktree),
-                        &record.base_sha,
-                        &record.branch,
-                    ),
-                    Ok(0)
-                ) || ensure_clean(Path::new(&record.worktree), "abandoned fanout worktree")
-                    .is_err()
-                {
-                    FanoutGcOutcome::Retained(branch)
+                if let Some(reason) = commit_inspection_reason(uncollected_commit_count(
+                    Path::new(&record.worktree),
+                    &record.base_sha,
+                    &record.branch,
+                )) {
+                    FanoutGcOutcome::retained(branch, reason)
+                } else if let Some(reason) = cleanliness_reason(ensure_clean(
+                    Path::new(&record.worktree),
+                    "abandoned fanout worktree",
+                )) {
+                    FanoutGcOutcome::retained(branch, reason)
                 } else {
                     let revalidated = fanout.read_transaction(|records, lifecycle| {
                         abandoned_worktree_decision(
@@ -500,31 +633,26 @@ pub(crate) fn reap_abandoned_worktrees(
                     })?;
                     match revalidated {
                         FanoutGcDecision::Skipped => FanoutGcOutcome::Skipped,
-                        FanoutGcDecision::Retained(branch) => FanoutGcOutcome::Retained(branch),
+                        FanoutGcDecision::Retained { branch, reason } => {
+                            FanoutGcOutcome::retained(branch, reason)
+                        }
                         FanoutGcDecision::Candidate(candidate) => {
                             let record = candidate.record;
                             let branch = record.branch.clone();
-                            match remove_unstarted_worktree(
-                                Path::new(&record.repo_common_dir),
-                                Path::new(&record.worktree),
-                            ) {
-                                Ok(()) => FanoutGcOutcome::Removed(branch),
-                                Err(_) => FanoutGcOutcome::Retained(branch),
-                            }
+                            removal_outcome(
+                                branch,
+                                remove_unstarted_worktree(
+                                    Path::new(&record.repo_common_dir),
+                                    Path::new(&record.worktree),
+                                ),
+                            )
                         }
                     }
                 }
             }
         };
 
-        match outcome {
-            FanoutGcOutcome::Skipped => {}
-            FanoutGcOutcome::Retained(branch) => report.retained_branches.push(branch),
-            FanoutGcOutcome::Removed(branch) => {
-                report.removed_worktrees += 1;
-                report.retained_branches.push(branch);
-            }
-        }
+        report.record(outcome);
     }
     Ok(report)
 }
@@ -1100,4 +1228,59 @@ fn advance_collection(
         increment_record_version(current)?;
         Ok(current.clone())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retention_report_keeps_reason_discriminants() {
+        let protective_reasons = [
+            legacy_shape_reason(&["reservation".to_string()]).expect("legacy shape"),
+            changed_candidate_reason(false, None).expect("repository identity change"),
+            changed_candidate_reason(true, Some(false)).expect("worktree snapshot change"),
+            commit_inspection_reason(Ok(1)).expect("uncollected commit"),
+            commit_inspection_reason(Err("inspect".into())).expect("commit inspection failure"),
+            cleanliness_reason(Err("dirty".into())).expect("dirty worktree"),
+        ];
+        let mut report = FanoutGcReport::default();
+        for (index, reason) in protective_reasons.into_iter().enumerate() {
+            report.record(FanoutGcOutcome::retained(format!("branch-{index}"), reason));
+        }
+
+        assert_eq!(
+            report
+                .entries
+                .iter()
+                .map(|entry| entry.reason)
+                .collect::<Vec<_>>(),
+            vec![
+                FanoutGcReason::LegacyShape,
+                FanoutGcReason::RepositoryIdentityChanged,
+                FanoutGcReason::WorktreeChanged,
+                FanoutGcReason::UncollectedCommits,
+                FanoutGcReason::CommitInspectionFailed,
+                FanoutGcReason::WorktreeNotClean,
+            ]
+        );
+    }
+
+    #[test]
+    fn removal_failure_has_distinct_report_reason() {
+        let mut report = FanoutGcReport::default();
+        report.record(removal_outcome(
+            "relay/fanout-failed".into(),
+            Err("git worktree remove failed".into()),
+        ));
+
+        assert_eq!(
+            report.entries,
+            vec![FanoutGcReportEntry {
+                branch: Some("relay/fanout-failed".into()),
+                reason: FanoutGcReason::RemovalFailed,
+            }]
+        );
+        assert_eq!(report.removed_worktrees, 0);
+    }
 }

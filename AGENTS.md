@@ -27,6 +27,20 @@ For every future check, choose exactly one owning scenario, update that scenario
 
 The shared store defaults to `~/.agent-relay` (`AGENT_RELAY_HOME`, then legacy `SESSION_RELAY_HOME`, override it). `relay hook` and `relay bus` run a six-hour-throttled sweep: abandoned fan-out worktrees are swept after one day, while the shared-store inactivity threshold defaults to 14 days; `AGENT_RELAY_GC_DAYS=<days>` overrides the shared-store threshold, and `0` disables GC. Collection is all-surfaces-old and held-lock-safe; it enumerates only relay-owned mailbox/marker/watcher/resume-lock/spawn-log files, never the invoking id, and removes registry/name entries last. Spawn stderr is pumped independently of the short-lived parent and compacted from just over 4 MiB to the newest 3 MiB; `File::create` still truncates the new target before child launch.
 
+Fan-out GC emits one structured stderr record per reported outcome; its `reason`
+field is rendered only from the typed report discriminant. Treat the stable
+reasons as operator instructions: `legacy_shape` means preserve the branch and
+worktree and inspect the flat reservation manually; `repository_identity_changed`
+means verify the recorded repository and current Git common-directory identity;
+`worktree_changed` means inspect replacement, movement, or metadata changes
+before retrying; `uncollected_commits` means collect or otherwise preserve the
+branch commits; `commit_inspection_failed` means repair Git access or metadata
+and rerun inspection; `worktree_not_clean` means preserve or clean dirty changes
+before retrying; `removal_failed` means repair the Git worktree registration or
+filesystem failure and retry removal; and `worktrees_surface_unavailable` means
+restore or securely recreate the store's `worktrees` directory before rerunning
+GC. A diagnostic is not removal authority.
+
 ## Correlated protocol boundary
 
 Session Relay 0.14 adds `request` / `reply` and typed fan-out results without
@@ -70,6 +84,14 @@ merge. Default collect stdout is immutable; `--result-json` is the sole
 machine-readable opt-in. Pre-0.14 records preserve legacy handback/collect and
 never fabricate a typed result. Durable fan-out authority lives in mode-0600
 `fanout-v1.json`, separate from `lifecycle-v1.json` and `protocol-v1/`.
+
+Fan-out GC accepts keyed two- and three-component persisted worktree paths for
+removal eligibility. It still resolves one-component paths for validation and
+rollback, but refuses that flat legacy shape during reaping with
+`legacy_shape`: the persisted path is not rewritten or migrated, and both the
+worktree and branch remain. Every protective or failed-removal retention uses
+the stable reason/action contract under Store hygiene; never infer a replacement
+reason at the stderr boundary or delete a branch ref.
 
 ## Binary release discipline
 

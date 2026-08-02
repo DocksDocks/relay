@@ -877,6 +877,49 @@ fn gc_surface_dir<'a>(dirs: &'a [GcSurfaceDir], name: &str) -> Option<&'a GcSurf
     dirs.iter().find(|dir| dir.name == name)
 }
 
+fn collect_fanout_gc(
+    surface_dirs: &[GcSurfaceDir],
+    root: &Path,
+    cutoff: SystemTime,
+) -> Result<crate::fanout::FanoutGcReport, String> {
+    match gc_surface_dir(surface_dirs, "worktrees") {
+        Some(worktrees) => crate::fanout::reap_abandoned_worktrees(
+            &crate::fanout::FanoutStore::new(root.to_path_buf()),
+            worktrees,
+            cutoff,
+        ),
+        None => Ok(crate::fanout::FanoutGcReport::worktrees_surface_unavailable()),
+    }
+}
+
+fn write_fanout_diagnostics<W: Write>(
+    writer: &mut W,
+    report: &crate::fanout::FanoutGcReport,
+) -> std::io::Result<()> {
+    for branch in &report.retained_branches {
+        writeln!(writer, "[session-relay/gc] retained fanout branch {branch}")?;
+    }
+    for entry in &report.entries {
+        if let Some(branch) = &entry.branch {
+            let branch = JsonValue::from(branch.clone())
+                .stringify()
+                .expect("fanout branch string is valid JSON");
+            writeln!(
+                writer,
+                r#"[session-relay/gc] {{"event":"fanout_gc","branch":{branch},"reason":"{}"}}"#,
+                entry.reason.label()
+            )?;
+        } else {
+            writeln!(
+                writer,
+                r#"[session-relay/gc] {{"event":"fanout_gc","reason":"{}"}}"#,
+                entry.reason.label()
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn gc_surface_id(directory: &str, name: &str) -> Option<String> {
     let id = match directory {
         "mailbox" => name.strip_suffix(".jsonl")?,
@@ -1310,16 +1353,13 @@ impl LegacyGc {
             .min(i64::MAX as u128) as i64;
         let cutoff_iso = iso_from_unix_ms(cutoff_ms);
 
-        let fanout_report = match gc_surface_dir(&self.surface_dirs, "worktrees") {
-            Some(worktrees) => crate::fanout::reap_abandoned_worktrees(
-                &crate::fanout::FanoutStore::new(self.root.clone()),
-                worktrees,
-                fanout_worktree_cutoff,
-            )?,
-            None => crate::fanout::FanoutGcReport::default(),
-        };
-        for branch in &fanout_report.retained_branches {
-            eprintln!("[session-relay/gc] retained fanout branch {branch}");
+        let fanout_report =
+            collect_fanout_gc(&self.surface_dirs, &self.root, fanout_worktree_cutoff)?;
+        {
+            let stderr = std::io::stderr();
+            let mut stderr = stderr.lock();
+            write_fanout_diagnostics(&mut stderr, &fanout_report)
+                .map_err(|error| format!("write fanout GC diagnostic: {error}"))?;
         }
         let removed_worktrees = fanout_report.removed_worktrees;
 
@@ -1872,5 +1912,74 @@ mod tests {
         drop(dirs);
         drop(root_fd);
         fs::remove_dir_all(root).expect("remove GC freshness fixture");
+    }
+
+    #[test]
+    fn fanout_diagnostics_render_report_reasons() {
+        use crate::fanout::{FanoutGcReason, FanoutGcReport, FanoutGcReportEntry};
+
+        let reasons = [
+            FanoutGcReason::LegacyShape,
+            FanoutGcReason::RepositoryIdentityChanged,
+            FanoutGcReason::WorktreeChanged,
+            FanoutGcReason::UncollectedCommits,
+            FanoutGcReason::CommitInspectionFailed,
+            FanoutGcReason::WorktreeNotClean,
+            FanoutGcReason::RemovalFailed,
+            FanoutGcReason::WorktreesSurfaceUnavailable,
+        ];
+        let report = FanoutGcReport {
+            entries: reasons
+                .into_iter()
+                .enumerate()
+                .map(|(index, reason)| FanoutGcReportEntry {
+                    branch: (reason != FanoutGcReason::WorktreesSurfaceUnavailable)
+                        .then(|| format!("branch-{index}")),
+                    reason,
+                })
+                .collect(),
+            ..FanoutGcReport::default()
+        };
+        let mut rendered = Vec::new();
+        write_fanout_diagnostics(&mut rendered, &report).expect("render fanout diagnostics");
+
+        assert_eq!(
+            rendered,
+            concat!(
+                "[session-relay/gc] {\"event\":\"fanout_gc\",\"branch\":\"branch-0\",\"reason\":\"legacy_shape\"}\n",
+                "[session-relay/gc] {\"event\":\"fanout_gc\",\"branch\":\"branch-1\",\"reason\":\"repository_identity_changed\"}\n",
+                "[session-relay/gc] {\"event\":\"fanout_gc\",\"branch\":\"branch-2\",\"reason\":\"worktree_changed\"}\n",
+                "[session-relay/gc] {\"event\":\"fanout_gc\",\"branch\":\"branch-3\",\"reason\":\"uncollected_commits\"}\n",
+                "[session-relay/gc] {\"event\":\"fanout_gc\",\"branch\":\"branch-4\",\"reason\":\"commit_inspection_failed\"}\n",
+                "[session-relay/gc] {\"event\":\"fanout_gc\",\"branch\":\"branch-5\",\"reason\":\"worktree_not_clean\"}\n",
+                "[session-relay/gc] {\"event\":\"fanout_gc\",\"branch\":\"branch-6\",\"reason\":\"removal_failed\"}\n",
+                "[session-relay/gc] {\"event\":\"fanout_gc\",\"reason\":\"worktrees_surface_unavailable\"}\n",
+            )
+            .as_bytes()
+        );
+    }
+
+    #[test]
+    fn missing_worktrees_surface_reports_unavailable() {
+        use crate::fanout::{FanoutGcReason, FanoutGcReportEntry};
+
+        let report = collect_fanout_gc(&[], Path::new("/not-opened"), UNIX_EPOCH)
+            .expect("missing worktrees surface is reported");
+        assert_eq!(report.removed_worktrees, 0);
+        assert!(report.retained_branches.is_empty());
+        assert_eq!(
+            report.entries,
+            vec![FanoutGcReportEntry {
+                branch: None,
+                reason: FanoutGcReason::WorktreesSurfaceUnavailable,
+            }]
+        );
+
+        let mut rendered = Vec::new();
+        write_fanout_diagnostics(&mut rendered, &report).expect("render unavailable diagnostic");
+        assert_eq!(
+            rendered,
+            b"[session-relay/gc] {\"event\":\"fanout_gc\",\"reason\":\"worktrees_surface_unavailable\"}\n"
+        );
     }
 }

@@ -119,12 +119,13 @@
     "fanout_reap": {
       "tests": [
         "abandoned_reservation_past_window_removes_worktree_and_reports_retained_branch",
-        "legacy_flat_worktree_past_fanout_cutoff_is_reaped",
+        "legacy_flat_worktree_is_refused_and_reported",
         "live_worker_reservation_is_untouched",
         "lost_authority_without_observation_is_untouched",
         "managed_workspace_gate_refusal_skips_only_that_reservation",
         "nested_worktree_past_fanout_cutoff_is_reaped",
         "reservation_inside_window_keeps_worktree_and_branch",
+        "reservation_with_dirty_changes_keeps_worktree_and_reports_reason",
         "reservation_with_uncollected_commits_keeps_worktree_and_reports_branch",
         "two_day_fanout_worktree_is_reaped_while_shared_mailbox_is_retained"
       ]

@@ -252,6 +252,28 @@ fn reservation_with_uncollected_commits_keeps_worktree_and_reports_branch() {
     assert!(fixture.worktree().is_dir());
     assert!(fixture.branch_exists());
     assert!(report.contains(&fixture.reservation.branch), "{report}");
+    assert!(
+        report.contains(r#""reason":"uncollected_commits""#),
+        "{report}"
+    );
+}
+
+#[test]
+fn reservation_with_dirty_changes_keeps_worktree_and_reports_reason() {
+    let fixture = Fixture::new("fanout-reap-dirty");
+    fs::write(fixture.worktree().join("dirty.txt"), "dirty\n").expect("write dirty work");
+    fixture.age_past_gc_window();
+
+    let output = fixture.run_gc();
+    let report = String::from_utf8_lossy(&output.stderr);
+
+    assert!(fixture.worktree().is_dir());
+    assert!(fixture.branch_exists());
+    assert!(report.contains(&fixture.reservation.branch), "{report}");
+    assert!(
+        report.contains(r#""reason":"worktree_not_clean""#),
+        "{report}"
+    );
 }
 
 #[test]
@@ -353,7 +375,7 @@ fn managed_workspace_gate_refusal_skips_only_that_reservation() {
 }
 
 #[test]
-fn legacy_flat_worktree_past_fanout_cutoff_is_reaped() {
+fn legacy_flat_worktree_is_refused_and_reported() {
     let mut fixture = Fixture::new("fanout-reap-legacy-flat");
     let nested_worktree = fixture.worktree().to_path_buf();
     let legacy_worktree = fixture
@@ -382,12 +404,25 @@ fn legacy_flat_worktree_past_fanout_cutoff_is_reaped() {
     fixture.reservation.worktree = legacy_worktree.to_string_lossy().into_owned();
     fixture.age_past_gc_window();
 
-    fixture.run_gc();
+    let output = fixture.run_gc();
+    let report = String::from_utf8_lossy(&output.stderr);
+    let persisted = fixture
+        .store
+        .read(&fixture.reservation.reservation_id)
+        .expect("read fanout authority")
+        .expect("flat reservation remains");
 
     assert!(
-        !legacy_worktree.exists(),
-        "legacy one-component worktree was not reaped"
+        legacy_worktree.is_dir(),
+        "legacy one-component worktree must be preserved"
     );
+    assert!(fixture.branch_exists(), "legacy branch must be preserved");
+    assert_eq!(
+        persisted.worktree, fixture.reservation.worktree,
+        "legacy persisted path must not be rewritten"
+    );
+    assert!(report.contains(&fixture.reservation.branch), "{report}");
+    assert!(report.contains(r#""reason":"legacy_shape""#), "{report}");
 }
 
 #[test]
