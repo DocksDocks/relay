@@ -9,6 +9,7 @@ import { parse as parseYaml } from 'yaml';
 import {
   ASSETS,
   canonicalize,
+  loadReleaseInstance,
   PRERELEASE_BODY,
   REPO,
   REPOSITORY_ID,
@@ -18,6 +19,7 @@ import {
   TAG,
   VERSION,
 } from '../../../scripts/lib/session-relay-release-core.mjs';
+import { releaseTagCommit } from '../../../scripts/lib/session-relay-release-instances/schema.mjs';
 import {
   PROMOTION_EVIDENCE_REBIND_RECEIPT_DESCRIPTOR,
   promoteReviewed,
@@ -31,11 +33,17 @@ import {
 import { resolveHistoricalPublicationPlanPath } from './historical-plan-path.mjs';
 import { resolveShippedRelayVersion } from './version.mjs';
 
-const SOURCE = '3fb9211f3309977f24853a10714d4b7a82b38c8f';
+const INSTANCE = loadReleaseInstance(VERSION, {
+  require: ['current_attempt', 'planrun_attempt', 'public_child'],
+});
+const RETAINED_V2_INSTANCE = loadReleaseInstance('0.14.0', { require: ['current_attempt'] });
+
+// Fixed historical 0.13 source fixture; it never impersonates the current release-tag commit.
+const LEGACY_SOURCE_COMMIT_FIXTURE = '3fb9211f3309977f24853a10714d4b7a82b38c8f';
 const EXPECTED_VERSION = '0.13.0';
 const EXPECTED_TAG = 'session-relay--v0.13.0';
-const DOCKS_PLAN_PATH = 'docs/plans/active/session-relay-0.15.0-release.md';
-const DOCKS_FINISHED_PLAN_PATH = 'docs/plans/finished/2026-07-23-session-relay-0.15.0-release.md';
+const DOCKS_PLAN_PATH = RETAINED_V2_INSTANCE.current_attempt.release_plan_path;
+const DOCKS_FINISHED_PLAN_PATH = 'docs/plans/finished/2026-07-23-session-relay-linux-workspace-recertification.md';
 const PUBLIC_PLAN_PATH = 'docs/plans/active/session-relay-cli-0.13.0-release-preparation.md';
 const ORDINARY_ASSETS = Object.freeze([
   'session-relay-aarch64-apple-darwin',
@@ -45,39 +53,21 @@ const ORDINARY_ASSETS = Object.freeze([
 ]);
 const EXPECTED_ASSETS = Object.freeze([...ORDINARY_ASSETS, 'SHA256SUMS']);
 const { version: CURRENT_VERSION, tag: CURRENT_TAG } = resolveShippedRelayVersion(REPO);
-const CURRENT_PUBLIC_VERSION = '0.13.0';
-const CURRENT_PUBLIC_TAG = 'cli-v0.13.0';
+const CURRENT_PUBLIC_VERSION = INSTANCE.public_child.version;
+const CURRENT_PUBLIC_TAG = INSTANCE.public_child.tag;
 const HISTORICAL_PUBLICATION_SHA256 = '31d096d31702b66d7e97085a82d8b7da1b75155f828b1d2382a0ac8427ba7ea2';
 const HISTORICAL_RELEASE_PLAN_PATH = resolveHistoricalPublicationPlanPath(REPO);
-const CURRENT_GOAL_ID = '258b44c2-c3b2-4902-862c-7461724ca078';
-const CURRENT_DOCKS_RUN_ID = '12a460e2-af44-4bc8-bc7d-d7aaec2c991b';
-const CURRENT_DOCKS_PLAN_PATH = 'docs/plans/active/session-relay-0.15.0-release.md';
-const CURRENT_DOCKS_SOURCE_BASE = 'c5c29cec073f1c6734a8f9b6b98ce8bf7ac4029f';
-const SUCCESSOR_DOCKS_RUN_ID = '12a460e2-af44-4bc8-bc7d-d7aaec2c991b';
-const SUCCESSOR_DOCKS_PLAN_PATH = 'docs/plans/active/session-relay-0.15.0-release.md';
-const SUCCESSOR_DOCKS_SOURCE_BASE = 'c5c29cec073f1c6734a8f9b6b98ce8bf7ac4029f';
-const IMMUTABLE_RELEASE_TAG_COMMIT = 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef';
-const SUCCESSOR_AFFECTED_PATHS = Object.freeze([
-  '.claude-plugin/marketplace.json',
-  'plugins/session-relay/.claude-plugin/plugin.json',
-  'plugins/session-relay/.codex-plugin/plugin.json',
-  'plugins/session-relay/rust/Cargo.lock',
-  'plugins/session-relay/rust/Cargo.toml',
-  'plugins/session-relay/test/companion-distribution-contract.mjs',
-  'plugins/session-relay/test/distribution-contract.mjs',
-  'plugins/session-relay/test/fixtures/release-identity-inventory.json',
-  'plugins/session-relay/test/release-evidence-contract.mjs',
-  'plugins/session-relay/test/release-instance-contract.mjs',
-  'plugins/session-relay/test/release-promotion-contract.mjs',
-  'plugins/session-relay/test/release-publication-contract.mjs',
-  'plugins/session-relay/test/remediation-contract.mjs',
-  'scripts/lib/session-relay-release-core.mjs',
-  'scripts/lib/session-relay-release-instances/0.15.0.json',
-  'scripts/lib/session-relay-release-promotion.mjs',
-  'scripts/lib/session-relay-release-publication.mjs',
-]);
-const CURRENT_PUBLIC_RUN_ID = 'ad7f3b75-dfff-4bcd-8d1f-c8c11555b119';
-const CURRENT_PUBLIC_ACTIVE_PLAN_PATH = 'docs/plans/active/session-relay-0.15.0-docks-kit-0.13.0-release.md';
+const CURRENT_GOAL_ID = INSTANCE.current_attempt.goal_id;
+const CURRENT_DOCKS_RUN_ID = INSTANCE.current_attempt.docks_run_id;
+const CURRENT_DOCKS_PLAN_PATH = INSTANCE.current_attempt.docks_plan_path;
+const CURRENT_DOCKS_SOURCE_BASE = INSTANCE.current_attempt.docks_source_base;
+const SUCCESSOR_DOCKS_RUN_ID = INSTANCE.planrun_attempt.docks_run_id;
+const SUCCESSOR_DOCKS_PLAN_PATH = INSTANCE.planrun_attempt.docks_plan_path;
+const SUCCESSOR_DOCKS_SOURCE_BASE = INSTANCE.planrun_attempt.docks_source_base;
+const RELEASE_TAG_COMMIT = releaseTagCommit(INSTANCE);
+const SUCCESSOR_AFFECTED_PATHS = Object.freeze([...INSTANCE.planrun_attempt.docks_affected_paths]);
+const CURRENT_PUBLIC_RUN_ID = INSTANCE.current_attempt.public_run_id;
+const CURRENT_PUBLIC_ACTIVE_PLAN_PATH = `docs/plans/active/session-relay-${VERSION}-docks-kit-${CURRENT_PUBLIC_VERSION}-release.md`;
 const CURRENT_PUBLIC_FINISHED_PLAN_PATH =
   'docs/plans/finished/2026-07-26-session-relay-0.15.0-docks-kit-0.13.0-release.md';
 const HISTORICAL_SOURCE_PROOF_V1_SHA256 = '419b23ccdcf0ca21672e81c05ae9d22c55bc67781839ffb6a29e7eecc2b59396';
@@ -145,7 +135,7 @@ function proof(directory) {
     type: 'SourcePreparationCandidateV1',
     repository_id: REPOSITORY_ID,
     version: EXPECTED_VERSION,
-    source_commit: SOURCE,
+    source_commit: LEGACY_SOURCE_COMMIT_FIXTURE,
     execution_base_commit: 'b'.repeat(40),
     plan: {
       path: DOCKS_PLAN_PATH,
@@ -232,8 +222,8 @@ function proof(directory) {
     type: 'SourcePreparationProofV1',
     repository_id: REPOSITORY_ID,
     version: EXPECTED_VERSION,
-    source_commit: SOURCE,
-    tag_commit: SOURCE,
+    source_commit: LEGACY_SOURCE_COMMIT_FIXTURE,
+    tag_commit: LEGACY_SOURCE_COMMIT_FIXTURE,
     evidence_commit: '6'.repeat(40),
     shipped_commit: '2'.repeat(40),
     promoted_commit: '3'.repeat(40),
@@ -249,13 +239,13 @@ function proof(directory) {
     },
     completion_review_sha256: '5'.repeat(64),
     source_ancestry: {
-      source_commit: SOURCE,
+      source_commit: LEGACY_SOURCE_COMMIT_FIXTURE,
       evidence_commit: '6'.repeat(40),
       shipped_commit: '2'.repeat(40),
       verified: true,
     },
     non_plan_tree_equivalence: {
-      source_commit: SOURCE,
+      source_commit: LEGACY_SOURCE_COMMIT_FIXTURE,
       shipped_commit: '2'.repeat(40),
       excluded_paths: [DOCKS_PLAN_PATH, DOCKS_FINISHED_PLAN_PATH],
       verified: true,
@@ -279,7 +269,7 @@ function run(id = 701, event = 'push') {
   return {
     id,
     run_attempt: 3,
-    head_sha: SOURCE,
+    head_sha: LEGACY_SOURCE_COMMIT_FIXTURE,
     head_branch: EXPECTED_TAG,
     path: WORKFLOW_PATH,
     event,
@@ -311,7 +301,7 @@ function runAttestationRecords(workflowRun, assets, mode = workflowRun.event ===
       return {
         asset_name: asset.name,
         inputs: {
-          expected_commit: workflowRun.event === 'push' ? '' : SOURCE,
+          expected_commit: workflowRun.event === 'push' ? '' : LEGACY_SOURCE_COMMIT_FIXTURE,
           expected_tag: workflowRun.event === 'push' ? '' : EXPECTED_TAG,
           mode,
         },
@@ -319,7 +309,7 @@ function runAttestationRecords(workflowRun, assets, mode = workflowRun.event ===
         runner_os: runners[target][1],
         schema: 'SessionRelayBinaryAttestationV1',
         sha256: asset.digest,
-        source_commit: SOURCE,
+        source_commit: LEGACY_SOURCE_COMMIT_FIXTURE,
         target,
         version_stdout: `session-relay ${EXPECTED_VERSION}`,
         workflow_run_attempt: workflowRun.run_attempt,
@@ -348,7 +338,7 @@ function prerelease(runAssets, overrides = {}) {
   return {
     id: 501,
     tag_name: TAG,
-    target_commitish: SOURCE,
+    target_commitish: LEGACY_SOURCE_COMMIT_FIXTURE,
     prerelease: true,
     draft: false,
     body: PRERELEASE_BODY,
@@ -379,7 +369,7 @@ function capturedRun() {
   return {
     id: CAPTURED_RUN_ID,
     run_attempt: 1,
-    head_sha: SOURCE,
+    head_sha: LEGACY_SOURCE_COMMIT_FIXTURE,
     head_branch: EXPECTED_TAG,
     path: WORKFLOW_PATH,
     event: 'push',
@@ -404,7 +394,7 @@ function capturedPrerelease(overrides = {}) {
   return {
     id: CAPTURED_RELEASE_ID,
     tag_name: TAG,
-    target_commitish: SOURCE,
+    target_commitish: LEGACY_SOURCE_COMMIT_FIXTURE,
     prerelease: true,
     draft: false,
     body: PRERELEASE_BODY,
@@ -445,7 +435,7 @@ function capturedAdapter({
 }
 
 function fakeAdapter({
-  tagCommit = SOURCE,
+  tagCommit = LEGACY_SOURCE_COMMIT_FIXTURE,
   runs = [run()],
   release = prerelease(runAssetRecords()),
   runAssets = runAssetRecords(),
@@ -1096,7 +1086,9 @@ function currentSourcePreparationProofV3(directory) {
   value.type = 'SourcePreparationProofV3';
   value.run_id = SUCCESSOR_DOCKS_RUN_ID;
   value.source_commit = SUCCESSOR_DOCKS_SOURCE_BASE;
-  value.tag_commit = IMMUTABLE_RELEASE_TAG_COMMIT;
+  // Before the tag is cut, the existing implementation fixture is only a valid
+  // rejection candidate. After it is cut, bind the proof to the recorded commit.
+  value.tag_commit = RELEASE_TAG_COMMIT ?? value.implementation_commit;
   value.plan_run = {
     ...value.plan_run,
     run_id: SUCCESSOR_DOCKS_RUN_ID,
@@ -1189,9 +1181,8 @@ function currentCompletedPublicationFixture(directory) {
   return { fake, options, releaseCreatedAt, sourceProof };
 }
 
-function currentFinalizationFixture(directory, { prerelease = false, sourceSchema = 2 } = {}) {
-  const sourceProof =
-    sourceSchema === 3 ? currentSourcePreparationProofV3(directory) : currentSourcePreparationProofV2(directory);
+function currentFinalizationFixture(directory, { prerelease = false } = {}) {
+  const sourceProof = currentSourcePreparationProofV3(directory);
   const publicationValue = structuredClone(currentPublicationReceiptV2().value);
   publicationValue.source_proof_sha256 = sourceProof.digest;
   publicationValue.source.reviewed_commit =
@@ -1433,7 +1424,7 @@ function currentFinalizationFixture(directory, { prerelease = false, sourceSchem
 }
 
 function schema4FinalizationFixture(directory) {
-  const current = currentFinalizationFixture(directory, { sourceSchema: 3 });
+  const current = currentFinalizationFixture(directory);
   current.fake.adapter.now = () => '2026-07-26T12:30:00.000Z';
   const publicReleaseValue = structuredClone(current.publicRelease.value);
   publicReleaseValue.schema = 3;
@@ -1502,12 +1493,276 @@ function schema4FinalizationFixture(directory) {
   return { ...current, promotion, publicRelease };
 }
 
+function assertCutReleaseFinalization() {
+  {
+    const directory = fs.mkdtempSync(path.join(root, 'current-finalize-'));
+    const current = currentFinalizationFixture(directory);
+    finalizeReviewed(current.options, current.fake.adapter, validatePromotionReceiptForFinalization);
+    const stableBytes = fs.readFileSync(current.options.get('receipt-out'));
+    const stableReceipt = JSON.parse(stableBytes);
+    validatePublicationReceipt(
+      { value: stableReceipt, digest: sha256(stableBytes) },
+      current.sourceProof,
+      'current stable finalization',
+    );
+    assert.equal(stableReceipt.schema, 2);
+    assert.equal(stableReceipt.type, 'SessionRelayPublicationReceiptV2');
+    assert.equal(stableReceipt.release_state, 'stable');
+    assert.equal(stableReceipt.transition, 'already_stable');
+    assert.equal(stableReceipt.body_sha256, sha256(Buffer.from(STABLE_BODY)));
+    assert.equal(stableReceipt.release_database_id, current.publication.value.release_database_id);
+    assert.deepEqual(stableReceipt.assets, current.publication.value.assets);
+    assert.equal(
+      current.fake.state.edited,
+      0,
+      'current finalization must consume the promoted stable release without reopening the target',
+    );
+
+    const resumedOptions = new Map(current.options);
+    resumedOptions.set('receipt-out', path.join(directory, 'current-stable-finalization-resumed.json'));
+    resumedOptions.set('resume-finalization', current.options.get('receipt-out'));
+    resumedOptions.set('resume-finalization-sha256', sha256(stableBytes));
+    finalizeReviewed(resumedOptions, current.fake.adapter, validatePromotionReceiptForFinalization);
+    assert.equal(current.fake.state.edited, 0, 'current finalization resume must not edit the stable release');
+    assert.equal(
+      fs.readFileSync(resumedOptions.get('receipt-out'), 'utf8'),
+      stableBytes.toString('utf8'),
+      'current finalization resume must emit the byte-identical V2 stable receipt',
+    );
+    checks += 2;
+  }
+
+  {
+    const directory = fs.mkdtempSync(path.join(root, 'schema4-evidence-finalize-'));
+    const current = schema4FinalizationFixture(directory);
+    const injectedPromotionAdapter = Object.freeze({
+      getPublicationWorkflowRun(runId) {
+        const workflowRun = current.fake.state.runs.find(({ id }) => id === runId);
+        return {
+          id: workflowRun.id,
+          run_attempt: workflowRun.run_attempt,
+          head_sha: workflowRun.head_sha,
+          path: workflowRun.path,
+          event: workflowRun.event,
+          status: workflowRun.status,
+          conclusion: workflowRun.conclusion,
+          run_started_at: workflowRun.run_started_at,
+          updated_at: workflowRun.updated_at,
+        };
+      },
+    });
+    const releaseBefore = structuredClone(current.fake.state.release);
+    // Full schema 4 validation lives in the promotion contract; this spy locks the finalizer handoff.
+    let validationCalls = 0;
+    const validateSchema4Bindings = (receipt, context, adapter) => {
+      validationCalls += 1;
+      assert.equal(receipt.schema, PROMOTION_EVIDENCE_REBIND_RECEIPT_DESCRIPTOR.schema);
+      assert.equal(receipt.type, PROMOTION_EVIDENCE_REBIND_RECEIPT_DESCRIPTOR.type);
+      assert.equal(context.proof.digest, current.sourceProof.digest);
+      assert.equal(context.proof.value.schema, 3);
+      assert.equal(context.proof.value.type, 'SourcePreparationProofV3');
+      assert.equal(context.proof.value.run_id, SUCCESSOR_DOCKS_RUN_ID);
+      assert.equal(context.proof.value.source_commit, SUCCESSOR_DOCKS_SOURCE_BASE);
+      assert.equal(context.publication.digest, current.publication.digest);
+      assert.equal(context.publicRelease.digest, current.publicRelease.digest);
+      assert.equal(context.publicRelease.value.schema, 3);
+      assert.equal(context.publicRelease.value.type, 'PublicReleaseReceiptV3');
+      assert.equal(adapter, injectedPromotionAdapter);
+      const workflowRun = adapter.getPublicationWorkflowRun(context.publication.value.workflow.run_id);
+      assert.equal(workflowRun.id, context.publication.value.workflow.run_id);
+      assert.equal(workflowRun.updated_at, current.fake.state.runs[0].updated_at);
+      assert.equal(receipt.chronology.publication_workflow_completed_at, workflowRun.updated_at);
+      return receipt;
+    };
+    finalizeReviewed(current.options, current.fake.adapter, validateSchema4Bindings, injectedPromotionAdapter);
+    const stableBytes = fs.readFileSync(current.options.get('receipt-out'));
+    const stableReceipt = JSON.parse(stableBytes);
+    validatePublicationReceipt(
+      { value: stableReceipt, digest: sha256(stableBytes) },
+      current.sourceProof,
+      'schema4 stable finalization',
+    );
+    assert.equal(validationCalls, 1);
+    assert.equal(stableReceipt.schema, 2);
+    assert.equal(stableReceipt.type, 'SessionRelayPublicationReceiptV2');
+    assert.equal(stableReceipt.release_state, 'stable');
+    assert.equal(stableReceipt.transition, 'already_stable');
+    assert.equal(stableReceipt.source.reviewed_commit, current.sourceProof.value.tag_commit);
+    assert.equal(stableReceipt.source.implementation_commit, current.sourceProof.value.implementation_commit);
+    assertNoPublicationMutation(current.fake.state);
+    assert.equal(current.fake.state.edited, 0);
+    assert.deepEqual(current.fake.state.downloaded, []);
+    assert.deepEqual(
+      current.fake.state.release,
+      releaseBefore,
+      'schema4 finalization must not edit stable metadata or asset identities',
+    );
+    checks += 1;
+  }
+
+  {
+    const directory = fs.mkdtempSync(path.join(root, 'schema4-public-release-binding-mismatch-'));
+    const current = schema4FinalizationFixture(directory);
+    const changed = structuredClone(current.promotion.value);
+    changed.public_release_receipt_sha256 = '0'.repeat(64);
+    const promotion = writeCanonical(directory, 'mismatched-schema4-evidence.json', changed);
+    current.options.set('promotion', promotion.file);
+    current.options.set('promotion-sha256', promotion.digest);
+    expectConflict(
+      () =>
+        finalizeReviewed(current.options, current.fake.adapter, (receipt, context) => {
+          if (receipt.public_release_receipt_sha256 !== context.publicRelease.digest) {
+            throw new SessionRelayReleaseError('promotion evidence fresh public release binding mismatch');
+          }
+          return receipt;
+        }),
+      /fresh public release binding mismatch/i,
+    );
+    assertNoPublicationMutation(current.fake.state);
+    assert.equal(current.fake.state.edited, 0);
+    assert.equal(fs.existsSync(current.options.get('receipt-out')), false);
+  }
+
+  {
+    const directory = fs.mkdtempSync(path.join(root, 'schema4-descriptor-mismatch-'));
+    const current = schema4FinalizationFixture(directory);
+    const changed = structuredClone(current.promotion.value);
+    changed.type = 'PromotionEvidenceRebindReceiptV2';
+    const promotion = writeCanonical(directory, 'wrong-schema4-descriptor.json', changed);
+    current.options.set('promotion', promotion.file);
+    current.options.set('promotion-sha256', promotion.digest);
+    let validationCalls = 0;
+    expectConflict(
+      () =>
+        finalizeReviewed(current.options, current.fake.adapter, () => {
+          validationCalls += 1;
+        }),
+      /--promotion|schema|type/i,
+    );
+    assert.equal(validationCalls, 0);
+    assertNoPublicationMutation(current.fake.state);
+    assert.equal(current.fake.state.edited, 0);
+    assert.equal(fs.existsSync(current.options.get('receipt-out')), false);
+  }
+
+  {
+    const directory = fs.mkdtempSync(path.join(root, 'current-promote-finalize-'));
+    const current = currentFinalizationFixture(directory, { prerelease: true });
+    const implementation = current.sourceProof.value.implementation_commit;
+    let promotions = 0;
+    const promotionAdapter = {
+      now: () => '2026-07-25T18:00:00.000Z',
+      loadProof: () => ({ value: structuredClone(current.sourceProof.value), digest: current.sourceProof.digest }),
+      loadPublication: () => ({
+        value: structuredClone(current.publication.value),
+        digest: current.publication.digest,
+      }),
+      loadPublicRelease: () => ({
+        value: structuredClone(current.publicRelease.value),
+        digest: current.publicRelease.digest,
+      }),
+      remoteRef: (ref) => (ref === 'refs/heads/main' ? implementation : null),
+      isAncestor: () => true,
+      isPublicAncestor: () => true,
+      currentReleaseState: () => ({
+        commit: current.fake.state.tagCommit,
+        release: structuredClone(current.fake.state.release),
+      }),
+      promoteStable: ({ tag, releaseDatabaseId, body }) => {
+        assert.equal(tag, TAG);
+        assert.equal(releaseDatabaseId, current.publication.value.release_database_id);
+        assert.equal(body, STABLE_BODY);
+        promotions += 1;
+        current.fake.state.release.prerelease = false;
+        current.fake.state.release.body = STABLE_BODY;
+      },
+      assertReceiptOutputAvailable: ({ path: output }) => {
+        assert.equal(fs.existsSync(output), false);
+      },
+      writeReceipt: ({ path: output, receipt, allowExisting }) => {
+        assert.equal(allowExisting, false);
+        const bytes = Buffer.from(canonicalize(receipt));
+        fs.writeFileSync(output, bytes, { mode: 0o600, flag: 'wx' });
+        return { bytes, digest: sha256(bytes), path: output };
+      },
+    };
+    const promotionOptions = new Map([
+      ['docks-kit-release', CURRENT_PUBLIC_TAG],
+      ['expected-origin-main', implementation],
+      ['receipt-out', path.join(directory, 'current-promotion-e2e.json')],
+    ]);
+    const promoted = promoteReviewed(promotionOptions, false, promotionAdapter);
+    assert.equal(promotions, 1, 'end-to-end current promotion must promote the staged release exactly once');
+    assert.equal(promoted.receipt.schema, 2);
+    assert.equal(promoted.receipt.type, 'PromotionReceiptV2');
+    assert.equal(promoted.receipt.publication_receipt_sha256, current.publication.digest);
+    assert.equal(promoted.receipt.public_release_receipt_sha256, current.publicRelease.digest);
+    assert.equal(current.fake.state.release.prerelease, false, 'promotion must leave the live release stable');
+
+    const promotionBytes = fs.readFileSync(promotionOptions.get('receipt-out'));
+    assert.equal(promotionBytes.toString('utf8'), canonicalize(promoted.receipt));
+    current.options.set('promotion', promotionOptions.get('receipt-out'));
+    current.options.set('promotion-sha256', sha256(promotionBytes));
+    finalizeReviewed(current.options, current.fake.adapter, validatePromotionReceiptForFinalization);
+    const finalReceipt = receiptAt(current.options.get('receipt-out'));
+    assert.equal(finalReceipt.release_state, 'stable');
+    assert.equal(finalReceipt.transition, 'already_stable');
+    assert.equal(finalReceipt.body_sha256, sha256(Buffer.from(STABLE_BODY)));
+    assert.equal(
+      current.fake.state.edited,
+      0,
+      'end-to-end finalization must bind the promoted stable receipt without a second stable edit',
+    );
+    checks += 2;
+  }
+
+  {
+    const directory = fs.mkdtempSync(path.join(root, 'current-finalize-unpromoted-'));
+    const current = currentFinalizationFixture(directory, { prerelease: true });
+    expectConflict(
+      () => finalizeReviewed(current.options, current.fake.adapter, validatePromotionReceiptForFinalization),
+      /promoted stable release|stable promotion/i,
+    );
+    assert.equal(current.fake.state.edited, 0);
+    assert.equal(fs.existsSync(current.options.get('receipt-out')), false);
+  }
+
+  {
+    const directory = fs.mkdtempSync(path.join(root, 'current-finalize-snapshot-mismatch-'));
+    const current = currentFinalizationFixture(directory);
+    const tampered = JSON.parse(fs.readFileSync(current.promotion.file, 'utf8'));
+    tampered.stable_release.workflow_run_id += 1;
+    const tamperedReceipt = writeCanonical(directory, 'tampered-promotion.json', tampered);
+    current.options.set('promotion', tamperedReceipt.file);
+    current.options.set('promotion-sha256', tamperedReceipt.digest);
+    expectConflict(
+      () => finalizeReviewed(current.options, current.fake.adapter, acceptPromotionReceipt),
+      /stable promotion snapshot/i,
+    );
+    assert.equal(current.fake.state.edited, 0);
+    assert.equal(fs.existsSync(current.options.get('receipt-out')), false);
+  }
+
+  {
+    const directory = fs.mkdtempSync(path.join(root, 'current-finalize-byte-drift-'));
+    const current = currentFinalizationFixture(directory);
+    current.fake.state.release.assets[0].digest = `sha256:${'f'.repeat(64)}`;
+    expectConflict(
+      () => finalizeReviewed(current.options, current.fake.adapter, validatePromotionReceiptForFinalization),
+      /asset identities changed|digest/i,
+    );
+    assert.equal(current.fake.state.edited, 0);
+    assert.equal(fs.existsSync(current.options.get('receipt-out')), false);
+  }
+}
+
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'session-relay-publication-contract-'));
 try {
   assert.equal(VERSION, CURRENT_VERSION, 'Session Relay production version must be 0.15.0');
   assert.equal(TAG, CURRENT_TAG, 'Session Relay production tag must be session-relay--v0.15.0');
   assert.match(PRERELEASE_BODY, /Session Relay 0\.15\.0/, 'prerelease body must announce Session Relay 0.15.0');
   assert.match(STABLE_BODY, /Session Relay 0\.15\.0/, 'stable body must announce Session Relay 0.15.0');
+  let tagStateBranch;
   assert.deepEqual(ASSETS, EXPECTED_ASSETS, 'publication must bind SHA256SUMS and exactly four ordinary native assets');
   assert.deepEqual(
     ASSETS.filter((name) => name !== 'SHA256SUMS'),
@@ -1618,14 +1873,35 @@ try {
     assert.equal(fs.existsSync(ordinaryOptions.get('receipt-out')), false);
     checks += 1;
   }
-
-  {
+  if (RELEASE_TAG_COMMIT === null) {
+    tagStateBranch = 'unborn';
+    const directory = fs.mkdtempSync(path.join(root, 'unborn-successor-completed-publication-rebind-'));
+    const current = currentCompletedPublicationFixture(directory);
+    assert.equal(
+      current.sourceProof.value.tag_commit,
+      current.sourceProof.value.implementation_commit,
+      'unborn V3 candidate must use an existing fixture commit rather than impersonating the release tag',
+    );
+    expectConflict(
+      () => publishReviewed(current.options, current.fake.adapter),
+      /PlanRun source proof tag commit is not the immutable Session Relay release commit/i,
+    );
+    assertNoPublicationMutation(current.fake.state);
+    assert.equal(current.fake.state.edited, 0);
+    assert.equal(
+      fs.existsSync(current.options.get('receipt-out')),
+      false,
+      'unborn release tag must prevent completed-publication rebind receipts',
+    );
+  } else {
+    tagStateBranch = 'cut';
     const directory = fs.mkdtempSync(path.join(root, 'successor-completed-publication-rebind-'));
     const current = currentCompletedPublicationFixture(directory);
     publishReviewed(current.options, current.fake.adapter);
     const receipt = receiptAt(current.options.get('receipt-out'));
     assert.equal(receipt.schema, 2);
     assert.equal(receipt.type, 'SessionRelayPublicationReceiptV2');
+    assert.equal(receipt.source.reviewed_commit, RELEASE_TAG_COMMIT);
     assert.equal(receipt.source.reviewed_commit, current.sourceProof.value.tag_commit);
     assert.equal(receipt.source.implementation_commit, current.sourceProof.value.implementation_commit);
     assert.notEqual(receipt.source.reviewed_commit, receipt.source.implementation_commit);
@@ -1991,7 +2267,7 @@ try {
     const sourceProof = proof(directory);
     const options = optionsFor(directory, sourceProof);
     expectConflict(() => publishReviewed(options, fake.adapter), /bounded.*tag-push.*run/i);
-    assert.deepEqual(fake.state.pushed, [SOURCE]);
+    assert.deepEqual(fake.state.pushed, [LEGACY_SOURCE_COMMIT_FIXTURE]);
     assert.equal(fake.state.dispatched.length, 0);
     assert.equal(fake.state.sleeps, POLL_LIMIT - 1);
   }
@@ -2037,11 +2313,11 @@ try {
       conclusion: 'success',
       event: 'push',
       file: WORKFLOW_PATH,
-      head_sha: SOURCE,
+      head_sha: LEGACY_SOURCE_COMMIT_FIXTURE,
       inputs: { expected_commit: '', expected_tag: '', mode: '' },
       path: WORKFLOW_PATH,
       run_id: 701,
-      workflow_sha: SOURCE,
+      workflow_sha: LEGACY_SOURCE_COMMIT_FIXTURE,
     });
     assert.deepEqual(
       receipt.assets.map(({ digest }) => digest),
@@ -2121,7 +2397,7 @@ try {
       return originalList();
     };
     const { receipt } = publish(directory, fake);
-    assert.deepEqual(fake.state.dispatched, [SOURCE]);
+    assert.deepEqual(fake.state.dispatched, [LEGACY_SOURCE_COMMIT_FIXTURE]);
     assert.deepEqual(fake.state.downloaded, [705]);
     assert.deepEqual(fake.state.uploaded, missing);
     assert.equal(receipt.workflow.run_id, 705);
@@ -2183,11 +2459,11 @@ try {
       return original();
     };
     const { receipt } = publish(directory, fake);
-    assert.deepEqual(fake.state.dispatched, [SOURCE]);
+    assert.deepEqual(fake.state.dispatched, [LEGACY_SOURCE_COMMIT_FIXTURE]);
     assert.equal(receipt.workflow.run_id, 702);
     assert.equal(receipt.workflow.event, 'workflow_dispatch');
     assert.deepEqual(receipt.workflow.inputs, {
-      expected_commit: SOURCE,
+      expected_commit: LEGACY_SOURCE_COMMIT_FIXTURE,
       expected_tag: TAG,
       mode: 'publish-existing-tag',
     });
@@ -2576,268 +2852,30 @@ try {
     assert.equal(fake.state.edited, 0);
   }
 
-  {
-    const directory = fs.mkdtempSync(path.join(root, 'current-finalize-'));
+  if (RELEASE_TAG_COMMIT === null) {
+    const directory = fs.mkdtempSync(path.join(root, 'unborn-current-finalization-'));
     const current = currentFinalizationFixture(directory);
-    finalizeReviewed(current.options, current.fake.adapter, validatePromotionReceiptForFinalization);
-    const stableBytes = fs.readFileSync(current.options.get('receipt-out'));
-    const stableReceipt = JSON.parse(stableBytes);
-    validatePublicationReceipt(
-      { value: stableReceipt, digest: sha256(stableBytes) },
-      current.sourceProof,
-      'current stable finalization',
-    );
-    assert.equal(stableReceipt.schema, 2);
-    assert.equal(stableReceipt.type, 'SessionRelayPublicationReceiptV2');
-    assert.equal(stableReceipt.release_state, 'stable');
-    assert.equal(stableReceipt.transition, 'already_stable');
-    assert.equal(stableReceipt.body_sha256, sha256(Buffer.from(STABLE_BODY)));
-    assert.equal(stableReceipt.release_database_id, current.publication.value.release_database_id);
-    assert.deepEqual(stableReceipt.assets, current.publication.value.assets);
-    assert.equal(
-      current.fake.state.edited,
-      0,
-      'current finalization must consume the promoted stable release without reopening the target',
-    );
-
-    const resumedOptions = new Map(current.options);
-    resumedOptions.set('receipt-out', path.join(directory, 'current-stable-finalization-resumed.json'));
-    resumedOptions.set('resume-finalization', current.options.get('receipt-out'));
-    resumedOptions.set('resume-finalization-sha256', sha256(stableBytes));
-    finalizeReviewed(resumedOptions, current.fake.adapter, validatePromotionReceiptForFinalization);
-    assert.equal(current.fake.state.edited, 0, 'current finalization resume must not edit the stable release');
-    assert.equal(
-      fs.readFileSync(resumedOptions.get('receipt-out'), 'utf8'),
-      stableBytes.toString('utf8'),
-      'current finalization resume must emit the byte-identical V2 stable receipt',
-    );
-    checks += 2;
-  }
-
-  {
-    const directory = fs.mkdtempSync(path.join(root, 'schema4-evidence-finalize-'));
-    const current = schema4FinalizationFixture(directory);
-    const injectedPromotionAdapter = Object.freeze({
-      getPublicationWorkflowRun(runId) {
-        const workflowRun = current.fake.state.runs.find(({ id }) => id === runId);
-        return {
-          id: workflowRun.id,
-          run_attempt: workflowRun.run_attempt,
-          head_sha: workflowRun.head_sha,
-          path: workflowRun.path,
-          event: workflowRun.event,
-          status: workflowRun.status,
-          conclusion: workflowRun.conclusion,
-          run_started_at: workflowRun.run_started_at,
-          updated_at: workflowRun.updated_at,
-        };
-      },
-    });
-    const releaseBefore = structuredClone(current.fake.state.release);
-    // Full schema 4 validation lives in the promotion contract; this spy locks the finalizer handoff.
-    let validationCalls = 0;
-    const validateSchema4Bindings = (receipt, context, adapter) => {
-      validationCalls += 1;
-      assert.equal(receipt.schema, PROMOTION_EVIDENCE_REBIND_RECEIPT_DESCRIPTOR.schema);
-      assert.equal(receipt.type, PROMOTION_EVIDENCE_REBIND_RECEIPT_DESCRIPTOR.type);
-      assert.equal(context.proof.digest, current.sourceProof.digest);
-      assert.equal(context.proof.value.schema, 3);
-      assert.equal(context.proof.value.type, 'SourcePreparationProofV3');
-      assert.equal(context.proof.value.run_id, SUCCESSOR_DOCKS_RUN_ID);
-      assert.equal(context.proof.value.source_commit, SUCCESSOR_DOCKS_SOURCE_BASE);
-      assert.equal(context.publication.digest, current.publication.digest);
-      assert.equal(context.publicRelease.digest, current.publicRelease.digest);
-      assert.equal(context.publicRelease.value.schema, 3);
-      assert.equal(context.publicRelease.value.type, 'PublicReleaseReceiptV3');
-      assert.equal(adapter, injectedPromotionAdapter);
-      const workflowRun = adapter.getPublicationWorkflowRun(context.publication.value.workflow.run_id);
-      assert.equal(workflowRun.id, context.publication.value.workflow.run_id);
-      assert.equal(workflowRun.updated_at, current.fake.state.runs[0].updated_at);
-      assert.equal(receipt.chronology.publication_workflow_completed_at, workflowRun.updated_at);
-      return receipt;
-    };
-    finalizeReviewed(current.options, current.fake.adapter, validateSchema4Bindings, injectedPromotionAdapter);
-    const stableBytes = fs.readFileSync(current.options.get('receipt-out'));
-    const stableReceipt = JSON.parse(stableBytes);
-    validatePublicationReceipt(
-      { value: stableReceipt, digest: sha256(stableBytes) },
-      current.sourceProof,
-      'schema4 stable finalization',
-    );
-    assert.equal(validationCalls, 1);
-    assert.equal(stableReceipt.schema, 2);
-    assert.equal(stableReceipt.type, 'SessionRelayPublicationReceiptV2');
-    assert.equal(stableReceipt.release_state, 'stable');
-    assert.equal(stableReceipt.transition, 'already_stable');
-    assert.equal(stableReceipt.source.reviewed_commit, current.sourceProof.value.tag_commit);
-    assert.equal(stableReceipt.source.implementation_commit, current.sourceProof.value.implementation_commit);
-    assertNoPublicationMutation(current.fake.state);
-    assert.equal(current.fake.state.edited, 0);
-    assert.deepEqual(current.fake.state.downloaded, []);
-    assert.deepEqual(
-      current.fake.state.release,
-      releaseBefore,
-      'schema4 finalization must not edit stable metadata or asset identities',
-    );
-    checks += 1;
-  }
-
-  {
-    const directory = fs.mkdtempSync(path.join(root, 'schema4-public-release-binding-mismatch-'));
-    const current = schema4FinalizationFixture(directory);
-    const changed = structuredClone(current.promotion.value);
-    changed.public_release_receipt_sha256 = '0'.repeat(64);
-    const promotion = writeCanonical(directory, 'mismatched-schema4-evidence.json', changed);
-    current.options.set('promotion', promotion.file);
-    current.options.set('promotion-sha256', promotion.digest);
-    expectConflict(
-      () =>
-        finalizeReviewed(current.options, current.fake.adapter, (receipt, context) => {
-          if (receipt.public_release_receipt_sha256 !== context.publicRelease.digest) {
-            throw new SessionRelayReleaseError('promotion evidence fresh public release binding mismatch');
-          }
-          return receipt;
-        }),
-      /fresh public release binding mismatch/i,
-    );
-    assertNoPublicationMutation(current.fake.state);
-    assert.equal(current.fake.state.edited, 0);
-    assert.equal(fs.existsSync(current.options.get('receipt-out')), false);
-  }
-
-  {
-    const directory = fs.mkdtempSync(path.join(root, 'schema4-descriptor-mismatch-'));
-    const current = schema4FinalizationFixture(directory);
-    const changed = structuredClone(current.promotion.value);
-    changed.type = 'PromotionEvidenceRebindReceiptV2';
-    const promotion = writeCanonical(directory, 'wrong-schema4-descriptor.json', changed);
-    current.options.set('promotion', promotion.file);
-    current.options.set('promotion-sha256', promotion.digest);
     let validationCalls = 0;
     expectConflict(
       () =>
         finalizeReviewed(current.options, current.fake.adapter, () => {
           validationCalls += 1;
         }),
-      /--promotion|schema|type/i,
+      /PlanRun source proof tag commit is not the immutable Session Relay release commit/i,
     );
-    assert.equal(validationCalls, 0);
+    assert.equal(validationCalls, 0, 'unborn tag must refuse before promotion evidence validation');
     assertNoPublicationMutation(current.fake.state);
     assert.equal(current.fake.state.edited, 0);
-    assert.equal(fs.existsSync(current.options.get('receipt-out')), false);
-  }
-
-  {
-    const directory = fs.mkdtempSync(path.join(root, 'current-promote-finalize-'));
-    const current = currentFinalizationFixture(directory, { prerelease: true });
-    const implementation = current.sourceProof.value.implementation_commit;
-    let promotions = 0;
-    const promotionAdapter = {
-      now: () => '2026-07-25T18:00:00.000Z',
-      loadProof: () => ({ value: structuredClone(current.sourceProof.value), digest: current.sourceProof.digest }),
-      loadPublication: () => ({
-        value: structuredClone(current.publication.value),
-        digest: current.publication.digest,
-      }),
-      loadPublicRelease: () => ({
-        value: structuredClone(current.publicRelease.value),
-        digest: current.publicRelease.digest,
-      }),
-      remoteRef: (ref) => (ref === 'refs/heads/main' ? implementation : null),
-      isAncestor: () => true,
-      isPublicAncestor: () => true,
-      currentReleaseState: () => ({
-        commit: current.fake.state.tagCommit,
-        release: structuredClone(current.fake.state.release),
-      }),
-      promoteStable: ({ tag, releaseDatabaseId, body }) => {
-        assert.equal(tag, TAG);
-        assert.equal(releaseDatabaseId, current.publication.value.release_database_id);
-        assert.equal(body, STABLE_BODY);
-        promotions += 1;
-        current.fake.state.release.prerelease = false;
-        current.fake.state.release.body = STABLE_BODY;
-      },
-      assertReceiptOutputAvailable: ({ path: output }) => {
-        assert.equal(fs.existsSync(output), false);
-      },
-      writeReceipt: ({ path: output, receipt, allowExisting }) => {
-        assert.equal(allowExisting, false);
-        const bytes = Buffer.from(canonicalize(receipt));
-        fs.writeFileSync(output, bytes, { mode: 0o600, flag: 'wx' });
-        return { bytes, digest: sha256(bytes), path: output };
-      },
-    };
-    const promotionOptions = new Map([
-      ['docks-kit-release', CURRENT_PUBLIC_TAG],
-      ['expected-origin-main', implementation],
-      ['receipt-out', path.join(directory, 'current-promotion-e2e.json')],
-    ]);
-    const promoted = promoteReviewed(promotionOptions, false, promotionAdapter);
-    assert.equal(promotions, 1, 'end-to-end current promotion must promote the staged release exactly once');
-    assert.equal(promoted.receipt.schema, 2);
-    assert.equal(promoted.receipt.type, 'PromotionReceiptV2');
-    assert.equal(promoted.receipt.publication_receipt_sha256, current.publication.digest);
-    assert.equal(promoted.receipt.public_release_receipt_sha256, current.publicRelease.digest);
-    assert.equal(current.fake.state.release.prerelease, false, 'promotion must leave the live release stable');
-
-    const promotionBytes = fs.readFileSync(promotionOptions.get('receipt-out'));
-    assert.equal(promotionBytes.toString('utf8'), canonicalize(promoted.receipt));
-    current.options.set('promotion', promotionOptions.get('receipt-out'));
-    current.options.set('promotion-sha256', sha256(promotionBytes));
-    finalizeReviewed(current.options, current.fake.adapter, validatePromotionReceiptForFinalization);
-    const finalReceipt = receiptAt(current.options.get('receipt-out'));
-    assert.equal(finalReceipt.release_state, 'stable');
-    assert.equal(finalReceipt.transition, 'already_stable');
-    assert.equal(finalReceipt.body_sha256, sha256(Buffer.from(STABLE_BODY)));
     assert.equal(
-      current.fake.state.edited,
-      0,
-      'end-to-end finalization must bind the promoted stable receipt without a second stable edit',
+      fs.existsSync(current.options.get('receipt-out')),
+      false,
+      'unborn release tag must prevent stable finalization receipts',
     );
-    checks += 2;
+  } else {
+    assertCutReleaseFinalization();
   }
-
-  {
-    const directory = fs.mkdtempSync(path.join(root, 'current-finalize-unpromoted-'));
-    const current = currentFinalizationFixture(directory, { prerelease: true });
-    expectConflict(
-      () => finalizeReviewed(current.options, current.fake.adapter, validatePromotionReceiptForFinalization),
-      /promoted stable release|stable promotion/i,
-    );
-    assert.equal(current.fake.state.edited, 0);
-    assert.equal(fs.existsSync(current.options.get('receipt-out')), false);
-  }
-
-  {
-    const directory = fs.mkdtempSync(path.join(root, 'current-finalize-snapshot-mismatch-'));
-    const current = currentFinalizationFixture(directory);
-    const tampered = JSON.parse(fs.readFileSync(current.promotion.file, 'utf8'));
-    tampered.stable_release.workflow_run_id += 1;
-    const tamperedReceipt = writeCanonical(directory, 'tampered-promotion.json', tampered);
-    current.options.set('promotion', tamperedReceipt.file);
-    current.options.set('promotion-sha256', tamperedReceipt.digest);
-    expectConflict(
-      () => finalizeReviewed(current.options, current.fake.adapter, acceptPromotionReceipt),
-      /stable promotion snapshot/i,
-    );
-    assert.equal(current.fake.state.edited, 0);
-    assert.equal(fs.existsSync(current.options.get('receipt-out')), false);
-  }
-
-  {
-    const directory = fs.mkdtempSync(path.join(root, 'current-finalize-byte-drift-'));
-    const current = currentFinalizationFixture(directory);
-    current.fake.state.release.assets[0].digest = `sha256:${'f'.repeat(64)}`;
-    expectConflict(
-      () => finalizeReviewed(current.options, current.fake.adapter, validatePromotionReceiptForFinalization),
-      /asset identities changed|digest/i,
-    );
-    assert.equal(current.fake.state.edited, 0);
-    assert.equal(fs.existsSync(current.options.get('receipt-out')), false);
-  }
-
   assertCurrentPublicationContract();
+  assert.ok(tagStateBranch === 'unborn' || tagStateBranch === 'cut', 'exactly one release-tag state branch must run');
 
   console.log(`release publication contract: ${checks} production-handler cases passed`);
 } finally {

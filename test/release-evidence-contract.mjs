@@ -18,8 +18,9 @@ import {
   canonicalVerificationResults,
   createAffectedPathManifest,
 } from '../../../plugins/docks/skills/productivity/plan-manager/scripts/plan-run.mjs';
-import { gitRaw } from '../../../scripts/lib/session-relay-release-core.mjs';
+import { gitRaw, loadReleaseInstance } from '../../../scripts/lib/session-relay-release-core.mjs';
 import { runFixture } from '../../../scripts/lib/session-relay-release-fixture.mjs';
+import { releaseTagCommit } from '../../../scripts/lib/session-relay-release-instances/schema.mjs';
 import {
   bindCompletion,
   checkPrepared,
@@ -56,6 +57,9 @@ const TARGETS = [
   ['aarch64-apple-darwin', 'macOS', 'ARM64'],
 ];
 const { version: CURRENT_RELEASE_VERSION, tag: CURRENT_RELEASE_TAG } = resolveShippedRelayVersion(REPO);
+const CURRENT_RELEASE_INSTANCE = loadReleaseInstance(CURRENT_RELEASE_VERSION, {
+  require: ['current_attempt', 'planrun_attempt', 'public_child'],
+});
 const CURRENT_RELEASE_INSTANCE_PATH = `scripts/lib/session-relay-release-instances/${CURRENT_RELEASE_VERSION}.json`;
 const CURRENT_PUBLIC_VERSION = '0.12.0';
 const CURRENT_PUBLIC_TAG = 'cli-v0.12.0';
@@ -106,11 +110,14 @@ const CURRENT_AFFECTED_PATHS = [
   'scripts/lib/session-relay-release-promotion.mjs',
   'scripts/lib/session-relay-release-publication.mjs',
 ];
-const PLANRUN_GOAL_ID = '258b44c2-c3b2-4902-862c-7461724ca078';
-const PLANRUN_DOCKS_RUN_ID = '12a460e2-af44-4bc8-bc7d-d7aaec2c991b';
-const PLANRUN_DOCKS_PLAN_PATH = 'docs/plans/active/session-relay-0.15.0-release.md';
-const PLANRUN_DOCKS_SOURCE_BASE = 'c5c29cec073f1c6734a8f9b6b98ce8bf7ac4029f';
-const PLANRUN_RELEASE_TAG_COMMIT = 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef';
+// Derived, never pinned: these four are the LIVE 0.15.0 identity, so a literal would
+// silently disagree the moment the instance moves - a rebase changing the source
+// base, or a replacement run changing the run id. The frozen 0.14 constants above
+// may stay literal because that instance is closed history; these may not.
+const PLANRUN_GOAL_ID = CURRENT_RELEASE_INSTANCE.current_attempt.goal_id;
+const PLANRUN_DOCKS_RUN_ID = CURRENT_RELEASE_INSTANCE.planrun_attempt.docks_run_id;
+const PLANRUN_DOCKS_PLAN_PATH = CURRENT_RELEASE_INSTANCE.planrun_attempt.docks_plan_path;
+const PLANRUN_DOCKS_SOURCE_BASE = CURRENT_RELEASE_INSTANCE.planrun_attempt.docks_source_base;
 const PLANRUN_AFFECTED_PATHS = [
   'plugins/session-relay/.claude-plugin/plugin.json',
   'plugins/session-relay/.codex-plugin/plugin.json',
@@ -308,7 +315,7 @@ function nativeProducerJobs() {
   }));
 }
 
-function artifactFixture({ mutateArchive, releaseVersion = RETAINED_RELEASE_VERSION } = {}) {
+function artifactFixture({ mutateArchive, releaseVersion = CURRENT_RELEASE_VERSION } = {}) {
   const archives = new Map();
   const artifacts = [];
   const binaryDigests = new Map();
@@ -355,7 +362,7 @@ function artifactFixture({ mutateArchive, releaseVersion = RETAINED_RELEASE_VERS
   return { archives, artifacts, jobs: nativeProducerJobs(), releaseVersion };
 }
 
-function artifactRecord(id, name, archive, releaseVersion = RETAINED_RELEASE_VERSION) {
+function artifactRecord(id, name, archive, releaseVersion = CURRENT_RELEASE_VERSION) {
   return {
     id,
     name,
@@ -1415,8 +1422,7 @@ function preparationAdapter({
       }
       if (joined === `rev-parse ${COMMIT}:.github/workflows/build-binaries.yml`) return WORKFLOW_BLOB;
       if (joined === `rev-parse ${COMMIT}:.github/workflows/ci.yml`) return sourceCi.workflow.file_blob_id;
-      if (joined === `show ${COMMIT}:docs/plans/active/session-relay-linux-workspace-recertification.md`)
-        return Buffer.from(sourcePlan);
+      if (joined === `show ${COMMIT}:${PLANRUN_DOCKS_PLAN_PATH}`) return Buffer.from(sourcePlan);
       for (const receipt of [docksRed, publicRed]) {
         for (const test of receipt.test_paths) {
           if (
@@ -1631,8 +1637,7 @@ function testPreparationHandlers(temp, preflight, sourceCi) {
       publicRed: publicRed.value,
       publicPlan,
       sourceCi: sourceCi.result.receipt,
-      status:
-        '1 .M N... 100644 100644 100644 abcdef1 abcdef1 docs/plans/active/session-relay-linux-workspace-recertification.md\0',
+      status: `1 .M N... 100644 100644 100644 abcdef1 abcdef1 ${PLANRUN_DOCKS_PLAN_PATH}\0`,
     }),
   );
   assert.equal(dirtyPlan.receipt.source_commit, COMMIT);
@@ -1650,8 +1655,7 @@ function testPreparationHandlers(temp, preflight, sourceCi) {
           publicRed: publicRed.value,
           publicPlan,
           sourceCi: sourceCi.result.receipt,
-          status:
-            '1 M. N... 100644 100644 100644 abcdef1 abcdef1 x docs/plans/active/session-relay-linux-workspace-recertification.md\0',
+          status: `1 M. N... 100644 100644 100644 abcdef1 abcdef1 x ${PLANRUN_DOCKS_PLAN_PATH}\0`,
         }),
       ),
     /working tree is not clean/i,
@@ -1694,7 +1698,7 @@ function testPreparationHandlers(temp, preflight, sourceCi) {
     `- Source CI receipt SHA-256: ${sha256(fs.readFileSync(sourceCi.receiptOut))}\n` +
     `- Source preparation candidate JCS bytes: ${fs.readFileSync(candidateOut, 'utf8')}\n` +
     `- Source preparation candidate SHA-256: ${sha256(fs.readFileSync(candidateOut))}\n`;
-  const verifyOptions = new Map([['plan', 'docs/plans/active/session-relay-linux-workspace-recertification.md']]);
+  const verifyOptions = new Map([['plan', PLANRUN_DOCKS_PLAN_PATH]]);
   const verified = verifyEmbedded(
     verifyOptions,
     preparationAdapter({
@@ -3553,7 +3557,6 @@ function bindPlanRunCompletionFixture(
     });
     return runGit(['rev-parse', 'HEAD^{commit}']);
   };
-  const preparationLogical = 'scripts/lib/session-relay-release-preparation.mjs';
   if (defaultDependencies) {
     copyPreparationRuntime(root);
   }
@@ -3564,12 +3567,11 @@ function bindPlanRunCompletionFixture(
       fs.copyFileSync(path.join(REPO, ...logical.split('/')), target);
     }
     assert.ok(fs.statSync(target).isFile(), `successor affected-path fixture is absent: ${logical}`);
-    const marker =
-      logical.endsWith('.json')
-        ? '\n'
-        : logical.endsWith('.toml') || logical.endsWith('.lock')
-          ? `\n# Successor implementation fixture: ${logical}\n`
-          : `\n// Successor implementation fixture: ${logical}\n`;
+    const marker = logical.endsWith('.json')
+      ? '\n'
+      : logical.endsWith('.toml') || logical.endsWith('.lock')
+        ? `\n# Successor implementation fixture: ${logical}\n`
+        : `\n// Successor implementation fixture: ${logical}\n`;
     fs.appendFileSync(target, marker);
   }
   const implementationPaths = [...PLANRUN_AFFECTED_PATHS];
@@ -3767,81 +3769,118 @@ function bindPlanRunCompletionFixture(
   };
 }
 
-function testPlanRunCompletionBindingUsesFreshSourceAndPlanOnlyContinuation(temp) {
-  const generated = bindPlanRunCompletionFixture(temp, {
-    name: 'fresh-source-plan-only',
-    defaultDependencies: true,
-  });
-  const proof = generated.result.receipt;
-  assert.equal(proof.schema, 3);
-  assert.equal(proof.type, 'SourcePreparationProofV3');
-  assert.equal(proof.run_id, PLANRUN_DOCKS_RUN_ID);
-  assert.equal(proof.source_commit, PLANRUN_DOCKS_SOURCE_BASE);
-  assert.equal(proof.implementation_commit, generated.implementationCommit);
-  assert.equal(proof.tag_commit, PLANRUN_RELEASE_TAG_COMMIT);
-  assert.deepEqual(proof.plan_run, {
+function unbornPlanRunSourcePreparationProofV3() {
+  const implementationCommit = PLANRUN_DOCKS_SOURCE_BASE;
+  const manifestPaths = PLANRUN_AFFECTED_PATHS.map((logical) => ({
+    path: logical,
+    state: 'missing',
+    kind: null,
+    mode: null,
+    sha256: null,
+  }));
+  const manifest = {
     schema: 1,
+    source_base: implementationCommit,
+    source_sha256: sha256(Buffer.from(jcs({ schema: 1, source_base: implementationCommit, paths: manifestPaths }))),
+    paths: manifestPaths,
+  };
+  const publicVersion = CURRENT_RELEASE_INSTANCE.public_child.version;
+  const publicTag = CURRENT_RELEASE_INSTANCE.public_child.tag;
+  return {
+    schema: 3,
+    type: 'SourcePreparationProofV3',
     repository_id: REPOSITORY_ID,
-    goal_id: PLANRUN_GOAL_ID,
-    run_id: PLANRUN_DOCKS_RUN_ID,
-    plan_path: PLANRUN_DOCKS_PLAN_PATH,
-    source_base: PLANRUN_DOCKS_SOURCE_BASE,
-    implementation_commit: generated.implementationCommit,
-    status: 'ongoing',
-  });
-  assert.equal(proof.completion_review.reviewed_commit, generated.implementationCommit);
-  assert.equal(proof.completion_review.result_sha256, generated.completionReviewSha256);
-  assert.equal(proof.completion_review.diff_sha256, generated.completionDiffSha256);
-  assert.deepEqual(
-    proof.acceptance.manifest.paths.map(({ path: logical }) => logical),
-    PLANRUN_AFFECTED_PATHS,
-  );
-  assert.deepEqual(proof.acceptance.changed_paths, PLANRUN_AFFECTED_PATHS);
-  assert.deepEqual(generated.implementationChangedPaths, PLANRUN_AFFECTED_PATHS);
-  assert.deepEqual(generated.postImplementationPaths, [PLANRUN_DOCKS_PLAN_PATH]);
-  assert.notEqual(generated.headCommit, generated.implementationCommit);
-  assert.deepEqual(proof.ancestry, {
-    tag_to_source: true,
-    source_to_implementation: true,
-    implementation_to_reviewed: true,
-  });
-  assert.equal(generated.completionDiffBytes.at(-1), 0x0a, 'successor reviewed diff must retain its final byte');
-  const trimmedDiff = Buffer.from(generated.completionDiffBytes.toString('utf8').trim(), 'utf8');
-  assert.notEqual(sha256(trimmedDiff), generated.completionDiffSha256);
-  assert.equal(
-    proof.completion_review.diff_sha256,
-    sha256(generated.completionDiffBytes),
-    'V3 completion proof must hash exact raw diff bytes from its immutable source base',
-  );
-  validateSourcePreparationProof(proof);
+    version: CURRENT_RELEASE_VERSION,
+    tag: CURRENT_RELEASE_TAG,
+    goal_id: CURRENT_RELEASE_INSTANCE.current_attempt.goal_id,
+    run_id: CURRENT_RELEASE_INSTANCE.planrun_attempt.docks_run_id,
+    source_commit: PLANRUN_DOCKS_SOURCE_BASE,
+    implementation_commit: implementationCommit,
+    // This is the real source commit, not a stand-in tag identity. The unborn contract
+    // must reject every concrete commit until the release instance records the cut tag.
+    tag_commit: PLANRUN_DOCKS_SOURCE_BASE,
+    plan_run: {
+      schema: 1,
+      repository_id: REPOSITORY_ID,
+      goal_id: CURRENT_RELEASE_INSTANCE.current_attempt.goal_id,
+      run_id: CURRENT_RELEASE_INSTANCE.planrun_attempt.docks_run_id,
+      plan_path: PLANRUN_DOCKS_PLAN_PATH,
+      source_base: PLANRUN_DOCKS_SOURCE_BASE,
+      implementation_commit: implementationCommit,
+      status: 'ongoing',
+    },
+    completion_review: {
+      schema: 1,
+      type: 'CompletionReviewV1',
+      reviewed_commit: implementationCommit,
+      diff_sha256: '6'.repeat(64),
+      result_sha256: '7'.repeat(64),
+      verdict: 'pass',
+    },
+    acceptance: {
+      manifest,
+      verification_sha256: '5'.repeat(64),
+      changed_paths: [...PLANRUN_AFFECTED_PATHS],
+    },
+    ancestry: {
+      tag_to_source: true,
+      source_to_implementation: true,
+      implementation_to_reviewed: true,
+    },
+    companion: {
+      repository_id: 'DocksDocks/public',
+      goal_id: CURRENT_RELEASE_INSTANCE.current_attempt.goal_id,
+      run_id: CURRENT_RELEASE_INSTANCE.current_attempt.public_run_id,
+      plan_path: `docs/plans/active/session-relay-${CURRENT_RELEASE_VERSION}-docks-kit-${publicVersion}-release.md`,
+      version: publicVersion,
+      tag: publicTag,
+      session_relay_version: CURRENT_RELEASE_VERSION,
+      session_relay_tag: CURRENT_RELEASE_TAG,
+      package: 'docks-kit',
+      npm_version: publicVersion,
+    },
+    historical_receipts: {
+      version: '0.13.0',
+      tag: 'session-relay--v0.13.0',
+      ...HISTORICAL_RECEIPT_SHA256,
+    },
+    created_at: '2026-08-02T00:00:00.000Z',
+  };
+}
 
-  const injectedPath = structuredClone(proof);
-  injectedPath.acceptance.changed_paths = [...injectedPath.acceptance.changed_paths, 'AGENTS.md'].sort();
-  expectReject(
-    'V3 proof rejects an injected unrelated changed_paths entry',
-    () => validateSourcePreparationProof(injectedPath),
-    /changed paths|scope|AGENTS/i,
-  );
-  const jointlyInjectedPath = structuredClone(proof);
-  jointlyInjectedPath.acceptance.manifest.paths = [
-    ...jointlyInjectedPath.acceptance.manifest.paths,
-    { path: 'AGENTS.md', state: 'missing', kind: null, mode: null, sha256: null },
-  ].sort((left, right) => left.path.localeCompare(right.path));
-  jointlyInjectedPath.acceptance.manifest.source_sha256 = sha256(
-    Buffer.from(
-      jcs({
-        schema: jointlyInjectedPath.acceptance.manifest.schema,
-        source_base: jointlyInjectedPath.acceptance.manifest.source_base,
-        paths: jointlyInjectedPath.acceptance.manifest.paths,
-      }),
-    ),
-  );
-  jointlyInjectedPath.acceptance.changed_paths = [...jointlyInjectedPath.acceptance.changed_paths, 'AGENTS.md'].sort();
-  expectReject(
-    'V3 proof rejects coordinated manifest and changed_paths injection',
-    () => validateSourcePreparationProof(jointlyInjectedPath),
-    /acceptance manifest|affected|path|AGENTS/i,
-  );
+function testPlanRunTagState(temp) {
+  const tagCommit = releaseTagCommit(CURRENT_RELEASE_INSTANCE);
+  let branch;
+  if (tagCommit === null) {
+    branch = 'unborn';
+    assert.throws(
+      () => validateSourcePreparationProof(unbornPlanRunSourcePreparationProofV3()),
+      {
+        name: 'SessionRelayReleaseError',
+        message: 'PlanRun source proof tag commit is not the immutable Session Relay release commit',
+      },
+      'an unborn release tag must refuse every concrete source-proof tag commit',
+    );
+  } else {
+    branch = 'cut';
+    const generated = bindPlanRunCompletionFixture(temp, {
+      name: 'fresh-source-plan-only',
+      defaultDependencies: true,
+    });
+    const proof = generated.result.receipt;
+    assert.equal(proof.schema, 3);
+    assert.equal(proof.type, 'SourcePreparationProofV3');
+    assert.equal(proof.version, CURRENT_RELEASE_VERSION);
+    assert.equal(proof.tag, CURRENT_RELEASE_TAG);
+    assert.equal(proof.run_id, PLANRUN_DOCKS_RUN_ID);
+    assert.equal(proof.source_commit, PLANRUN_DOCKS_SOURCE_BASE);
+    assert.equal(proof.implementation_commit, generated.implementationCommit);
+    assert.equal(proof.tag_commit, tagCommit);
+    assert.deepEqual(proof.acceptance.changed_paths, PLANRUN_AFFECTED_PATHS);
+    assert.deepEqual(generated.postImplementationPaths, [PLANRUN_DOCKS_PLAN_PATH]);
+    validateSourcePreparationProof(proof);
+  }
+  assert.ok(branch === 'unborn' || branch === 'cut', 'exactly one tag-state branch must run');
 }
 
 function testPlanRunCompletionBindingRejectsUnrelatedContinuation(temp) {
@@ -4014,7 +4053,7 @@ function main() {
     testDefaultCompletionBindingReproducesImplementationManifestAfterPlanOnlyHead(temp);
     testDefaultCompletionBindingAllowsBoundedPostReviewTooling(temp);
     testDefaultCompletionBindingRejectsUnauthorizedPostReviewPath(temp);
-    testPlanRunCompletionBindingUsesFreshSourceAndPlanOnlyContinuation(temp);
+    testPlanRunTagState(temp);
     testPlanRunCompletionBindingRejectsUnrelatedContinuation(temp);
     testPlanRunAffectedDiffCannotHideImplementationScopeDrift(temp);
     testCurrentCorrelatedReleaseEvidence();

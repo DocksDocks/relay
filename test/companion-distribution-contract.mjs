@@ -7,7 +7,6 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { resolveShippedRelayVersion } from './version.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO = path.resolve(HERE, '../../..');
@@ -19,7 +18,10 @@ const DOCKS_PLAN = 'docs/plans/finished/2026-07-23-session-relay-linux-workspace
 const PUBLIC_VERSION = '0.13.0';
 const PRODUCTION_VERSION = '0.12.0';
 const BLOCKED_REASON = 'Awaiting the four independently hashed `session-relay--v0.13.0` production asset digests.';
-const { version: CURRENT_RELAY_VERSION, tag: CURRENT_RELAY_TAG } = resolveShippedRelayVersion(REPO);
+// This contract revalidates the already-published public main. That checkout
+// intentionally trails the Relay candidate in this repository until publication.
+const CURRENT_PUBLIC_RELAY_VERSION = '0.14.0';
+const CURRENT_PUBLIC_RELAY_TAG = `session-relay--v${CURRENT_PUBLIC_RELAY_VERSION}`;
 const CURRENT_PUBLIC_VERSION = '0.12.0';
 const CURRENT_PUBLIC_TAG = `cli-v${CURRENT_PUBLIC_VERSION}`;
 const CURRENT_PUBLIC_PLAN = 'docs/plans/active/session-relay-0.14.0-docks-kit-0.12.0-release.md';
@@ -44,16 +46,30 @@ const FROZEN_COMMAND = [
   'cli/test/unit/sessionRelayCli.test.ts',
   'cli/test/unit/pluginRefresh.test.ts',
 ];
+function recordedCompanionArgs() {
+  const plan = fs.readFileSync(path.join(REPO, DOCKS_PLAN), 'utf8');
+  const field = (name) => plan.match(new RegExp(`^- ${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}: (.+)$`, 'm'))?.[1];
+  assert.equal(field('Companion repository ID'), 'DocksDocks/public');
+  const ref = field('Companion validation ref');
+  const commit = field('Companion implementation commit');
+  assert.ok(ref, 'recorded companion validation ref is absent');
+  assert.ok(commit, 'recorded companion implementation commit is absent');
+  return ['--public-remote', PUBLIC_REMOTE, '--public-ref', ref, '--public-commit', commit, '--detached-clone'];
+}
 
 function parseCli(argv) {
+  // Release contracts are invoked without arguments by scripts/ci.mjs. Keep the
+  // explicit release-preparation mode, but derive the standalone identity from
+  // the immutable Docks plan that recorded the companion tuple.
+  const effectiveArgv = argv.length === 0 ? recordedCompanionArgs() : argv;
   const result = {};
   const names = new Map([
     ['--public-remote', 'remote'],
     ['--public-ref', 'ref'],
     ['--public-commit', 'commit'],
   ]);
-  for (let index = 0; index < argv.length; index += 1) {
-    const option = argv[index];
+  for (let index = 0; index < effectiveArgv.length; index += 1) {
+    const option = effectiveArgv[index];
     if (option === '--detached-clone') {
       assert.equal(result.detached, undefined, 'duplicate --detached-clone');
       result.detached = true;
@@ -63,7 +79,7 @@ function parseCli(argv) {
     assert.ok(name, `unknown option ${option}`);
     assert.equal(result[name], undefined, `duplicate ${option}`);
     index += 1;
-    const value = argv[index];
+    const value = effectiveArgv[index];
     assert.ok(value && !value.startsWith('--'), `${option} requires a value`);
     result[name] = value;
   }
@@ -81,6 +97,12 @@ function git(cwd, args, { ancestorMiss = false } = {}) {
   assert.equal(result.status, 0, `git ${args.join(' ')}: ${result.stderr}`);
   return result.stdout.trim();
 }
+function gitBytes(cwd, args) {
+  const result = spawnSync('git', args, { cwd, shell: false });
+  assert.equal(result.status, 0, `git ${args.join(' ')}: ${result.stderr.toString('utf8')}`);
+  return result.stdout;
+}
+
 function run(cwd, executable, args) {
   const result = spawnSync(executable, args, {
     cwd,
@@ -144,7 +166,6 @@ function verifyCurrentPublicMain(directory, cli) {
   );
 
   const currentPlanPath = currentPublicPlanFile(directory);
-  const currentPlanRelative = path.relative(directory, currentPlanPath).split(path.sep).join('/');
   const currentPlan = fs.readFileSync(currentPlanPath, 'utf8');
   const currentRun = planRun(currentPlan, 'current public child');
   const docksRun = planRun(
@@ -160,9 +181,9 @@ function verifyCurrentPublicMain(directory, cli) {
     ['kind', 'policy', 'verified', 'repository', 'tag', 'plugin_id', 'plugin_version', 'install_path', 'assets'],
     'current Session Relay manifest is closed',
   );
-  assert.equal(relay.verified, CURRENT_RELAY_VERSION);
-  assert.equal(relay.plugin_version, CURRENT_RELAY_VERSION);
-  assert.equal(relay.tag, CURRENT_RELAY_TAG);
+  assert.equal(relay.verified, CURRENT_PUBLIC_RELAY_VERSION);
+  assert.equal(relay.plugin_version, CURRENT_PUBLIC_RELAY_VERSION);
+  assert.equal(relay.tag, CURRENT_PUBLIC_RELAY_TAG);
   assert.deepEqual(Object.keys(relay.assets).sort(), Object.keys(HISTORICAL_ASSET_DIGESTS).sort());
   assert.equal(
     Object.keys(relay.assets).some((target) => /windows|win32|msvc/i.test(target)),
@@ -192,53 +213,58 @@ function verifyCurrentPublicMain(directory, cli) {
   assert.equal(docksRun.run_id, CURRENT_DOCKS_RUN_ID);
   assert.equal(docksRun.plan_path, CURRENT_DOCKS_PLAN);
   assert.equal(docksRun.draft_review?.state, 'passed');
-  assert.equal(currentRun.plan_path, currentPlanRelative);
+  // Archival moves the file but deliberately does not rewrite PlanRun identity.
+  assert.equal(currentRun.plan_path, CURRENT_PUBLIC_PLAN);
   assert.equal(currentRun.completion_review?.state, 'passed');
   assert.match(currentRun.execution_parent, COMMIT);
   assert.match(currentRun.implementation_commit, COMMIT);
   assert.ok(currentRun.acceptance, 'finished public child acceptance is absent');
   assert.match(currentPlan, /^status:\s*finished$/m);
   assert.doesNotMatch(currentPlan, /^Not run\.$/m);
-  const redReceiptBytes = currentPlan.match(/^Public TDD-red receipt JCS bytes: (\{.*\})$/m)?.[1];
-  const redReceiptSha256 = currentPlan.match(/^Public TDD-red receipt SHA-256: ([0-9a-f]{64})$/m)?.[1];
-  assert.ok(redReceiptBytes && redReceiptSha256, 'public TDD-red receipt is absent');
-  assert.equal(canonicalize(JSON.parse(redReceiptBytes)), redReceiptBytes);
-  assert.equal(sha256(redReceiptBytes), redReceiptSha256);
-  const redReceipt = JSON.parse(redReceiptBytes);
-  exactKeys(
-    redReceipt,
-    [
-      'schema',
-      'type',
-      'repository_id',
-      'pre_production_commit',
-      'test_paths',
-      'command',
-      'exit_code',
-      'stdout_sha256',
-      'stderr_sha256',
-      'captured_at',
-      'producer',
-    ],
-    'current public TDD-red receipt is closed',
+  // This child predates canonical TddRedReceiptV1 capture. Its finished plan
+  // records the red command, failure, commit, and frozen file hashes directly.
+  const redLine = currentPlan.match(/^- TDD red at commit .*$/m)?.[0];
+  assert.ok(redLine, 'current public TDD-red verification result is absent');
+  const redCommit = redLine.match(/at commit `([0-9a-f]{40})`/)?.[1];
+  const redCommand = redLine.match(/: `([^`]+)` exited/)?.[1];
+  const redExitCode = Number(redLine.match(/` exited ([0-9]+) with/)?.[1]);
+  assert.match(redCommit ?? '', COMMIT);
+  assert.equal(
+    redCommand,
+    'bun run test:unit -- cli/test/unit/sessionRelayCli.test.ts cli/test/unit/pluginRefresh.test.ts cli/test/unit/toolchain.test.ts cli/test/unit/engine-di.test.ts',
   );
-  assert.equal(redReceipt.schema, 1);
-  assert.equal(redReceipt.type, 'TddRedReceiptV1');
-  assert.equal(redReceipt.repository_id, 'DocksDocks/public');
-  assert.notEqual(redReceipt.exit_code, 0);
-  assert.ok(redReceipt.command?.argv?.length > 0, 'public red command is absent');
-  assert.ok(redReceipt.test_paths?.length > 0, 'public red test blob evidence is absent');
-  for (const test of redReceipt.test_paths) {
-    assert.match(test.path, /^(?:cli\/test|SoT\/)/);
-    assert.match(test.blob_id, COMMIT);
+  assert.equal(redExitCode, 1);
+  assert.match(redLine, /exactly three intended assertions/);
+  const previousMinorVersion = (version) => {
+    const [major, minor, patch] = version.split('.').map(Number);
+    assert.equal(patch, 0);
+    assert.ok(minor > 0);
+    return `${major}.${minor - 1}.${patch}`;
+  };
+  const versionMismatch = (label, previous, current) =>
+    new RegExp(`${label} ${previous.replaceAll('.', '\\.')} instead of ${current.replaceAll('.', '\\.')}`);
+  const previousPublicVersion = previousMinorVersion(CURRENT_PUBLIC_VERSION);
+  const previousRelayVersion = previousMinorVersion(CURRENT_PUBLIC_RELAY_VERSION);
+  assert.match(redLine, versionMismatch('package', previousPublicVersion, CURRENT_PUBLIC_VERSION));
+  assert.match(redLine, versionMismatch('Relay version/tag', previousRelayVersion, CURRENT_PUBLIC_RELAY_VERSION));
+  const frozenTests = [...redLine.matchAll(/`([0-9a-f]{64})` for `([^`]+\.test\.ts)`/g)];
+  assert.deepEqual(
+    frozenTests.map(([, , name]) => name),
+    ['toolchain.test.ts', 'engine-di.test.ts'],
+  );
+  for (const [, digest, name] of frozenTests) {
+    const testPath = `cli/test/unit/${name}`;
+    assert.equal(sha256(gitBytes(directory, ['show', `${redCommit}:${testPath}`])), digest);
+    assert.equal(
+      sha256(gitBytes(directory, ['show', `${currentRun.implementation_commit}:${testPath}`])),
+      digest,
+      `${testPath} changed after the recorded red failure`,
+    );
   }
-  assert.match(currentPlan, /^Public TDD-red expected failure signature:\s*\S.+$/m);
-  const redCommit = redReceipt.pre_production_commit;
-  assert.match(redCommit, COMMIT);
   assert.equal(git(directory, ['merge-base', '--is-ancestor', currentRun.execution_parent, redCommit]), '');
   assert.equal(git(directory, ['merge-base', '--is-ancestor', redCommit, currentRun.implementation_commit]), '');
   assert.equal(git(directory, ['merge-base', '--is-ancestor', currentRun.implementation_commit, currentCommit]), '');
-  assert.match(currentPlan, new RegExp(CURRENT_RELAY_TAG.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  assert.match(currentPlan, new RegExp(CURRENT_PUBLIC_RELAY_TAG.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
   assert.match(currentPlan, new RegExp(CURRENT_PUBLIC_TAG.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
   assert.match(currentPlan, /docks-kit@0\.12\.0/);
   assert.equal(git(directory, ['status', '--porcelain=v1']), '');

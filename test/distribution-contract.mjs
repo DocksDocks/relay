@@ -24,6 +24,13 @@ const RELEASE_TAG = `session-relay--v${RELEASE_VERSION}`;
 const PUBLIC_REF = /^refs\/heads\/preflight\/session-relay-cli-0\.13\.0-[0-9a-f]{12}$/;
 const COMMIT = /^[0-9a-f]{40}$/;
 const { version: CURRENT_RELEASE_VERSION, tag: CURRENT_RELEASE_TAG } = resolveShippedRelayVersion(REPO);
+// DELIBERATELY PINNED - do not "clean up" into `loadReleaseInstance`. Every other
+// release suite now derives its identity from the instance file, which makes those
+// assertions instance-against-itself: they catch a library reading the wrong group,
+// but they cannot catch a WRONG VALUE written into the instance. These two literals
+// are the last independent oracle for that, so an unintended edit to the 0.15.0
+// instance fails here. Update them by hand, as a deliberate act, when the release
+// identity legitimately changes.
 const CURRENT_DOCKS_PLAN_TEMPLATE = 'docs/plans/active/session-relay-0.15.0-release.md';
 const CURRENT_DOCKS_RUN_ID = '12a460e2-af44-4bc8-bc7d-d7aaec2c991b';
 const CURRENT_PUBLIC_PLAN = 'docs/plans/active/session-relay-0.15.0-docks-kit-0.13.0-release.md';
@@ -1082,7 +1089,10 @@ function currentCorrelatedReleaseContract() {
   assert.match(currentPlan, new RegExp(CURRENT_RELEASE_TAG.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
   assert.match(currentPlan, /docks-kit[^\n]*0\.13\.0/);
   assert.match(currentPlan, new RegExp(CURRENT_PUBLIC_PLAN.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
-  assert.match(currentPlan, /stage the Relay prerelease[\s\S]*child's completed release[\s\S]*stable, non-prerelease release/i);
+  assert.match(
+    currentPlan,
+    /stage the Relay prerelease[\s\S]*child's completed release[\s\S]*stable, non-prerelease release/i,
+  );
 }
 
 function verifyCompanion() {
