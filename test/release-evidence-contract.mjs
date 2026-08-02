@@ -3638,15 +3638,37 @@ function bindPlanRunCompletionFixture(
     templatePath = path.join(finishedDirectory, candidates[0]);
   }
   fs.copyFileSync(templatePath, planPath);
-  const template = fs
-    .readFileSync(planPath, 'utf8')
-    .replace(/^status: (?:planned|blocked|finished)$/m, 'status: ongoing');
+  const rawTemplate = fs.readFileSync(planPath, 'utf8');
+  const templateStatus = /^status: (\S+)$/m.exec(rawTemplate)?.[1];
+  assert.ok(templateStatus, 'fresh successor PlanRun fixture has no status');
+  // `ongoing` belongs in this alternation: without it the substitution is a silent
+  // no-op whenever the live plan has already started, and the fixture only gets the
+  // bytes it wants by coincidence.
+  const template = rawTemplate.replace(/^status: (?:planned|ongoing|blocked|finished)$/m, 'status: ongoing');
   const runMatch = /^Plan-run: (\{.*\})$/m.exec(template);
   assert.ok(runMatch, 'fresh successor PlanRun fixture is absent');
   const templateRun = JSON.parse(runMatch[1]);
   assert.equal(templateRun.run_id, PLANRUN_DOCKS_RUN_ID);
   assert.equal(templateRun.source_base, PLANRUN_DOCKS_SOURCE_BASE);
-  assert.equal(templateRun.execution_parent, null);
+  // The live plan is a moving target: it advances through its lifecycle while this
+  // suite reads it as a template. The run object below overwrites `execution_parent`
+  // outright, so this is only a drift guard - but pinning it to one lifecycle state
+  // made the suite fail on a legitimate `planned -> ongoing` transition. Assert what
+  // each state actually guarantees instead, mirroring plan-run.mjs:545/575/650, so
+  // both branches keep biting and binding `implementation_commit` later cannot break
+  // them. `blocked` is the one status that legitimately sits on either side of start.
+  const preStart = templateStatus === 'drafting' || templateStatus === 'planned' || templateStatus === 'scheduled';
+  const postStart = templateStatus === 'ongoing' || templateStatus === 'finished';
+  if (templateRun.execution_parent === null) {
+    assert.ok(!postStart, `a ${templateStatus} run must carry the execution_parent captured at start`);
+  } else {
+    assert.ok(!preStart, `a ${templateStatus} run precedes implementation and cannot carry execution_parent`);
+    assert.match(templateRun.execution_parent, /^[0-9a-f]{40}$/, 'execution_parent must be a full commit identity');
+    assert.doesNotThrow(
+      () => gitRaw(['-C', REPO, 'merge-base', '--is-ancestor', templateRun.execution_parent, 'HEAD']),
+      'execution_parent must be reachable from HEAD',
+    );
+  }
   let plan = template.replace(
     /## Verification Results\n[\s\S]*$/u,
     '## Verification Results\n\n- Focused successor release evidence passed on the reviewed implementation.\n',
