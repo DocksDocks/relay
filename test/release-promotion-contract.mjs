@@ -1499,6 +1499,10 @@ function makePublicReleaseAdapter(
     },
     getPinnedAssets: () => structuredClone(pinnedAssets),
     getNpmState: () => 'published',
+    // The legacy V2 finished plan carries no `Plan-run:` line, so the PlanRun branch that consults
+    // the released-content pin must never be reached from here.
+    expectedImplementationContent: () =>
+      assert.fail('legacy public release path must not consult the released-content pin'),
   };
   return { adapter, completionDigest: hash(completionReceiptText), successfulRun };
 }
@@ -1938,6 +1942,7 @@ function makeCurrentPublicReleaseAdapter(
   request,
   {
     ancestryFailure = null,
+    contentPinOverride = null,
     evidenceCopies = 1,
     evidenceMutation = null,
     npmState = 'published',
@@ -2006,6 +2011,17 @@ function makeCurrentPublicReleaseAdapter(
     [`${CURRENT_PUBLIC_IMPLEMENTATION_COMMIT}...${CURRENT_PUBLIC_RELEASE_COMMIT}`, 'implementation_to_release'],
     [`${CURRENT_PUBLIC_RELEASE_COMMIT}...${CURRENT_PUBLIC_ARCHIVE_COMMIT}`, 'release_to_archive'],
   ]);
+  const expectedContentDigest =
+    contentPinOverride ??
+    (planRunFixture === null
+      ? DIGEST('c')
+      : hash({
+          schema: 1,
+          source_base: CURRENT_PUBLIC_IMPLEMENTATION_COMMIT,
+          paths: [...planRunFixture.fileBytes.keys()]
+            .sort()
+            .map((filePath) => ({ path: filePath, sha256: hash(planRunFixture.fileBytes.get(filePath)) })),
+        }));
   const adapter = {
     now: () => '2026-07-25T18:00:00.000Z',
     getTagCommit: () => CURRENT_PUBLIC_RELEASE_COMMIT,
@@ -2039,6 +2055,10 @@ function makeCurrentPublicReleaseAdapter(
       assert.equal(run.id, successfulRun.id, 'npm docks-kit@0.12.0 must bind the exact successful workflow');
       return npmState;
     },
+    // Snapshot at construction, exactly like the reviewed instance value it stands in for. A lazy
+    // derivation would drift together with the implementation bytes and could never fail, which is
+    // precisely the vacuous shape the refusal cases below exist to rule out.
+    expectedImplementationContent: () => expectedContentDigest,
   };
   return { adapter, completionDigest, evidence, planRunFixture };
 }
@@ -2143,6 +2163,34 @@ function verifyCurrentPublicBoundary(directory, boundary, observation, output) {
       planRunVerified.receipt.public_plan.finished_path,
       CURRENT_PUBLIC_FINISHED_PLAN_PATH,
       'PlanRun receipt must bind the observed finished archive path',
+    );
+
+    // Non-vacuity for the released-content pin. The positive case above derives the expectation
+    // from the fixture's own implementation bytes, so on its own it could pass while comparing
+    // nothing. Feed a pin the observed bytes cannot produce and require refusal; then feed the
+    // right pin with one implementation byte changed and require refusal again, so neither side of
+    // the comparison can be dropped without a test going red.
+    assert.throws(
+      () =>
+        verifyCurrentPublicBoundary(
+          directory,
+          boundary,
+          makeCurrentPublicReleaseAdapter(boundary.request, {
+            planRun: true,
+            contentPinOverride: DIGEST('b'),
+          }),
+          'wrong-released-content-pin.json',
+        ),
+      /released affected-path content does not match the reviewed digest/,
+      'current verify-public-release must refuse a released-content digest it did not observe',
+    );
+    const driftedContent = makeCurrentPublicReleaseAdapter(boundary.request, { planRun: true });
+    const driftedPath = [...driftedContent.planRunFixture.fileBytes.keys()].sort()[0];
+    driftedContent.planRunFixture.fileBytes.set(driftedPath, Buffer.from('drifted release content\n'));
+    assert.throws(
+      () => verifyCurrentPublicBoundary(directory, boundary, driftedContent, 'drifted-released-content.json'),
+      /released affected-path content does not match the reviewed digest/,
+      'current verify-public-release must refuse implementation bytes that drifted from the reviewed digest',
     );
 
     for (const [name, observation, pattern] of [

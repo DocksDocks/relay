@@ -18,24 +18,32 @@ const DOCKS_PLAN = 'docs/plans/finished/2026-07-23-session-relay-linux-workspace
 const PUBLIC_VERSION = '0.13.0';
 const PRODUCTION_VERSION = '0.12.0';
 const BLOCKED_REASON = 'Awaiting the four independently hashed `session-relay--v0.13.0` production asset digests.';
-// This contract revalidates the already-published public main. That checkout
-// intentionally trails the Relay candidate in this repository until publication.
-const CURRENT_PUBLIC_RELAY_VERSION = '0.14.0';
+// This contract revalidates the published public main after the child release
+// finishes, binding the generation that the active Docks parent now consumes.
+const CURRENT_PUBLIC_RELAY_VERSION = '0.15.0';
 const CURRENT_PUBLIC_RELAY_TAG = `session-relay--v${CURRENT_PUBLIC_RELAY_VERSION}`;
-const CURRENT_PUBLIC_VERSION = '0.12.0';
+const CURRENT_PUBLIC_VERSION = '0.13.0';
 const CURRENT_PUBLIC_TAG = `cli-v${CURRENT_PUBLIC_VERSION}`;
-const CURRENT_PUBLIC_PLAN = 'docs/plans/active/session-relay-0.14.0-docks-kit-0.12.0-release.md';
-const CURRENT_DOCKS_PLAN = 'docs/plans/active/session-relay-correlated-results-release-completion.md';
-const CURRENT_DOCKS_PLAN_TEMPLATE =
-  'docs/plans/finished/2026-07-26-session-relay-correlated-results-release-completion.md';
-const CURRENT_DOCKS_RUN_ID = 'a69dcd97-d1bd-46fc-9b6b-70e349e353fc';
-const CURRENT_GOAL_ID = '8b89aabf-7336-4352-bc11-225bab67f9aa';
+const CURRENT_PUBLIC_PLAN = 'docs/plans/active/session-relay-0.15.0-docks-kit-0.13.0-release.md';
+const CURRENT_PUBLIC_RUN_ID = 'ad7f3b75-dfff-4bcd-8d1f-c8c11555b119';
+const CURRENT_PUBLIC_EXECUTION_PARENT = '3e4eddec347e51189f1a13b3a48c0ca737520d94';
+const CURRENT_PUBLIC_IMPLEMENTATION_COMMIT = '7ea0611958b85cd98123a8131189ddf950ce6fb9';
+const CURRENT_DOCKS_PLAN = 'docs/plans/active/session-relay-0.15.0-release.md';
+const CURRENT_DOCKS_PLAN_TEMPLATE = 'docs/plans/active/session-relay-0.15.0-release.md';
+const CURRENT_DOCKS_RUN_ID = '887eaf82-ffac-4d78-9368-b62cb64dda19';
+const CURRENT_GOAL_ID = '258b44c2-c3b2-4902-862c-7461724ca078';
 const HISTORICAL_PUBLIC_PLAN_SHA256 = 'e0b1d183122def14a3f4bd6f05605c6aa7de3fb2dccf4330e8956acc3e0db9ff';
 const HISTORICAL_ASSET_DIGESTS = Object.freeze({
   'x86_64-unknown-linux-musl': 'f8c6374c2c704f48135cd646028fbd9e53fd43f9800b4a255fa36a0818744b7b',
   'aarch64-unknown-linux-musl': '6ebc6d9a38a8c3d1f191647d3ab679d56b69cffba36c3bc3c8eb99b0e163852e',
   'x86_64-apple-darwin': '06c046182922c6897e81278fecd7280008fa8040a489910993283017101f1be3',
   'aarch64-apple-darwin': '0686e68e3a88dd0dee647fc18211e941dd0d8012818d0bcfb79fac142b5baf21',
+});
+const CURRENT_ASSET_DIGESTS = Object.freeze({
+  'x86_64-unknown-linux-musl': '875ca460a21d4f205833db5629bcf249413da77e444f4927107a44e63b71acab',
+  'aarch64-unknown-linux-musl': 'ee52d7757a22febe3fcb4e00dbb81ec1fb1a1d5769c5eeda903f11a765029a06',
+  'x86_64-apple-darwin': '8f4b11be831d5fc232965264c354f202c67c2260f383fba3e8c811eb6ea8ca39',
+  'aarch64-apple-darwin': '24ef2cc98a4034391fef60bc3c13a672511b024f0d6493395bb61562936ac5c7',
 });
 const FROZEN_TESTS = ['cli/test/unit/pluginRefresh.test.ts', 'cli/test/unit/sessionRelayCli.test.ts'];
 const FROZEN_COMMAND = [
@@ -127,6 +135,7 @@ function canonicalize(value) {
 const sha256 = (value) => createHash('sha256').update(value).digest('hex');
 const exactKeys = (object, expected, label) =>
   assert.deepEqual(Object.keys(object).sort(), [...expected].sort(), label);
+const escapeRegExp = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 function planRun(plan, label) {
   const raw = plan.match(/^Plan-run:\s*(\{.*\})$/m)?.[1];
@@ -140,10 +149,11 @@ function currentPublicPlanFile(directory) {
   const active = path.join(directory, CURRENT_PUBLIC_PLAN);
   if (fs.existsSync(active)) return active;
   const finishedDirectory = path.join(directory, 'docs/plans/finished');
+  const finishedPlanName = new RegExp(
+    `^\\d{4}-\\d{2}-\\d{2}-session-relay-${escapeRegExp(CURRENT_PUBLIC_RELAY_VERSION)}-docks-kit-${escapeRegExp(CURRENT_PUBLIC_VERSION)}-release\\.md$`,
+  );
   const matches = fs.existsSync(finishedDirectory)
-    ? fs
-        .readdirSync(finishedDirectory)
-        .filter((name) => /^\d{4}-\d{2}-\d{2}-session-relay-0\.14\.0-docks-kit-0\.12\.0-release\.md$/.test(name))
+    ? fs.readdirSync(finishedDirectory).filter((name) => finishedPlanName.test(name))
     : [];
   assert.equal(matches.length, 1, 'exactly one current finished public Session Relay child must exist');
   return path.join(finishedDirectory, matches[0]);
@@ -181,10 +191,23 @@ function verifyCurrentPublicMain(directory, cli) {
     ['kind', 'policy', 'verified', 'repository', 'tag', 'plugin_id', 'plugin_version', 'install_path', 'assets'],
     'current Session Relay manifest is closed',
   );
-  assert.equal(relay.verified, CURRENT_PUBLIC_RELAY_VERSION);
-  assert.equal(relay.plugin_version, CURRENT_PUBLIC_RELAY_VERSION);
-  assert.equal(relay.tag, CURRENT_PUBLIC_RELAY_TAG);
+  assert.equal(
+    relay.verified,
+    CURRENT_PUBLIC_RELAY_VERSION,
+    'current Relay verified version does not match the published generation',
+  );
+  assert.equal(
+    relay.plugin_version,
+    CURRENT_PUBLIC_RELAY_VERSION,
+    'current Relay plugin version does not match the published generation',
+  );
+  assert.equal(relay.tag, CURRENT_PUBLIC_RELAY_TAG, 'current Relay tag does not match the published generation');
   assert.deepEqual(Object.keys(relay.assets).sort(), Object.keys(HISTORICAL_ASSET_DIGESTS).sort());
+  assert.deepEqual(
+    relay.assets,
+    CURRENT_ASSET_DIGESTS,
+    'current Relay asset digests do not match independently recorded publication evidence',
+  );
   assert.equal(
     Object.keys(relay.assets).some((target) => /windows|win32|msvc/i.test(target)),
     false,
@@ -199,74 +222,86 @@ function verifyCurrentPublicMain(directory, cli) {
   assert.equal(
     JSON.parse(fs.readFileSync(path.join(directory, 'package.json'), 'utf8')).version,
     CURRENT_PUBLIC_VERSION,
+    'current public package version does not match the published generation',
   );
   const generated = fs.readFileSync(path.join(directory, 'cli/src/generated/sotPayload.ts'), 'utf8');
-  assert.match(generated, /GENERATED_PACKAGE_VERSION\s*=\s*["']0\.12\.0["']/);
-  assert.match(generated, /session-relay--v0\.14\.0/);
+  assert.match(
+    generated,
+    new RegExp(`GENERATED_PACKAGE_VERSION\\s*=\\s*["']${escapeRegExp(CURRENT_PUBLIC_VERSION)}["']`),
+    'generated payload package version does not match the current public version',
+  );
+  assert.match(
+    generated,
+    new RegExp(escapeRegExp(CURRENT_PUBLIC_RELAY_TAG)),
+    'generated payload Relay tag does not match the current public Relay tag',
+  );
   for (const digest of Object.values(relay.assets)) assert.match(generated, new RegExp(digest));
 
   assert.equal(currentRun.schema, 1);
   assert.equal(currentRun.repository_id, 'DocksDocks/public');
+  assert.equal(currentRun.run_id, CURRENT_PUBLIC_RUN_ID);
   assert.equal(currentRun.goal_id, CURRENT_GOAL_ID);
   assert.equal(currentRun.goal_id, docksRun.goal_id);
-  assert.equal(docksRun.repository_id, 'DocksDocks/docks');
+  assert.equal(currentRun.risk, 'external');
+  assert.deepEqual(currentRun.requested_effects, ['local', 'probe', 'publish', 'push', 'release']);
+  assert.equal(currentRun.source_base, currentRun.execution_parent);
+  assert.equal(currentRun.execution_parent, CURRENT_PUBLIC_EXECUTION_PARENT);
+  assert.equal(currentRun.implementation_commit, CURRENT_PUBLIC_IMPLEMENTATION_COMMIT);
+  assert.equal(currentRun.draft_review?.state, 'passed');
+  assert.equal(currentRun.completion_review?.state, 'passed');
+  exactKeys(currentRun.acceptance, ['source_sha256', 'verification_sha256'], 'current public acceptance is closed');
+  assert.match(currentRun.acceptance.source_sha256, SHA, 'current public source acceptance is not bound');
+  assert.match(currentRun.acceptance.verification_sha256, SHA, 'current public verification acceptance is not bound');
+  assert.equal(docksRun.repository_id, `docks:${REPO}`);
   assert.equal(docksRun.run_id, CURRENT_DOCKS_RUN_ID);
   assert.equal(docksRun.plan_path, CURRENT_DOCKS_PLAN);
   assert.equal(docksRun.draft_review?.state, 'passed');
-  // Archival moves the file but deliberately does not rewrite PlanRun identity.
+  // Archival moves the public file but deliberately does not rewrite PlanRun identity.
+  // The Docks parent is still active, so its live PlanRun is read from its active path.
   assert.equal(currentRun.plan_path, CURRENT_PUBLIC_PLAN);
-  assert.equal(currentRun.completion_review?.state, 'passed');
-  assert.match(currentRun.execution_parent, COMMIT);
-  assert.match(currentRun.implementation_commit, COMMIT);
-  assert.ok(currentRun.acceptance, 'finished public child acceptance is absent');
   assert.match(currentPlan, /^status:\s*finished$/m);
   assert.doesNotMatch(currentPlan, /^Not run\.$/m);
-  // This child predates canonical TddRedReceiptV1 capture. Its finished plan
-  // records the red command, failure, commit, and frozen file hashes directly.
-  const redLine = currentPlan.match(/^- TDD red at commit .*$/m)?.[0];
-  assert.ok(redLine, 'current public TDD-red verification result is absent');
-  const redCommit = redLine.match(/at commit `([0-9a-f]{40})`/)?.[1];
-  const redCommand = redLine.match(/: `([^`]+)` exited/)?.[1];
-  const redExitCode = Number(redLine.match(/` exited ([0-9]+) with/)?.[1]);
-  assert.match(redCommit ?? '', COMMIT);
+  // This child records no historical TDD-red receipt. Instead, its finished
+  // PlanRun binds passed draft/completion review and acceptance hashes, while
+  // its verification results record the generated, focused-unit, full-gate,
+  // and both planted-mismatch prove-red outcomes over the implementation.
+  assert.match(
+    currentPlan,
+    /^- bun run check:generated: exit 0\.$/m,
+    'current public generated-freshness verification result is absent',
+  );
+  assert.match(
+    currentPlan,
+    /^- bun run test:unit -- cli\/test\/unit\/toolchain\.test\.ts cli\/test\/unit\/engine-di\.test\.ts: exit 0, 2 files and 18 tests passed\.$/m,
+    'current public focused pin-unit verification result is absent',
+  );
+  assert.match(
+    currentPlan,
+    /^- bun run test:ci: exit 0; generated freshness, typecheck, 26 unit files \/ 192 tests, POSIX runtime smoke, 25 dry-run golden cases, and 71 mutation golden cases passed\.$/m,
+    'current public full-gate verification result is absent',
+  );
+  assert.match(
+    currentPlan,
+    /^- bun cli\/test\/golden-dryrun\.ts --prove-red: expected exit 1 with prove-red OK: golden-dryrun detected 25 planted mismatch\(es\); intentionally exiting 1\.$/m,
+    'current public dry-run planted-mismatch result is absent',
+  );
+  assert.match(
+    currentPlan,
+    /^- bun cli\/test\/golden-mutation\.ts --prove-red: expected exit 1 with prove-red OK: golden-mutation detected 68 planted mismatch\(es\); intentionally exiting 1\.$/m,
+    'current public mutation planted-mismatch result is absent',
+  );
   assert.equal(
-    redCommand,
-    'bun run test:unit -- cli/test/unit/sessionRelayCli.test.ts cli/test/unit/pluginRefresh.test.ts cli/test/unit/toolchain.test.ts cli/test/unit/engine-di.test.ts',
+    git(directory, ['merge-base', '--is-ancestor', currentRun.execution_parent, currentRun.implementation_commit]),
+    '',
   );
-  assert.equal(redExitCode, 1);
-  assert.match(redLine, /exactly three intended assertions/);
-  const previousMinorVersion = (version) => {
-    const [major, minor, patch] = version.split('.').map(Number);
-    assert.equal(patch, 0);
-    assert.ok(minor > 0);
-    return `${major}.${minor - 1}.${patch}`;
-  };
-  const versionMismatch = (label, previous, current) =>
-    new RegExp(`${label} ${previous.replaceAll('.', '\\.')} instead of ${current.replaceAll('.', '\\.')}`);
-  const previousPublicVersion = previousMinorVersion(CURRENT_PUBLIC_VERSION);
-  const previousRelayVersion = previousMinorVersion(CURRENT_PUBLIC_RELAY_VERSION);
-  assert.match(redLine, versionMismatch('package', previousPublicVersion, CURRENT_PUBLIC_VERSION));
-  assert.match(redLine, versionMismatch('Relay version/tag', previousRelayVersion, CURRENT_PUBLIC_RELAY_VERSION));
-  const frozenTests = [...redLine.matchAll(/`([0-9a-f]{64})` for `([^`]+\.test\.ts)`/g)];
-  assert.deepEqual(
-    frozenTests.map(([, , name]) => name),
-    ['toolchain.test.ts', 'engine-di.test.ts'],
-  );
-  for (const [, digest, name] of frozenTests) {
-    const testPath = `cli/test/unit/${name}`;
-    assert.equal(sha256(gitBytes(directory, ['show', `${redCommit}:${testPath}`])), digest);
-    assert.equal(
-      sha256(gitBytes(directory, ['show', `${currentRun.implementation_commit}:${testPath}`])),
-      digest,
-      `${testPath} changed after the recorded red failure`,
-    );
-  }
-  assert.equal(git(directory, ['merge-base', '--is-ancestor', currentRun.execution_parent, redCommit]), '');
-  assert.equal(git(directory, ['merge-base', '--is-ancestor', redCommit, currentRun.implementation_commit]), '');
   assert.equal(git(directory, ['merge-base', '--is-ancestor', currentRun.implementation_commit, currentCommit]), '');
-  assert.match(currentPlan, new RegExp(CURRENT_PUBLIC_RELAY_TAG.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
-  assert.match(currentPlan, new RegExp(CURRENT_PUBLIC_TAG.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
-  assert.match(currentPlan, /docks-kit@0\.12\.0/);
+  assert.match(currentPlan, new RegExp(escapeRegExp(CURRENT_PUBLIC_RELAY_TAG)));
+  assert.match(currentPlan, new RegExp(escapeRegExp(CURRENT_PUBLIC_TAG)));
+  assert.match(
+    currentPlan,
+    new RegExp(`docks-kit@${escapeRegExp(CURRENT_PUBLIC_VERSION)}`),
+    'current public npm package evidence does not match the published version',
+  );
   assert.equal(git(directory, ['status', '--porcelain=v1']), '');
 }
 
