@@ -151,17 +151,8 @@ fn removal_outcome(branch: String, removal: Result<(), String>) -> FanoutGcOutco
     }
 }
 
-fn changed_candidate_reason(
-    repository_identity_matches: bool,
-    worktree_snapshot_matches: Option<bool>,
-) -> Option<FanoutGcReason> {
-    if !repository_identity_matches {
-        Some(FanoutGcReason::RepositoryIdentityChanged)
-    } else if worktree_snapshot_matches == Some(false) {
-        Some(FanoutGcReason::WorktreeChanged)
-    } else {
-        None
-    }
+fn changed_worktree_reason(worktree_snapshot_matches: Option<bool>) -> Option<FanoutGcReason> {
+    (worktree_snapshot_matches == Some(false)).then_some(FanoutGcReason::WorktreeChanged)
 }
 
 fn legacy_shape_reason(components: &[String]) -> Option<FanoutGcReason> {
@@ -194,7 +185,6 @@ impl FanoutGcDecision {
 struct ReapContext<'a> {
     fanout: &'a FanoutStore,
     worktrees: &'a store::GcSurfaceDir,
-    identity: &'a git::RepoIdentity,
     cutoff: SystemTime,
 }
 
@@ -523,10 +513,7 @@ fn abandoned_worktree_decision(
     } else {
         None
     };
-    if let Some(reason) = changed_candidate_reason(
-        ctx.identity.matches_record(current),
-        worktree_snapshot_matches,
-    ) {
+    if let Some(reason) = changed_worktree_reason(worktree_snapshot_matches) {
         return Ok(FanoutGcDecision::retained(branch, reason));
     }
     Ok(FanoutGcDecision::Candidate(Box::new(FanoutGcCandidate {
@@ -583,7 +570,14 @@ pub(crate) fn reap_abandoned_worktrees(
         };
         let identity = match repo_identity(Path::new(&snapshot.worktree)) {
             Ok(identity) if identity.matches_record(&snapshot) => identity,
-            Ok(_) | Err(_) => continue,
+            Ok(_) => {
+                report.record(FanoutGcOutcome::retained(
+                    snapshot.branch,
+                    FanoutGcReason::RepositoryIdentityChanged,
+                ));
+                continue;
+            }
+            Err(_) => continue,
         };
         let Ok((_repository_gate, _roots)) = acquire_legacy_gate(&identity) else {
             continue;
@@ -591,7 +585,6 @@ pub(crate) fn reap_abandoned_worktrees(
         let ctx = ReapContext {
             fanout,
             worktrees,
-            identity: &identity,
             cutoff,
         };
 
@@ -1238,8 +1231,7 @@ mod tests {
     fn retention_report_keeps_reason_discriminants() {
         let protective_reasons = [
             legacy_shape_reason(&["reservation".to_string()]).expect("legacy shape"),
-            changed_candidate_reason(false, None).expect("repository identity change"),
-            changed_candidate_reason(true, Some(false)).expect("worktree snapshot change"),
+            changed_worktree_reason(Some(false)).expect("worktree snapshot change"),
             commit_inspection_reason(Ok(1)).expect("uncollected commit"),
             commit_inspection_reason(Err("inspect".into())).expect("commit inspection failure"),
             cleanliness_reason(Err("dirty".into())).expect("dirty worktree"),
@@ -1257,7 +1249,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 FanoutGcReason::LegacyShape,
-                FanoutGcReason::RepositoryIdentityChanged,
                 FanoutGcReason::WorktreeChanged,
                 FanoutGcReason::UncollectedCommits,
                 FanoutGcReason::CommitInspectionFailed,

@@ -238,6 +238,47 @@ fn reservation_inside_window_keeps_worktree_and_branch() {
 }
 
 #[test]
+fn reservation_with_changed_repository_identity_is_retained_and_reported() {
+    let fixture = Fixture::new("fanout-reap-repository-identity");
+    let worktree = fixture.worktree().to_path_buf();
+    git(
+        &fixture.repo,
+        &[
+            "worktree",
+            "remove",
+            "--force",
+            worktree.to_str().expect("worktree path is UTF-8"),
+        ],
+    );
+    fs::create_dir(&worktree).expect("recreate worktree path");
+    git(&worktree, &["init", "-q"]);
+    fixture.age_past_gc_window();
+
+    let output = fixture.run_gc();
+    let report = String::from_utf8_lossy(&output.stderr);
+    let persisted = fixture
+        .store
+        .read(&fixture.reservation.reservation_id)
+        .expect("read fanout authority")
+        .expect("reservation remains");
+
+    assert!(worktree.is_dir(), "changed repository must be preserved");
+    assert!(
+        fixture.branch_exists(),
+        "reservation branch must be preserved"
+    );
+    assert_eq!(
+        persisted.worktree, fixture.reservation.worktree,
+        "persisted worktree path must not be rewritten"
+    );
+    assert!(report.contains(&fixture.reservation.branch), "{report}");
+    assert!(
+        report.contains(r#""reason":"repository_identity_changed""#),
+        "{report}"
+    );
+}
+
+#[test]
 fn reservation_with_uncollected_commits_keeps_worktree_and_reports_branch() {
     let fixture = Fixture::new("fanout-reap-ahead");
     fs::write(fixture.worktree().join("uncollected.txt"), "uncollected\n")

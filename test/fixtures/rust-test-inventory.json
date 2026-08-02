@@ -125,6 +125,7 @@
         "managed_workspace_gate_refusal_skips_only_that_reservation",
         "nested_worktree_past_fanout_cutoff_is_reaped",
         "reservation_inside_window_keeps_worktree_and_branch",
+        "reservation_with_changed_repository_identity_is_retained_and_reported",
         "reservation_with_dirty_changes_keeps_worktree_and_reports_reason",
         "reservation_with_uncollected_commits_keeps_worktree_and_reports_branch",
         "two_day_fanout_worktree_is_reaped_while_shared_mailbox_is_retained"
