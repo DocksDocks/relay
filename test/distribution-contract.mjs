@@ -42,7 +42,10 @@ const CURRENT_DOCKS_RUN_ID = '75c7a055-44f2-4435-b863-301af9bb352f';
 // docks-kit 0.14.0 child archive that pins the three 0.16.0 assets. Pretag, the
 // instance binds the retained finished 0.13.0 child; the plan text names the
 // 0.14.0 archive as the release precondition, which is what this pin checks.
-const CURRENT_PUBLIC_PLAN = 'docs/plans/finished/2026-08-02-session-relay-0.16.0-docks-kit-0.14.0-release.md';
+// Date-free by construction. The archive prefix is the child's own FINISH date, which this
+// repository cannot know when the parent plan is written, so pinning it couples a parent
+// assertion to the day a different repository happens to land. The suffix is the stable part.
+const CURRENT_PUBLIC_PLAN_SUFFIX = '-session-relay-0.16.0-docks-kit-0.14.0-release.md';
 const HISTORICAL_RELEASE_PLAN = resolveHistoricalPublicationPlanPath(REPO);
 const HISTORICAL_RECEIPT_SHA256 = Object.freeze([
   '419b23ccdcf0ca21672e81c05ae9d22c55bc67781839ffb6a29e7eecc2b59396',
@@ -1109,7 +1112,7 @@ function currentCorrelatedReleaseContract() {
   assert.match(currentPlan, /"draft_review":\{[^}]*"state":"passed"/);
   assert.match(currentPlan, new RegExp(CURRENT_RELEASE_TAG.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
   assert.match(currentPlan, /docks-kit[^\n]*0\.13\.0/);
-  assert.match(currentPlan, new RegExp(CURRENT_PUBLIC_PLAN.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  assert.match(currentPlan, new RegExp(CURRENT_PUBLIC_PLAN_SUFFIX.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
   assert.match(
     currentPlan,
     /stage the [\d.]+ prerelease[\s\S]*completed child[\s\S]*stable release is non-draft\/non-prerelease/i,
