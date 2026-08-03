@@ -1947,6 +1947,18 @@ fn supervise_connected(
                 }
                 Control::Cancel | Control::Disconnected => {
                     disconnected = matches!(control, Control::Disconnected);
+                    // A caller transport disconnect is not a cancel. When the
+                    // operation is bound to a managed worker, this supervisor's
+                    // own custody of the child is intact (`ChildOwned`), so the
+                    // caller's death must not fence the worker or kill the
+                    // child: only writes to the absent caller are suppressed,
+                    // and the child runs to its normal `ChildReaped` terminal
+                    // transition below. Explicit `cancel` frames keep the
+                    // cancel-and-reap path, as does unmanaged disconnect
+                    // linearization (cancel-first claim transfer).
+                    if disconnected && resolved.operation.worker_id.is_some() {
+                        continue;
+                    }
                     if !cancellation_requested {
                         store.publish_disconnect_cancel(
                             &args.operation_id,

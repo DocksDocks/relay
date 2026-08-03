@@ -1,7 +1,7 @@
 {
   "name": "session-relay",
   "description": "Cross-session, cross-project, cross-tool agent message bus (Claude Code + Codex). A SessionStart hook auto-registers sessions and drains inboxes; the MCP bus exposes whoami/register/roster/send/request/reply/inbox/discover; correlated MessageV2 requests admit one terminal reply; typed fan-out results are available through opt-in result JSON; and the CLI wakes idle targets with a tool-aware doorbell.",
-  "version": "0.15.0",
+  "version": "0.16.0",
   "author": {
     "name": "Eduardo Marquez"
   },

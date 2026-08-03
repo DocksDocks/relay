@@ -50,10 +50,12 @@ const PUBLIC_PLAN_PATH = 'docs/plans/active/session-relay-cli-0.13.0-release-pre
 const PUBLIC_COMMIT = '6c07f9bc02ef7a0a26b8ffb539c16c42a87a3172';
 const PUBLIC_SOURCE_COMMIT = '3ce9db40c9da62bd396a34665ad0a98ca126394f';
 const PUBLIC_VALIDATION_REF = 'refs/heads/preflight/session-relay-cli-0.13.0-6c07f9bc02ef';
+// The CURRENT three-target producer matrix. Retained 0.13-0.15 evidence keeps
+// its four-target (x86_64-apple-darwin) shape inside frozen receipts and
+// digest-pinned plans; only these live fixtures narrowed.
 const TARGETS = [
   ['x86_64-unknown-linux-musl', 'Linux', 'X64'],
   ['aarch64-unknown-linux-musl', 'Linux', 'ARM64'],
-  ['x86_64-apple-darwin', 'macOS', 'X64'],
   ['aarch64-apple-darwin', 'macOS', 'ARM64'],
 ];
 const { version: CURRENT_RELEASE_VERSION, tag: CURRENT_RELEASE_TAG } = resolveShippedRelayVersion(REPO);
@@ -80,6 +82,9 @@ const CURRENT_RED_PRODUCER_PATH = 'scripts/capture-tdd-red.mjs';
 const PREPARATION_RUNTIME_DEPENDENCIES = [
   'scripts/lib/session-relay-release-preparation.mjs',
   'scripts/lib/session-relay-release-core.mjs',
+  // The preparation binder now derives its current target set from rust-bin,
+  // so the helper travels with the closure like the instance files above.
+  'scripts/lib/rust-bin.mjs',
   'scripts/lib/session-relay-release-instances/schema.mjs',
   'scripts/lib/session-relay-release-instances/0.13.0.json',
   'scripts/lib/session-relay-release-instances/0.14.0.json',
@@ -264,7 +269,6 @@ function nativeProducerJobs() {
   const descriptors = [
     ['x86_64-unknown-linux-musl', 'ubuntu-24.04', 'Linux'],
     ['aarch64-unknown-linux-musl', 'ubuntu-24.04-arm', 'Linux'],
-    ['x86_64-apple-darwin', 'macos-15-intel', 'macOS'],
     ['aarch64-apple-darwin', 'macos-15', 'macOS'],
   ];
   const stepNames = [
@@ -1076,13 +1080,6 @@ function testNativeProducerWorkflow() {
         asset: 'session-relay-aarch64-unknown-linux-musl',
       },
       {
-        runner: 'macos-15-intel',
-        runner_os: 'macOS',
-        runner_arch: 'X64',
-        target: 'x86_64-apple-darwin',
-        asset: 'session-relay-x86_64-apple-darwin',
-      },
-      {
         runner: 'macos-15',
         runner_os: 'macOS',
         runner_arch: 'ARM64',
@@ -1127,7 +1124,7 @@ function testNativeProducerWorkflow() {
 
 function testNativeProducerEvidence(temp) {
   const linuxTargets = ['x86_64-unknown-linux-musl', 'aarch64-unknown-linux-musl'];
-  const darwinTargets = ['x86_64-apple-darwin', 'aarch64-apple-darwin'];
+  const darwinTargets = ['aarch64-apple-darwin'];
   const baselineFixture = artifactFixture();
   const baseline = runPreflight(temp, baselineFixture);
   const successfulTargets = (stepName) =>
@@ -1147,17 +1144,17 @@ function testNativeProducerEvidence(temp) {
   assert.deepEqual(
     successfulTargets('prove macOS managed-workspace admission STOP'),
     darwinTargets,
-    'native producer evidence must contain exactly two macOS refusal legs',
+    'native producer evidence must contain exactly one macOS refusal leg',
   );
   assert.deepEqual(
     baseline.receipt.artifacts.map(({ target }) => target).sort(),
     [...linuxTargets, ...darwinTargets].sort(),
-    'all four ordinary native artifacts remain required',
+    'all three ordinary native artifacts remain required',
   );
   assert.deepEqual(
     baseline.receipt.attestations.map(({ target }) => target).sort(),
     [...linuxTargets, ...darwinTargets].sort(),
-    'all four ordinary native attestations remain required',
+    'all three ordinary native attestations remain required',
   );
 
   let adversary = 0;
@@ -1195,16 +1192,13 @@ function testNativeProducerEvidence(temp) {
       /smoke|conclusion/i,
     );
   }
-  for (const jobIndex of [2, 3]) {
-    expectJobsReject(
-      `failed macOS refusal leg ${jobIndex - 1}`,
-      (jobs) => {
-        jobs[jobIndex].steps.find(({ name }) => name === 'prove macOS managed-workspace admission STOP').conclusion =
-          'failure';
-      },
-      /admission STOP|conclusion/i,
-    );
-  }
+  expectJobsReject(
+    'failed macOS refusal leg',
+    (jobs) => {
+      jobs[2].steps.find(({ name }) => name === 'prove macOS managed-workspace admission STOP').conclusion = 'failure';
+    },
+    /admission STOP|conclusion/i,
+  );
   for (const substitute of ['custody', 'support']) {
     expectJobsReject(
       `macOS ${substitute} substitution`,
@@ -1264,7 +1258,37 @@ function testNativeProducerEvidence(temp) {
     },
     /attestation|missing|entries/i,
   );
-  assert.equal(adversary, 15);
+  expectFixtureReject(
+    'reintroduced Intel Darwin artifact',
+    ({ archives, artifacts }) => {
+      const target = 'x86_64-apple-darwin';
+      const archive = zip([
+        { name: `session-relay-${target}`, bytes: binaryFor(target), deflate: true, dataDescriptor: true },
+      ]);
+      archives.set(9100, archive);
+      artifacts.push(artifactRecord(9100, `session-relay-binary-${target}`, archive));
+    },
+    /artifact count|unexpected artifact/i,
+  );
+  expectFixtureReject(
+    'reintroduced Intel Darwin checksum row',
+    ({ archives, artifacts }) => {
+      const checksums = artifacts.find(({ name }) => name === 'session-relay-checksums');
+      const rows = [
+        'aarch64-apple-darwin',
+        'aarch64-unknown-linux-musl',
+        'x86_64-apple-darwin',
+        'x86_64-unknown-linux-musl',
+      ]
+        .map((target) => `${sha256(binaryFor(target))}  session-relay-${target}\n`)
+        .join('');
+      const archive = zip([{ name: 'SHA256SUMS', bytes: Buffer.from(rows), deflate: true, dataDescriptor: true }]);
+      archives.set(checksums.id, archive);
+      Object.assign(checksums, artifactRecord(checksums.id, 'session-relay-checksums', archive));
+    },
+    /exactly three entries|unexpected asset/i,
+  );
+  assert.equal(adversary, 16);
 }
 
 function writeReceipt(file, value) {
@@ -4086,8 +4110,8 @@ function main() {
     const preflight = runPreflight(temp);
     assert.equal(fs.statSync(preflight.receiptOut).mode & 0o777, 0o600);
     assert.equal(preflight.receipt.workflow.file_blob_id, WORKFLOW_BLOB);
-    assert.equal(preflight.receipt.artifacts.length, 4);
-    assert.equal(preflight.receipt.attestations.length, 4);
+    assert.equal(preflight.receipt.artifacts.length, 3);
+    assert.equal(preflight.receipt.attestations.length, 3);
     assert.deepEqual(
       preflight.receipt.artifacts.map(({ target }) => target).sort(),
       TARGETS.map(([target]) => target).sort(),

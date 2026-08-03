@@ -1,6 +1,6 @@
 [package]
 name = "session-relay"
-version = "0.15.0"
+version = "0.16.0"
 edition = "2024"
 rust-version = "1.85"
 description = "session-relay: cross-session/cross-tool agent message bus, single static binary"

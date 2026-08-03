@@ -8,6 +8,11 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parse as parseYaml } from 'yaml';
+import {
+  INTEL_DARWIN_DEPRECATION,
+  PRERELEASE_BODY,
+  STABLE_BODY,
+} from '../../../scripts/lib/session-relay-release-core.mjs';
 import { resolveHistoricalPublicationPlanPath, resolveReleasePlanPath } from './historical-plan-path.mjs';
 import { resolveShippedRelayVersion } from './version.mjs';
 
@@ -28,12 +33,16 @@ const { version: CURRENT_RELEASE_VERSION, tag: CURRENT_RELEASE_TAG } = resolveSh
 // release suite now derives its identity from the instance file, which makes those
 // assertions instance-against-itself: they catch a library reading the wrong group,
 // but they cannot catch a WRONG VALUE written into the instance. These two literals
-// are the last independent oracle for that, so an unintended edit to the 0.15.0
+// are the last independent oracle for that, so an unintended edit to the 0.16.0
 // instance fails here. Update them by hand, as a deliberate act, when the release
 // identity legitimately changes.
 const CURRENT_DOCKS_PLAN_TEMPLATE = resolveReleasePlanPath(REPO, CURRENT_RELEASE_VERSION);
-const CURRENT_DOCKS_RUN_ID = '887eaf82-ffac-4d78-9368-b62cb64dda19';
-const CURRENT_PUBLIC_PLAN = 'docs/plans/active/session-relay-0.15.0-docks-kit-0.13.0-release.md';
+const CURRENT_DOCKS_RUN_ID = 'ce7df5fd-8ccb-41a6-942c-56bbf67cd1bb';
+// The public child plan the current docks plan itself declares: the reviewed
+// docks-kit 0.14.0 child archive that pins the three 0.16.0 assets. Pretag, the
+// instance binds the retained finished 0.13.0 child; the plan text names the
+// 0.14.0 archive as the release precondition, which is what this pin checks.
+const CURRENT_PUBLIC_PLAN = 'docs/plans/finished/2026-08-02-session-relay-0.16.0-docks-kit-0.14.0-release.md';
 const HISTORICAL_RELEASE_PLAN = resolveHistoricalPublicationPlanPath(REPO);
 const HISTORICAL_RECEIPT_SHA256 = Object.freeze([
   '419b23ccdcf0ca21672e81c05ae9d22c55bc67781839ffb6a29e7eecc2b59396',
@@ -41,10 +50,12 @@ const HISTORICAL_RECEIPT_SHA256 = Object.freeze([
   '31d096d31702b66d7e97085a82d8b7da1b75155f828b1d2382a0ac8427ba7ea2',
   '7cf02781a2ed3c75423321492fb2cd4c4944f6da6d6d41290e26a5f3ca0cf902',
 ]);
+// The CURRENT-generation ordinary asset list (three targets). The retired
+// x86_64-apple-darwin binary survives only in retained historical evidence
+// (companion-distribution-contract, captured 0.13 fixtures), never here.
 const ASSETS = [
   'session-relay-aarch64-apple-darwin',
   'session-relay-aarch64-unknown-linux-musl',
-  'session-relay-x86_64-apple-darwin',
   'session-relay-x86_64-unknown-linux-musl',
 ];
 const sha256 = (value) => createHash('sha256').update(value).digest('hex');
@@ -455,13 +466,6 @@ function assertNativeWorkflowBoundary(document) {
       asset: 'session-relay-aarch64-unknown-linux-musl',
     },
     {
-      runner: 'macos-15-intel',
-      runner_os: 'macOS',
-      runner_arch: 'X64',
-      target: 'x86_64-apple-darwin',
-      asset: 'session-relay-x86_64-apple-darwin',
-    },
-    {
       runner: 'macos-15',
       runner_os: 'macOS',
       runner_arch: 'ARM64',
@@ -527,8 +531,8 @@ function assertNativeWorkflowBoundary(document) {
   const checksumRows = aggregate.run
     .match(/sha256sum \\\n([\s\S]*?)> SHA256SUMS/)?.[1]
     ?.match(/session-relay-[a-z0-9_-]+/g);
-  assert.deepEqual(checksumRows, ASSETS, 'checksum manifest must contain exactly the four ordinary native assets');
-  assert.match(aggregate.run, /test "\$\(wc -l < SHA256SUMS\)" -eq 4/);
+  assert.deepEqual(checksumRows, ASSETS, 'checksum manifest must contain exactly the three ordinary native assets');
+  assert.match(aggregate.run, /test "\$\(wc -l < SHA256SUMS\)" -eq 3/);
 }
 
 function workflowContract() {
@@ -579,7 +583,7 @@ function workflowContract() {
   }
 }
 check(
-  'binary workflow publishes four native, attested, checksummed prerelease assets with least privilege',
+  'binary workflow publishes three native, attested, checksummed prerelease assets with least privilege',
   workflowContract,
 );
 
@@ -1036,19 +1040,27 @@ function currentCorrelatedReleaseContract() {
   assert.deepEqual(
     [cargo, claude, codex, claudeMarket],
     Array(4).fill(CURRENT_RELEASE_VERSION),
-    'all version-bearing current Session Relay manifests must bind 0.15.0',
+    'all version-bearing current Session Relay manifests must bind 0.16.0',
   );
   assert.deepEqual(agentsRelay.source, { source: 'local', path: './plugins/session-relay' });
   assert.match(
     fs.readFileSync(path.join(REPO, 'plugins/session-relay/rust/Cargo.lock'), 'utf8'),
-    /\[\[package\]\]\nname = "session-relay"\nversion = "0\.15\.0"/,
-    'Cargo.lock must bind Session Relay 0.15.0',
+    /\[\[package\]\]\nname = "session-relay"\nversion = "0\.16\.0"/,
+    'Cargo.lock must bind Session Relay 0.16.0',
   );
 
   const coreSource = fs.readFileSync(path.join(REPO, 'scripts/lib/session-relay-release-core.mjs'), 'utf8');
-  assert.match(coreSource, /export const VERSION = '0\.15\.0';/);
+  assert.match(coreSource, /export const VERSION = '0\.16\.0';/);
   assert.match(coreSource, /Session Relay \$\{VERSION\} is staged for compatibility validation/);
   assert.match(coreSource, /Session Relay \$\{VERSION\} is available through docks-kit/);
+  // The exact retirement sentence is pinned here as an independent oracle; the
+  // release-core constant and the workflow-rendered prerelease body must both
+  // carry it byte-for-byte, and the two bodies must stay byte-identical.
+  const deprecationSentence =
+    'x86_64-apple-darwin is no longer published as of Session Relay 0.16.0; macOS support is aarch64-apple-darwin.';
+  assert.equal(INTEL_DARWIN_DEPRECATION, deprecationSentence);
+  assert.ok(PRERELEASE_BODY.endsWith(`\n\n${deprecationSentence}`), 'prerelease body must end with the deprecation');
+  assert.ok(STABLE_BODY.endsWith(`\n\n${deprecationSentence}`), 'stable body must end with the deprecation');
   const promotionSource = fs.readFileSync(path.join(REPO, 'scripts/lib/session-relay-release-promotion.mjs'), 'utf8');
   assert.match(promotionSource, /const PUBLIC_VERSION = '0\.13\.0';/);
   assert.match(promotionSource, /const PUBLIC_TAG = `cli-v\$\{PUBLIC_VERSION\}`;/);
@@ -1057,7 +1069,7 @@ function currentCorrelatedReleaseContract() {
 
   const document = parseYaml(fs.readFileSync(WORKFLOW, 'utf8'));
   const matrixAssets = document.jobs.build.strategy.matrix.include.map(({ asset }) => asset);
-  assert.deepEqual(matrixAssets.sort(), [...ASSETS].sort(), '0.15 producer must retain exactly four native binaries');
+  assert.deepEqual(matrixAssets.sort(), [...ASSETS].sort(), '0.16 producer must publish exactly three native binaries');
   assert.equal(
     matrixAssets.some((name) => /windows|win32|\.exe$/i.test(name)),
     false,
@@ -1074,13 +1086,22 @@ function currentCorrelatedReleaseContract() {
   assert.match(aggregate.run, /record\.workflow_run_id,\s*Number\(process\.env\.WORKFLOW_RUN_ID\)/);
   assert.match(aggregate.run, /record\.workflow_run_attempt,\s*Number\(process\.env\.WORKFLOW_RUN_ATTEMPT\)/);
   const publish = document.jobs.publish.steps.find(
-    ({ name }) => name === 'create or reconcile public prerelease from exactly five same-run assets',
+    ({ name }) => name === 'create or reconcile public prerelease from exactly four same-run assets',
   );
   assert.match(publish.run, /local_digest\["\$name"\]="\$\(sha256sum "\$file"/);
   assert.match(publish.run, /"sha256:\$\{local_digest\[\$name\]\}" = "\$digest"/);
-  assert.match(
-    document.jobs.publish.steps.find(({ name }) => name === 'validate and stage exactly five release assets').run,
-    /sha256sum --check --strict SHA256SUMS/,
+  const stage = document.jobs.publish.steps.find(
+    ({ name }) => name === 'validate and stage exactly four release assets',
+  );
+  assert.match(stage.run, /sha256sum --check --strict SHA256SUMS/);
+  const printfFormat = stage.run.match(
+    /printf '([^']+)' \\\n\s+"\$EXPECTED_VERSION" > "\$RUNNER_TEMP\/session-relay-prerelease\.md"/,
+  )?.[1];
+  assert.ok(printfFormat, 'staged prerelease body printf must be present');
+  assert.equal(
+    printfFormat.replace('%s', CURRENT_RELEASE_VERSION).replace(/\\n/g, '\n'),
+    PRERELEASE_BODY,
+    'workflow prerelease body must stay byte-identical to the release-core expected body',
   );
 
   const currentPlan = fs.readFileSync(path.join(REPO, CURRENT_DOCKS_PLAN_TEMPLATE), 'utf8');
@@ -1091,7 +1112,7 @@ function currentCorrelatedReleaseContract() {
   assert.match(currentPlan, new RegExp(CURRENT_PUBLIC_PLAN.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
   assert.match(
     currentPlan,
-    /stage the Relay prerelease[\s\S]*child's completed release[\s\S]*stable, non-prerelease release/i,
+    /stage the [\d.]+ prerelease[\s\S]*completed child[\s\S]*stable release is non-draft\/non-prerelease/i,
   );
 }
 
@@ -1118,7 +1139,7 @@ function verifyCompanion() {
 }
 check('companion validation ref is a clean detached, receipt-bound installer contract', verifyCompanion);
 check(
-  'current Relay 0.15.0 and docks-kit 0.13.0 release chain is exact while 0.13 receipts stay immutable',
+  'current Relay 0.16.0 three-target release chain is exact while 0.13 receipts stay immutable',
   currentCorrelatedReleaseContract,
 );
 

@@ -1,6 +1,6 @@
 {
   "name": "session-relay",
-  "version": "0.15.0",
+  "version": "0.16.0",
   "description": "Cross-session, cross-project agent message bus (Claude Code + Codex). SessionStart hooks register and drain mail; the MCP bus exposes whoami/register/roster/send/request/reply/inbox/discover; correlated requests admit one terminal reply; typed fan-out results are opt-in; and the CLI provides tool-aware wakes. Skills + hooks + MCP on Codex.",
   "author": {
     "name": "Eduardo Marquez"

@@ -45,10 +45,20 @@ const EXPECTED_TAG = 'session-relay--v0.13.0';
 const DOCKS_PLAN_PATH = RETAINED_V2_INSTANCE.current_attempt.release_plan_path;
 const DOCKS_FINISHED_PLAN_PATH = 'docs/plans/finished/2026-07-23-session-relay-linux-workspace-recertification.md';
 const PUBLIC_PLAN_PATH = 'docs/plans/active/session-relay-cli-0.13.0-release-preparation.md';
-const ORDINARY_ASSETS = Object.freeze([
+// Retained 0.13-generation ordinary assets: that generation shipped four
+// binaries including x86_64-apple-darwin; the captured release rows below stay
+// byte-identical to it.
+const RETAINED_ORDINARY_ASSETS = Object.freeze([
   'session-relay-aarch64-apple-darwin',
   'session-relay-aarch64-unknown-linux-musl',
   'session-relay-x86_64-apple-darwin',
+  'session-relay-x86_64-unknown-linux-musl',
+]);
+const RETAINED_EXPECTED_ASSETS = Object.freeze([...RETAINED_ORDINARY_ASSETS, 'SHA256SUMS']);
+// Current 0.16-generation ordinary assets: exactly three targets.
+const ORDINARY_ASSETS = Object.freeze([
+  'session-relay-aarch64-apple-darwin',
+  'session-relay-aarch64-unknown-linux-musl',
   'session-relay-x86_64-unknown-linux-musl',
 ]);
 const EXPECTED_ASSETS = Object.freeze([...ORDINARY_ASSETS, 'SHA256SUMS']);
@@ -120,6 +130,12 @@ const CAPTURED_RELEASE_ASSETS = Object.freeze([
     digest: 'f8c6374c2c704f48135cd646028fbd9e53fd43f9800b4a255fa36a0818744b7b',
   }),
 ]);
+// Current-lane rebind fixtures reuse the captured bytes minus the retired
+// Intel Darwin leg; the full four-row capture above stays frozen as the
+// retained 0.13-generation oracle.
+const CURRENT_CAPTURED_RELEASE_ASSETS = Object.freeze(
+  CAPTURED_RELEASE_ASSETS.filter(({ name }) => name !== 'session-relay-x86_64-apple-darwin'),
+);
 let checks = 0;
 
 function writeCanonical(directory, name, value) {
@@ -292,7 +308,6 @@ function runAttestationRecords(workflowRun, assets, mode = workflowRun.event ===
   const runners = {
     'aarch64-apple-darwin': ['ARM64', 'macOS'],
     'aarch64-unknown-linux-musl': ['ARM64', 'Linux'],
-    'x86_64-apple-darwin': ['X64', 'macOS'],
     'x86_64-unknown-linux-musl': ['X64', 'Linux'],
   };
   return assets
@@ -383,7 +398,7 @@ function capturedRun() {
 }
 
 function capturedRunAssetRecords() {
-  return CAPTURED_RELEASE_ASSETS.map(({ name, size, digest }, index) => ({
+  return CURRENT_CAPTURED_RELEASE_ASSETS.map(({ name, size, digest }, index) => ({
     name,
     size,
     digest,
@@ -402,7 +417,7 @@ function capturedPrerelease(overrides = {}) {
     created_at: '2026-07-23T14:26:39Z',
     published_at: '2026-07-24T02:28:53Z',
     author: GITHUB_ACTIONS_BOT,
-    assets: CAPTURED_RELEASE_ASSETS.map(({ id, name, size, digest }) => ({
+    assets: CURRENT_CAPTURED_RELEASE_ASSETS.map(({ id, name, size, digest }) => ({
       id,
       name,
       size,
@@ -899,7 +914,7 @@ function assertCurrentPublicationContract() {
   assert.deepEqual(
     publication.value.assets.map(({ name }) => name),
     [...EXPECTED_ASSETS].sort(),
-    '0.15 publication must contain exactly four native binaries plus SHA256SUMS',
+    'current publication must contain exactly three native binaries plus SHA256SUMS',
   );
   assert.equal(
     publication.value.assets.some(({ name }) => /windows|win32|\.exe$/i.test(name)),
@@ -1759,16 +1774,29 @@ function assertCutReleaseFinalization() {
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'session-relay-publication-contract-'));
 try {
-  assert.equal(VERSION, CURRENT_VERSION, 'Session Relay production version must be 0.15.0');
-  assert.equal(TAG, CURRENT_TAG, 'Session Relay production tag must be session-relay--v0.15.0');
-  assert.match(PRERELEASE_BODY, /Session Relay 0\.15\.0/, 'prerelease body must announce Session Relay 0.15.0');
-  assert.match(STABLE_BODY, /Session Relay 0\.15\.0/, 'stable body must announce Session Relay 0.15.0');
+  assert.equal(VERSION, CURRENT_VERSION, 'Session Relay production version must be 0.16.0');
+  assert.equal(TAG, CURRENT_TAG, 'Session Relay production tag must be session-relay--v0.16.0');
+  assert.match(PRERELEASE_BODY, /Session Relay 0\.16\.0/, 'prerelease body must announce Session Relay 0.16.0');
+  assert.match(STABLE_BODY, /Session Relay 0\.16\.0/, 'stable body must announce Session Relay 0.16.0');
+  const intelDeprecation =
+    'x86_64-apple-darwin is no longer published as of Session Relay 0.16.0; macOS support is aarch64-apple-darwin.';
+  assert.ok(PRERELEASE_BODY.includes(intelDeprecation), 'prerelease body must carry the exact Intel deprecation');
+  assert.ok(STABLE_BODY.includes(intelDeprecation), 'stable body must carry the exact Intel deprecation');
   let tagStateBranch;
-  assert.deepEqual(ASSETS, EXPECTED_ASSETS, 'publication must bind SHA256SUMS and exactly four ordinary native assets');
+  assert.deepEqual(
+    ASSETS,
+    EXPECTED_ASSETS,
+    'publication must bind SHA256SUMS and exactly three ordinary native assets',
+  );
   assert.deepEqual(
     ASSETS.filter((name) => name !== 'SHA256SUMS'),
     ORDINARY_ASSETS,
-    'publication ordinary asset order and four target pins are frozen',
+    'publication ordinary asset order and three target pins are frozen',
+  );
+  assert.deepEqual(
+    CAPTURED_RELEASE_ASSETS.map(({ name }) => name).sort(),
+    [...RETAINED_EXPECTED_ASSETS].sort(),
+    'captured 0.13 release rows retain all four binaries plus SHA256SUMS byte-identically',
   );
   {
     const cli = spawnSync(
@@ -1971,7 +1999,7 @@ try {
     );
     assert.deepEqual(
       rebound.receipt.assets,
-      CAPTURED_RELEASE_ASSETS.map(({ id, name, size, digest }) => ({
+      CURRENT_CAPTURED_RELEASE_ASSETS.map(({ id, name, size, digest }) => ({
         name,
         database_id: id,
         size,
@@ -2065,7 +2093,7 @@ try {
     assert.equal(fs.existsSync(options.get('receipt-out')), false);
   }
 
-  for (const asset of CAPTURED_RELEASE_ASSETS) {
+  for (const asset of CURRENT_CAPTURED_RELEASE_ASSETS) {
     for (const [field, value] of [
       ['created_at', '2026-07-24T02:26:13Z'],
       ['updated_at', '2026-07-24T02:28:57Z'],
@@ -2084,6 +2112,35 @@ try {
       assertNoPublicationMutation(fake.state);
       assert.equal(fs.existsSync(options.get('receipt-out')), false);
     }
+  }
+
+  {
+    // Revert-sensitivity: a CURRENT-lane live release that still carries the
+    // retired session-relay-x86_64-apple-darwin asset (the full captured
+    // four-row 0.13 shape) must now be refused as incomplete/conflicting.
+    const directory = fs.mkdtempSync(path.join(root, 'captured-intel-darwin-reintroduced-'));
+    const release = capturedPrerelease({
+      assets: CAPTURED_RELEASE_ASSETS.map(({ id, name, size, digest }) => ({
+        id,
+        name,
+        size,
+        digest: `sha256:${digest}`,
+        created_at: '2026-07-24T02:28:52Z',
+        updated_at: '2026-07-24T02:28:53Z',
+        uploader: GITHUB_ACTIONS_BOT,
+      })),
+    });
+    const fake = capturedAdapter({ release });
+    const sourceProof = proof(directory);
+    const options = optionsFor(directory, sourceProof);
+    options.set('rebind-complete-publication', true);
+    expectConflict(
+      () => publishReviewed(options, fake.adapter),
+      /complete matching prerelease|asset set is absent, partial, duplicated, or conflicting|name is invalid/i,
+    );
+    assertNoPublicationMutation(fake.state);
+    assert.equal(fs.existsSync(options.get('receipt-out')), false);
+    checks += 1;
   }
 
   for (const [label, runs, pattern] of [
@@ -2279,10 +2336,24 @@ try {
       'substituted-darwin',
       (records) =>
         records.map((record) =>
-          record.name === 'session-relay-x86_64-apple-darwin'
-            ? { ...record, name: 'session-relay-x86_64-apple-darwin-workspace-supported' }
+          record.name === 'session-relay-aarch64-apple-darwin'
+            ? { ...record, name: 'session-relay-aarch64-apple-darwin-workspace-supported' }
             : record,
         ),
+    ],
+    [
+      // The retired Intel Darwin binary is an EXTRA current asset and must be
+      // refused, not silently tolerated.
+      'reintroduced-intel-darwin',
+      (records) => [
+        ...records,
+        {
+          name: 'session-relay-x86_64-apple-darwin',
+          size: 21,
+          digest: sha256(Buffer.from('same-run:session-relay-x86_64-apple-darwin')),
+          path: '/bound-run/reintroduced-intel',
+        },
+      ],
     ],
   ]) {
     const directory = fs.mkdtempSync(path.join(root, `${label}-ordinary-asset-`));
@@ -2330,7 +2401,7 @@ try {
   {
     const directory = fs.mkdtempSync(path.join(root, 'partial-'));
     const assets = runAssetRecords();
-    const missing = [assets[1].name, assets[4].name];
+    const missing = [assets[1].name, assets[3].name];
     const fake = fakeAdapter({ release: prerelease(assets, { assets: releaseAssets(assets, { missing }) }) });
     publish(directory, fake);
     assert.deepEqual(fake.state.uploaded.sort(), missing.sort());

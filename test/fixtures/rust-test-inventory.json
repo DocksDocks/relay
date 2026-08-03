@@ -134,6 +134,7 @@
     "lifecycle_supervisor": {
       "tests": [
         "lifecycle_supervisor_disconnect_linearizes_unmanaged_cancel_and_reap",
+        "lifecycle_supervisor_disconnect_preserves_managed_worker_when_custody_intact",
         "lifecycle_supervisor_handshake_survives_a_retired_ready_record",
         "lifecycle_supervisor_handshake_survives_a_retired_socket_path",
         "lifecycle_supervisor_pipe_preserves_bytes_eof_streams_and_reap_custody",

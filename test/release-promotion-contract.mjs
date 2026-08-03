@@ -79,6 +79,9 @@ const DOCKS_PLAN_PATH = LEGACY_RELEASE_INSTANCE.legacy_0_13.pinned_completion_st
 const DOCKS_FINISHED_PLAN_PATH = LEGACY_RELEASE_INSTANCE.legacy_0_13.pinned_completion.finishedPlanPath;
 const PUBLIC_PLAN_PATH = LEGACY_RELEASE_INSTANCE.legacy_0_13.public_plan_path;
 const PUBLIC_FINISHED_PLAN_PATH = 'docs/plans/finished/2026-07-23-session-relay-cli-0.13.0-production-release.md';
+// Retained 0.13-generation Relay asset lists: the legacy promotion machine
+// fixtures below stay four-target (including x86_64-apple-darwin) because the
+// frozen 0.13 receipts they replay shipped four binaries.
 const ORDINARY_ASSET_NAMES = Object.freeze([
   'session-relay-aarch64-apple-darwin',
   'session-relay-aarch64-unknown-linux-musl',
@@ -86,6 +89,18 @@ const ORDINARY_ASSET_NAMES = Object.freeze([
   'session-relay-x86_64-unknown-linux-musl',
 ]);
 const PUBLICATION_ASSET_NAMES = Object.freeze(['SHA256SUMS', ...ORDINARY_ASSET_NAMES]);
+// Current 0.16-generation Relay asset lists: exactly three targets.
+const CURRENT_ORDINARY_ASSET_NAMES = Object.freeze([
+  'session-relay-aarch64-apple-darwin',
+  'session-relay-aarch64-unknown-linux-musl',
+  'session-relay-x86_64-unknown-linux-musl',
+]);
+const CURRENT_PUBLICATION_ASSET_NAMES = Object.freeze(['SHA256SUMS', ...CURRENT_ORDINARY_ASSET_NAMES]);
+const CURRENT_PUBLIC_ASSET_TARGETS = Object.freeze([
+  'x86_64-unknown-linux-musl',
+  'aarch64-unknown-linux-musl',
+  'aarch64-apple-darwin',
+]);
 const { version: CURRENT_RELEASE_VERSION, tag: CURRENT_RELEASE_TAG } = resolveShippedRelayVersion(REPO);
 const CURRENT_RELEASE_INSTANCE = loadReleaseInstance(CURRENT_RELEASE_VERSION, { require: ['planrun_attempt'] });
 const RETAINED_V2_RELEASE_VERSION = '0.14.0';
@@ -120,23 +135,27 @@ const NOT_PLANRUN_DOCKS_SOURCE_BASE = differentHex(PLANRUN_DOCKS_SOURCE_BASE);
 // release actually declares. localeCompare-ascending, which the validator enforces.
 const PLANRUN_DOCKS_AFFECTED_PATHS = Object.freeze([
   '.claude-plugin/marketplace.json',
+  '.github/AGENTS.md',
+  '.github/workflows/build-binaries.yml',
   'plugins/session-relay/.claude-plugin/plugin.json',
   'plugins/session-relay/.codex-plugin/plugin.json',
+  'plugins/session-relay/AGENTS.md',
   'plugins/session-relay/rust/Cargo.lock',
   'plugins/session-relay/rust/Cargo.toml',
-  'plugins/session-relay/test/companion-distribution-contract.mjs',
+  'plugins/session-relay/rust/src/supervisor.rs',
+  'plugins/session-relay/rust/tests/lifecycle_supervisor.rs',
   'plugins/session-relay/test/distribution-contract.mjs',
   'plugins/session-relay/test/fixtures/release-identity-inventory.json',
+  'plugins/session-relay/test/fixtures/rust-test-inventory.json',
   'plugins/session-relay/test/release-evidence-contract.mjs',
   'plugins/session-relay/test/release-instance-contract.mjs',
   'plugins/session-relay/test/release-promotion-contract.mjs',
   'plugins/session-relay/test/release-publication-contract.mjs',
-  'plugins/session-relay/test/remediation-contract.mjs',
+  'scripts/AGENTS.md',
   'scripts/lib/plugins.mjs',
+  'scripts/lib/rust-bin.mjs',
   'scripts/lib/session-relay-release-core.mjs',
-  'scripts/lib/session-relay-release-instances/0.14.0.json',
-  'scripts/lib/session-relay-release-instances/0.15.0.json',
-  'scripts/lib/session-relay-release-instances/schema.mjs',
+  'scripts/lib/session-relay-release-instances/0.16.0.json',
   'scripts/lib/session-relay-release-preparation.mjs',
   'scripts/lib/session-relay-release-promotion.mjs',
   'scripts/lib/session-relay-release-publication.mjs',
@@ -145,9 +164,8 @@ const PLANRUN_DOCKS_AFFECTED_PATHS = Object.freeze([
 const CURRENT_PUBLIC_RUN_ID = CURRENT_RELEASE_INSTANCE.current_attempt.public_run_id;
 // The child's ACTIVE plan, which preparation.mjs:84 derives the same way. Its
 // archived counterpart is a separate constant: one artifact, two lifecycle paths.
-const CURRENT_PUBLIC_PLAN_PATH = 'docs/plans/active/session-relay-0.15.0-docks-kit-0.13.0-release.md';
-const CURRENT_PUBLIC_FINISHED_PLAN_PATH =
-  'docs/plans/finished/2026-07-26-session-relay-0.15.0-docks-kit-0.13.0-release.md';
+const CURRENT_PUBLIC_PLAN_PATH = `docs/plans/active/session-relay-${CURRENT_RELEASE_VERSION}-docks-kit-${CURRENT_PUBLIC_VERSION}-release.md`;
+const CURRENT_PUBLIC_FINISHED_PLAN_PATH = `docs/plans/finished/2026-08-02-session-relay-${CURRENT_RELEASE_VERSION}-docks-kit-${CURRENT_PUBLIC_VERSION}-release.md`;
 // The immutable 0.13 publication identities remain historical inputs to every
 // promotion generation, independently of the current retained-attempt shape.
 const HISTORICAL_RELEASE_PLAN_PATH = resolveHistoricalPublicationPlanPath(REPO);
@@ -433,6 +451,7 @@ const publication = {
     created_at: '2026-07-17T20:00:00.000Z',
   },
 };
+// Retained 0.13-generation pin targets for the legacy machine fixtures above.
 const PUBLIC_ASSET_TARGETS = [
   'x86_64-unknown-linux-musl',
   'aarch64-unknown-linux-musl',
@@ -878,7 +897,7 @@ function currentReleaseChainV2() {
   const publicImplementationCommit = 'd'.repeat(40);
   const publicReleaseCommit = 'e'.repeat(40);
   const publicArchiveCommit = 'f'.repeat(40);
-  const relayAssets = PUBLICATION_ASSET_NAMES.map((name, index) => ({
+  const relayAssets = CURRENT_PUBLICATION_ASSET_NAMES.map((name, index) => ({
     name,
     database_id: 2_000 + index,
     size: 20_000 + index,
@@ -887,7 +906,7 @@ function currentReleaseChainV2() {
       .slice(0, 64),
   }));
   const relayPins = Object.fromEntries(
-    PUBLIC_ASSET_TARGETS.map((target) => [
+    CURRENT_PUBLIC_ASSET_TARGETS.map((target) => [
       target,
       relayAssets.find(({ name }) => name === `session-relay-${target}`).digest,
     ]),
@@ -1105,13 +1124,13 @@ function assertCurrentReleasePromotionContract() {
   assert.equal(publication.value.release_state, 'prerelease');
   assert.deepEqual(
     publication.value.assets.map(({ name }) => name),
-    PUBLICATION_ASSET_NAMES,
-    'Relay 0.14.0 prerelease must contain exactly four native binaries plus SHA256SUMS',
+    CURRENT_PUBLICATION_ASSET_NAMES,
+    'current Relay prerelease must contain exactly three native binaries plus SHA256SUMS',
   );
   assert.equal(
     publication.value.assets.some(({ name }) => /windows|win32|\.exe$/i.test(name)),
     false,
-    'Relay 0.14.0 prerelease must not contain Windows',
+    'current Relay prerelease must not contain Windows',
   );
   assert.deepEqual(
     publication.value.digest_evidence.artifact_sha256,
@@ -1744,7 +1763,7 @@ const CURRENT_PUBLIC_RELEASED_AT = '2026-07-25T17:00:00.000Z';
 
 function currentBoundaryPublicationValue() {
   const tagCommit = 'a'.repeat(40);
-  const relayAssets = [...ORDINARY_ASSET_NAMES, 'SHA256SUMS'].sort().map((name, index) => ({
+  const relayAssets = [...CURRENT_ORDINARY_ASSET_NAMES, 'SHA256SUMS'].sort().map((name, index) => ({
     name,
     database_id: 4_000 + index,
     size: 40_000 + index,
@@ -1811,7 +1830,7 @@ function currentPublicBoundaryFixture(directory) {
   const publicationFile = writeBoundaryValue(directory, 'current-publication.json', currentBoundaryPublicationValue());
   const publicationAssets = new Map(publicationFile.value.assets.map((asset) => [asset.name, asset]));
   const pinnedAssets = Object.fromEntries(
-    PUBLIC_ASSET_TARGETS.map((target) => [target, publicationAssets.get(`session-relay-${target}`).digest]),
+    CURRENT_PUBLIC_ASSET_TARGETS.map((target) => [target, publicationAssets.get(`session-relay-${target}`).digest]),
   );
   const request = writeBoundaryValue(directory, 'current-public-request.json', {
     schema: 1,
@@ -2491,7 +2510,7 @@ function makeCurrentPromotionAdapter({
     };
   }
   publicReleaseValue.pinned_assets = Object.fromEntries(
-    PUBLIC_ASSET_TARGETS.map((target) => [
+    CURRENT_PUBLIC_ASSET_TARGETS.map((target) => [
       target,
       publicationValue.assets.find(({ name }) => name === `session-relay-${target}`).digest,
     ]),
@@ -2643,7 +2662,7 @@ function makePromotionEvidenceRebindAdapter({
     finished_at: retainedPromotion.public_child.finished_at,
   };
   publicReleaseValue.pinned_assets = Object.fromEntries(
-    PUBLIC_ASSET_TARGETS.map((target) => [
+    CURRENT_PUBLIC_ASSET_TARGETS.map((target) => [
       target,
       publicationValue.assets.find(({ name }) => name === `session-relay-${target}`).digest,
     ]),

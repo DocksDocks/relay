@@ -534,6 +534,148 @@ fn lifecycle_supervisor_disconnect_linearizes_unmanaged_cancel_and_reap() {
 }
 
 #[test]
+fn lifecycle_supervisor_disconnect_preserves_managed_worker_when_custody_intact() {
+    let home = fresh_home("disconnect-managed");
+    let cwd = home.join("project");
+    let session = "81111111-1111-4111-8111-111111111111";
+    let worker = "82222222-2222-4222-8222-222222222222";
+    let generation = "83333333-3333-4333-8333-333333333333";
+    seed_entry(&home, session, "claude", &cwd);
+    let store = LifecycleStore::new(home.clone());
+    store
+        .create_pending(
+            pending(worker, generation, session, &cwd),
+            "disconnect-managed-token",
+        )
+        .unwrap();
+    assert!(matches!(
+        store
+            .claim_managed_attach(claim(
+                "disconnect-managed-token",
+                worker,
+                generation,
+                session,
+                &cwd,
+            ))
+            .unwrap(),
+        ClaimOutcome::Active { .. }
+    ));
+    let bin = home.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    // The owned child's environment is scrubbed to CHILD_ENV_ALLOWLIST, so the
+    // release-file path rides the allowlisted RELAY_TEST_SENTINEL variable.
+    let release = home.join("release");
+    write_executable(
+        &bin.join("claude"),
+        "#!/bin/sh\ntrap '' TERM HUP INT\nwhile [ ! -e \"$RELAY_TEST_SENTINEL\" ]; do sleep 0.02; done\nexit 0\n",
+    );
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let mut attach = Command::new(env!("CARGO_BIN_EXE_relay"))
+        .args(["attach", session])
+        .env("AGENT_RELAY_HOME", &home)
+        .env("RELAY_TEST_SENTINEL", &release)
+        .env("PATH", path.clone())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_until(
+        Duration::from_secs(3),
+        "owned operation never started",
+        || {
+            store
+                .read_operations_for_session(session)
+                .is_ok_and(|operations| {
+                    operations.iter().any(|operation| {
+                        matches!(operation.custody, ExternalCustody::ChildOwned { .. })
+                    })
+                })
+        },
+    );
+    let before = store.read_worker(worker).unwrap().unwrap();
+    assert_eq!(before.state, ManagedState::Active);
+
+    // Transport loss, not an explicit cancel: SIGKILL the caller.
+    attach.kill().unwrap();
+    attach.wait().unwrap();
+    // Give the supervisor ample time to observe the disconnect before the
+    // child is released, so the reap happens strictly after the transport
+    // loss. A correct supervisor changes nothing in the store here.
+    thread::sleep(Duration::from_millis(1_000));
+    assert_eq!(
+        store.read_worker(worker).unwrap().unwrap().state,
+        ManagedState::Active,
+        "caller disconnect with intact ChildOwned custody must not fence the managed worker"
+    );
+
+    // Let the owned child terminate normally and observe the reap.
+    fs::write(&release, b"go").unwrap();
+    wait_until(
+        Duration::from_secs(5),
+        "owned child was not reaped after caller disconnect",
+        || {
+            store
+                .read_operations_for_session(session)
+                .is_ok_and(|operations| {
+                    operations.iter().any(|operation| {
+                        operation.terminal
+                            && matches!(operation.custody, ExternalCustody::ChildReaped { .. })
+                    })
+                })
+        },
+    );
+    let operation = store
+        .read_operations_for_session(session)
+        .unwrap()
+        .into_iter()
+        .find(|operation| operation.terminal)
+        .unwrap();
+    assert!(
+        !operation.cancelled,
+        "caller disconnect must not publish a cancel for a managed operation"
+    );
+    assert!(matches!(
+        operation.custody,
+        ExternalCustody::ChildReaped { exit_status: 0, .. }
+    ));
+    let after = store.read_worker(worker).unwrap().unwrap();
+    assert_eq!(
+        after, before,
+        "managed worker must stay byte-for-field Active across a caller disconnect"
+    );
+
+    // Second use of the same worker: managed resume answers Active...
+    assert!(matches!(
+        store
+            .resume_managed_attach(session, "claude", &cwd.to_string_lossy())
+            .unwrap(),
+        ClaimOutcome::Active {
+            duplicate: true,
+            ..
+        }
+    ));
+    // ...and a full second wake through a fresh supervisor still succeeds.
+    let second = Command::new(env!("CARGO_BIN_EXE_relay"))
+        .args(["attach", session])
+        .env("AGENT_RELAY_HOME", &home)
+        .env("RELAY_TEST_SENTINEL", &release)
+        .env("PATH", path)
+        .output()
+        .unwrap();
+    assert!(
+        second.status.success(),
+        "second use of the managed worker failed after caller disconnect: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert_eq!(
+        store.read_worker(worker).unwrap().unwrap().state,
+        ManagedState::Active
+    );
+    fs::remove_dir_all(home).ok();
+}
+
+#[test]
 fn lifecycle_supervisor_watchdog_marks_managed_worker_on_supervisor_death() {
     let home = fresh_home("watchdog");
     let cwd = home.join("project");
