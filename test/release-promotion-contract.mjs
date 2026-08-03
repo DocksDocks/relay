@@ -32,7 +32,7 @@ import {
 import {
   canonicalPlanView,
   canonicalVerificationResults,
-} from '../../docks/skills/productivity/plan-manager/scripts/plan-run.mjs';
+} from '../../plan-lifecycle/skills/productivity/plan-manager/scripts/plan-run.mjs';
 import { resolveHistoricalPublicationPlanPath } from './historical-plan-path.mjs';
 import { resolveShippedRelayVersion } from './version.mjs';
 
