@@ -14,7 +14,7 @@ import {
   jcs,
   parsePlan,
   validatePlanRun,
-} from '../../../plugins/docks/skills/productivity/plan-manager/scripts/plan-run.mjs';
+} from '../../../plugins/plan-lifecycle/skills/productivity/plan-manager/scripts/plan-run.mjs';
 import {
   bindCompletion,
   validateSourcePreparationProof,

@@ -12,12 +12,12 @@ import { parse as parseYaml } from 'yaml';
 import {
   canonicalPlanView,
   validateDraftReceipt,
-} from '../../../plugins/docks/skills/productivity/plan-manager/scripts/legacy-review-records.mjs';
+} from '../../../plugins/plan-lifecycle/skills/productivity/plan-manager/scripts/legacy-review-records.mjs';
 import {
   canonicalPlanView as canonicalCurrentPlanView,
   canonicalVerificationResults,
   createAffectedPathManifest,
-} from '../../../plugins/docks/skills/productivity/plan-manager/scripts/plan-run.mjs';
+} from '../../../plugins/plan-lifecycle/skills/productivity/plan-manager/scripts/plan-run.mjs';
 import { gitRaw, loadReleaseInstance } from '../../../scripts/lib/session-relay-release-core.mjs';
 import { runFixture } from '../../../scripts/lib/session-relay-release-fixture.mjs';
 import { releaseTagCommit } from '../../../scripts/lib/session-relay-release-instances/schema.mjs';
@@ -84,6 +84,11 @@ const PREPARATION_RUNTIME_DEPENDENCIES = [
   'scripts/lib/session-relay-release-instances/0.13.0.json',
   'scripts/lib/session-relay-release-instances/0.14.0.json',
   CURRENT_RELEASE_INSTANCE_PATH,
+  // The binder's PlanRun modules moved to the plan-lifecycle plugin, so a
+  // fixture tree checked out at a pre-extraction source base no longer carries
+  // them; the current binder travels with its current module closure.
+  'plugins/plan-lifecycle/skills/productivity/plan-manager/scripts/plan-run.mjs',
+  'plugins/plan-lifecycle/skills/productivity/plan-manager/scripts/legacy-review-records.mjs',
 ];
 const copyPreparationRuntime = (root) => {
   for (const logical of PREPARATION_RUNTIME_DEPENDENCIES) {
