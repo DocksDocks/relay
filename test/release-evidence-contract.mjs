@@ -3940,7 +3940,6 @@ function unbornPlanRunSourcePreparationProofV3() {
     },
     ancestry: {
       source_to_tag: true,
-      plan_source_to_implementation: true,
       tag_to_implementation: true,
       implementation_to_reviewed: true,
     },
@@ -4029,10 +4028,11 @@ function testPlanRunPostTagSuccessorSource(temp) {
   assert.notEqual(generated.planSource, generated.executionParent);
   assert.equal(proof.source_commit, PLANRUN_DOCKS_SOURCE_BASE);
   assert.equal(proof.plan_run.source_base, generated.planSource);
-  assert.equal(proof.ancestry.source_to_tag, true);
-  assert.equal(proof.ancestry.plan_source_to_implementation, true);
-  assert.equal(proof.ancestry.tag_to_implementation, true);
-  assert.equal(proof.ancestry.implementation_to_reviewed, true);
+  assert.deepEqual(proof.ancestry, {
+    source_to_tag: true,
+    tag_to_implementation: true,
+    implementation_to_reviewed: true,
+  });
 
   expectReject(
     'successor completion binder rejects an unrelated PlanRun source',

@@ -1865,8 +1865,12 @@ function currentPublicReleaseEvidenceFixture(completionDigest) {
     },
   };
 }
-function currentPlanRunPublicFixture() {
+function currentPlanRunPublicFixture(timestamps = {}) {
   const activePlanPath = `docs/plans/active/session-relay-${CURRENT_RELEASE_VERSION}-docks-kit-${CURRENT_PUBLIC_VERSION}-release.md`;
+  const createdAt = timestamps.created ?? '2026-07-25T12:00:00.000+00:00';
+  const updatedAt = timestamps.updated ?? '2026-07-26T01:00:00.000+00:00';
+  const startedAt = timestamps.started_at ?? '2026-07-25T13:00:00.000+00:00';
+  const finishedAt = timestamps.finished_at ?? '2026-07-26T01:00:00.000+00:00';
   const fileBytes = new Map([
     ['SoT/toolchain.json', Buffer.from(`{"tools":{"session-relay":{"verified":"${CURRENT_RELEASE_VERSION}"}}}\n`)],
     ['package.json', Buffer.from(`{"name":"docks-kit","version":"${CURRENT_PUBLIC_VERSION}"}\n`)],
@@ -1922,10 +1926,10 @@ function currentPlanRunPublicFixture() {
         '---',
         'title: Current public PlanRun fixture',
         'status: finished',
-        'created: "2026-07-25T12:00:00.000Z"',
-        'updated: "2026-07-26T01:00:00.000Z"',
-        'started_at: "2026-07-25T13:00:00.000Z"',
-        'finished_at: "2026-07-26T01:00:00.000Z"',
+        `created: ${JSON.stringify(createdAt)}`,
+        `updated: ${JSON.stringify(updatedAt)}`,
+        `started_at: ${JSON.stringify(startedAt)}`,
+        `finished_at: ${JSON.stringify(finishedAt)}`,
         'assignee: null',
         'tags: [session-relay, release]',
         'affected_paths:',
@@ -1970,10 +1974,11 @@ function makeCurrentPublicReleaseAdapter(
     evidenceMutation = null,
     npmState = 'published',
     planRun = false,
+    planRunTimestamps = {},
     publishedAt = CURRENT_PUBLIC_RELEASED_AT,
   } = {},
 ) {
-  const planRunFixture = planRun ? currentPlanRunPublicFixture() : null;
+  const planRunFixture = planRun ? currentPlanRunPublicFixture(planRunTimestamps) : null;
   const completionReceipt = completionReceiptForReviewedHead(CURRENT_PUBLIC_IMPLEMENTATION_COMMIT);
   const completionReceiptText = canonicalize(completionReceipt);
   const completionDigest = planRunFixture?.completionDigest ?? hash(completionReceiptText);
@@ -2253,6 +2258,37 @@ function verifyCurrentPublicBoundary(directory, boundary, observation, output) {
       /source-base-to-implementation ancestry was not independently observed/i,
       'current verify-public-release must refuse an unrelated child PlanRun source base',
     );
+    verifyCurrentPublicBoundary(
+      directory,
+      boundary,
+      makeCurrentPublicReleaseAdapter(boundary.request, {
+        planRun: true,
+        planRunTimestamps: { finished_at: '2026-07-26T01:00:00.000Z' },
+      }),
+      'current-public-planrun-z-time.json',
+    );
+    for (const [name, finishedAt] of [
+      ['negative-offset', '2026-07-26T01:00:00.000-03:00'],
+      ['positive-offset', '2026-07-26T01:00:00.000+01:00'],
+      ['missing-milliseconds', '2026-07-26T01:00:00+00:00'],
+      ['impossible-date', '2026-02-30T01:00:00.000+00:00'],
+      ['non-string', 42],
+    ]) {
+      assert.throws(
+        () =>
+          verifyCurrentPublicBoundary(
+            directory,
+            boundary,
+            makeCurrentPublicReleaseAdapter(boundary.request, {
+              planRun: true,
+              planRunTimestamps: { finished_at: finishedAt },
+            }),
+            `invalid-current-public-planrun-${name}.json`,
+          ),
+        /exact RFC3339 UTC timestamp/,
+        `current public PlanRun must reject ${name} timestamps`,
+      );
+    }
 
     // Non-vacuity for the released-content pin. The positive case above derives the expectation
     // from the fixture's own implementation bytes, so on its own it could pass while comparing
@@ -2478,7 +2514,6 @@ function currentPromotionProofV3() {
   delete proof.tdd_red;
   proof.ancestry = {
     source_to_tag: true,
-    plan_source_to_implementation: true,
     tag_to_implementation: true,
     implementation_to_reviewed: true,
   };
@@ -3281,7 +3316,6 @@ if (PLANRUN_RELEASE_TAG_COMMIT !== null) {
     );
     assert.deepEqual(current.adapter.loadProof().value.ancestry, {
       source_to_tag: true,
-      plan_source_to_implementation: true,
       tag_to_implementation: true,
       implementation_to_reviewed: true,
     });
