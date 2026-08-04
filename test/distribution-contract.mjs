@@ -37,7 +37,7 @@ const { version: CURRENT_RELEASE_VERSION, tag: CURRENT_RELEASE_TAG } = resolveSh
 // instance fails here. Update them by hand, as a deliberate act, when the release
 // identity legitimately changes.
 const CURRENT_DOCKS_PLAN_TEMPLATE = resolveReleasePlanPath(REPO, CURRENT_RELEASE_VERSION);
-const CURRENT_DOCKS_RUN_ID = '1c5b6f71-c69d-4566-adcc-4c15a9f0c599';
+const CURRENT_DOCKS_RUN_ID = 'd5d1e9fa-7627-47b8-bac2-bed0b7465d9e';
 // The public child plan the current docks plan itself declares: the reviewed
 // docks-kit 0.14.0 child archive that pins the three 0.16.0 assets. The instance
 // now binds that completed child; this pin checks the plan text names the same
@@ -1065,9 +1065,9 @@ function currentCorrelatedReleaseContract() {
   assert.ok(PRERELEASE_BODY.endsWith(`\n\n${deprecationSentence}`), 'prerelease body must end with the deprecation');
   assert.ok(STABLE_BODY.endsWith(`\n\n${deprecationSentence}`), 'stable body must end with the deprecation');
   const promotionSource = fs.readFileSync(path.join(REPO, 'scripts/lib/session-relay-release-promotion.mjs'), 'utf8');
-  assert.match(promotionSource, /const PUBLIC_VERSION = '0\.13\.0';/);
+  assert.match(promotionSource, /const PUBLIC_VERSION = '0\.14\.0';/);
   assert.match(promotionSource, /const PUBLIC_TAG = `cli-v\$\{PUBLIC_VERSION\}`;/);
-  assert.match(promotionSource, /const CURRENT_DOCKS_KIT_RELEASE = 'cli-v0\.13\.0';/);
+  assert.match(promotionSource, /const CURRENT_DOCKS_KIT_RELEASE = 'cli-v0\.14\.0';/);
   assert.match(promotionSource, /session-relay-\$\{CURRENT_VERSION\}-docks-kit-\$\{PUBLIC_VERSION\}-release/);
 
   const document = parseYaml(fs.readFileSync(WORKFLOW, 'utf8'));

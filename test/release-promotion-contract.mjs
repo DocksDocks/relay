@@ -159,6 +159,7 @@ const PLANRUN_DOCKS_AFFECTED_PATHS = Object.freeze([
   'scripts/lib/session-relay-release-preparation.mjs',
   'scripts/lib/session-relay-release-promotion.mjs',
   'scripts/lib/session-relay-release-publication.mjs',
+  'scripts/tests/ci-plugin-targeting.mjs',
   'scripts/verify-session-relay-preflight.mjs',
 ]);
 const CURRENT_PUBLIC_RUN_ID = CURRENT_RELEASE_INSTANCE.current_attempt.public_run_id;

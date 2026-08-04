@@ -79,8 +79,10 @@ const RELEASE_TAG_COMMIT = releaseTagCommit(INSTANCE);
 const SUCCESSOR_AFFECTED_PATHS = Object.freeze([...INSTANCE.planrun_attempt.docks_affected_paths]);
 const CURRENT_PUBLIC_RUN_ID = INSTANCE.current_attempt.public_run_id;
 const CURRENT_PUBLIC_ACTIVE_PLAN_PATH = `docs/plans/active/session-relay-${VERSION}-docks-kit-${CURRENT_PUBLIC_VERSION}-release.md`;
-const CURRENT_PUBLIC_FINISHED_PLAN_PATH =
-  'docs/plans/finished/2026-07-26-session-relay-0.15.0-docks-kit-0.13.0-release.md';
+// Basename derived from the current lane and companion so finalizing onto a new child cannot leave
+// this pinned at a retired archive; only the date prefix is literal, and the validator that
+// consumes it matches the prefix as a pattern rather than a fixed day.
+const CURRENT_PUBLIC_FINISHED_PLAN_PATH = `docs/plans/finished/2026-08-04-session-relay-${VERSION}-docks-kit-${CURRENT_PUBLIC_VERSION}-release.md`;
 const HISTORICAL_SOURCE_PROOF_V1_SHA256 = '419b23ccdcf0ca21672e81c05ae9d22c55bc67781839ffb6a29e7eecc2b59396';
 const HISTORICAL_SOURCE_PROOF_V2_SHA256 = '87a6260ae20280712ebb2d76d39667b128c8f6cf687141ebd779d8eca16c2262';
 const HISTORICAL_PUBLIC_REQUEST_SHA256 = '7cf02781a2ed3c75423321492fb2cd4c4944f6da6d6d41290e26a5f3ca0cf902';
