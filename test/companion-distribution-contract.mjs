@@ -21,20 +21,20 @@ const PRODUCTION_VERSION = '0.12.0';
 const BLOCKED_REASON = 'Awaiting the four independently hashed `session-relay--v0.13.0` production asset digests.';
 // This contract revalidates the published public main after the child release
 // finishes, binding the generation that the active Docks parent now consumes.
-const CURRENT_PUBLIC_RELAY_VERSION = '0.15.0';
+const CURRENT_PUBLIC_RELAY_VERSION = '0.16.0';
 const CURRENT_PUBLIC_RELAY_TAG = `session-relay--v${CURRENT_PUBLIC_RELAY_VERSION}`;
-const CURRENT_PUBLIC_VERSION = '0.13.0';
+const CURRENT_PUBLIC_VERSION = '0.14.0';
 const CURRENT_PUBLIC_TAG = `cli-v${CURRENT_PUBLIC_VERSION}`;
-const CURRENT_PUBLIC_PLAN = 'docs/plans/active/session-relay-0.15.0-docks-kit-0.13.0-release.md';
-const CURRENT_PUBLIC_RUN_ID = 'ad7f3b75-dfff-4bcd-8d1f-c8c11555b119';
-const CURRENT_PUBLIC_EXECUTION_PARENT = '3e4eddec347e51189f1a13b3a48c0ca737520d94';
-const CURRENT_PUBLIC_IMPLEMENTATION_COMMIT = '7ea0611958b85cd98123a8131189ddf950ce6fb9';
+const CURRENT_PUBLIC_PLAN = 'docs/plans/active/session-relay-0.16.0-docks-kit-0.14.0-release.md';
+const CURRENT_PUBLIC_RUN_ID = 'fb5a6880-9bca-45c5-9136-d0424a020d5a';
+const CURRENT_PUBLIC_EXECUTION_PARENT = 'cf7df092d068d15eee68d389a047f16c858006ca';
+const CURRENT_PUBLIC_IMPLEMENTATION_COMMIT = '23e9995173c72f6a32e947a39fca8bf433c46f4d';
 // The Docks release plan for this generation. It starts under `docs/plans/active/` and moves to a
 // dated path under `docs/plans/finished/` when the release finishes; `currentDocksPlanFile()`
 // accepts exactly one of the two.
-const CURRENT_DOCKS_PLAN = 'docs/plans/active/session-relay-0.15.0-release.md';
-const CURRENT_DOCKS_RUN_ID = '887eaf82-ffac-4d78-9368-b62cb64dda19';
-const CURRENT_GOAL_ID = '258b44c2-c3b2-4902-862c-7461724ca078';
+const CURRENT_DOCKS_PLAN = 'docs/plans/active/session-relay-0.16.0-release.md';
+const CURRENT_DOCKS_RUN_ID = 'c268ecc1-cf5e-4266-9a29-a83b59e9717d';
+const CURRENT_GOAL_ID = 'cef66d21-5bd3-4e07-a0e8-e393822dcfb0';
 const HISTORICAL_PUBLIC_PLAN_SHA256 = 'e0b1d183122def14a3f4bd6f05605c6aa7de3fb2dccf4330e8956acc3e0db9ff';
 const HISTORICAL_ASSET_DIGESTS = Object.freeze({
   'x86_64-unknown-linux-musl': 'f8c6374c2c704f48135cd646028fbd9e53fd43f9800b4a255fa36a0818744b7b',
@@ -43,10 +43,9 @@ const HISTORICAL_ASSET_DIGESTS = Object.freeze({
   'aarch64-apple-darwin': '0686e68e3a88dd0dee647fc18211e941dd0d8012818d0bcfb79fac142b5baf21',
 });
 const CURRENT_ASSET_DIGESTS = Object.freeze({
-  'x86_64-unknown-linux-musl': '875ca460a21d4f205833db5629bcf249413da77e444f4927107a44e63b71acab',
-  'aarch64-unknown-linux-musl': 'ee52d7757a22febe3fcb4e00dbb81ec1fb1a1d5769c5eeda903f11a765029a06',
-  'x86_64-apple-darwin': '8f4b11be831d5fc232965264c354f202c67c2260f383fba3e8c811eb6ea8ca39',
-  'aarch64-apple-darwin': '24ef2cc98a4034391fef60bc3c13a672511b024f0d6493395bb61562936ac5c7',
+  'x86_64-unknown-linux-musl': 'b3ca082dc5ea51e8322be407cdb4bbcaaa05d80bd62c3553f82ab98c1a95498a',
+  'aarch64-unknown-linux-musl': '816b6b8bd2d2c2518ea359a5a21502213347b387a1cc576a0fb9cf541e5646ed',
+  'aarch64-apple-darwin': 'da8b114216c3f2301ad582df8e59b49e91953abcc1112b510466b31637fda825',
 });
 const FROZEN_TESTS = ['cli/test/unit/pluginRefresh.test.ts', 'cli/test/unit/sessionRelayCli.test.ts'];
 const FROZEN_COMMAND = [
@@ -205,7 +204,11 @@ function verifyCurrentPublicMain(directory, cli) {
     'current Relay plugin version does not match the published generation',
   );
   assert.equal(relay.tag, CURRENT_PUBLIC_RELAY_TAG, 'current Relay tag does not match the published generation');
-  assert.deepEqual(Object.keys(relay.assets).sort(), Object.keys(HISTORICAL_ASSET_DIGESTS).sort());
+  assert.deepEqual(Object.keys(relay.assets).sort(), [
+    'aarch64-apple-darwin',
+    'aarch64-unknown-linux-musl',
+    'x86_64-unknown-linux-musl',
+  ]);
   assert.deepEqual(
     relay.assets,
     CURRENT_ASSET_DIGESTS,
@@ -247,7 +250,7 @@ function verifyCurrentPublicMain(directory, cli) {
   assert.equal(currentRun.goal_id, docksRun.goal_id);
   assert.equal(currentRun.risk, 'external');
   assert.deepEqual(currentRun.requested_effects, ['local', 'probe', 'publish', 'push', 'release']);
-  assert.equal(currentRun.source_base, currentRun.execution_parent);
+  assert.equal(currentRun.source_base, CURRENT_PUBLIC_IMPLEMENTATION_COMMIT);
   assert.equal(currentRun.execution_parent, CURRENT_PUBLIC_EXECUTION_PARENT);
   assert.equal(currentRun.implementation_commit, CURRENT_PUBLIC_IMPLEMENTATION_COMMIT);
   assert.equal(currentRun.draft_review?.state, 'passed');
@@ -264,34 +267,28 @@ function verifyCurrentPublicMain(directory, cli) {
   assert.equal(currentRun.plan_path, CURRENT_PUBLIC_PLAN);
   assert.match(currentPlan, /^status:\s*finished$/m);
   assert.doesNotMatch(currentPlan, /^Not run\.$/m);
-  // This child records no historical TDD-red receipt. Instead, its finished
-  // PlanRun binds passed draft/completion review and acceptance hashes, while
-  // its verification results record the generated, focused-unit, full-gate,
-  // and both planted-mismatch prove-red outcomes over the implementation.
+  // The finished child records the four acceptance boundaries it re-ran against
+  // the published implementation. Assert those observed results rather than
+  // inheriting the predecessor generation's command-level prose.
   assert.match(
     currentPlan,
-    /^- bun run check:generated: exit 0\.$/m,
-    'current public generated-freshness verification result is absent',
+    /^- \*\*A1\*\* `pin exact at 23e9995173c7`$/m,
+    'current public exact-pin acceptance result is absent',
   );
   assert.match(
     currentPlan,
-    /^- bun run test:unit -- cli\/test\/unit\/toolchain\.test\.ts cli\/test\/unit\/engine-di\.test\.ts: exit 0, 2 files and 18 tests passed\.$/m,
-    'current public focused pin-unit verification result is absent',
+    /^- \*\*A2\*\* `tag, release and npm provenance all bind 23e9995173c7`$/m,
+    'current public publication acceptance result is absent',
   );
   assert.match(
     currentPlan,
-    /^- bun run test:ci: exit 0; generated freshness, typecheck, 26 unit files \/ 192 tests, POSIX runtime smoke, 25 dry-run golden cases, and 71 mutation golden cases passed\.$/m,
-    'current public full-gate verification result is absent',
+    /^- \*\*A3\*\* `published surface matches 13 declared paths`$/m,
+    'current public surface acceptance result is absent',
   );
   assert.match(
     currentPlan,
-    /^- bun cli\/test\/golden-dryrun\.ts --prove-red: expected exit 1 with prove-red OK: golden-dryrun detected 25 planted mismatch\(es\); intentionally exiting 1\.$/m,
-    'current public dry-run planted-mismatch result is absent',
-  );
-  assert.match(
-    currentPlan,
-    /^- bun cli\/test\/golden-mutation\.ts --prove-red: expected exit 1 with prove-red OK: golden-mutation detected 68 planted mismatch\(es\); intentionally exiting 1\.$/m,
-    'current public mutation planted-mismatch result is absent',
+    /^- \*\*A4\*\* `both disclosed stale README lines are present at 23e9995173c7`$/m,
+    'current public disclosure acceptance result is absent',
   );
   assert.equal(
     git(directory, ['merge-base', '--is-ancestor', currentRun.execution_parent, currentRun.implementation_commit]),

@@ -144,6 +144,7 @@ const PLANRUN_DOCKS_AFFECTED_PATHS = Object.freeze([
   'plugins/session-relay/rust/Cargo.toml',
   'plugins/session-relay/rust/src/supervisor.rs',
   'plugins/session-relay/rust/tests/lifecycle_supervisor.rs',
+  'plugins/session-relay/test/companion-distribution-contract.mjs',
   'plugins/session-relay/test/distribution-contract.mjs',
   'plugins/session-relay/test/fixtures/release-identity-inventory.json',
   'plugins/session-relay/test/fixtures/rust-test-inventory.json',
@@ -166,7 +167,7 @@ const CURRENT_PUBLIC_RUN_ID = CURRENT_RELEASE_INSTANCE.current_attempt.public_ru
 // The child's ACTIVE plan, which preparation.mjs:84 derives the same way. Its
 // archived counterpart is a separate constant: one artifact, two lifecycle paths.
 const CURRENT_PUBLIC_PLAN_PATH = `docs/plans/active/session-relay-${CURRENT_RELEASE_VERSION}-docks-kit-${CURRENT_PUBLIC_VERSION}-release.md`;
-const CURRENT_PUBLIC_FINISHED_PLAN_PATH = `docs/plans/finished/2026-08-02-session-relay-${CURRENT_RELEASE_VERSION}-docks-kit-${CURRENT_PUBLIC_VERSION}-release.md`;
+const CURRENT_PUBLIC_FINISHED_PLAN_PATH = `docs/plans/finished/2026-08-04-session-relay-${CURRENT_RELEASE_VERSION}-docks-kit-${CURRENT_PUBLIC_VERSION}-release.md`;
 // The immutable 0.13 publication identities remain historical inputs to every
 // promotion generation, independently of the current retained-attempt shape.
 const HISTORICAL_RELEASE_PLAN_PATH = resolveHistoricalPublicationPlanPath(REPO);
