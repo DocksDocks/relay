@@ -34,6 +34,7 @@ import {
   loadReleaseInstance,
   PLUGIN,
   VERSION,
+  validatePublicChildIdentity,
 } from '../../../scripts/lib/session-relay-release-core.mjs';
 import { validateReleaseInstance } from '../../../scripts/lib/session-relay-release-instances/schema.mjs';
 
@@ -250,6 +251,15 @@ function caseValidator() {
     () => loadReleaseInstance('0.13.0', { require: ['current_attempt'] }),
     /missing required field group current_attempt/,
     'the loader cache bypasses the required-group check',
+  );
+
+  assert.doesNotThrow(() =>
+    validatePublicChildIdentity({ version: '0.14.0', tag: 'cli-v0.14.0' }, 'probe.public_child'),
+  );
+  assert.throws(
+    () => validatePublicChildIdentity({ version: '0.14.0', tag: 'cli-v0.99.0' }, 'probe.public_child'),
+    /probe\.public_child tag must equal cli-v0\.14\.0/,
+    'the loader accepts a public child tag from a different package version',
   );
 
   console.log(`release instance contract: validator rejected ${messages.length} shapes distinctly`);
