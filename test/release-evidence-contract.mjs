@@ -3540,6 +3540,8 @@ function bindPlanRunCompletionFixture(
     continuationPath = null,
     implementationExtraPath = null,
     distinctExecutionParent = false,
+    distinctPlanSource = false,
+    unrelatedPlanSource = false,
   },
 ) {
   const clonePath = path.join(temp, `planrun-completion-${name}`);
@@ -3602,6 +3604,16 @@ function bindPlanRunCompletionFixture(
     runGit(['add', '--', executionParentPath]);
     executionParent = commitFixture('test: advance the PlanRun execution parent', '2026-07-26T20:50:00.000Z');
   }
+  let planSource = PLANRUN_DOCKS_SOURCE_BASE;
+  if (distinctPlanSource) {
+    const planSourcePath = 'plugins/session-relay/test/release-evidence-contract.mjs';
+    fs.appendFileSync(
+      path.join(root, ...planSourcePath.split('/')),
+      '\n// Distinct post-tag PlanRun source fixture.\n',
+    );
+    runGit(['add', '--', planSourcePath]);
+    planSource = commitFixture('test: advance the post-tag PlanRun source', '2026-07-26T20:55:00.000Z');
+  }
   for (const logical of PLANRUN_AFFECTED_PATHS) {
     const target = path.join(root, ...logical.split('/'));
     if (!fs.existsSync(target) && logical === CURRENT_RELEASE_INSTANCE_PATH) {
@@ -3628,6 +3640,10 @@ function bindPlanRunCompletionFixture(
     'fix: bind successor release evidence fixture',
     '2026-07-26T21:00:00.000Z',
   );
+  if (unrelatedPlanSource) {
+    const implementationTree = runGit(['rev-parse', `${implementationCommit}^{tree}`]);
+    planSource = runGit(['commit-tree', implementationTree, '-m', 'test: create unrelated PlanRun source']);
+  }
   const acceptanceManifest = createAffectedPathManifest({
     repo: root,
     paths: PLANRUN_AFFECTED_PATHS,
@@ -3693,7 +3709,7 @@ function bindPlanRunCompletionFixture(
   assert.ok(runMatch, 'fresh successor PlanRun fixture is absent');
   const templateRun = JSON.parse(runMatch[1]);
   assert.equal(templateRun.run_id, PLANRUN_DOCKS_RUN_ID);
-  assert.equal(templateRun.source_base, PLANRUN_DOCKS_SOURCE_BASE);
+  assert.match(templateRun.source_base, /^[0-9a-f]{40}$/, 'template source_base must be a full commit identity');
   // The live plan is a moving target: it advances through its lifecycle while this
   // suite reads it as a template. The run object below overwrites `execution_parent`
   // outright, so this is only a drift guard - but pinning it to one lifecycle state
@@ -3779,7 +3795,7 @@ function bindPlanRunCompletionFixture(
     goal_id: PLANRUN_GOAL_ID,
     run_id: PLANRUN_DOCKS_RUN_ID,
     plan_path: PLANRUN_DOCKS_PLAN_PATH,
-    source_base: PLANRUN_DOCKS_SOURCE_BASE,
+    source_base: planSource,
   };
   assert.deepEqual(
     run.draft_review,
@@ -3860,6 +3876,7 @@ function bindPlanRunCompletionFixture(
     implementationChangedPaths,
     implementationCommit,
     executionParent,
+    planSource,
     planPath,
     postImplementationPaths,
     receiptOut,
@@ -3923,6 +3940,7 @@ function unbornPlanRunSourcePreparationProofV3() {
     },
     ancestry: {
       source_to_tag: true,
+      plan_source_to_implementation: true,
       tag_to_implementation: true,
       implementation_to_reviewed: true,
     },
@@ -3996,6 +4014,36 @@ function testPlanRunCompletionBindingUsesExecutionParent(temp) {
     generated.result.receipt.completion_review.diff_sha256,
     generated.completionDiffSha256,
     'the source proof must bind the exact execution-parent completion diff',
+  );
+}
+
+function testPlanRunPostTagSuccessorSource(temp) {
+  const generated = bindPlanRunCompletionFixture(temp, {
+    name: 'post-tag-plan-source',
+    defaultDependencies: true,
+    distinctExecutionParent: true,
+    distinctPlanSource: true,
+  });
+  const proof = generated.result.receipt;
+  assert.notEqual(generated.planSource, PLANRUN_DOCKS_SOURCE_BASE);
+  assert.notEqual(generated.planSource, generated.executionParent);
+  assert.equal(proof.source_commit, PLANRUN_DOCKS_SOURCE_BASE);
+  assert.equal(proof.plan_run.source_base, generated.planSource);
+  assert.equal(proof.ancestry.source_to_tag, true);
+  assert.equal(proof.ancestry.plan_source_to_implementation, true);
+  assert.equal(proof.ancestry.tag_to_implementation, true);
+  assert.equal(proof.ancestry.implementation_to_reviewed, true);
+
+  expectReject(
+    'successor completion binder rejects an unrelated PlanRun source',
+    () =>
+      bindPlanRunCompletionFixture(temp, {
+        name: 'unrelated-plan-source',
+        defaultDependencies: true,
+        distinctExecutionParent: true,
+        unrelatedPlanSource: true,
+      }),
+    /PlanRun source-to-implementation ancestry/i,
   );
 }
 
@@ -4171,6 +4219,7 @@ function main() {
     testDefaultCompletionBindingRejectsUnauthorizedPostReviewPath(temp);
     testPlanRunTagState(temp);
     testPlanRunCompletionBindingUsesExecutionParent(temp);
+    testPlanRunPostTagSuccessorSource(temp);
     testPlanRunCompletionBindingRejectsUnrelatedContinuation(temp);
     testPlanRunAffectedDiffCannotHideImplementationScopeDrift(temp);
     testCurrentCorrelatedReleaseEvidence();

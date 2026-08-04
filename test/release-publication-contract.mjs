@@ -1138,6 +1138,7 @@ function currentSourcePreparationProofV3(directory) {
   delete value.tdd_red;
   value.ancestry = {
     source_to_tag: true,
+    plan_source_to_implementation: true,
     tag_to_implementation: true,
     implementation_to_reviewed: true,
   };

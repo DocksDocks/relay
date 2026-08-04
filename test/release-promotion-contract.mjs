@@ -121,16 +121,14 @@ const CURRENT_PUBLIC_TAG = CURRENT_RELEASE_INSTANCE.public_child.tag;
 const CURRENT_GOAL_ID = CURRENT_RELEASE_INSTANCE.current_attempt.goal_id;
 const CURRENT_DOCKS_RUN_ID = CURRENT_RELEASE_INSTANCE.current_attempt.docks_run_id;
 const CURRENT_DOCKS_PLAN_PATH = CURRENT_RELEASE_INSTANCE.current_attempt.docks_plan_path;
-const CURRENT_DOCKS_SOURCE_BASE = CURRENT_RELEASE_INSTANCE.current_attempt.docks_source_base;
 const PLANRUN_DOCKS_REPOSITORY_ID = CURRENT_RELEASE_INSTANCE.planrun_attempt.docks_repository_id;
 const PLANRUN_DOCKS_RUN_ID = CURRENT_RELEASE_INSTANCE.planrun_attempt.docks_run_id;
 const PLANRUN_DOCKS_PLAN_PATH = CURRENT_RELEASE_INSTANCE.planrun_attempt.docks_plan_path;
 const PLANRUN_DOCKS_SOURCE_BASE = CURRENT_RELEASE_INSTANCE.planrun_attempt.docks_source_base;
-// A commit guaranteed NOT to be the bound PlanRun source base, for rejection
-// fixtures. Derived rather than pinned so it can never coincide with the real value:
-// this release has current_attempt and planrun_attempt on the same commit, so a
-// hardcoded stale literal would make the rejection test vacuous.
-const NOT_PLANRUN_DOCKS_SOURCE_BASE = differentHex(PLANRUN_DOCKS_SOURCE_BASE);
+// The instance source is the immutable release source. A current same-path
+// successor has a later PlanRun source and must preserve both identities.
+const POST_TAG_PLANRUN_SOURCE_BASE = differentHex(PLANRUN_DOCKS_SOURCE_BASE);
+const NOT_PLANRUN_DOCKS_SOURCE_BASE = `${differentHex(PLANRUN_DOCKS_SOURCE_BASE.slice(0, -1))}${PLANRUN_DOCKS_SOURCE_BASE.at(-1)}`;
 // Sourced from the instance so the manifest census cannot drift from what the
 // release actually declares. localeCompare-ascending, which the validator enforces.
 const PLANRUN_DOCKS_AFFECTED_PATHS = Object.freeze([
@@ -1753,6 +1751,7 @@ function verifyPublicBoundary(
   }
 }
 
+const CURRENT_PUBLIC_SOURCE_BASE = '1'.repeat(40);
 const CURRENT_PUBLIC_EXECUTION_PARENT = 'b'.repeat(40);
 // A PlanRun run's implementation commit is deliberately later than the tag it publishes, so this
 // fixture value must differ from the publication's tag commit.
@@ -1914,7 +1913,7 @@ function currentPlanRunPublicFixture() {
     risk: 'external',
     run_id: CURRENT_PUBLIC_RUN_ID,
     schema: 1,
-    source_base: CURRENT_PUBLIC_EXECUTION_PARENT,
+    source_base: CURRENT_PUBLIC_SOURCE_BASE,
     source_sha256: DIGEST('4'),
   };
   const render = () =>
@@ -2028,6 +2027,7 @@ function makeCurrentPublicReleaseAdapter(
     );
   const ancestryFlags = new Map([
     [`${CURRENT_PUBLIC_RED_COMMIT}...${CURRENT_PUBLIC_IMPLEMENTATION_COMMIT}`, 'red_to_implementation'],
+    [`${CURRENT_PUBLIC_SOURCE_BASE}...${CURRENT_PUBLIC_IMPLEMENTATION_COMMIT}`, 'source_base_to_implementation'],
     [
       `${CURRENT_PUBLIC_EXECUTION_PARENT}...${CURRENT_PUBLIC_IMPLEMENTATION_COMMIT}`,
       'execution_parent_to_implementation',
@@ -2239,6 +2239,20 @@ function verifyCurrentPublicBoundary(directory, boundary, observation, output) {
       CURRENT_PUBLIC_FINISHED_PLAN_PATH,
       'PlanRun receipt must bind the observed finished archive path',
     );
+    assert.throws(
+      () =>
+        verifyCurrentPublicBoundary(
+          directory,
+          boundary,
+          makeCurrentPublicReleaseAdapter(boundary.request, {
+            planRun: true,
+            ancestryFailure: 'source_base_to_implementation',
+          }),
+          'unrelated-public-source-base.json',
+        ),
+      /source-base-to-implementation ancestry was not independently observed/i,
+      'current verify-public-release must refuse an unrelated child PlanRun source base',
+    );
 
     // Non-vacuity for the released-content pin. The positive case above derives the expectation
     // from the fixture's own implementation bytes, so on its own it could pass while comparing
@@ -2430,7 +2444,7 @@ function currentPromotionProofV3() {
     goal_id: CURRENT_GOAL_ID,
     run_id: PLANRUN_DOCKS_RUN_ID,
     plan_path: PLANRUN_DOCKS_PLAN_PATH,
-    source_base: PLANRUN_DOCKS_SOURCE_BASE,
+    source_base: POST_TAG_PLANRUN_SOURCE_BASE,
   };
   proof.companion = {
     ...proof.companion,
@@ -2464,6 +2478,7 @@ function currentPromotionProofV3() {
   delete proof.tdd_red;
   proof.ancestry = {
     source_to_tag: true,
+    plan_source_to_implementation: true,
     tag_to_implementation: true,
     implementation_to_reviewed: true,
   };
@@ -2476,6 +2491,7 @@ function makeCurrentPromotionAdapter({
   sourcePlanRun = true,
   refConflict = null,
   stableInitially = false,
+  planSourceAncestry = true,
 } = {}) {
   const proofValue = sourcePlanRun ? currentPromotionProofV3() : currentPromotionProofV2();
   const proofEnvelope = { value: proofValue, digest: hash(proofValue) };
@@ -2553,7 +2569,7 @@ function makeCurrentPromotionAdapter({
     },
     isAncestor: (ancestor, descendant) => {
       state.ancestryCalls.push([ancestor, descendant]);
-      return true;
+      return planSourceAncestry || ancestor !== POST_TAG_PLANRUN_SOURCE_BASE;
     },
     isPublicAncestor: () => true,
     currentReleaseState: () => ({
@@ -3031,14 +3047,10 @@ if (PLANRUN_RELEASE_TAG_COMMIT !== null) {
       /fresh successor|source proof|identity|PlanRun|run/i,
     ],
     [
-      'stale successor source base',
+      'wrong immutable release source',
       {
-        // Derived, never pinned: this release's current and PlanRun source bases are
-        // the same commit, so a hardcoded "stale" literal would silently coincide with
-        // the bound value and this rejection test would stop rejecting anything.
         proofMutation: (proof) => {
           proof.source_commit = NOT_PLANRUN_DOCKS_SOURCE_BASE;
-          proof.plan_run.source_base = NOT_PLANRUN_DOCKS_SOURCE_BASE;
         },
       },
       /fresh successor|source|PlanRun/i,
@@ -3263,8 +3275,13 @@ if (PLANRUN_RELEASE_TAG_COMMIT !== null) {
     assert.equal(result.receipt.docks_plan.run_id, PLANRUN_DOCKS_RUN_ID);
     assert.equal(result.receipt.docks_plan.plan_path, PLANRUN_DOCKS_PLAN_PATH);
     assert.equal(current.adapter.loadProof().value.tag_commit, PLANRUN_RELEASE_TAG_COMMIT);
+    assert.notEqual(
+      current.adapter.loadProof().value.plan_run.source_base,
+      current.adapter.loadProof().value.source_commit,
+    );
     assert.deepEqual(current.adapter.loadProof().value.ancestry, {
       source_to_tag: true,
+      plan_source_to_implementation: true,
       tag_to_implementation: true,
       implementation_to_reviewed: true,
     });
@@ -3284,6 +3301,7 @@ if (PLANRUN_RELEASE_TAG_COMMIT !== null) {
     assert.deepEqual(current.state.ancestryCalls, [
       [PLANRUN_DOCKS_SOURCE_BASE, PLANRUN_RELEASE_TAG_COMMIT],
       [PLANRUN_RELEASE_TAG_COMMIT, current.adapter.loadProof().value.implementation_commit],
+      [POST_TAG_PLANRUN_SOURCE_BASE, current.adapter.loadProof().value.implementation_commit],
     ]);
     const wrongTag = currentPromotionProofV3();
     wrongTag.tag_commit = wrongTag.implementation_commit;
@@ -3304,6 +3322,17 @@ if (PLANRUN_RELEASE_TAG_COMMIT !== null) {
       'PlanRun source proof must bind source-to-tag-to-implementation ancestry',
     );
   }
+
+  const unrelatedPlanSource = makeCurrentPromotionAdapter({
+    planRun: true,
+    sourcePlanRun: true,
+    planSourceAncestry: false,
+  });
+  assert.throws(
+    () => promoteReviewed(unrelatedPlanSource.options, false, unrelatedPlanSource.adapter),
+    /plan-source-to-implementation ancestry was not independently observed/i,
+    'promotion must independently refuse an unrelated successor PlanRun source',
+  );
 
   {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'session-relay-current-production-adapter-'));

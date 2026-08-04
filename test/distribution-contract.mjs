@@ -37,7 +37,7 @@ const { version: CURRENT_RELEASE_VERSION, tag: CURRENT_RELEASE_TAG } = resolveSh
 // instance fails here. Update them by hand, as a deliberate act, when the release
 // identity legitimately changes.
 const CURRENT_DOCKS_PLAN_TEMPLATE = resolveReleasePlanPath(REPO, CURRENT_RELEASE_VERSION);
-const CURRENT_DOCKS_RUN_ID = '1d28abf4-a843-42db-9ac4-db86dcb3e420';
+const CURRENT_DOCKS_RUN_ID = '3c2a2253-3999-464f-b58c-055bf60604e1';
 // The public child plan the current docks plan itself declares: the reviewed
 // docks-kit 0.14.0 child archive that pins the three 0.16.0 assets. The instance
 // now binds that completed child; this pin checks the plan text names the same
@@ -1113,9 +1113,12 @@ function currentCorrelatedReleaseContract() {
   assert.match(currentPlan, new RegExp(CURRENT_RELEASE_TAG.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
   assert.match(currentPlan, /docks-kit[^\n]*0\.13\.0/);
   assert.match(currentPlan, new RegExp(CURRENT_PUBLIC_PLAN_SUFFIX.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
-  assert.match(
-    currentPlan,
-    /stage the [\d.]+ prerelease[\s\S]*completed child[\s\S]*stable release is non-draft\/non-prerelease/i,
+  const stageIndex = currentPlan.search(/\| \d+ \| tag_stage \|/);
+  const childIndex = currentPlan.search(/\| \d+ \| read_child \|/);
+  const promoteIndex = currentPlan.search(/\| \d+ \| promote_stable \|/);
+  assert.ok(
+    stageIndex >= 0 && childIndex > stageIndex && promoteIndex > childIndex,
+    'the current release plan must stage the prerelease, accept the completed child, then promote stable',
   );
 }
 
