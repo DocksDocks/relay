@@ -3534,7 +3534,13 @@ function testDefaultCompletionBindingRejectsUnauthorizedPostReviewPath(temp) {
 
 function bindPlanRunCompletionFixture(
   temp,
-  { name, defaultDependencies = false, continuationPath = null, implementationExtraPath = null },
+  {
+    name,
+    defaultDependencies = false,
+    continuationPath = null,
+    implementationExtraPath = null,
+    distinctExecutionParent = false,
+  },
 ) {
   const clonePath = path.join(temp, `planrun-completion-${name}`);
   const cloned = spawnSync('git', ['clone', '--quiet', '--no-hardlinks', REPO, clonePath], {
@@ -3586,6 +3592,16 @@ function bindPlanRunCompletionFixture(
   if (defaultDependencies) {
     copyPreparationRuntime(root);
   }
+  let executionParent = PLANRUN_DOCKS_SOURCE_BASE;
+  if (distinctExecutionParent) {
+    const executionParentPath = 'plugins/session-relay/test/release-evidence-contract.mjs';
+    fs.appendFileSync(
+      path.join(root, ...executionParentPath.split('/')),
+      '\n// Distinct PlanRun execution-parent fixture.\n',
+    );
+    runGit(['add', '--', executionParentPath]);
+    executionParent = commitFixture('test: advance the PlanRun execution parent', '2026-07-26T20:50:00.000Z');
+  }
   for (const logical of PLANRUN_AFFECTED_PATHS) {
     const target = path.join(root, ...logical.split('/'));
     if (!fs.existsSync(target) && logical === CURRENT_RELEASE_INSTANCE_PATH) {
@@ -3625,7 +3641,7 @@ function bindPlanRunCompletionFixture(
     '--no-ext-diff',
     '--no-textconv',
     '--no-color',
-    PLANRUN_DOCKS_SOURCE_BASE,
+    executionParent,
     implementationCommit,
     '--',
     ...PLANRUN_AFFECTED_PATHS,
@@ -3746,7 +3762,7 @@ function bindPlanRunCompletionFixture(
   const run = {
     ...templateRun,
     draft_review: draftReview,
-    execution_parent: PLANRUN_DOCKS_SOURCE_BASE,
+    execution_parent: executionParent,
     implementation_commit: implementationCommit,
     completion_review: {
       state: 'passed',
@@ -3843,6 +3859,7 @@ function bindPlanRunCompletionFixture(
     headCommit,
     implementationChangedPaths,
     implementationCommit,
+    executionParent,
     planPath,
     postImplementationPaths,
     receiptOut,
@@ -3963,6 +3980,23 @@ function testPlanRunTagState(temp) {
     validateSourcePreparationProof(proof);
   }
   assert.ok(branch === 'unborn' || branch === 'cut', 'exactly one tag-state branch must run');
+}
+function testPlanRunCompletionBindingUsesExecutionParent(temp) {
+  const generated = bindPlanRunCompletionFixture(temp, {
+    name: 'distinct-execution-parent',
+    defaultDependencies: true,
+    distinctExecutionParent: true,
+  });
+  assert.notEqual(
+    generated.executionParent,
+    PLANRUN_DOCKS_SOURCE_BASE,
+    'the regression must keep source_base and execution_parent distinct',
+  );
+  assert.equal(
+    generated.result.receipt.completion_review.diff_sha256,
+    generated.completionDiffSha256,
+    'the source proof must bind the exact execution-parent completion diff',
+  );
 }
 
 function testPlanRunCompletionBindingRejectsUnrelatedContinuation(temp) {
@@ -4136,6 +4170,7 @@ function main() {
     testDefaultCompletionBindingAllowsBoundedPostReviewTooling(temp);
     testDefaultCompletionBindingRejectsUnauthorizedPostReviewPath(temp);
     testPlanRunTagState(temp);
+    testPlanRunCompletionBindingUsesExecutionParent(temp);
     testPlanRunCompletionBindingRejectsUnrelatedContinuation(temp);
     testPlanRunAffectedDiffCannotHideImplementationScopeDrift(temp);
     testCurrentCorrelatedReleaseEvidence();

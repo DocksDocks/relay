@@ -33,7 +33,7 @@ const CURRENT_PUBLIC_IMPLEMENTATION_COMMIT = '23e9995173c72f6a32e947a39fca8bf433
 // dated path under `docs/plans/finished/` when the release finishes; `currentDocksPlanFile()`
 // accepts exactly one of the two.
 const CURRENT_DOCKS_PLAN = 'docs/plans/active/session-relay-0.16.0-release.md';
-const CURRENT_DOCKS_RUN_ID = 'c268ecc1-cf5e-4266-9a29-a83b59e9717d';
+const CURRENT_DOCKS_RUN_ID = '1d28abf4-a843-42db-9ac4-db86dcb3e420';
 const CURRENT_GOAL_ID = 'cef66d21-5bd3-4e07-a0e8-e393822dcfb0';
 const HISTORICAL_PUBLIC_PLAN_SHA256 = 'e0b1d183122def14a3f4bd6f05605c6aa7de3fb2dccf4330e8956acc3e0db9ff';
 const HISTORICAL_ASSET_DIGESTS = Object.freeze({

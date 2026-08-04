@@ -37,7 +37,7 @@ const { version: CURRENT_RELEASE_VERSION, tag: CURRENT_RELEASE_TAG } = resolveSh
 // instance fails here. Update them by hand, as a deliberate act, when the release
 // identity legitimately changes.
 const CURRENT_DOCKS_PLAN_TEMPLATE = resolveReleasePlanPath(REPO, CURRENT_RELEASE_VERSION);
-const CURRENT_DOCKS_RUN_ID = 'c268ecc1-cf5e-4266-9a29-a83b59e9717d';
+const CURRENT_DOCKS_RUN_ID = '1d28abf4-a843-42db-9ac4-db86dcb3e420';
 // The public child plan the current docks plan itself declares: the reviewed
 // docks-kit 0.14.0 child archive that pins the three 0.16.0 assets. The instance
 // now binds that completed child; this pin checks the plan text names the same
