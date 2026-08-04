@@ -74,11 +74,11 @@ const CURRENT_DOCKS_PLAN_TEMPLATE_PATH =
 const CURRENT_DOCKS_SOURCE_BASE = '494881a0d973863d1ac8e233734c827eb6913ce8';
 const CURRENT_RED_TEST_PATH = 'plugins/session-relay/test/release-evidence-contract.mjs';
 const CURRENT_RED_PRODUCER_PATH = 'scripts/capture-tdd-red.mjs';
-// The binder reads release identity through `loadReleaseInstance` in the lane core, which
-// resolves a per-version instance file. A fixture that copies the current binder into a
-// synthetic tree without those siblings fails at import rather than at the assertion under
-// test, so they travel together. No historical expectation moves: the fixture already
-// overlays the current binder deliberately, and this only completes what it now needs.
+// The copied binder first derives VERSION from the Claude manifest, Codex manifest,
+// and Claude marketplace, then resolves that version's release-instance file. Every
+// copied runtime therefore carries the synchronized current manifest identity. Tests
+// for retained 0.14.0 completion still route through the explicit retained instance,
+// exactly as production does when current VERSION is newer than the requested version.
 const PREPARATION_RUNTIME_DEPENDENCIES = [
   'scripts/lib/session-relay-release-preparation.mjs',
   'scripts/lib/session-relay-release-core.mjs',
@@ -95,12 +95,48 @@ const PREPARATION_RUNTIME_DEPENDENCIES = [
   'plugins/plan-lifecycle/skills/productivity/plan-manager/scripts/plan-run.mjs',
   'plugins/plan-lifecycle/skills/productivity/plan-manager/scripts/legacy-review-records.mjs',
 ];
-const copyPreparationRuntime = (root) => {
+function writeFixtureRelayIdentity(root, version) {
+  const writeJson = (logical, value) => {
+    const target = path.join(root, ...logical.split('/'));
+    fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(target, `${JSON.stringify(value, null, 2)}\n`);
+  };
+  for (const logical of [
+    'plugins/session-relay/.claude-plugin/plugin.json',
+    'plugins/session-relay/.codex-plugin/plugin.json',
+  ]) {
+    const target = path.join(root, ...logical.split('/'));
+    const manifest = fs.existsSync(target) ? JSON.parse(fs.readFileSync(target, 'utf8')) : {};
+    if (manifest.name !== 'session-relay' || manifest.version !== version) {
+      writeJson(logical, { ...manifest, name: 'session-relay', version });
+    }
+  }
+
+  const marketplaceLogical = '.claude-plugin/marketplace.json';
+  const marketplacePath = path.join(root, ...marketplaceLogical.split('/'));
+  const marketplace = fs.existsSync(marketplacePath) ? JSON.parse(fs.readFileSync(marketplacePath, 'utf8')) : {};
+  const plugins = Array.isArray(marketplace.plugins) ? marketplace.plugins : [];
+  const relayEntries = plugins.filter(({ name }) => name === 'session-relay');
+  if (relayEntries.length === 1 && relayEntries[0].version === version) return;
+
+  let replaced = false;
+  const synchronizedPlugins = plugins.flatMap((entry) => {
+    if (entry.name !== 'session-relay') return [entry];
+    if (replaced) return [];
+    replaced = true;
+    return [{ ...entry, name: 'session-relay', version }];
+  });
+  if (!replaced) synchronizedPlugins.push({ name: 'session-relay', version });
+  writeJson(marketplaceLogical, { ...marketplace, plugins: synchronizedPlugins });
+}
+
+const copyPreparationRuntime = (root, version) => {
   for (const logical of PREPARATION_RUNTIME_DEPENDENCIES) {
     const target = path.join(root, ...logical.split('/'));
     fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
     fs.copyFileSync(path.join(REPO, ...logical.split('/')), target);
   }
+  writeFixtureRelayIdentity(root, version);
 };
 const CURRENT_AFFECTED_PATHS = [
   'plugins/session-relay/README.md',
@@ -3109,7 +3145,7 @@ function bindCurrentCompletionFixture(
   assert.equal(red.exit_code, 17);
 
   const preparationPath = path.join(root, 'scripts/lib/session-relay-release-preparation.mjs');
-  if (defaultDependencies) copyPreparationRuntime(root);
+  if (defaultDependencies) copyPreparationRuntime(root, CURRENT_RELEASE_VERSION);
   fs.appendFileSync(preparationPath, '\n// Current release-evidence contract implementation fixture.\n');
   runGit(['add', '--', 'scripts/lib/session-relay-release-preparation.mjs']);
   const implementationCommit = commitFixture('fix: bind current release evidence fixture', '2026-07-25T14:00:00.000Z');
@@ -3592,7 +3628,7 @@ function bindPlanRunCompletionFixture(
     return runGit(['rev-parse', 'HEAD^{commit}']);
   };
   if (defaultDependencies) {
-    copyPreparationRuntime(root);
+    copyPreparationRuntime(root, CURRENT_RELEASE_VERSION);
   }
   let executionParent = PLANRUN_DOCKS_SOURCE_BASE;
   if (distinctExecutionParent) {

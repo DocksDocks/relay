@@ -11,6 +11,7 @@ import { parse as parseYaml } from 'yaml';
 import {
   INTEL_DARWIN_DEPRECATION,
   PRERELEASE_BODY,
+  VERSION as RELEASE_CORE_VERSION,
   STABLE_BODY,
 } from '../../../scripts/lib/session-relay-release-core.mjs';
 import { resolveHistoricalPublicationPlanPath, resolveReleasePlanPath } from './historical-plan-path.mjs';
@@ -1052,8 +1053,43 @@ function currentCorrelatedReleaseContract() {
     'Cargo.lock must bind Session Relay 0.16.0',
   );
 
+  assert.equal(
+    RELEASE_CORE_VERSION,
+    CURRENT_RELEASE_VERSION,
+    'release-core VERSION must equal the synchronized current Session Relay manifest identity',
+  );
   const coreSource = fs.readFileSync(path.join(REPO, 'scripts/lib/session-relay-release-core.mjs'), 'utf8');
-  assert.match(coreSource, /export const VERSION = '0\.16\.0';/);
+  const currentVersionReaderStart = coreSource.indexOf('function currentRelayVersion() {');
+  const currentVersionReaderEnd = coreSource.indexOf('\nexport const VERSION =', currentVersionReaderStart);
+  assert.notEqual(currentVersionReaderStart, -1, 'release core must define the current manifest version reader');
+  assert.notEqual(
+    currentVersionReaderEnd,
+    -1,
+    'release core must export VERSION after the current manifest version reader',
+  );
+  const currentVersionReader = coreSource.slice(currentVersionReaderStart, currentVersionReaderEnd);
+  assert.match(currentVersionReader, /const claudePath = claudeManifest\(plugin\);/);
+  assert.match(currentVersionReader, /const codexPath = codexManifest\(plugin\);/);
+  assert.match(currentVersionReader, /const claude = readReleaseIdentityJson\(claudePath\);/);
+  assert.match(currentVersionReader, /const codex = readReleaseIdentityJson\(codexPath\);/);
+  assert.match(currentVersionReader, /const marketplace = readReleaseIdentityJson\(CLAUDE_MARKETPLACE\);/);
+  assert.match(currentVersionReader, /return synchronizedRelayVersion\(\[/);
+  assert.match(currentVersionReader, /\{ source: claudePath, name: claude\?\.name, version: claude\?\.version \},/);
+  assert.match(currentVersionReader, /\{ source: codexPath, name: codex\?\.name, version: codex\?\.version \},/);
+  assert.match(currentVersionReader, /source: CLAUDE_MARKETPLACE,/);
+  assert.match(currentVersionReader, /version: marketEntryVersion\(marketplace, PLUGIN\),/);
+  const escapedCurrentReleaseVersion = CURRENT_RELEASE_VERSION.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  assert.doesNotMatch(
+    currentVersionReader,
+    new RegExp(String.raw`["'\x60]${escapedCurrentReleaseVersion}["'\x60]`),
+    'currentRelayVersion must not contain a hardcoded live version',
+  );
+  assert.match(coreSource, /export const VERSION = currentRelayVersion\(\);/);
+  assert.doesNotMatch(
+    coreSource,
+    /export const VERSION\s*=\s*['"`]/,
+    'release-core VERSION must not duplicate the live version as a literal',
+  );
   assert.match(coreSource, /Session Relay \$\{VERSION\} is staged for compatibility validation/);
   assert.match(coreSource, /Session Relay \$\{VERSION\} is available through docks-kit/);
   // The exact retirement sentence is pinned here as an independent oracle; the
@@ -1065,9 +1101,13 @@ function currentCorrelatedReleaseContract() {
   assert.ok(PRERELEASE_BODY.endsWith(`\n\n${deprecationSentence}`), 'prerelease body must end with the deprecation');
   assert.ok(STABLE_BODY.endsWith(`\n\n${deprecationSentence}`), 'stable body must end with the deprecation');
   const promotionSource = fs.readFileSync(path.join(REPO, 'scripts/lib/session-relay-release-promotion.mjs'), 'utf8');
-  assert.match(promotionSource, /const PUBLIC_VERSION = '0\.14\.0';/);
-  assert.match(promotionSource, /const PUBLIC_TAG = `cli-v\$\{PUBLIC_VERSION\}`;/);
-  assert.match(promotionSource, /const CURRENT_DOCKS_KIT_RELEASE = 'cli-v0\.14\.0';/);
+  assert.match(promotionSource, /const INSTANCE = loadReleaseInstance\(CURRENT_VERSION, \{/);
+  assert.match(promotionSource, /require: \['current_attempt', 'planrun_attempt', 'public_child'\],/);
+  assert.match(promotionSource, /const PUBLIC_VERSION = INSTANCE\.public_child\.version;/);
+  assert.match(promotionSource, /const PUBLIC_TAG = INSTANCE\.public_child\.tag;/);
+  assert.match(promotionSource, /const CURRENT_DOCKS_KIT_RELEASE = PUBLIC_TAG;/);
+  assert.doesNotMatch(promotionSource, /const PUBLIC_VERSION\s*=\s*['"`]/);
+  assert.doesNotMatch(promotionSource, /const CURRENT_DOCKS_KIT_RELEASE\s*=\s*['"`]/);
   assert.match(promotionSource, /session-relay-\$\{CURRENT_VERSION\}-docks-kit-\$\{PUBLIC_VERSION\}-release/);
 
   const document = parseYaml(fs.readFileSync(WORKFLOW, 'utf8'));
