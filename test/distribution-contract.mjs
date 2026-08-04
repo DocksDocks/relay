@@ -8,6 +8,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parse as parseYaml } from 'yaml';
+import { PLUGINS } from '../../../scripts/lib/plugins.mjs';
 import {
   INTEL_DARWIN_DEPRECATION,
   PRERELEASE_BODY,
@@ -645,7 +646,7 @@ function releaseFixtureRoot() {
   return { root: fs.mkdtempSync(path.join(os.tmpdir(), 'session-relay-release-fixtures-')), owned: true };
 }
 
-function runReleaseFixture(root, mode, scenario, expectedOutcome, releaseArgs) {
+function runReleaseFixture(root, mode, scenario, fixtureOutcome, releaseArgs, effectiveOutcome = fixtureOutcome) {
   const directory = path.join(root, `${mode}-${scenario}`);
   fs.mkdirSync(directory, { recursive: true });
   const fixture = {
@@ -664,7 +665,7 @@ function runReleaseFixture(root, mode, scenario, expectedOutcome, releaseArgs) {
         .slice(0, 64),
       database_id: 100 + index,
     })),
-    expected_outcome: expectedOutcome,
+    expected_outcome: fixtureOutcome,
   };
   const fixturePath = path.join(directory, 'fixture.json');
   const reportPath = path.join(directory, 'report.json');
@@ -676,7 +677,7 @@ function runReleaseFixture(root, mode, scenario, expectedOutcome, releaseArgs) {
       SESSION_RELAY_RELEASE_REPORT: reportPath,
     },
   });
-  const unsuccessful = ['conflict', 'failure', 'manual_incident', 'restored_failure'].includes(expectedOutcome);
+  const unsuccessful = ['conflict', 'failure', 'manual_incident', 'restored_failure'].includes(effectiveOutcome);
   assert.equal(result.status, unsuccessful ? 1 : 0, `${mode}/${scenario}: ${result.stderr}`);
   assert.equal(fs.existsSync(reportPath), true, `${mode}/${scenario} did not emit a fixture report`);
   const report = JSON.parse(fs.readFileSync(reportPath));
@@ -688,7 +689,7 @@ function runReleaseFixture(root, mode, scenario, expectedOutcome, releaseArgs) {
   assert.equal(report.schema, 1);
   assert.equal(report.type, 'SessionRelayReleaseFixtureReportV1');
   assert.equal(report.scenario, scenario);
-  assert.equal(report.outcome, expectedOutcome);
+  assert.equal(report.outcome, effectiveOutcome);
   assert.ok(Array.isArray(report.calls));
   assert.ok(report.state && typeof report.state === 'object' && !Array.isArray(report.state));
   assert.ok(Array.isArray(report.mutations));
@@ -752,6 +753,8 @@ function releaseContracts() {
         ...pair('source-proof', 'a'),
         '--publication',
         ...pair('publication', 'b'),
+        '--public-release',
+        ...pair('public-release', 'd'),
         '--docks-kit-release',
         'cli-v0.9.0',
         '--expected-origin-main',
@@ -784,6 +787,8 @@ function releaseContracts() {
         ...pair('source-proof', 'a'),
         '--publication',
         ...pair('publication', 'b'),
+        '--public-release',
+        ...pair('public-release', 'd'),
         '--docks-kit-release',
         'cli-v0.9.0',
         '--expected-origin-main',
@@ -921,7 +926,7 @@ function releaseContracts() {
       runReleaseFixture(fixtureRoot.root, mode, 'valid', 'success', args);
     }
 
-    for (const plugin of ['docks', 'effect-kit']) {
+    for (const { name: plugin } of PLUGINS.filter(({ release }) => release.kind === 'generic')) {
       for (const bump of ['patch', 'minor', 'major', '9.8.7']) {
         const report = runReleaseFixture(fixtureRoot.root, 'legacy-release', `${plugin}-${bump}`, 'success', [
           '--plugin',
@@ -1005,6 +1010,15 @@ function releaseContracts() {
         fs.rmSync(outPath('grammar'));
       }
     }
+    const parseConflict = runReleaseFixture(
+      fixtureRoot.root,
+      'grammar',
+      'parse-error-overrides-success',
+      'success',
+      ['--prepare', '--plugin', 'session-relay', RELEASE_VERSION, '--unknown'],
+      'conflict',
+    );
+    assert.deepEqual(parseConflict.mutations, [], 'parse failure reported a successful fixture mutation');
     const positionalRelay = runReleaseFixture(fixtureRoot.root, 'grammar', 'session-relay-positional', 'conflict', [
       '--plugin',
       'session-relay',
