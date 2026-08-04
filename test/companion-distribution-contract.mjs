@@ -19,12 +19,13 @@ const DOCKS_PLAN = 'docs/plans/finished/2026-07-23-session-relay-linux-workspace
 const PUBLIC_VERSION = '0.13.0';
 const PRODUCTION_VERSION = '0.12.0';
 const BLOCKED_REASON = 'Awaiting the four independently hashed `session-relay--v0.13.0` production asset digests.';
-// This contract revalidates the published public main after the child release
-// finishes, binding the generation that the active Docks parent now consumes.
+// This contract reads final child evidence from retained public main and release
+// payload authority from the immutable tag, binding them through ancestry.
 const CURRENT_PUBLIC_RELAY_VERSION = '0.16.0';
 const CURRENT_PUBLIC_RELAY_TAG = `session-relay--v${CURRENT_PUBLIC_RELAY_VERSION}`;
 const CURRENT_PUBLIC_VERSION = '0.14.0';
 const CURRENT_PUBLIC_TAG = `cli-v${CURRENT_PUBLIC_VERSION}`;
+const CURRENT_PUBLIC_TAG_OBJECT = '526633f2cf927d67e7f84e54c28b108d7326588d';
 const CURRENT_PUBLIC_PLAN = 'docs/plans/active/session-relay-0.16.0-docks-kit-0.14.0-release.md';
 const CURRENT_PUBLIC_RUN_ID = 'fb5a6880-9bca-45c5-9136-d0424a020d5a';
 const CURRENT_PUBLIC_EXECUTION_PARENT = 'cf7df092d068d15eee68d389a047f16c858006ca';
@@ -107,11 +108,6 @@ function git(cwd, args, { ancestorMiss = false } = {}) {
   assert.equal(result.status, 0, `git ${args.join(' ')}: ${result.stderr}`);
   return result.stdout.trim();
 }
-function gitBytes(cwd, args) {
-  const result = spawnSync('git', args, { cwd, shell: false });
-  assert.equal(result.status, 0, `git ${args.join(' ')}: ${result.stderr.toString('utf8')}`);
-  return result.stdout;
-}
 
 function run(cwd, executable, args) {
   const result = spawnSync(executable, args, {
@@ -165,7 +161,6 @@ function verifyCurrentPublicMain(directory, cli) {
   git(directory, ['fetch', '--quiet', '--no-tags', cli.remote, 'refs/heads/main']);
   const currentCommit = git(directory, ['rev-parse', 'FETCH_HEAD^{commit}']);
   assert.match(currentCommit, COMMIT);
-  assert.notEqual(currentCommit, cli.commit, 'current public main must be distinct from the immutable 0.13 preflight');
   git(directory, ['checkout', '--detach', '--quiet', currentCommit]);
   assert.equal(git(directory, ['rev-parse', 'HEAD']), currentCommit);
   assert.equal(git(directory, ['status', '--porcelain=v1']), '');
@@ -174,9 +169,11 @@ function verifyCurrentPublicMain(directory, cli) {
   assert.equal(
     sha256(fs.readFileSync(historicalPlanPath)),
     HISTORICAL_PUBLIC_PLAN_SHA256,
-    'legacy public 0.13 plan/receipt bytes changed',
+    'legacy public 0.13 plan/receipt bytes changed or are no longer retained on public main',
   );
 
+  // Public main is authority only for the preserved post-release archive and
+  // its final PlanRun/completion evidence.
   const currentPlanPath = currentPublicPlanFile(directory);
   const currentPlan = fs.readFileSync(currentPlanPath, 'utf8');
   const currentRun = planRun(currentPlan, 'current public child');
@@ -184,6 +181,23 @@ function verifyCurrentPublicMain(directory, cli) {
     fs.readFileSync(path.join(REPO, resolveReleasePlanPath(REPO, CURRENT_PUBLIC_RELAY_VERSION)), 'utf8'),
     'current Docks child',
   );
+
+  // The exact annotated tag and peeled implementation are authority for every
+  // released package, generated payload, and Relay pin assertion below.
+  const tagRef = `refs/tags/${CURRENT_PUBLIC_TAG}`;
+  assert.deepEqual(
+    git(directory, ['ls-remote', '--tags', cli.remote, tagRef, `${tagRef}^{}`])
+      .split('\n')
+      .sort(),
+    [`${CURRENT_PUBLIC_TAG_OBJECT}\t${tagRef}`, `${CURRENT_PUBLIC_IMPLEMENTATION_COMMIT}\t${tagRef}^{}`].sort(),
+    'immutable docks-kit 0.14.0 release tag is missing or repointed',
+  );
+  git(directory, ['fetch', '--quiet', '--no-tags', cli.remote, tagRef]);
+  assert.equal(git(directory, ['rev-parse', 'FETCH_HEAD']), CURRENT_PUBLIC_TAG_OBJECT);
+  assert.equal(git(directory, ['rev-parse', 'FETCH_HEAD^{commit}']), CURRENT_PUBLIC_IMPLEMENTATION_COMMIT);
+  git(directory, ['checkout', '--detach', '--quiet', CURRENT_PUBLIC_IMPLEMENTATION_COMMIT]);
+  assert.equal(git(directory, ['rev-parse', 'HEAD']), CURRENT_PUBLIC_IMPLEMENTATION_COMMIT);
+  assert.equal(git(directory, ['status', '--porcelain=v1']), '');
 
   const toolchainBytes = fs.readFileSync(path.join(directory, 'SoT/toolchain.json'), 'utf8');
   const toolchain = JSON.parse(toolchainBytes);
@@ -294,7 +308,11 @@ function verifyCurrentPublicMain(directory, cli) {
     git(directory, ['merge-base', '--is-ancestor', currentRun.execution_parent, currentRun.implementation_commit]),
     '',
   );
-  assert.equal(git(directory, ['merge-base', '--is-ancestor', currentRun.implementation_commit, currentCommit]), '');
+  assert.equal(
+    git(directory, ['merge-base', '--is-ancestor', currentRun.implementation_commit, currentCommit]),
+    '',
+    'tagged public child implementation is not retained in current public main ancestry',
+  );
   assert.match(currentPlan, new RegExp(escapeRegExp(CURRENT_PUBLIC_RELAY_TAG)));
   assert.match(currentPlan, new RegExp(escapeRegExp(CURRENT_PUBLIC_TAG)));
   assert.match(

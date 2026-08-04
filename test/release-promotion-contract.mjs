@@ -102,7 +102,9 @@ const CURRENT_PUBLIC_ASSET_TARGETS = Object.freeze([
   'aarch64-apple-darwin',
 ]);
 const { version: CURRENT_RELEASE_VERSION, tag: CURRENT_RELEASE_TAG } = resolveShippedRelayVersion(REPO);
-const CURRENT_RELEASE_INSTANCE = loadReleaseInstance(CURRENT_RELEASE_VERSION, { require: ['planrun_attempt'] });
+const CURRENT_RELEASE_INSTANCE = loadReleaseInstance(CURRENT_RELEASE_VERSION, {
+  require: ['current_attempt', 'planrun_attempt', 'public_child'],
+});
 const RETAINED_V2_RELEASE_VERSION = '0.14.0';
 const RETAINED_V2_RELEASE_TAG = `session-relay--v${RETAINED_V2_RELEASE_VERSION}`;
 const RETAINED_V2_INSTANCE = loadReleaseInstance(RETAINED_V2_RELEASE_VERSION, {
@@ -154,7 +156,7 @@ const PLANRUN_DOCKS_AFFECTED_PATHS = Object.freeze([
   'scripts/lib/plugins.mjs',
   'scripts/lib/rust-bin.mjs',
   'scripts/lib/session-relay-release-core.mjs',
-  'scripts/lib/session-relay-release-instances/0.16.0.json',
+  `scripts/lib/session-relay-release-instances/${CURRENT_RELEASE_VERSION}.json`,
   'scripts/lib/session-relay-release-preparation.mjs',
   'scripts/lib/session-relay-release-promotion.mjs',
   'scripts/lib/session-relay-release-publication.mjs',

@@ -3,8 +3,8 @@
 //
 // The Session Relay release lane must carry protocol logic only. Every value that
 // identifies one particular release attempt - run ids, commits, receipt digests, plan
-// paths - belongs in a per-version instance file the lane loads by version, so that
-// releasing edits the single `VERSION` declaration and nothing else.
+// paths - belongs in a per-version instance file. The live release version comes from
+// exact manifest/catalog agreement and selects that instance without scanning for a maximum.
 //
 // Cases:
 //   (default)         scan the lane and require zero identity literals
@@ -28,14 +28,39 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import url from 'node:url';
-
-import { INSTANCE_DIR, loadReleaseInstance, VERSION } from '../../../scripts/lib/session-relay-release-core.mjs';
+import { byName, CLAUDE_MARKETPLACE, claudeManifest, codexManifest } from '../../../scripts/lib/plugins.mjs';
+import {
+  INSTANCE_DIR,
+  loadReleaseInstance,
+  PLUGIN,
+  VERSION,
+} from '../../../scripts/lib/session-relay-release-core.mjs';
 import { validateReleaseInstance } from '../../../scripts/lib/session-relay-release-instances/schema.mjs';
 
 const HERE = path.dirname(url.fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(HERE, '../../..');
 const LANE_DIR = path.join(REPO_ROOT, 'scripts/lib');
 const INVENTORY = path.join(HERE, 'fixtures/release-identity-inventory.json');
+const CURRENT_PLUGIN = byName(PLUGIN);
+assert.notEqual(CURRENT_PLUGIN, null, 'Session Relay plugin descriptor is missing');
+const currentClaudeManifest = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, claudeManifest(CURRENT_PLUGIN)), 'utf8'));
+const currentCodexManifest = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, codexManifest(CURRENT_PLUGIN)), 'utf8'));
+const currentMarketplace = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, CLAUDE_MARKETPLACE), 'utf8'));
+const currentMarketplaceEntries = currentMarketplace.plugins.filter(({ name }) => name === PLUGIN);
+assert.equal(currentMarketplaceEntries.length, 1, 'Claude marketplace must contain exactly one Session Relay entry');
+assert.deepEqual(
+  [
+    { name: currentClaudeManifest.name, version: currentClaudeManifest.version },
+    { name: currentCodexManifest.name, version: currentCodexManifest.version },
+    { name: currentMarketplaceEntries[0].name, version: currentMarketplaceEntries[0].version },
+  ],
+  [
+    { name: PLUGIN, version: VERSION },
+    { name: PLUGIN, version: VERSION },
+    { name: PLUGIN, version: VERSION },
+  ],
+  'live Session Relay version is not derived from exact Claude, Codex, and marketplace agreement',
+);
 
 // The seven modules that make up the lane.
 const MODULES = [

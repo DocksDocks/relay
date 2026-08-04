@@ -1776,10 +1776,16 @@ function assertCutReleaseFinalization() {
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'session-relay-publication-contract-'));
 try {
-  assert.equal(VERSION, CURRENT_VERSION, 'Session Relay production version must be 0.16.0');
-  assert.equal(TAG, CURRENT_TAG, 'Session Relay production tag must be session-relay--v0.16.0');
-  assert.match(PRERELEASE_BODY, /Session Relay 0\.16\.0/, 'prerelease body must announce Session Relay 0.16.0');
-  assert.match(STABLE_BODY, /Session Relay 0\.16\.0/, 'stable body must announce Session Relay 0.16.0');
+  assert.equal(VERSION, CURRENT_VERSION, 'Session Relay production version must match the shipped manifest');
+  assert.equal(TAG, CURRENT_TAG, 'Session Relay production tag must match the shipped manifest');
+  assert.ok(
+    PRERELEASE_BODY.includes(`Session Relay ${VERSION}`),
+    'prerelease body must announce the manifest-derived Session Relay version',
+  );
+  assert.ok(
+    STABLE_BODY.includes(`Session Relay ${VERSION}`),
+    'stable body must announce the manifest-derived Session Relay version',
+  );
   const intelDeprecation =
     'x86_64-apple-darwin is no longer published as of Session Relay 0.16.0; macOS support is aarch64-apple-darwin.';
   assert.ok(PRERELEASE_BODY.includes(intelDeprecation), 'prerelease body must carry the exact Intel deprecation');
