@@ -37,11 +37,11 @@ const { version: CURRENT_RELEASE_VERSION, tag: CURRENT_RELEASE_TAG } = resolveSh
 // instance fails here. Update them by hand, as a deliberate act, when the release
 // identity legitimately changes.
 const CURRENT_DOCKS_PLAN_TEMPLATE = resolveReleasePlanPath(REPO, CURRENT_RELEASE_VERSION);
-const CURRENT_DOCKS_RUN_ID = '75c7a055-44f2-4435-b863-301af9bb352f';
+const CURRENT_DOCKS_RUN_ID = '1c5b6f71-c69d-4566-adcc-4c15a9f0c599';
 // The public child plan the current docks plan itself declares: the reviewed
-// docks-kit 0.14.0 child archive that pins the three 0.16.0 assets. Pretag, the
-// instance binds the retained finished 0.13.0 child; the plan text names the
-// 0.14.0 archive as the release precondition, which is what this pin checks.
+// docks-kit 0.14.0 child archive that pins the three 0.16.0 assets. The instance
+// now binds that completed child; this pin checks the plan text names the same
+// archive, by suffix rather than by the day the child happened to finish.
 // Date-free by construction. The archive prefix is the child's own FINISH date, which this
 // repository cannot know when the parent plan is written, so pinning it couples a parent
 // assertion to the day a different repository happens to land. The suffix is the stable part.
