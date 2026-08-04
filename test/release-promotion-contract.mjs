@@ -1751,7 +1751,7 @@ function verifyPublicBoundary(
   }
 }
 
-const CURRENT_PUBLIC_SOURCE_BASE = '1'.repeat(40);
+const CURRENT_PUBLIC_SOURCE_BASE = 'd'.repeat(40);
 const CURRENT_PUBLIC_EXECUTION_PARENT = 'b'.repeat(40);
 // A PlanRun run's implementation commit is deliberately later than the tag it publishes, so this
 // fixture value must differ from the publication's tag commit.
