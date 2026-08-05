@@ -1,5 +1,5 @@
 {
-  "schema_version": 4,
+  "schema_version": 5,
   "acceptance_owners": {
     "A01": "workspace_lease_process::two_writers_same_worktree_exactly_one_lease",
     "A02": "workspace_lease_process::separate_worktrees_both_hold_leases",
@@ -32,6 +32,33 @@
     "A29": "test/workspace-smoke.mjs::docs-contract"
   },
   "pending_api_gaps": {},
+  "omitted_targets": {
+    "bus_smoke": {
+      "owner": "plugins/session-relay/test/rust-test-inventory.mjs",
+      "reason": "Not selected by the orchestrated source-check target set; review for explicit gate inclusion.",
+      "expires": "2027-08-05"
+    },
+    "lifecycle_admission": {
+      "owner": "plugins/session-relay/test/rust-test-inventory.mjs",
+      "reason": "Not selected by the orchestrated source-check target set; review for explicit gate inclusion.",
+      "expires": "2027-08-05"
+    },
+    "lifecycle_managed": {
+      "owner": "plugins/session-relay/test/rust-test-inventory.mjs",
+      "reason": "Not selected by the orchestrated source-check target set; review for explicit gate inclusion.",
+      "expires": "2027-08-05"
+    },
+    "lifecycle_release": {
+      "owner": "plugins/session-relay/test/rust-test-inventory.mjs",
+      "reason": "Not selected by the orchestrated source-check target set; review for explicit gate inclusion.",
+      "expires": "2027-08-05"
+    },
+    "lock_race": {
+      "owner": "plugins/session-relay/test/rust-test-inventory.mjs",
+      "reason": "Not selected by the orchestrated source-check target set; review for explicit gate inclusion.",
+      "expires": "2027-08-05"
+    }
+  },
   "cases": {
     "protocol": {
       "tests": [

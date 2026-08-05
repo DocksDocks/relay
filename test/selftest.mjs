@@ -44,6 +44,18 @@ export const SCENARIOS = Object.freeze([
   scenario('follow-doctor-mailbox', FOLLOW_DOCTOR_MAILBOX_LABELS),
 ]);
 
+export const LABEL_CONTRACT_OWNERS = Object.freeze(
+  Object.fromEntries(
+    SCENARIOS.map(({ name, modulePath, expectedLabels }) => [
+      name,
+      Object.freeze({
+        owner: path.relative(path.resolve(HERE, '../../..'), modulePath).split(path.sep).join('/'),
+        label_count: expectedLabels.length,
+      }),
+    ]),
+  ),
+);
+
 export const PRODUCTION_OUTPUT_LABELS = Object.freeze([
   ...CORE_LABELS,
   ...DISCOVERY_HARDENING_LABELS,

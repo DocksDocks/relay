@@ -572,7 +572,7 @@ function sourceCiFixture(
       completed_at: '2026-07-17T18:10:00Z',
       steps: requiredSteps.map((name, index) => ({
         name,
-        number: [3, 5, 9, 11, 12, 13, 14][index],
+        number: [3, 6, 11, 13, 14, 15, 16][index],
         status: 'completed',
         conclusion: 'success',
       })),
@@ -785,7 +785,7 @@ function testSourceCi(temp) {
     /validation-shards|skipped|non-authoritative/i,
   );
   const noOpWorkflow = authoritativeCiWorkflow().replace(
-    'SESSION_RELAY_TEST_CGROUP_ROOT="$CGROUP" node scripts/ci.mjs\n',
+    'SESSION_RELAY_TEST_CGROUP_ROOT="$CGROUP" node scripts/ci.mjs --timings-json "$RUNNER_TEMP/docks-ci-timings.json"\n',
     'SESSION_RELAY_TEST_CGROUP_ROOT="$CGROUP" printf \'node scripts/ci.mjs\\n\'\n',
   );
   expectReject(
@@ -839,9 +839,9 @@ function testSourceCi(temp) {
   const unguardedInstall = authoritativeCiWorkflow().replace(
     `      - name: "install pnpm dependencies (--frozen-lockfile; yaml + lockfile-pinned claude-code)"
         if: github.event_name != 'pull_request'
-        run: pnpm install --frozen-lockfile`,
+        run: |`,
     `      - name: "install pnpm dependencies (--frozen-lockfile; yaml + lockfile-pinned claude-code)"
-        run: pnpm install --frozen-lockfile`,
+        run: |`,
   );
   expectReject(
     'source-CI validate install without pull-request guard',
@@ -854,8 +854,10 @@ function testSourceCi(temp) {
   );
   const relaxedCargoCondition = authoritativeCiWorkflow().replace(
     `      - name: "cache Cargo dependencies and target outputs"
+        id: cargo-cache
         if: github.event_name != 'pull_request' && (github.event_name != 'push' || steps.target.outputs.needs_rust == 'true')`,
     `      - name: "cache Cargo dependencies and target outputs"
+        id: cargo-cache
         if: github.event_name != 'push' || steps.target.outputs.needs_rust == 'true'`,
   );
   expectReject(
@@ -911,10 +913,10 @@ function testSourceCi(temp) {
   );
   const conditionalShardInstall = authoritativeCiWorkflow().replace(
     `      - name: "install pnpm dependencies (--frozen-lockfile; yaml + lockfile-pinned claude-code)"
-        run: pnpm install --frozen-lockfile`,
+        run: |`,
     `      - name: "install pnpm dependencies (--frozen-lockfile; yaml + lockfile-pinned claude-code)"
         if: matrix.lane != 'mutations'
-        run: pnpm install --frozen-lockfile`,
+        run: |`,
   );
   expectReject(
     'source-CI validation dependency install made lane-conditional',
@@ -927,8 +929,10 @@ function testSourceCi(temp) {
   );
   const coreRustCacheOverride = authoritativeCiWorkflow().replace(
     `      - name: "cache Cargo dependencies and target outputs"
+        id: cargo-cache
         if: matrix.lane == 'relay'`,
     `      - name: "cache Cargo dependencies and target outputs"
+        id: cargo-cache
         if: matrix.lane == 'core'`,
   );
   expectReject(

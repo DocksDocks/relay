@@ -18,6 +18,39 @@ const workspaceTargets = [
 ];
 const featureTargets = ['protocol', 'fanout', 'fanout_reap', 'lifecycle_supervisor'];
 const runnableTargets = [...featureTargets, ...workspaceTargets];
+const omittedTargets = {
+  bus_smoke: {
+    owner: 'plugins/session-relay/test/rust-test-inventory.mjs',
+    reason: 'Not selected by the orchestrated source-check target set; review for explicit gate inclusion.',
+    expires: '2027-08-05',
+  },
+  lifecycle_admission: {
+    owner: 'plugins/session-relay/test/rust-test-inventory.mjs',
+    reason: 'Not selected by the orchestrated source-check target set; review for explicit gate inclusion.',
+    expires: '2027-08-05',
+  },
+  lifecycle_managed: {
+    owner: 'plugins/session-relay/test/rust-test-inventory.mjs',
+    reason: 'Not selected by the orchestrated source-check target set; review for explicit gate inclusion.',
+    expires: '2027-08-05',
+  },
+  lifecycle_release: {
+    owner: 'plugins/session-relay/test/rust-test-inventory.mjs',
+    reason: 'Not selected by the orchestrated source-check target set; review for explicit gate inclusion.',
+    expires: '2027-08-05',
+  },
+  lock_race: {
+    owner: 'plugins/session-relay/test/rust-test-inventory.mjs',
+    reason: 'Not selected by the orchestrated source-check target set; review for explicit gate inclusion.',
+    expires: '2027-08-05',
+  },
+};
+const discoveredTargets = fs
+  .readdirSync(path.join(rust, 'tests'), { withFileTypes: true })
+  .filter((entry) => entry.isFile() && entry.name.endsWith('.rs'))
+  .map((entry) => entry.name.slice(0, -3))
+  .sort();
+const discoveredOmittedTargets = discoveredTargets.filter((target) => !runnableTargets.includes(target));
 const acceptanceOwners = {
   A01: 'workspace_lease_process::two_writers_same_worktree_exactly_one_lease',
   A02: 'workspace_lease_process::separate_worktrees_both_hold_leases',
@@ -70,16 +103,38 @@ if (process.argv.includes('--generate')) {
     assert.ok(entry.tests.length > 0, `${target}: generated test set is empty`);
   fs.writeFileSync(
     fixturePath,
-    `${JSON.stringify({ schema_version: 4, acceptance_owners: acceptanceOwners, pending_api_gaps: pendingApiGaps, cases }, null, 2)}\n`,
+    `${JSON.stringify(
+      {
+        schema_version: 5,
+        acceptance_owners: acceptanceOwners,
+        pending_api_gaps: pendingApiGaps,
+        omitted_targets: omittedTargets,
+        cases,
+      },
+      null,
+      2,
+    )}\n`,
   );
   console.log(`PASS rust_test_inventory generated=${runnableTargets.length}`);
   process.exit(0);
 }
 
-assert.deepEqual(Object.keys(fixture).sort(), ['acceptance_owners', 'cases', 'pending_api_gaps', 'schema_version']);
-assert.equal(fixture.schema_version, 4);
+assert.deepEqual(Object.keys(fixture).sort(), [
+  'acceptance_owners',
+  'cases',
+  'omitted_targets',
+  'pending_api_gaps',
+  'schema_version',
+]);
+assert.equal(fixture.schema_version, 5);
 assert.deepEqual(fixture.acceptance_owners, acceptanceOwners, 'A01-A29 owner matrix drifted');
 assert.deepEqual(fixture.pending_api_gaps, pendingApiGaps, 'declared production API gaps drifted');
+assert.deepEqual(fixture.omitted_targets, omittedTargets, 'omitted Rust target ownership drifted');
+assert.deepEqual(
+  Object.keys(fixture.omitted_targets).sort(),
+  discoveredOmittedTargets,
+  'every unselected Rust target must have an explicit owner, reason, and expiry',
+);
 assert.deepEqual(Object.keys(fixture.cases).sort(), [...runnableTargets].sort(), 'Rust targets drifted');
 assert.deepEqual(
   Object.keys(fixture.acceptance_owners),
