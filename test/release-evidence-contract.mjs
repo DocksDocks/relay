@@ -1047,9 +1047,20 @@ function testSourceCi(temp) {
       }),
     /workflow|validate|definition|needs/i,
   );
-  const joinAssertionOverride = authoritativeCiWorkflow().replace(
-    'echo "validation shards result: $VALIDATION_SHARDS_RESULT" >&2',
-    'echo "validation shards ignored" >&2',
+  // The join is pinned by behaviour, not bytes, so the mutation that must be caught
+  // is a WEAKENING: drop the validation-shards comparison and a pull request whose
+  // shard job was skipped goes green with nothing gated.
+  const joinAssertionLine = 'require validation-shards "$EXPECT_SHARDS" "$VALIDATION_SHARDS_RESULT"\n';
+  const authoritativeCi = authoritativeCiWorkflow();
+  assert.ok(
+    authoritativeCi.includes(joinAssertionLine.trim()),
+    'the source CI join must still compare the validation-shards result; this fixture cannot weaken what it cannot find',
+  );
+  const joinAssertionOverride = authoritativeCi.replace(`          ${joinAssertionLine}`, '');
+  assert.notEqual(
+    joinAssertionOverride,
+    authoritativeCi,
+    'the join weakening fixture must actually mutate the workflow',
   );
   expectReject(
     'source-CI validation shard assertion override',
@@ -1058,7 +1069,7 @@ function testSourceCi(temp) {
         receiptName: 'join-assertion-source-ci.json',
         workflowBytes: Buffer.from(joinAssertionOverride),
       }),
-    /workflow|validate|definition|assert/i,
+    /workflow|validate|definition|assert|join/i,
   );
 
   let runReads = 0;
