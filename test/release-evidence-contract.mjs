@@ -85,6 +85,11 @@ const PREPARATION_RUNTIME_DEPENDENCIES = [
   // The preparation binder now derives its current target set from rust-bin,
   // so the helper travels with the closure like the instance files above.
   'scripts/lib/rust-bin.mjs',
+  // The binder derives the CI shard topology it pins from the plugin registry
+  // rather than restating lanes, so the registry and its resolver travel with the
+  // closure too.
+  'scripts/lib/ci-targeting.mjs',
+  'scripts/lib/plugins.mjs',
   'scripts/lib/session-relay-release-instances/schema.mjs',
   'scripts/lib/session-relay-release-instances/0.13.0.json',
   'scripts/lib/session-relay-release-instances/0.14.0.json',
@@ -912,8 +917,14 @@ function testSourceCi(temp) {
       }),
     /workflow|job|definition|store/i,
   );
+  // The shard matrix is resolved per pull request instead of being listed literally,
+  // so the old `lane: [core, relay]` mutation has no text to bite on. These three
+  // mutations replace it and cover strictly more: a static topology of any shape is
+  // rejected (including the pre-change one, which silently drops the always-on
+  // repo-wide shard), and neutering the resolver's fail-open branch is rejected.
+  const DYNAMIC_SHARD_MATRIX = 'lane: ${{ fromJSON(needs.resolve-shards.outputs.lanes) }}';
   const mutationLaneOverride = authoritativeCiWorkflow().replace(
-    'lane: [core, relay]',
+    DYNAMIC_SHARD_MATRIX,
     'lane: [core, relay, mutations]',
   );
   expectReject(
@@ -924,6 +935,29 @@ function testSourceCi(temp) {
         workflowBytes: Buffer.from(mutationLaneOverride),
       }),
     /workflow|validation-shards|definition|matrix/i,
+  );
+  const staticShardMatrix = authoritativeCiWorkflow().replace(DYNAMIC_SHARD_MATRIX, 'lane: [core, relay]');
+  expectReject(
+    'source-CI shard matrix hard-coded back to a static lane list',
+    () =>
+      sourceCiFixture(temp, {
+        receiptName: 'static-shard-matrix-source-ci.json',
+        workflowBytes: Buffer.from(staticShardMatrix),
+      }),
+    /workflow|validation-shards|definition|matrix/i,
+  );
+  const closedShardResolution = authoritativeCiWorkflow().replace(
+    'node scripts/ci-target.mjs shards --unresolved --github-output "$GITHUB_OUTPUT"',
+    'node scripts/ci-target.mjs shards --event push --github-output "$GITHUB_OUTPUT"',
+  );
+  expectReject(
+    'source-CI shard resolver fail-open branch replaced',
+    () =>
+      sourceCiFixture(temp, {
+        receiptName: 'closed-shard-resolution-source-ci.json',
+        workflowBytes: Buffer.from(closedShardResolution),
+      }),
+    /workflow|resolve-shards|definition/i,
   );
   const conditionalShardInstall = authoritativeCiWorkflow().replace(
     `      - name: "install pnpm dependencies (--frozen-lockfile; yaml + lockfile-pinned claude-code)"
@@ -985,8 +1019,8 @@ function testSourceCi(temp) {
     /workflow|validation-shards|definition|command/i,
   );
   const joinDependencyOverride = authoritativeCiWorkflow().replace(
-    'needs: [validation-shards, targeting-contracts]',
-    'needs: [substituted-job, targeting-contracts]',
+    'needs: [validation-shards, targeting-contracts, resolve-shards]',
+    'needs: [substituted-job, targeting-contracts, resolve-shards]',
   );
   expectReject(
     'source-CI validate join dependency override',
@@ -994,6 +1028,22 @@ function testSourceCi(temp) {
       sourceCiFixture(temp, {
         receiptName: 'join-dependency-source-ci.json',
         workflowBytes: Buffer.from(joinDependencyOverride),
+      }),
+    /workflow|validate|definition|needs/i,
+  );
+  // A failed resolver skips validation-shards, and a skipped shard job reads as a
+  // pass in the join. Dropping resolve-shards from the join is therefore how a
+  // pull request goes green with no shard having run at all.
+  const joinDropsResolver = authoritativeCiWorkflow().replace(
+    'needs: [validation-shards, targeting-contracts, resolve-shards]',
+    'needs: [validation-shards, targeting-contracts]',
+  );
+  expectReject(
+    'source-CI validate join no longer depends on shard resolution',
+    () =>
+      sourceCiFixture(temp, {
+        receiptName: 'join-drops-resolver-source-ci.json',
+        workflowBytes: Buffer.from(joinDropsResolver),
       }),
     /workflow|validate|definition|needs/i,
   );
