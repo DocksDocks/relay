@@ -92,8 +92,21 @@ const PREPARATION_RUNTIME_DEPENDENCIES = [
   // The binder's PlanRun modules moved to the plan-lifecycle plugin, so a
   // fixture tree checked out at a pre-extraction source base no longer carries
   // them; the current binder travels with its current module closure.
+  //
+  // `plan-run.mjs` is a facade over `scripts/runtime/*.mjs`, so the closure is the
+  // directory, not a hand-listed set of modules. Enumerating them here is what broke when
+  // the authority split into six: the facade copied fine and then failed to resolve its own
+  // imports inside the fixture tree. Reading the directory keeps a seventh module from
+  // reintroducing that failure silently.
   'plugins/plan-lifecycle/skills/productivity/plan-manager/scripts/plan-run.mjs',
   'plugins/plan-lifecycle/skills/productivity/plan-manager/scripts/legacy-review-records.mjs',
+  ...fs
+    .readdirSync(path.join(REPO, 'plugins/plan-lifecycle/skills/productivity/plan-manager/scripts/runtime'), {
+      withFileTypes: true,
+    })
+    .filter((entry) => entry.isFile() && entry.name.endsWith('.mjs'))
+    .map((entry) => `plugins/plan-lifecycle/skills/productivity/plan-manager/scripts/runtime/${entry.name}`)
+    .sort(),
 ];
 function writeFixtureRelayIdentity(root, version) {
   const writeJson = (logical, value) => {
