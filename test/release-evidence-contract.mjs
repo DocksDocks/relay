@@ -176,8 +176,9 @@ const PLANRUN_GOAL_ID = CURRENT_RELEASE_INSTANCE.current_attempt.goal_id;
 // The plan lineage's own recorded repository identity, derived like the run id and
 // source base beside it. NOT the GitHub repo identity: proof and receipt fields keep
 // REPOSITORY_ID. The 0.15.0 lineage records a local-form id and cannot be migrated,
-// because attempt history is immutable and plan-run.mjs:1740 preserves repository_id
-// across replacement.
+// because attempt history is immutable and `replacePlanRunInPlace`
+// (`plan-manager/scripts/runtime/transaction.mjs`) preserves repository_id across
+// replacement.
 const PLANRUN_DOCKS_REPOSITORY_ID = CURRENT_RELEASE_INSTANCE.planrun_attempt.docks_repository_id;
 const PLANRUN_DOCKS_RUN_ID = CURRENT_RELEASE_INSTANCE.planrun_attempt.docks_run_id;
 const PLANRUN_DOCKS_PLAN_PATH = CURRENT_RELEASE_INSTANCE.planrun_attempt.docks_plan_path;
@@ -3767,7 +3768,8 @@ function bindPlanRunCompletionFixture(
   // suite reads it as a template. The run object below overwrites `execution_parent`
   // outright, so this is only a drift guard - but pinning it to one lifecycle state
   // made the suite fail on a legitimate `planned -> ongoing` transition. Assert what
-  // each state actually guarantees instead, mirroring plan-run.mjs:545/575/650, so
+  // each state actually guarantees instead, mirroring `validateTuple`'s per-status
+  // `execution_parent` rules (`plan-manager/scripts/runtime/plan-state.mjs`), so
   // both branches keep biting and binding `implementation_commit` later cannot break
   // them. `blocked` is the one status that legitimately sits on either side of start.
   const preStart = templateStatus === 'drafting' || templateStatus === 'planned' || templateStatus === 'scheduled';
