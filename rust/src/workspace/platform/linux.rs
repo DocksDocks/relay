@@ -771,7 +771,32 @@ impl DelegatedCgroup {
         &self,
         root: &ProcessIdentity,
     ) -> Result<EmptyEvidence, String> {
-        let deadline = Instant::now() + GRACEFUL_STOP_DEADLINE;
+        self.graceful_stop_and_wait_empty_within(
+            root,
+            Instant::now() + GRACEFUL_STOP_DEADLINE,
+            EMPTY_DEADLINE,
+        )
+    }
+
+    // The two waits below bound different things and must not share a budget.
+    // `stop_deadline` bounds how long the root may take to leave after SIGTERM;
+    // `empty_timeout` bounds how long the kernel takes to schedule the remaining
+    // members through `do_exit` once it has. Spending one budget on both meant a
+    // slow SIGTERM wait handed `wait_recursive_empty` a `Duration::ZERO`, which
+    // reads `populated` once and returns Err with no retry (see its loop), so a
+    // healthy shutdown under CPU contention became `quiesce_failed` at
+    // supervisor.rs and left custody retained for explicit recovery.
+    //
+    // The deadlines are parameters rather than constants so a test can drive the
+    // exhausted case deterministically; `wait_pidfd_exit` errors as soon as its
+    // remaining budget is zero, so the caller must pass a small nonzero stop
+    // deadline rather than an already-expired one.
+    pub fn graceful_stop_and_wait_empty_within(
+        &self,
+        root: &ProcessIdentity,
+        stop_deadline: Instant,
+        empty_timeout: Duration,
+    ) -> Result<EmptyEvidence, String> {
         if pidfd_is_live(root)? {
             if let Err(error) = signal_pidfd(root, libc::SIGTERM) {
                 if pidfd_is_live(root)? {
@@ -779,12 +804,9 @@ impl DelegatedCgroup {
                 }
             }
         }
-        wait_pidfd_exit(root, deadline)?;
+        wait_pidfd_exit(root, stop_deadline)?;
         reap_pidfd(root)?;
-        wait_recursive_empty(
-            &self.leaf,
-            deadline.saturating_duration_since(Instant::now()),
-        )?;
+        wait_recursive_empty(&self.leaf, empty_timeout)?;
         let evidence_sha256 =
             hex_digest(format!("cgroup-empty-v1\0{}\0populated=0", self.membership).as_bytes());
         Ok(EmptyEvidence {

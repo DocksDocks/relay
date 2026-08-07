@@ -194,6 +194,7 @@
         "cgroup_reconcile_removes_empty_orphan_and_refuses_nonempty_or_foreign_identity",
         "crashed_writer_recovers_only_after_empty_proof",
         "custody_packets_reject_malformed_frames_replay_and_wrong_fds",
+        "graceful_stop_keeps_the_empty_proof_off_the_stop_budget",
         "linux_cgroup_pidfd_guardian_kills_hostile_descendants",
         "macos_process_group_recursive_guardian_kills_hostile_descendants",
         "read_only_spawn_coexists_with_writer",

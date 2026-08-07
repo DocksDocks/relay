@@ -1790,3 +1790,108 @@ fn macos_process_group_recursive_guardian_kills_hostile_descendants() {
         "process groups are escapable, kqueue is PID observation rather than durable containment, and no documented public primitive provides crash-durable descendant membership plus atomic kill/empty proof",
     );
 }
+
+// Regression: the graceful-stop budget and the empty-proof budget are separate.
+//
+// They previously shared one 500 ms `Instant`, and the empty proof received
+// whatever the SIGTERM wait had not spent. Under CPU contention that remainder
+// reached zero, `wait_recursive_empty` read `populated` once and returned Err
+// with no retry, and `supervisor.rs` turned that into `quiesce_failed` and
+// retained custody. The two waits bound unrelated things - how long the root
+// takes to leave, and how long the kernel takes to schedule the remaining
+// members through `do_exit` - so one budget cannot serve both.
+//
+// The assertions come in a pair on purpose. The first proves a nearly exhausted
+// stop budget does not shorten the empty wait; the second proves the empty
+// budget is still honoured, so the first cannot pass by the deadline being
+// ignored altogether.
+#[cfg(target_os = "linux")]
+#[test]
+fn graceful_stop_keeps_the_empty_proof_off_the_stop_budget() {
+    use std::time::Instant;
+
+    if std::env::var_os("SESSION_RELAY_TEST_CGROUP_ROOT").is_none() {
+        return;
+    }
+
+    // Spawns a process, moves it into `leaf`, and returns its pid. Writing
+    // cgroup.procs is legal here because the runner already sits inside the
+    // delegated subtree, so it owns the common ancestor.
+    fn place(leaf: &std::path::Path, seconds: &str) -> libc::pid_t {
+        let child = Command::new("sleep")
+            .arg(seconds)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn cgroup member");
+        let pid = child.id() as libc::pid_t;
+        std::mem::forget(child); // reap_pidfd owns the wait; Child must not race it.
+        fs::write(leaf.join("cgroup.procs"), format!("{pid}\n")).expect("place pid in leaf");
+        pid
+    }
+
+    // A root that has already exited, so `wait_pidfd_exit` returns immediately
+    // and the stop budget is left almost entirely unspent-but-tiny.
+    fn exited_root(leaf: &std::path::Path) -> ProcessIdentity {
+        let pid = place(leaf, "0.05");
+        let pidfd = pidfd_open(pid).expect("pidfd for root");
+        let start_token = process_start_token(pid).expect("start token for root");
+        // A process that has exited but not been reaped stays in /proc as a
+        // zombie, so presence is not an exit test. Read the state field, which
+        // sits after the LAST ')' because comm is parenthesised and may itself
+        // contain spaces and parentheses. Gone or 'Z' both mean exited, and the
+        // kernel already excludes zombies from cgroup.events populated.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
+                break;
+            };
+            let tail = &stat[stat.rfind(')').map_or(0, |i| i + 2)..];
+            if tail.starts_with('Z') {
+                break;
+            }
+            assert!(Instant::now() < deadline, "root never exited");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        ProcessIdentity {
+            pid,
+            pidfd,
+            start_token,
+        }
+    }
+
+    // 1. A 100 ms stop budget must not become the empty budget. The member
+    //    lingers for 3 s, which is far beyond the stop budget and far inside
+    //    the 10 s empty budget, so only an independent budget can succeed.
+    let cgroup = DelegatedCgroup::create(&request_id()).unwrap();
+    let leaf = cgroup.path().to_owned();
+    place(&leaf, "3");
+    let root = exited_root(&leaf);
+    let evidence = cgroup
+        .graceful_stop_and_wait_empty_within(
+            &root,
+            Instant::now() + Duration::from_millis(100),
+            Duration::from_secs(10),
+        )
+        .expect("empty proof must not inherit the stop budget");
+    assert!(!evidence.populated, "evidence claims a populated leaf");
+
+    // 2. The empty budget is still enforced: the same shape with a 50 ms empty
+    //    budget and a 3 s member must fail, so assertion 1 cannot be passing
+    //    because the deadline is ignored.
+    let cgroup2 = DelegatedCgroup::create(&request_id()).unwrap();
+    let leaf2 = cgroup2.path().to_owned();
+    place(&leaf2, "3");
+    let root2 = exited_root(&leaf2);
+    let error = cgroup2
+        .graceful_stop_and_wait_empty_within(
+            &root2,
+            Instant::now() + Duration::from_millis(100),
+            Duration::from_millis(50),
+        )
+        .expect_err("a 50 ms empty budget must not outlast a 3 s member");
+    assert!(
+        error.contains("populated 0"),
+        "wrong empty-proof failure: {error}"
+    );
+}
