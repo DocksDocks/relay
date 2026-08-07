@@ -168,84 +168,96 @@ assert.ok(caseIndex >= 0 && process.argv[caseIndex + 1], 'usage: node rust-test-
 const name = process.argv[caseIndex + 1];
 assert.ok(runnableTargets.includes(name), `unknown rust test inventory case: ${name}`);
 let testEnv = process.env;
-let delegatedCgroupRoot = null;
-let originalCgroupProcs = null;
+// Three cases exercise real cgroup-v2 custody, so they need a delegated subtree this runner owns.
+// `unavailableDelegation` is non-null only when no such subtree exists; it is answered below,
+// after the inventory drift check, so an unusable host still proves the cheap half.
+let unavailableDelegation = null;
 if (
   ['workspace_identity', 'workspace_lease_process', 'workspace_coordination_process'].includes(name) &&
   process.platform === 'linux'
 ) {
+  // `systemd-run --user --scope -p Delegate=yes` hands us a cgroup we own with no privilege
+  // escalation, and `--collect` makes systemd reap the scope and everything under it once the
+  // last process exits. That is why this file no longer creates, moves into, or removes a
+  // cgroup: the previous teardown wrote `cgroup.kill` and immediately `rmdir`-ed, but
+  // `cgroup.kill` only *queues* SIGKILL, so the rmdir raced the exits and returned EBUSY,
+  // reddening a run whose every PASS line had already printed.
+  const scopeArgs = ['--user', '--scope', '-p', 'Delegate=yes', '--collect', '--quiet', '--'];
   const provided = process.env.SESSION_RELAY_TEST_CGROUP_ROOT;
   if (provided) {
+    // An explicit override wins over everything: .github/workflows/ci.yml provisions the
+    // delegation for the hosted runner and scripts/ci.mjs canonicalises it, so under CI this
+    // branch is the one that runs and this change does not touch that path.
     assert.ok(path.isAbsolute(provided), 'SESSION_RELAY_TEST_CGROUP_ROOT must be absolute');
-  } else {
-    assert.equal(typeof process.getuid, 'function', 'Linux cgroup delegation requires a native uid');
-    delegatedCgroupRoot = `/sys/fs/cgroup/session-relay-test-${process.getuid()}-${process.pid}-${Date.now()}`;
-    const create = spawnSync('sudo', ['-n', 'mkdir', delegatedCgroupRoot], { encoding: 'utf8' });
-    assert.equal(create.status, 0, `create test cgroup delegation failed:\n${create.stderr}`);
-    const own = spawnSync(
-      'sudo',
-      [
-        '-n',
-        'chown',
-        `${process.getuid()}:${process.getgid()}`,
-        delegatedCgroupRoot,
-        path.join(delegatedCgroupRoot, 'cgroup.kill'),
-        path.join(delegatedCgroupRoot, 'cgroup.procs'),
-        path.join(delegatedCgroupRoot, 'cgroup.threads'),
-        path.join(delegatedCgroupRoot, 'cgroup.subtree_control'),
-      ],
-      { encoding: 'utf8' },
-    );
-    assert.equal(own.status, 0, `own test cgroup delegation failed:\n${own.stderr}`);
-    testEnv = { ...process.env, SESSION_RELAY_TEST_CGROUP_ROOT: delegatedCgroupRoot };
+  } else if (process.env.SESSION_RELAY_TEST_CGROUP_SCOPE === '1') {
+    // We are the re-exec, running inside the delegated scope. The scope's own cgroup is the
+    // delegation: the runner is already in it, so the common ancestor of runner and leaf is a
+    // cgroup we own and clone3(CLONE_INTO_CGROUP) passes its permission check with no
+    // `cgroup.procs` relocation at all.
     const unified = fs
       .readFileSync('/proc/self/cgroup', 'utf8')
       .split('\n')
       .find((line) => line.startsWith('0::'));
     assert.ok(unified, 'Linux cgroup v2 membership is unavailable');
-    originalCgroupProcs = path.join('/sys/fs/cgroup', unified.slice(3).replace(/^\/+/, ''), 'cgroup.procs');
-    const enter = spawnSync('sudo', ['-n', 'tee', path.join(delegatedCgroupRoot, 'cgroup.procs')], {
+    const scope = path.join('/sys/fs/cgroup', unified.slice(3).replace(/^\/+/, ''));
+    // Mirror what workspace/platform/linux.rs validate_delegation demands. A scope that was
+    // created without a real delegation must name this harness, not surface as a custody error
+    // several layers down in a Rust test.
+    const scopeStat = fs.statSync(scope);
+    assert.ok(
+      scopeStat.isDirectory() && scopeStat.uid === process.getuid(),
+      `delegated scope ${scope} is not a uid-owned directory`,
+    );
+    for (const required of ['cgroup.controllers', 'cgroup.subtree_control', 'cgroup.procs']) {
+      assert.ok(fs.existsSync(path.join(scope, required)), `delegated scope ${scope} is missing ${required}`);
+    }
+    testEnv = { ...process.env, SESSION_RELAY_TEST_CGROUP_ROOT: scope };
+  } else {
+    // Probe with a throwaway scope carrying the same properties before committing: once the run
+    // is nested, "systemd could not give us a scope" and "the case failed" become the same
+    // non-zero exit, and an honest availability answer is the whole point of this branch.
+    const probe = spawnSync('systemd-run', [...scopeArgs, 'true'], {
       encoding: 'utf8',
-      input: `${process.pid}\n`,
+      stdio: ['ignore', 'pipe', 'pipe'],
     });
-    assert.equal(enter.status, 0, `enter test runner cgroup failed:\n${enter.stderr}`);
+    if (!probe.error && probe.signal === null && probe.status === 0) {
+      const scoped = spawnSync('systemd-run', [...scopeArgs, process.execPath, ...process.argv.slice(1)], {
+        stdio: 'inherit',
+        env: { ...process.env, SESSION_RELAY_TEST_CGROUP_SCOPE: '1' },
+      });
+      assert.equal(scoped.error, undefined, `delegated scope could not run this case: ${scoped.error?.message}`);
+      assert.equal(scoped.signal, null, `delegated case run was killed by ${scoped.signal}`);
+      process.exit(scoped.status);
+    }
+    unavailableDelegation = probe.error?.message || probe.stderr?.trim() || probe.signal || `exit ${probe.status}`;
   }
 }
-const cleanupDelegation = () => {
-  if (!delegatedCgroupRoot) return;
-  if (originalCgroupProcs) {
-    const restore = spawnSync('sudo', ['-n', 'tee', originalCgroupProcs], {
-      encoding: 'utf8',
-      input: `${process.pid}\n`,
-    });
-    assert.equal(restore.status, 0, `restore test runner cgroup failed:\n${restore.stderr}`);
-    originalCgroupProcs = null;
-  }
-  const removeChildCgroups = (root) => {
-    for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
-      if (!entry.isDirectory()) continue;
-      const child = path.join(root, entry.name);
-      removeChildCgroups(child);
-      fs.rmdirSync(child);
-    }
-  };
-  try {
-    fs.writeFileSync(path.join(delegatedCgroupRoot, 'cgroup.kill'), '1\n');
-  } catch (error) {
-    if (error.code !== 'ENOENT') throw error;
-  }
-  removeChildCgroups(delegatedCgroupRoot);
-  const cleanup = spawnSync('sudo', ['-n', 'rmdir', delegatedCgroupRoot], { encoding: 'utf8' });
-  if (cleanup.status !== 0) {
-    process.stderr.write(`cleanup test cgroup delegation failed:\n${cleanup.stderr}`);
-    process.exitCode = 1;
-  }
-  delegatedCgroupRoot = null;
-};
-process.on('exit', cleanupDelegation);
 
 const actual = listTests(name);
 assert.deepEqual(actual, fixture.cases[name].tests, `${name}: executable test inventory drifted`);
+if (unavailableDelegation) {
+  // Loud under CI: the hosted runner is expected to supply SESSION_RELAY_TEST_CGROUP_ROOT, so
+  // reaching here means the delegation the workflow promised is gone and these three cases would
+  // otherwise become a silent hole in the gate.
+  assert.notEqual(
+    process.env.GITHUB_ACTIONS,
+    'true',
+    `${name}: cgroup delegation is unavailable under CI (${unavailableDelegation}); ` +
+      'expected SESSION_RELAY_TEST_CGROUP_ROOT from the workflow or a usable systemd --user scope',
+  );
+  process.stderr.write(
+    `\n${'='.repeat(78)}\n` +
+      `NOT RUN: ${name} needs an owned cgroup-v2 delegation and this host has none.\n` +
+      `  systemd-run --user --scope -p Delegate=yes failed: ${unavailableDelegation}\n` +
+      '  Fix by starting a systemd user manager (loginctl enable-linger "$USER"), or point\n' +
+      '  SESSION_RELAY_TEST_CGROUP_ROOT at a cgroup-v2 directory you own.\n' +
+      `  The Rust custody tests for ${name} did NOT execute; this is not a pass.\n` +
+      `${'='.repeat(78)}\n\n`,
+  );
+  // No PASS line: a case that did not execute must never print one.
+  console.log(`SKIP rust_test_inventory case=${name} reason=cgroup-delegation-unavailable`);
+  process.exit(0);
+}
 const executed = spawnSync('cargo', ['test', '--locked', '--test', name, '--', '--nocapture', '--test-threads=1'], {
   cwd: rust,
   encoding: 'utf8',
@@ -265,4 +277,3 @@ for (const [acceptance, owner] of Object.entries(acceptanceOwners)) {
     console.log(`PASS acceptance=${acceptance} owner=${owner}`);
   }
 }
-cleanupDelegation();
