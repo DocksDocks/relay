@@ -5,6 +5,7 @@ import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { scaledTimeout } from './lib/time-factor.mjs';
 import { createFixture, createScenarioCheck, runScenarioCli } from './selftest-fixture.mjs';
 
 const testUuid = (value) => `00000000-0000-4000-8000-${value.toString(16).padStart(12, '0')}`;
@@ -174,7 +175,7 @@ export async function run({ bin, home, emit }) {
 
     const sleep = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
     const waitFor = (predicate, label, timeoutMs = 5000) => {
-      const deadline = Date.now() + timeoutMs;
+      const deadline = Date.now() + scaledTimeout(timeoutMs);
       while (Date.now() < deadline) {
         if (predicate()) return;
         sleep(25);

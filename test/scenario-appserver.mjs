@@ -5,6 +5,7 @@ import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { scaledTimeout } from './lib/time-factor.mjs';
 import { createFixture, createScenarioCheck, runScenarioCli } from './selftest-fixture.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -254,7 +255,7 @@ export async function run({ bin, home, emit }) {
   const lifecycleWait = new Int32Array(new SharedArrayBuffer(4));
   const waitForLifecycleCustody = () => {
     const lifecyclePath = path.join(HOME, 'lifecycle-v1.json');
-    const deadline = Date.now() + 5_000;
+    const deadline = Date.now() + scaledTimeout(5_000);
     while (fs.existsSync(lifecyclePath)) {
       const state = JSON.parse(fs.readFileSync(lifecyclePath, 'utf8')).state;
       const supervisors = Object.keys(state.lifecycle_supervisors ?? {});
@@ -306,7 +307,7 @@ process.exit(Number(process.env.WAKE_STUB_STATUS || 0));
     );
     const sleep = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
     const waitFor = (predicate, label, timeoutMs = 5000) => {
-      const deadline = Date.now() + timeoutMs;
+      const deadline = Date.now() + scaledTimeout(timeoutMs);
       while (Date.now() < deadline) {
         if (predicate()) return;
         sleep(25);

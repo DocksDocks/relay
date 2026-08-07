@@ -7,8 +7,17 @@ use std::path::{Path, PathBuf};
 use std::sync::Once;
 use std::time::{Duration, SystemTime};
 
-/// Homes abandoned for a full day cannot belong to a live test binary.
-const STALE_HOME_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+/// Fallback for homes whose name does not carry a parsable PID. Liveness does
+/// the real work now, so this only has to outlast the slowest single target
+/// (~250 s) by a wide margin.
+const STALE_HOME_AGE: Duration = Duration::from_secs(60 * 60);
+
+/// A dead PID can be recycled onto a fresh test binary, which would then be
+/// holding a home this sweep is about to delete. Requiring the home to also be
+/// untouched for this long makes that window unreachable in practice: the
+/// recycled process would have to create its home and then leave it idle for
+/// five minutes before the sweep looked at it.
+const PID_REUSE_GRACE: Duration = Duration::from_secs(5 * 60);
 
 /// One sweep per test binary. `fresh_home` has 54 call sites, and the tree this
 /// scans can hold hundreds of entries, so sweeping per call would pay a full
@@ -20,34 +29,73 @@ static SWEEP_ONCE: Once = Once::new();
 /// `fresh_home` hands back a plain `PathBuf` with no RAII guard, and cleanup is
 /// left to each caller: many never do it, and a panicking test never reaches
 /// its `remove_dir_all`. So homes accumulate even across fully passing runs -
-/// one observed tree held 517 of them from 76 distinct PIDs. Sweeping on entry
-/// keeps that bounded without changing the signature at 54 call sites, and
-/// preserves same-day directories for post-mortem inspection. Only entries
-/// older than a full day are removed, so a concurrently running test binary's
-/// homes are never touched.
+/// one observed tree held 446 of them, 168 MB and 223 live Git worktree
+/// markers, none older than 18 hours. Sweeping on entry keeps that bounded
+/// without changing the signature at 54 call sites.
+///
+/// Two rules, in order:
+///
+/// 1. `fresh_home` names every home `relay-test-{tag}-{pid}-{uuid}`, so the
+///    owning process is written on the directory. A home whose PID is no
+///    longer alive is reaped once it has also been idle for `PID_REUSE_GRACE`.
+///    That is exact rather than a guess, and it collects a crashed test's home
+///    on the very next run instead of a day later. Our own PID is never
+///    reaped, and neither is a name we cannot parse.
+/// 2. Anything unparsable falls back to plain age (`STALE_HOME_AGE`), so a
+///    home from some older naming scheme still gets collected eventually.
+///
+/// An age threshold alone was the previous rule and could not work: it was set
+/// to a full day while roughly 25 homes per hour arrive, so it legitimately
+/// reaped nothing.
 fn sweep_stale_homes(root: &Path) {
     let Ok(entries) = fs::read_dir(root) else {
         return;
     };
     let now = SystemTime::now();
+    let self_pid = std::process::id();
     for entry in entries.flatten() {
-        if !entry
-            .file_name()
-            .to_string_lossy()
-            .starts_with("relay-test-")
-        {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.starts_with("relay-test-") {
             continue;
         }
-        let stale = entry
+        let Ok(idle) = entry
             .metadata()
             .and_then(|meta| meta.modified())
-            .ok()
-            .and_then(|modified| now.duration_since(modified).ok())
-            .is_some_and(|age| age >= STALE_HOME_AGE);
+            .map(|modified| now.duration_since(modified).unwrap_or_default())
+        else {
+            continue;
+        };
+        let stale = match home_owner_pid(&name) {
+            Some(pid) => pid != self_pid && !pid_is_alive(pid) && idle >= PID_REUSE_GRACE,
+            None => idle >= STALE_HOME_AGE,
+        };
         if stale {
             fs::remove_dir_all(entry.path()).ok();
         }
     }
+}
+
+/// Recover the PID `fresh_home` stamped into `relay-test-{tag}-{pid}-{uuid}`.
+///
+/// The tag itself contains hyphens ("repository-gate"), so the PID can only be
+/// found from the right: the UUID is always the last five hyphen-separated
+/// fields.
+fn home_owner_pid(name: &str) -> Option<u32> {
+    let rest = name.strip_prefix("relay-test-")?;
+    let mut fields = rest.rsplit('-').skip(5);
+    let pid: u32 = fields.next()?.parse().ok()?;
+    // A tag must precede the PID; a bare `relay-test-<pid>-<uuid>` is not ours.
+    fields.next()?;
+    (pid > 0).then_some(pid)
+}
+
+/// `EPERM` means the PID exists and belongs to someone else, which is still
+/// alive for our purposes. Only `ESRCH` proves nobody holds it.
+fn pid_is_alive(pid: u32) -> bool {
+    if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }
 
 pub fn fresh_home(tag: &str) -> PathBuf {

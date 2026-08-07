@@ -5,6 +5,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { scaledTimeout } from './lib/time-factor.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const plugin = path.resolve(here, '..');
@@ -40,7 +41,7 @@ const git = (args, cwd = repo) => {
 };
 const relay = (args, options = {}) => run(bin, args, options);
 const waitFor = (description, predicate, timeoutMs = 10_000) => {
-  const deadline = Date.now() + timeoutMs;
+  const deadline = Date.now() + scaledTimeout(timeoutMs);
   while (Date.now() < deadline) {
     if (predicate()) return;
     sleep(50);

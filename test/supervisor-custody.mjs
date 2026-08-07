@@ -4,6 +4,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { scaledTimeout } from './lib/time-factor.mjs';
 
 if (process.argv[2] !== '--matrix') {
   console.error('usage: node supervisor-custody.mjs --matrix');
@@ -66,7 +67,7 @@ function operationRows(home) {
 }
 
 async function waitFor(label, predicate, timeoutMs = 5000) {
-  const deadline = Date.now() + timeoutMs;
+  const deadline = Date.now() + scaledTimeout(timeoutMs);
   while (Date.now() < deadline) {
     const value = predicate();
     if (value) return value;

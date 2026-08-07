@@ -167,6 +167,11 @@ const caseIndex = process.argv.indexOf('--case');
 assert.ok(caseIndex >= 0 && process.argv[caseIndex + 1], 'usage: node rust-test-inventory.mjs --case <name>');
 const name = process.argv[caseIndex + 1];
 assert.ok(runnableTargets.includes(name), `unknown rust test inventory case: ${name}`);
+// Widen the Rust poll-wait deadlines for this whole case. Mutating `process.env` rather than a
+// derived object is deliberate: every downstream spawn either passes `process.env` directly or
+// spreads it (including the `systemd-run` re-exec below, which builds an explicit `env`), so a
+// value set here survives both branches and cannot be dropped by one of them.
+process.env.SESSION_RELAY_TEST_TIME_FACTOR ||= '4';
 let testEnv = process.env;
 // Three cases exercise real cgroup-v2 custody, so they need a delegated subtree this runner owns.
 // `unavailableDelegation` is non-null only when no such subtree exists; it is answered below,

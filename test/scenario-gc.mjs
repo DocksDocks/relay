@@ -4,6 +4,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { scaledTimeout } from './lib/time-factor.mjs';
 import { createFixture, createScenarioCheck, runScenarioCli } from './selftest-fixture.mjs';
 
 export const EXPECTED_LABELS = [
@@ -27,7 +28,7 @@ export async function run({ bin, home, emit }) {
   const { bin: BIN, home: HOME, envFor, trackChild } = fixture;
   const sleep = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
   const waitFor = (predicate, label, timeoutMs = 5000) => {
-    const deadline = Date.now() + timeoutMs;
+    const deadline = Date.now() + scaledTimeout(timeoutMs);
     while (Date.now() < deadline) {
       if (predicate()) return;
       sleep(25);

@@ -12,6 +12,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
+use support::workspace::scaled_timeout;
 use support::{SupervisorGroupReaper, fresh_home, write_executable};
 use tinyjson::JsonValue;
 
@@ -44,7 +45,7 @@ fn seed_entry(home: &Path, id: &str, tool: &str, cwd: &Path) {
 }
 
 fn wait_until(timeout: Duration, message: &str, mut predicate: impl FnMut() -> bool) {
-    let deadline = Instant::now() + timeout;
+    let deadline = Instant::now() + scaled_timeout(timeout);
     while !predicate() {
         assert!(Instant::now() < deadline, "{message}");
         thread::sleep(Duration::from_millis(20));

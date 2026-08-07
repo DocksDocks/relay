@@ -1,4 +1,6 @@
-use relay::workspace::authority::AuthorityRoots;
+use relay::workspace::authority::{
+    AuthorityRootProvider, AuthorityRoots, SystemAuthorityRootProvider,
+};
 use relay::workspace::resources::executable_sha256;
 use relay::workspace::schema::{
     AbortRequestV1, CleanupReceiptV1, ClosedJcs, FinishRequestV1, HandbackRequestV1,
@@ -15,9 +17,10 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 use super::fresh_home;
@@ -32,6 +35,11 @@ pub struct TestRepository {
     pub root: PathBuf,
     pub home: PathBuf,
     pub base_commit: String,
+    /// This repository's product identity, computed exactly as `WorkspaceGit::open`
+    /// does (`src/workspace/git.rs:72`) from the canonical Git common dir's device
+    /// and inode. Captured at init, while that directory is guaranteed to exist,
+    /// so `Drop` can name this test's own records in the real user roots.
+    repository_id: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -68,10 +76,22 @@ impl TestRepository {
         git_ok(&root, ["add", "--", "base.txt"]);
         git_ok(&root, ["commit", "--quiet", "-m", "base"]);
         let base_commit = git_stdout(&root, ["rev-parse", "HEAD"]);
+        let common_dir = fs::canonicalize(git_stdout(
+            &root,
+            ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        ))
+        .expect("canonicalize Git common dir");
+        let common_meta = fs::metadata(&common_dir).expect("stat Git common dir");
+        let repository_id = relay::workspace::authority::repository_id(
+            unsafe { libc::geteuid() },
+            common_meta.dev(),
+            common_meta.ino(),
+        );
         Self {
             root,
             home,
             base_commit,
+            repository_id,
         }
     }
 
@@ -104,8 +124,49 @@ impl TestRepository {
 
 impl Drop for TestRepository {
     fn drop(&mut self) {
+        remove_system_records(&self.repository_id);
         let _ = fs::remove_dir_all(&self.home);
     }
+}
+
+/// Reclaim the records the relay binary wrote into the *real* user roots for
+/// this repository.
+///
+/// Integration tests that drive the shipped binary as a subprocess cannot
+/// redirect it: `SystemAuthorityRootProvider` resolves roots from the passwd
+/// database and deliberately ignores `HOME` (`src/workspace/authority.rs:179`).
+/// Such a test deposits a `workspaces-v1/<repository_id>/` tree and a
+/// `repository-gates/<repository_id>.lock` under the developer's home, and
+/// nothing ever reclaims them - one observed tree held 397 directories.
+///
+/// Every path below is derived from THIS repository's identity, a digest over
+/// the Git common dir's inode. That inode is pinned for as long as the
+/// repository exists, so no concurrently running test can share the digest and
+/// this stays safe under `cargo test`'s default in-process parallelism. Nothing
+/// here enumerates a root or deletes by age, and cleanup is best effort: a
+/// failure must never fail a passing test.
+///
+/// `data/preserved/` is deliberately absent. It is a product crash-recovery
+/// path holding user WIP receipts (`src/workspace.rs:727`), it is not keyed by
+/// repository, and no path below can name it: `repository_id` is a 64-character
+/// hex digest, so it never collides with `preserved` or `repositories`.
+fn remove_system_records(repository_id: &str) {
+    let Ok(roots) = SystemAuthorityRootProvider.roots() else {
+        return;
+    };
+    for directory in [
+        roots.data.join(repository_id),
+        roots.data.join("repositories").join(repository_id),
+        roots.authority.join("repositories").join(repository_id),
+    ] {
+        let _ = fs::remove_dir_all(directory);
+    }
+    let _ = fs::remove_file(
+        roots
+            .authority
+            .join("repository-gates")
+            .join(format!("{repository_id}.lock")),
+    );
 }
 
 pub fn git_output<I, S>(cwd: &Path, args: I) -> Output
@@ -227,8 +288,36 @@ where
     relay_output(cwd, command)
 }
 
+/// Test-only wall-clock multiplier for poll-wait deadlines.
+///
+/// The gate runs one target at a time but overlaps the Rust phase with other
+/// work, so a wait with comfortable margin on an idle host can sit under 2x in
+/// the real harness shape. Widening applies ONLY where a poll-wait helper
+/// computes its deadline: every duration a test asserts on is passed somewhere
+/// else, so helper-body-only scaling cannot move an assertion.
+const TIME_FACTOR_VAR: &str = "SESSION_RELAY_TEST_TIME_FACTOR";
+
+/// A 20 ms poll loop must not touch the environment on every iteration.
+static TIME_FACTOR: LazyLock<u32> = LazyLock::new(|| match std::env::var(TIME_FACTOR_VAR) {
+    Err(std::env::VarError::NotPresent) => 1,
+    Ok(raw) if raw.is_empty() => 1,
+    Ok(raw) => raw
+        .parse::<u32>()
+        .ok()
+        .filter(|factor| (1..=100).contains(factor))
+        .unwrap_or_else(|| panic!("{TIME_FACTOR_VAR} must be an integer 1..=100, got {raw:?}")),
+    // Silently defaulting would hide a mistyped override behind a flaky run.
+    Err(std::env::VarError::NotUnicode(raw)) => {
+        panic!("{TIME_FACTOR_VAR} must be an integer 1..=100, got {raw:?}")
+    }
+});
+
+pub fn scaled_timeout(base: Duration) -> Duration {
+    base * *TIME_FACTOR
+}
+
 pub fn wait_until(description: &str, timeout: Duration, mut condition: impl FnMut() -> bool) {
-    let deadline = Instant::now() + timeout;
+    let deadline = Instant::now() + scaled_timeout(timeout);
     while Instant::now() < deadline {
         if condition() {
             return;

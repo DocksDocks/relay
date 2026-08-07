@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { scaledTimeout } from './lib/time-factor.mjs';
 import { createFixture, createScenarioCheck, runScenarioCli } from './selftest-fixture.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -667,7 +668,7 @@ export async function run({ bin, home, emit }) {
     const lifecycleState = () => JSON.parse(fs.readFileSync(path.join(HOME, 'lifecycle-v1.json'), 'utf8')).state;
     const lifecycleWait = new Int32Array(new SharedArrayBuffer(4));
     waitForLifecycleCustody = () => {
-      const deadline = Date.now() + 5_000;
+      const deadline = Date.now() + scaledTimeout(5_000);
       while (true) {
         const state = lifecycleState();
         const supervisors = Object.keys(state.lifecycle_supervisors ?? {});

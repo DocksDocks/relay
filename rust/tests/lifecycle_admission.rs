@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 use support::fresh_home;
+use support::workspace::scaled_timeout;
 use tinyjson::JsonValue;
 
 fn seed_entry(home: &Path, id: &str, tool: &str, cwd: &Path) {
@@ -115,7 +116,7 @@ fn active_worker(
 }
 
 fn wait_until(mut predicate: impl FnMut() -> bool, message: &str) {
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + scaled_timeout(Duration::from_secs(3));
     while !predicate() {
         assert!(Instant::now() < deadline, "{message}");
         thread::sleep(Duration::from_millis(10));
