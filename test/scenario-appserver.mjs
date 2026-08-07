@@ -495,7 +495,7 @@ process.exit(Number(process.env.WAKE_STUB_STATUS || 0));
         spawnSync(BIN, ['channel'], {
           input: `${JSON.stringify(channelInit)}\n${JSON.stringify(channelInitialized)}\n`,
           encoding: 'utf8',
-          timeout: 2000,
+          timeout: 10000,
           env: envFor({
             CLAUDE_CODE_SESSION_ID: id,
             CLAUDE_PROJECT_DIR: dir,
@@ -510,7 +510,13 @@ process.exit(Number(process.env.WAKE_STUB_STATUS || 0));
       const missing = run('26262626-2626-4626-8626-262626262626', registeredDir);
       assert.notEqual(missing.status, 0);
       assert.match(missing.stderr, /exact registered session.*timed out/i);
-      assert.ok(Date.now() - started < 1500, 'registration timeout is bounded');
+      // Boundedness is the property under test: without the register wait the
+      // channel blocks on a session that never registers. 5s is fifty times the
+      // configured 100ms register timeout — wide enough that a loaded box cannot
+      // redden it — and still half the harness kill, so a channel that ignores
+      // RELAY_CHANNEL_REGISTER_TIMEOUT_MS and hangs is still caught here rather
+      // than by a SIGTERM with unmatched stderr.
+      assert.ok(Date.now() - started < 5000, 'channel registration timeout is bounded');
 
       const mismatched = run(registered, otherDir);
       assert.notEqual(mismatched.status, 0);

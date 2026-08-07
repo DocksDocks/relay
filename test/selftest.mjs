@@ -17,8 +17,15 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PLUGIN = path.resolve(HERE, '..');
 const MAX_CAPTURE_BYTES = 16 * 1024 * 1024;
 const MAX_RESULT_BYTES = 1024 * 1024;
+// SIGTERM politeness budget. Expiring only escalates to SIGKILL, so it is never a verdict on the
+// child - a slow-to-schedule exit on a saturated box costs an extra signal, not a failed run.
 const TERMINATE_GRACE_MS = 300;
-const TERMINATE_KILL_MS = 1000;
+// SIGKILL backstop. Only a process that genuinely refuses to die can consume this - see
+// rust/tests/support/mod.rs, where stubs that ignore TERM/HUP/INT were observed outliving their
+// run by 16 hours - so it is deliberately generous: a SIGKILLed process merely waiting to be
+// scheduled through exit must never be reported as an infrastructure failure.
+const TERMINATE_KILL_MS = 15_000;
+const TREE_POLL_INTERVAL_MS = 20;
 const RESULT_CLOCK_TOLERANCE_MS = 1000;
 const RESULT_KEYS = ['count', 'labels', 'scenario', 'schema', 'status'];
 const SUN_PATH_LIMIT_BYTES = 108;
@@ -226,10 +233,60 @@ function waitForClose(child, timeoutMs) {
   });
 }
 
-function processTreePids(rootPid) {
+// A pid alone is not an identity. A gate run churns thousands of short-lived pids, so a pid taken
+// from the `ps` snapshot below can be recycled before we signal or re-check it. Field 22
+// (starttime) of /proc/<pid>/stat pins the identity: a recycled pid reads back a different value.
+// Without the pin teardown can SIGKILL an unrelated process, or count a stranger as a survivor and
+// fail the run for it.
+function readPidStartTime(pid) {
+  let stat;
+  try {
+    stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+  } catch {
+    return null;
+  }
+  // Field 2 (comm) is parenthesised and may itself contain spaces and parentheses, so the later
+  // fields are only recoverable by splitting on the LAST ')': fields[0] is field 3 (state), which
+  // puts field 22 at fields[19].
+  const fields = stat
+    .slice(stat.lastIndexOf(')') + 1)
+    .trim()
+    .split(/\s+/);
+  return fields[19] ?? null;
+}
+
+// Hosts without /proc cannot pin identities. Treating every pid as vanished there would make
+// teardown vacuous - nothing signalled, nothing ever a survivor - so fall back to the unpinned
+// liveness probe instead of silently skipping the work.
+const PIDS_ARE_PINNED = readPidStartTime(process.pid) !== null;
+
+function pidTarget(pid) {
+  return { pid, startTime: readPidStartTime(pid), group: false };
+}
+
+// A process group cannot be pinned by starttime, and does not need to be: the kernel keeps a pid
+// number allocated while it is still in use as a pgid, so -pid cannot name a stranger's group
+// while any member of this tree is alive.
+function processGroupTarget(pid) {
+  return { pid: -pid, startTime: null, group: true };
+}
+
+function targetIsAlive(target) {
+  if (!target.group && PIDS_ARE_PINNED)
+    return target.startTime !== null && readPidStartTime(target.pid) === target.startTime;
+  try {
+    process.kill(target.pid, 0);
+    return true;
+  } catch (error) {
+    if (error?.code === 'ESRCH') return false;
+    throw error;
+  }
+}
+
+function processTreeTargets(rootPid) {
   if (!Number.isInteger(rootPid)) return [];
   const result = spawnSync('ps', ['-eo', 'pid=,ppid='], { encoding: 'utf8' });
-  if (result.status !== 0) return [rootPid];
+  if (result.status !== 0) return [pidTarget(rootPid)];
   const children = new Map();
   for (const line of result.stdout.split('\n')) {
     const [pidText, parentText] = line.trim().split(/\s+/);
@@ -246,51 +303,50 @@ function processTreePids(rootPid) {
     pids.push(pid);
   };
   visit(rootPid);
-  return pids;
+  // Starttimes are captured here, while the snapshot is fresh, so every later signal and liveness
+  // check compares against the process we actually saw.
+  return pids.map(pidTarget);
 }
 
-function signalPids(pids, signal) {
-  for (const pid of pids) {
+function signalTargets(targets, signal) {
+  for (const target of targets) {
+    // Re-verify identity immediately before signalling: a pid recycled since the snapshot must
+    // never receive our signal. A pid that has vanished is done, not an error.
+    if (!targetIsAlive(target)) continue;
     try {
-      process.kill(pid, signal);
+      process.kill(target.pid, signal);
     } catch (error) {
       if (error?.code !== 'ESRCH') throw error;
     }
   }
 }
 
-function livePids(pids) {
-  return pids.filter((pid) => {
-    try {
-      process.kill(pid, 0);
-      return true;
-    } catch (error) {
-      if (error?.code === 'ESRCH') return false;
-      throw error;
-    }
-  });
+function liveTargets(targets) {
+  return targets.filter(targetIsAlive);
 }
 
-async function waitForPids(pids, timeoutMs) {
+// Bounded polling on the observed state of the tree. The deadline bounds a stuck process; it does
+// not budget how long the kernel may take to run exits, which is why every caller polls rather
+// than sleeping a fixed interval and declaring a verdict.
+async function waitForTreeExit(targets, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
-  let remaining = livePids(pids);
+  let remaining = liveTargets(targets);
   while (remaining.length > 0 && Date.now() < deadline) {
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    remaining = livePids(remaining);
+    await new Promise((resolve) => setTimeout(resolve, TREE_POLL_INTERVAL_MS));
+    remaining = liveTargets(remaining);
   }
   return remaining;
 }
 
 async function terminateProcessTree(child) {
   if (child.exitCode !== null || child.signalCode !== null) return;
-  const pids = processTreePids(child.pid);
-  if (Number.isInteger(child.pid)) signalPids([-child.pid], 'SIGTERM');
-  signalPids(pids, 'SIGTERM');
-  const remaining = await waitForPids(pids, TERMINATE_GRACE_MS);
+  const groupTargets = Number.isInteger(child.pid) ? [processGroupTarget(child.pid)] : [];
+  const targets = [...groupTargets, ...processTreeTargets(child.pid)];
+  signalTargets(targets, 'SIGTERM');
+  const remaining = await waitForTreeExit(targets, TERMINATE_GRACE_MS);
   if (remaining.length > 0) {
-    if (Number.isInteger(child.pid)) signalPids([-child.pid], 'SIGKILL');
-    signalPids(remaining, 'SIGKILL');
-    await waitForPids(remaining, TERMINATE_KILL_MS);
+    signalTargets(remaining, 'SIGKILL');
+    await waitForTreeExit(remaining, TERMINATE_KILL_MS);
   }
   await waitForClose(child, TERMINATE_KILL_MS);
 }

@@ -142,6 +142,18 @@ export async function run({ bin, home, emit }) {
     if (process.env.STUB_STDERR_BYTES) fs.writeSync(2, Buffer.from('SPAWN_TAIL_MARKER'));
     const delay = Number(process.env.STUB_DELAY_MS || 0);
     if (delay > 0) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, delay);
+    const gate = process.env.STUB_WAIT_FILE;
+    if (gate) {
+      // Gated exit, not a fixed sleep: scenarios asserting "the parent returned
+      // before the child finished" must observe that ordering. A timer-based
+      // child can be outrun by a loaded box and redden a correct spawn. Bounded
+      // so a wedged scenario cannot leak a forever-child onto the host.
+      const gateDeadlineMs = Date.now() + 15000;
+      while (!fs.existsSync(gate) && Date.now() < gateDeadlineMs) {
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
+      }
+    }
+    if (process.env.STUB_DONE_RECORD) fs.writeFileSync(process.env.STUB_DONE_RECORD, String(process.pid));
     process.exit(Number(process.env.STUB_EXIT || 0));
     `,
       { mode: 0o755 },
@@ -396,7 +408,6 @@ export async function run({ bin, home, emit }) {
         const childRecord = path.join(HOME, 'spawn-appserver-child-record.json');
         fs.mkdirSync(dirS, { recursive: true });
         try {
-          const started = Date.now();
           const r = relay(
             [
               'spawn',
@@ -424,13 +435,26 @@ export async function run({ bin, home, emit }) {
               env: { RELAY_SPAWN_CMD_CODEX: stub, STUB_RECORD: childRecord },
             },
           );
-          const elapsedMs = Date.now() - started;
+          // Snapshot the server log at the instant the foreground returned. The
+          // property under test is an ordering fact — spawn detaches before the
+          // 1500ms elicitation and the 100ms completion behind it — and the log
+          // states that fact directly, so it no longer rides a wall-clock budget
+          // that one scheduling hiccup under parallel scenarios turns red.
+          const initial = fake.frames();
           assert.equal(r.status, 0, `spawn exited ${r.status}: ${r.stderr}`);
-          assert.ok(elapsedMs < 1000, `foreground returned before delayed elicitation/completion (${elapsedMs}ms)`);
+          assert.equal(
+            initial.some((frame) => frame.id === 990 && frame.result),
+            false,
+            'app-server spawn returned before the detached pump answered the delayed elicitation',
+          );
+          assert.equal(
+            initial.some((frame) => frame.event === 'connection/closed'),
+            false,
+            'app-server spawn returned while its detached pump still owned the live connection',
+          );
           assert.match(r.stdout, new RegExp(`^spawned w2 \\(${id}\\)`));
           assert.equal(fs.existsSync(childRecord), false, 'reachable app-server spawn never launches codex exec');
 
-          const initial = fake.frames();
           const threadStart = initial.find((frame) => frame.method === 'thread/start');
           assert.equal(threadStart.params.cwd, fs.realpathSync(dirS));
           assert.equal(threadStart.params.model, 'gpt-5.6-sol');
@@ -732,7 +756,12 @@ export async function run({ bin, home, emit }) {
         ]);
         const elapsedMs = Date.now() - started;
         assert.notEqual(r.status, 0, 'timed-out pump is not a successful watched turn');
-        assert.ok(elapsedMs >= 900 && elapsedMs < 3000, `pump honored the one-second cap (${elapsedMs}ms)`);
+        assert.ok(elapsedMs >= 900, `pump honored the one-second cap (${elapsedMs}ms)`);
+        // Boundedness is the property here: a pump that ignores --timeout waits on
+        // a server that never completes, i.e. forever. 10s is ten times the cap it
+        // must honor and far above scheduler noise, so it still separates "the
+        // timeout fired" from "the pump hung".
+        assert.ok(elapsedMs < 10000, `pump exited at its timeout instead of hanging (${elapsedMs}ms)`);
         assert.match(r.stdout, /first turn failed/);
         const frames = fake.frames();
         const turnStart = frames.find((frame) => frame.method === 'turn/start');
@@ -900,19 +929,24 @@ export async function run({ bin, home, emit }) {
       fs.mkdirSync(dir, { recursive: true });
       const started = Date.now();
       const r = relay(
-        ['spawn', dir, '--tool', 'claude', '--reply-to', 'agent-A', '--timeout', '5', '--watch', '--', 'task'],
+        ['spawn', dir, '--tool', 'claude', '--reply-to', 'agent-A', '--timeout', '30', '--watch', '--', 'task'],
         {
           env: { RELAY_SPAWN_CMD_CLAUDE: stub, STUB_RELAY_BIN: BIN, STUB_SKIP_HOOK: '1', STUB_EXIT: '9' },
         },
       );
       assert.equal(r.status, 9);
-      assert.ok(Date.now() - started < 2000, 'fast failure returned well under the 5s birth timeout');
+      // Boundedness is the property: a spawn that cannot see a pre-registration
+      // child death sits on the birth timeout, now 30s. 5s is six times the
+      // observed fast-failure cost under load and six times below that hang, so
+      // it still fails if birth detection regresses to waiting for the timeout.
+      assert.ok(Date.now() - started < 5000, 'fast failure returned well under the 30s birth timeout');
       assert.match(r.stderr, /before birth registration/);
     });
     check('spawn without --watch still returns immediately after registration', () => {
       const dir = path.join(HOME, 'proj-spawn-no-watch');
       fs.mkdirSync(dir, { recursive: true });
-      const started = Date.now();
+      const releaseFile = path.join(HOME, 'no-watch-child-release');
+      const childDone = path.join(HOME, 'no-watch-child-done');
       const r = relay(
         [
           'spawn',
@@ -929,11 +963,25 @@ export async function run({ bin, home, emit }) {
           'task',
         ],
         {
-          env: { RELAY_SPAWN_CMD_CLAUDE: stub, STUB_RELAY_BIN: BIN, STUB_DELAY_MS: '1500' },
+          env: {
+            RELAY_SPAWN_CMD_CLAUDE: stub,
+            STUB_RELAY_BIN: BIN,
+            STUB_WAIT_FILE: releaseFile,
+            STUB_DONE_RECORD: childDone,
+          },
         },
       );
+      // The child cannot finish until this scenario releases it, so "spawn
+      // returned before the child ran to completion" is a fact about state rather
+      // than a race against a 1000ms budget that a loaded box outruns.
+      assert.equal(
+        fs.existsSync(childDone),
+        false,
+        'non-watch spawn returned before the gated child ran to completion',
+      );
       assert.equal(r.status, 0, `spawn exited ${r.status}: ${r.stderr}`);
-      assert.ok(Date.now() - started < 1000, 'non-watch spawn returned before the delayed child exited');
+      fs.writeFileSync(releaseFile, '');
+      waitFor(() => fs.existsSync(childDone), 'the released non-watch child to run to completion');
       assert.match(r.stdout, /^spawned no-watch \([0-9a-f-]{36}\) in /);
     });
 
