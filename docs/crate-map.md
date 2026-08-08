@@ -152,6 +152,40 @@ No integration target stays outside the gate. The five binaries that earlier wai
 - **Lock order spans modules.** Lifecycle documents that the global store lock is never held while waiting for a session-binding lock, while repository admission separately tracks short-lock ranks in thread-local state and rejects inversions (`src/lifecycle.rs:1-7`, `src/lifecycle.rs:4914-4961`, `src/workspace/repository_gate.rs:18-90`). The OFD lifetime lease is a different lock class again (`src/workspace/authority.rs:590-828`).
 - **App-server injection must settle before turn start.** Starting immediately after `thread/inject_items` can wedge a turn, so delivery sleeps for the configured settle interval and must answer elicitation requests while awaiting completion (`src/appserver.rs:9-20`, `src/appserver.rs:146-244`, `src/appserver.rs:492-521`).
 - **Cleanup is evidence-first.** Git outcome, resource close, capability revocation, manifest CAS and cleanup receipt publication are ordered inside `finalize_closed`; moving a step across the durable intent/manifest boundary changes crash semantics (`src/workspace.rs:3611-3643`, `src/workspace.rs:4104-4324`).
+- **Runtime custody actions are not idempotent, so their I/O bound is widened rather than retried.** The controller requires an exact starting phase and advances it after every successful action: quiesce and terminate require `Active` before moving toward `Empty`, lease close requires `ReleasePrepared`, moves to `LeaseClosed`, and consumes `guardian_lease` with `take()`, while closed-committed requires `LeaseClosed`, moves to `ClosedCommitted`, reaps the supervisor, removes the command socket and ends the responder loop. The protocol has no request-ID replay cache, so a duplicate after a delivered command but lost response cannot be accepted in the resulting phase (`src/workspace/custody.rs:894-998`, `src/workspace.rs:7029-7192`).
+
+### Deadline taxonomy
+
+Use two buckets when reviewing a timeout. A deadline that bounds a local peer we spawned is a **contention-sensitive liveness budget**: it is a liveness guess and is wrong under contention when derived from idle latency. A deadline whose expiry is a verdict about an already-fenced peer, or which gates a fencing window, is a **safety verdict/fencing bound** and must stay strict.
+
+The contention-sensitive liveness budgets changed by the custody-deadlines work are:
+
+| Constant | Bucket | Current contract and rationale |
+|---|---|---|
+| `BROKER_READINESS_DEADLINE` (`src/workspace.rs:44`) | Contention-sensitive liveness budget | New 30 s ceiling, overridable via `RELAY_BROKER_READINESS_TIMEOUT_MS`; it replaced an inline 3 s busy-poll budget while preserving a bound on the broker we spawned. |
+| `CONTROL_EXCHANGE_DEADLINE` (`src/workspace/custody.rs`) | Contention-sensitive liveness budget | New `3 * HEARTBEAT_FENCE_AFTER` = 2250 ms ceiling at the **seven** one-shot reply sites that await no long operation; it bounds synchronous replies from the local custody peer rather than the heartbeat fencing oracle. Quiesce and Terminate are the exceptions and use `STOP_EXCHANGE_DEADLINE`. |
+| `STOP_EXCHANGE_DEADLINE` (`src/workspace/custody.rs`) | Contention-sensitive liveness budget | New `STOP_AND_EMPTY_BUDGET + CONTROL_EXCHANGE_DEADLINE` = 17.25 s, used only for the Quiesce and Terminate replies. Those are acknowledged *after* the responder finishes a graceful stop and its empty proof, so a reply deadline shorter than that work turns a healthy slow stop into a retained fault. Derived, never restated: whoever changes either input cannot leave this behind. |
+| `STOP_AND_EMPTY_BUDGET` (`src/workspace/platform/linux.rs`) | Unclassified: derived sum, not an expiry | `GRACEFUL_STOP_DEADLINE + EMPTY_DEADLINE` = 15 s, exported once so the reply deadline above has a single owner. Nothing expires on it directly; it exists so two budgets cannot drift apart from the deadline measured against their sum. |
+| `GATE_TIMEOUT` (`src/workspace/repository_gate.rs`) | Contention-sensitive liveness budget | 3 s for each repository-gate acquisition attempt; contention causes another attempt rather than a safety verdict. |
+| `GATE_TOTAL_BUDGET` (`src/workspace/repository_gate.rs`) | Contention-sensitive liveness budget | New 30 s ceiling over the complete acquisition loop, including the capped backoff between attempts. |
+| `GRACEFUL_STOP_DEADLINE` (`src/workspace/platform/linux.rs:65`) | Contention-sensitive liveness budget | Raised from 500 ms to 5 s for the spawned worker's graceful exit. |
+| `OBSERVED_SIGTERM_EXIT_TAIL` (`src/workspace/platform/linux.rs:64`) | Unclassified: measurement evidence, not a deadline | `893_576 ns`, the maximum SIGTERM-to-exit interval in 100 samples on an idle host; it justifies the provisional graceful-stop budget but has no expiry semantics of its own (`src/workspace/platform/linux.rs:61-65`). |
+| `RUNTIME_CLIENT_IO_DEADLINE` (`src/workspace.rs:39`) | Contention-sensitive liveness budget | 10 s on the client end of the custody command socket, for every action except a stop. |
+| `RUNTIME_STOP_CLIENT_IO_DEADLINE` (`src/workspace.rs`) | Contention-sensitive liveness budget | New `STOP_EXCHANGE_DEADLINE + RUNTIME_CLIENT_IO_DEADLINE` = 27.25 s, for Quiesce and Terminate only. The same inversion as `STOP_EXCHANGE_DEADLINE`, one layer out: the client must outlive a guardian that legitimately works before replying, or it reports retained custody while the stop is still succeeding. |
+| `RUNTIME_COMMAND_IO_DEADLINE` (`src/workspace.rs:41`) | Contention-sensitive liveness budget | 10 s on the responder end of the same custody command socket, consumed in `HEARTBEAT_INTERVAL` slices so the guardian keeps beating while it reads. Symmetry with the client prevents either local peer's I/O budget from failing first under contention; the slicing prevents the budget itself from silencing the heartbeat. |
+
+The following safety verdict/fencing bounds were deliberately left untouched:
+
+| Constant | Bucket | Why expiry is a real verdict |
+|---|---|---|
+| `MANAGED_ATTACH_DEADLINE_MS` (`src/lifecycle.rs:21`) | Safety verdict/fencing bound | Its 4360 ms window gates managed attachment; expiry yields `FencingUnconfirmed` rather than admitting another binding, preventing two workers from both believing they hold it. |
+| `MANAGED_CANCEL_GRACE_MS` (`src/lifecycle.rs:23`) | Safety verdict/fencing bound | Its 5000 ms cancellation window likewise ends in `FencingUnconfirmed`; widening it would widen the interval in which binding ownership cannot be proved exclusive. |
+| `PROVIDER_TIMEOUT` (`src/workspace/resources.rs:26`) | Safety verdict/fencing bound | Its 5 s expiry declares the third-party provider timed out and initiates process-group termination, so it gates entry into fencing rather than estimating ordinary local progress. |
+| `PROVIDER_TERMINATION_GRACE` (`src/workspace/resources.rs:27`) | Safety verdict/fencing bound | The 100 ms interval is the SIGTERM-to-SIGKILL escalation rung; expiry authorizes the hard fence and therefore cannot drift with host load. |
+| `EMPTY_DEADLINE` (`src/workspace/platform/linux.rs:59`) | Safety verdict/fencing bound | The 10 s bound waits for recursive cgroup `populated=0` after fencing and permits empty evidence only on success; expiry means the fence did not produce the required proof. |
+| `RUNTIME_EXCHANGE_DEADLINE` (`src/workspace.rs:43`) | Safety verdict/fencing bound | It remains 2 s at the post-SIGKILL pidfd check (`src/workspace.rs:4681-4686`); expiry reports that an explicitly fenced custodian is still live, a real leak verdict. |
+
+The severity is operational, not cosmetic: `retain_runtime_fault` is divergent (`src/supervisor.rs:863`, `-> !` at `:867`) and is reachable from fourteen sites in the release protocol beginning at `src/supervisor.rs:692`. One missed acknowledgement could therefore become a retained custody fault that only an operator could clear.
 
 ### Production functions over about 200 lines
 

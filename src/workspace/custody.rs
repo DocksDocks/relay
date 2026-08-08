@@ -16,6 +16,15 @@ use tinyjson::JsonValue;
 pub const CONTROL_FRAME_MAX: usize = 16 * 1024;
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(250);
 pub const HEARTBEAT_FENCE_AFTER: Duration = Duration::from_millis(750);
+pub const CONTROL_EXCHANGE_DEADLINE: Duration = HEARTBEAT_FENCE_AFTER.saturating_mul(3);
+// The reply deadline for a Quiesce or Terminate must outlive the work the responder does BEFORE it
+// answers: the supervisor acknowledges those only after one graceful stop and its empty proof return.
+// The crate learned this the hard way once already - `src/tests/workspace_lease_process.rs` records a
+// regression where one budget served two unrelated waits - so this is a sum of the operation budget
+// and ordinary reply slack, never a second guess at a number.
+pub const STOP_EXCHANGE_DEADLINE: Duration =
+    crate::workspace::platform::linux::STOP_AND_EMPTY_BUDGET
+        .saturating_add(CONTROL_EXCHANGE_DEADLINE);
 pub const HEARTBEAT_FENCE_ERROR: &str = "custody heartbeat fenced after three missed ACK deadlines";
 pub const CONTROL_KEY_BYTES: usize = 32;
 
@@ -502,7 +511,11 @@ impl ControlEndpoint {
             self.heartbeat()?;
         }
         let seq = self.send(command, payload, &[])?;
-        let received = self.receive(HEARTBEAT_FENCE_AFTER, 0)?;
+        let reply_deadline = match command {
+            PacketKind::Quiesce | PacketKind::Terminate => STOP_EXCHANGE_DEADLINE,
+            _ => CONTROL_EXCHANGE_DEADLINE,
+        };
+        let received = self.receive(reply_deadline, 0)?;
         if received.packet.kind != expected_ack {
             return Err(format!(
                 "custody command {} received {}, expected {}",
@@ -724,7 +737,7 @@ impl CustodyController {
     #[cfg(target_os = "linux")]
     pub fn finish_bootstrap(&mut self, seq: u64) -> Result<ControlPayload, String> {
         self.require_phase(CustodyPhase::Bootstrapping)?;
-        let ready = self.endpoint.receive(HEARTBEAT_FENCE_AFTER, 0)?;
+        let ready = self.endpoint.receive(CONTROL_EXCHANGE_DEADLINE, 0)?;
         if !matches!(
             ready.packet.kind,
             PacketKind::GuardianReady | PacketKind::SupervisorReady
@@ -751,7 +764,7 @@ impl CustodyController {
         self.require_phase(CustodyPhase::Ready)?;
         let packet = self
             .endpoint
-            .receive_admitted_fds(HEARTBEAT_FENCE_AFTER, &[0, 1])?;
+            .receive_admitted_fds(CONTROL_EXCHANGE_DEADLINE, &[0, 1])?;
         if packet.packet.kind == PacketKind::Fault && packet.fds.is_empty() {
             let (code, evidence_sha256) = validate_fault_payload(&packet.packet.payload)?;
             self.pending_bootstrap_fault = Some(packet);
@@ -795,7 +808,7 @@ impl CustodyController {
         let seq = self
             .endpoint
             .send(PacketKind::Activate, ControlPayload::new(), &[])?;
-        let received = self.endpoint.receive(HEARTBEAT_FENCE_AFTER, 0)?;
+        let received = self.endpoint.receive(CONTROL_EXCHANGE_DEADLINE, 0)?;
         if received.packet.kind == PacketKind::Fault {
             let (code, evidence_sha256) = validate_fault_payload(&received.packet.payload)?;
             self.pending_bootstrap_fault = Some(received);
@@ -837,7 +850,7 @@ impl CustodyController {
         }
         let fault = match self.pending_bootstrap_fault.take() {
             Some(fault) => fault,
-            None => self.endpoint.receive(HEARTBEAT_FENCE_AFTER, 0)?,
+            None => self.endpoint.receive(CONTROL_EXCHANGE_DEADLINE, 0)?,
         };
         if fault.packet.kind != PacketKind::Fault {
             return Err(format!(
@@ -848,7 +861,7 @@ impl CustodyController {
         let (code, evidence_sha256) = validate_fault_payload(&fault.packet.payload)?;
         self.endpoint
             .acknowledge(&fault.packet, PacketKind::Fault, Some(&evidence_sha256))?;
-        let empty = self.endpoint.receive(HEARTBEAT_FENCE_AFTER, 0)?;
+        let empty = self.endpoint.receive(CONTROL_EXCHANGE_DEADLINE, 0)?;
         let empty_sha256 = match (
             empty.packet.kind,
             empty.packet.payload.len(),
@@ -912,7 +925,7 @@ impl CustodyController {
     pub fn confirm_empty(&mut self, evidence_sha256: &str) -> Result<(), String> {
         self.require_phase(CustodyPhase::Quiesced)?;
         validate_sha256(evidence_sha256)?;
-        let empty = self.endpoint.receive(HEARTBEAT_FENCE_AFTER, 0)?;
+        let empty = self.endpoint.receive(CONTROL_EXCHANGE_DEADLINE, 0)?;
         if empty.packet.kind != PacketKind::Empty
             || empty.packet.payload != evidence_payload(evidence_sha256)?
         {
@@ -1009,7 +1022,7 @@ impl CustodyController {
     }
 }
 
-/// Receive side shared by guardian and supervisor. A 750ms command silence,
+/// Receive side shared by guardian and supervisor. A 2250ms command silence,
 /// EOF, malformed packet, or peer identity drift is returned as a fatal fence
 /// reason; HEARTBEAT is acknowledged internally.
 #[derive(Debug)]
@@ -1044,7 +1057,7 @@ impl CustodianServer {
         loop {
             let packet = self
                 .endpoint
-                .receive(HEARTBEAT_FENCE_AFTER, expected_fd_count)?;
+                .receive(CONTROL_EXCHANGE_DEADLINE, expected_fd_count)?;
             if packet.packet.kind == PacketKind::Heartbeat {
                 if expected_fd_count != 0 || !packet.fds.is_empty() {
                     return Err("HEARTBEAT carried unexpected FDs".to_string());
@@ -1076,7 +1089,7 @@ impl CustodianServer {
         command_seq: u64,
         evidence_sha256: Option<&str>,
     ) -> Result<(), String> {
-        let packet = self.endpoint.receive(HEARTBEAT_FENCE_AFTER, 0)?;
+        let packet = self.endpoint.receive(CONTROL_EXCHANGE_DEADLINE, 0)?;
         if packet.packet.kind != response {
             return Err(format!(
                 "custodian ACK kind is {}; expected {}",
@@ -1907,6 +1920,15 @@ fn wait_readable(fd: RawFd, timeout: Duration) -> Result<(), String> {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+    use crate::workspace::platform::linux::STOP_AND_EMPTY_BUDGET;
+
+    #[test]
+    fn quiesce_reply_deadline_outlives_the_stop_it_awaits() {
+        assert!(
+            STOP_EXCHANGE_DEADLINE > STOP_AND_EMPTY_BUDGET,
+            "the stop reply deadline must include normal exchange slack after stop-and-empty work",
+        );
+    }
 
     fn current_peer() -> PeerIdentity {
         let pid = unsafe { libc::getpid() };
@@ -1982,6 +2004,74 @@ mod tests {
         assert!(controller.heartbeat().is_ok());
         assert_eq!(controller.phase(), CustodyPhase::Active);
         responder.join().unwrap();
+    }
+
+    #[test]
+    fn control_reply_after_old_fence_is_accepted() {
+        fn endpoint_pair(key: [u8; CONTROL_KEY_BYTES]) -> (ControlEndpoint, ControlEndpoint) {
+            let peer = current_peer();
+            let (guardian_fd, supervisor_fd) = ControlEndpoint::pair().unwrap();
+            let session_id = "00000000-0000-4000-8000-000000000001".to_string();
+            let guardian = ControlEndpoint::new(
+                guardian_fd,
+                key,
+                session_id.clone(),
+                1,
+                Sender::Guardian,
+                peer.clone(),
+            )
+            .unwrap();
+            let supervisor =
+                ControlEndpoint::new(supervisor_fd, key, session_id, 1, Sender::Supervisor, peer)
+                    .unwrap();
+            (guardian, supervisor)
+        }
+
+        fn reply_after(
+            mut endpoint: ControlEndpoint,
+            delay: Duration,
+        ) -> std::thread::JoinHandle<()> {
+            std::thread::spawn(move || {
+                let command = endpoint.receive(Duration::from_secs(5), 0).unwrap();
+                assert_eq!(command.packet.kind, PacketKind::PrepareRelease);
+                std::thread::sleep(delay);
+                endpoint
+                    .acknowledge(&command.packet, PacketKind::ReleasePrepared, None)
+                    .unwrap();
+            })
+        }
+
+        let old_fence = Duration::from_millis(750);
+        let control_deadline = Duration::from_millis(2_250);
+        let accepted_delay = Duration::from_millis(1_250);
+        assert!(accepted_delay > old_fence);
+        assert!(accepted_delay < control_deadline);
+        let (mut controller, responder) = endpoint_pair([0x2a; CONTROL_KEY_BYTES]);
+        let response = reply_after(responder, accepted_delay);
+        controller
+            .command(
+                PacketKind::PrepareRelease,
+                ControlPayload::new(),
+                PacketKind::ReleasePrepared,
+                false,
+            )
+            .unwrap();
+        response.join().unwrap();
+
+        let rejected_delay = Duration::from_millis(3_000);
+        assert!(rejected_delay > control_deadline);
+        let (mut controller, responder) = endpoint_pair([0x2b; CONTROL_KEY_BYTES]);
+        let response = reply_after(responder, rejected_delay);
+        let error = controller
+            .command(
+                PacketKind::PrepareRelease,
+                ControlPayload::new(),
+                PacketKind::ReleasePrepared,
+                false,
+            )
+            .unwrap_err();
+        assert!(error.starts_with("custody control deadline elapsed after "));
+        response.join().unwrap();
     }
 
     #[test]

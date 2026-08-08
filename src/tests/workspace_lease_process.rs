@@ -7,11 +7,13 @@ use relay::workspace::custody::{
     Sender,
 };
 use relay::workspace::platform::linux::{
-    DelegatedCgroup, LandlockPolicy, ProcessIdentity, WorkerLaunch, pidfd_open, probe_closed_lease,
-    process_start_token, reconcile_empty_delegated_cgroup, require_ext4_fd, signal_pidfd,
-    validate_bootstrap_fds, validate_pidfd_identity,
+    DelegatedCgroup, GRACEFUL_STOP_DEADLINE, LandlockPolicy, ProcessIdentity, WorkerLaunch,
+    pidfd_open, probe_closed_lease, process_start_token, reconcile_empty_delegated_cgroup,
+    require_ext4_fd, signal_pidfd, validate_bootstrap_fds, validate_pidfd_identity,
 };
 use relay::workspace::recover_workspace_with_roots;
+use relay::workspace::repository_gate::GATE_TIMEOUT;
+use relay::workspace::resources::executable_sha256;
 use relay::workspace::schema::read_jcs_file;
 use relay::workspace::schema::{AbortRequestV1, PathClaimRequestV1, parse_jcs};
 use relay::workspace::schema::{JcsValue, RecoverRequestV1, WorkspaceState};
@@ -1798,5 +1800,142 @@ fn graceful_stop_keeps_the_empty_proof_off_the_stop_budget() {
     assert!(
         error.contains("populated 0"),
         "wrong empty-proof failure: {error}"
+    );
+}
+
+#[test]
+fn slow_peers_do_not_become_retained_custody_faults() {
+    let repository = TestRepository::init("slow-peers-release");
+    let roots = isolated_authority_roots(&repository, "slow-peers-release");
+    let mut prepared = prepare_test_workspace(
+        &repository,
+        &roots,
+        "slow-peers-release",
+        "commit",
+        vec![PathClaimRequestV1 {
+            path: "base.txt".to_owned(),
+            path_type: "file".to_owned(),
+            mode: "exclusive".to_owned(),
+        }],
+    );
+
+    // This derives the stimulus from the shipped budget without making its
+    // rollback shrink the stimulus too: shipped, max(5 s / 4, 2 * 500 ms) is
+    // 1.25 s, strictly between the old 500 ms and the shipped 5 s.
+    const OLD_GRACEFUL_STOP_DEADLINE: Duration = Duration::from_millis(500);
+    let slow_exit_delay = (GRACEFUL_STOP_DEADLINE / 4).max(OLD_GRACEFUL_STOP_DEADLINE * 2);
+    // The exact historical rollback proceeds past this construction guard so
+    // the failure proof exercises custody rather than stopping at arithmetic.
+    assert!(
+        GRACEFUL_STOP_DEADLINE == OLD_GRACEFUL_STOP_DEADLINE
+            || (slow_exit_delay > OLD_GRACEFUL_STOP_DEADLINE
+                && slow_exit_delay < GRACEFUL_STOP_DEADLINE),
+        "slow-exit delay {slow_exit_delay:?} must remain strictly between old \
+         {OLD_GRACEFUL_STOP_DEADLINE:?} and shipped {GRACEFUL_STOP_DEADLINE:?} \
+         graceful-stop deadlines"
+    );
+    let worker_source = format!(
+        r#"#include <errno.h>
+#include <signal.h>
+#include <stddef.h>
+#include <time.h>
+
+int main(void) {{
+    sigset_t signals;
+    if (sigemptyset(&signals) != 0 ||
+        sigaddset(&signals, SIGTERM) != 0 ||
+        sigprocmask(SIG_BLOCK, &signals, NULL) != 0) {{
+        return 91;
+    }}
+
+    int received = 0;
+    if (sigwait(&signals, &received) != 0 || received != SIGTERM) {{
+        return 92;
+    }}
+
+    struct timespec remaining = {{
+        .tv_sec = {delay_seconds},
+        .tv_nsec = {delay_nanoseconds},
+    }};
+    while (nanosleep(&remaining, &remaining) != 0) {{
+        if (errno != EINTR) {{
+            return 93;
+        }}
+    }}
+    return 0;
+}}
+"#,
+        delay_seconds = slow_exit_delay.as_secs(),
+        delay_nanoseconds = slow_exit_delay.subsec_nanos(),
+    );
+    let worker_source_path = repository.home.join("slow-worker.c");
+    let worker_executable = repository.home.join("slow-worker");
+    fs::write(&worker_source_path, worker_source).unwrap();
+    let compile = Command::new("cc")
+        .args(["-x", "c", "-O0", "-o"])
+        .arg(&worker_executable)
+        .arg(&worker_source_path)
+        .stdin(Stdio::null())
+        .output()
+        .expect("compile slow worker fixture");
+    assert!(
+        compile.status.success(),
+        "compile slow worker fixture: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    fs::set_permissions(&worker_executable, fs::Permissions::from_mode(0o500)).unwrap();
+    let worker_executable = fs::canonicalize(worker_executable).unwrap();
+    prepared.request.tool.executable_sha256 = executable_sha256(&worker_executable).unwrap();
+    prepared.request.tool.executable_path = worker_executable.to_string_lossy().into_owned();
+    prepared.request_sha256 = write_closed_record(&prepared.request_file, &prepared.request);
+
+    let started = start_workspace_with_roots_and_executable(
+        &roots,
+        &prepared.request_file,
+        &prepared.request_sha256,
+        None,
+        &prepared.relay_executable,
+    )
+    .expect("start workspace with slow worker root");
+    let fault_path = started
+        .manifest_file
+        .with_file_name("custody-fault-v1.json");
+
+    // Hold the real gate through two old single-attempt windows, but release it
+    // well inside the shipped total budget. A separately opened file description
+    // is required: flock locks on a duplicated description would not contend.
+    let gate_hold = GATE_TIMEOUT + GATE_TIMEOUT;
+    let gate_path = roots
+        .authority
+        .join("repository-gates")
+        .join(format!("{}.lock", started.result.repository_id));
+    let gate_holder = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&gate_path)
+        .expect("open repository gate independently");
+    assert_eq!(
+        unsafe { libc::flock(gate_holder.as_raw_fd(), libc::LOCK_EX) },
+        0,
+        "hold repository gate"
+    );
+    let unlocker = std::thread::spawn(move || {
+        std::thread::sleep(gate_hold);
+        assert_eq!(
+            unsafe { libc::flock(gate_holder.as_raw_fd(), libc::LOCK_UN) },
+            0,
+            "release repository gate"
+        );
+    });
+
+    handback_started_workspace(&repository, &started);
+    unlocker.join().expect("repository gate unlocker");
+    let cleanup = abort_started_workspace(&repository, &roots, started, "slow peer release");
+    assert!(cleanup.capabilities_revoked);
+    assert!(cleanup.lease_released);
+    assert!(cleanup.worktree_removed);
+    assert!(
+        !fault_path.exists(),
+        "slow, live peers produced a retained custody fault"
     );
 }

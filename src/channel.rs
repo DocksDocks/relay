@@ -30,7 +30,7 @@ fn fail(message: &str) -> ! {
     std::process::exit(1);
 }
 
-fn env_ms(name: &str, default: u64) -> Duration {
+pub(crate) fn env_ms(name: &str, default: u64) -> Duration {
     Duration::from_millis(
         std::env::var(name)
             .ok()

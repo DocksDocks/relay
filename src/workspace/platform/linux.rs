@@ -57,8 +57,23 @@ const CLONE_PIDFD: u64 = 0x0000_1000;
 const CLONE_INTO_CGROUP: u64 = 0x0002_0000_0000;
 const P_PIDFD: libc::idtype_t = 3;
 const EMPTY_DEADLINE: Duration = Duration::from_secs(10);
+// The wall-clock cost of one graceful stop followed by its empty proof, exported as ONE value.
+// `custody` needs it to size the reply deadline for a Quiesce or Terminate, because the supervisor
+// acknowledges those only after this whole sequence returns. Deriving it here rather than exporting
+// both inputs keeps a single owner: a reader who changes either budget cannot forget that the reply
+// deadline downstream is measured against their sum.
+pub(crate) const STOP_AND_EMPTY_BUDGET: Duration =
+    GRACEFUL_STOP_DEADLINE.saturating_add(EMPTY_DEADLINE);
 const PREPARED_DEADLINE: Duration = Duration::from_secs(10);
-const GRACEFUL_STOP_DEADLINE: Duration = Duration::from_millis(500);
+// Provisional: maximum of 100 handler-ready SIGTERM-to-exit samples on an
+// unloaded 5-CPU host (1-minute load average 1.04-1.66) on 2026-08-08.
+#[cfg(test)]
+const OBSERVED_SIGTERM_EXIT_TAIL: Duration = Duration::from_nanos(893_576);
+// `pub` for the same reason `GATE_TIMEOUT` and `HEARTBEAT_INTERVAL` are: an integration target links
+// this crate externally, so a test that must derive a stimulus from the shipped budget can only read
+// it through the public surface. Deriving instead of restating keeps the test honest when the budget
+// moves - a second literal would silently stop discriminating.
+pub const GRACEFUL_STOP_DEADLINE: Duration = Duration::from_secs(5);
 
 fn is_cgroup2_statfs(statfs: &libc::statfs) -> bool {
     u64::try_from(statfs.f_type) == Ok(CGROUP2_SUPER_MAGIC)
@@ -2520,6 +2535,12 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn graceful_stop_budget_exceeds_observed_sigterm_tail() {
+        assert!(GRACEFUL_STOP_DEADLINE > OBSERVED_SIGTERM_EXIT_TAIL);
+        assert!(GRACEFUL_STOP_DEADLINE < EMPTY_DEADLINE);
+    }
 
     #[test]
     fn loader_virtual_address_requires_an_exact_hex_record() {

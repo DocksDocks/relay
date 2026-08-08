@@ -34,7 +34,7 @@ const omittedTargets = {};
 // formatted, linted, and built, and this harness ran integration targets only. The `unit`
 // case closes that hole. The floor is a measured count, so a silent loss of tests fails.
 const UNIT_CASE = 'unit';
-const UNIT_TEST_FLOOR = 137;
+const UNIT_TEST_FLOOR = 144;
 const SUMMARY_PATTERN = /test result: ok\. (\d+) passed; 0 failed; (\d+) ignored; 0 measured; (\d+) filtered out/;
 const discoveredTargets = fs
   .readdirSync(path.join(repoRoot, 'src', 'tests'), { withFileTypes: true })

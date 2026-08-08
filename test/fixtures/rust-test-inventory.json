@@ -196,6 +196,7 @@
         "linux_cgroup_pidfd_guardian_kills_hostile_descendants",
         "read_only_spawn_coexists_with_writer",
         "separate_worktrees_both_hold_leases",
+        "slow_peers_do_not_become_retained_custody_faults",
         "two_writers_same_worktree_exactly_one_lease",
         "worker_merge_rebase_reset_and_force_push_are_refused"
       ]

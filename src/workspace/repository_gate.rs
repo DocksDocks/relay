@@ -13,6 +13,9 @@ use std::time::{Duration, Instant};
 
 pub const GATE_PROTOCOL: &str = "RepositoryGateV1";
 pub const GATE_TIMEOUT: Duration = Duration::from_secs(3);
+pub const GATE_TOTAL_BUDGET: Duration = Duration::from_secs(30);
+const GATE_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const GATE_BACKOFF_MAX_SHIFT: u32 = 4;
 const MARKER_RELATIVE_C: &[u8] = b"docks/workspace-admission-v1.json\0";
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -95,6 +98,17 @@ pub(crate) fn acquire_ranked_lock(
     label: &str,
     rank: ShortLockRank,
 ) -> Result<(File, LockFileIdentity, ShortLockToken), String> {
+    acquire_ranked_lock_with_budgets(path, euid, label, rank, GATE_TIMEOUT, GATE_TOTAL_BUDGET)
+}
+
+fn acquire_ranked_lock_with_budgets(
+    path: &Path,
+    euid: u32,
+    label: &str,
+    rank: ShortLockRank,
+    attempt_budget: Duration,
+    total_budget: Duration,
+) -> Result<(File, LockFileIdentity, ShortLockToken), String> {
     let token = enter_short_lock(rank)?;
     let (file, created) = match OpenOptions::new()
         .create_new(true)
@@ -147,31 +161,49 @@ pub(crate) fn acquire_ranked_lock(
             .sync_all()
             .map_err(|error| format!("fsync {label} parent: {error}"))?;
     }
-    let deadline = Instant::now() + GATE_TIMEOUT;
+
+    let total_deadline = Instant::now() + total_budget;
+    let mut failed_attempts = 0_u32;
     loop {
-        if Instant::now() >= deadline {
+        let now = Instant::now();
+        if now >= total_deadline {
             return Err(format!(
-                "{label} contention exceeded three seconds; no mutation performed"
+                "{label} contention exceeded {} ms; no mutation performed",
+                total_budget.as_millis()
             ));
         }
-        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        if result == 0 {
-            break;
+        let attempt_deadline = (now + attempt_budget).min(total_deadline);
+        loop {
+            let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if result == 0 {
+                revalidate_ranked_lock(&file, path, identity, euid, label)?;
+                return Ok((file, identity, token));
+            }
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::EINTR)
+                && error.raw_os_error() != Some(libc::EAGAIN)
+                && error.raw_os_error() != Some(libc::EWOULDBLOCK)
+            {
+                return Err(format!("lock {label}: {error}"));
+            }
+            let remaining = attempt_deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            if error.raw_os_error() != Some(libc::EINTR) {
+                std::thread::sleep(remaining.min(GATE_POLL_INTERVAL));
+            }
         }
-        let error = std::io::Error::last_os_error();
-        if error.raw_os_error() != Some(libc::EINTR)
-            && error.raw_os_error() != Some(libc::EAGAIN)
-            && error.raw_os_error() != Some(libc::EWOULDBLOCK)
-        {
-            return Err(format!("lock {label}: {error}"));
+
+        let remaining = total_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            continue;
         }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if error.raw_os_error() != Some(libc::EINTR) {
-            std::thread::sleep(remaining.min(Duration::from_millis(10)));
-        }
+        let shift = failed_attempts.min(GATE_BACKOFF_MAX_SHIFT);
+        let backoff = GATE_POLL_INTERVAL.saturating_mul(1_u32 << shift);
+        std::thread::sleep(remaining.min(backoff));
+        failed_attempts = failed_attempts.saturating_add(1);
     }
-    revalidate_ranked_lock(&file, path, identity, euid, label)?;
-    Ok((file, identity, token))
 }
 
 pub(crate) fn revalidate_ranked_lock(
@@ -706,6 +738,88 @@ mod tests {
             object_format: ObjectFormat::Sha1,
         };
         (base, roots, repository)
+    }
+
+    #[test]
+    fn gate_acquires_under_contention_and_expires_without_mutation() {
+        let (base, roots, _) = fixture();
+        let gate_path = roots
+            .authority
+            .join("repository-gates")
+            .join("contention.lock");
+        let mut holder = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .open(&gate_path)
+            .unwrap();
+        holder.write_all(b"unchanged").unwrap();
+        assert_eq!(unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX) }, 0);
+
+        let probe = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&gate_path)
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            -1
+        );
+        let probe_error = std::io::Error::last_os_error().raw_os_error();
+        assert!(
+            probe_error == Some(libc::EAGAIN) || probe_error == Some(libc::EWOULDBLOCK),
+            "second open file description did not contend: {probe_error:?}"
+        );
+        drop(probe);
+
+        let contender_path = gate_path.clone();
+        let euid = roots.euid;
+        let contender = std::thread::spawn(move || {
+            acquire_ranked_lock_with_budgets(
+                &contender_path,
+                euid,
+                "test gate",
+                ShortLockRank::RepositoryGate,
+                Duration::from_millis(20),
+                Duration::from_millis(400),
+            )
+            .map(|_| ())
+        });
+        std::thread::sleep(Duration::from_millis(75));
+        assert_eq!(unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_UN) }, 0);
+        contender.join().unwrap().unwrap();
+
+        assert_eq!(unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX) }, 0);
+        let expiry_path = gate_path.clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let expiry = std::thread::spawn(move || {
+            let result = acquire_ranked_lock_with_budgets(
+                &expiry_path,
+                euid,
+                "test gate",
+                ShortLockRank::RepositoryGate,
+                Duration::from_millis(15),
+                Duration::from_millis(80),
+            )
+            .map(|_| ());
+            sender.send(result).unwrap();
+        });
+        let error = receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("gate acquisition exceeded its scoped total budget")
+            .unwrap_err();
+        let guarantee = ["no mutation", " performed"].concat();
+        assert_eq!(
+            error,
+            format!("test gate contention exceeded 80 ms; {guarantee}")
+        );
+        assert_eq!(fs::read(&gate_path).unwrap(), b"unchanged");
+        assert_eq!(unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_UN) }, 0);
+        expiry.join().unwrap();
+
+        drop(holder);
+        fs::remove_dir_all(base).unwrap();
     }
 
     #[test]

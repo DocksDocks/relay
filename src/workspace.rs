@@ -36,9 +36,14 @@ pub const WORKSPACE_HELP: &str = "usage:\n  session-relay workspace preserve --r
 pub const WORKSPACE_WORKER_POLICY: &str = "Work only in the assigned Session Relay workspace. Use the generated Git shim for supported Git mutation, stay within admitted path claims, and use only the projected session resources. Do not reenter wake, attach, watch, shared app-server, integration-checkout, or unmanaged writer paths.";
 pub const MANAGED_MUTATION_REFUSAL: &str = "mutation is refused for a managed workspace or integration checkout; use session-relay workspace start for a contained writer or continue in read-only mode";
 #[cfg(target_os = "linux")]
-const RUNTIME_COMMAND_IO_DEADLINE: Duration = Duration::from_millis(200);
+const RUNTIME_CLIENT_IO_DEADLINE: Duration = Duration::from_secs(10);
+#[cfg(target_os = "linux")]
+const RUNTIME_COMMAND_IO_DEADLINE: Duration = Duration::from_secs(10);
+#[cfg(target_os = "linux")]
+const RUNTIME_COMMAND_IO_SLICE: Duration = custody::HEARTBEAT_INTERVAL;
 #[cfg(target_os = "linux")]
 const RUNTIME_EXCHANGE_DEADLINE: Duration = Duration::from_secs(2);
+const BROKER_READINESS_DEADLINE: Duration = Duration::from_secs(30);
 const BROKER_READY_DOMAIN: &[u8] = b"session-relay/broker-ready/v1\0";
 const BROKER_READY_TOKEN_LEN: usize = 32;
 
@@ -58,26 +63,25 @@ struct BrokerReadinessReader {
 impl BrokerReadinessReader {
     fn observe(&mut self) -> Result<BrokerReadinessState, String> {
         let mut buffer = [0_u8; BROKER_READY_TOKEN_LEN];
-        loop {
-            match self
-                .stream
-                .read(&mut buffer[..BROKER_READY_TOKEN_LEN - self.received.len()])
-            {
-                Ok(0) => return Ok(BrokerReadinessState::Closed),
-                Ok(read) => {
-                    self.received.extend_from_slice(&buffer[..read]);
-                    if self.received.len() == BROKER_READY_TOKEN_LEN {
-                        if !sha256::constant_time_eq(&self.received, &self.expected) {
-                            return Err("Git broker readiness authentication failed".into());
-                        }
-                        return Ok(BrokerReadinessState::Ready);
-                    }
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+        match self
+            .stream
+            .read(&mut buffer[..BROKER_READY_TOKEN_LEN - self.received.len()])
+        {
+            Ok(0) => Ok(BrokerReadinessState::Closed),
+            Ok(read) => {
+                self.received.extend_from_slice(&buffer[..read]);
+                if self.received.len() < BROKER_READY_TOKEN_LEN {
                     return Ok(BrokerReadinessState::Pending);
                 }
-                Err(error) => return Err(format!("read Git broker readiness: {error}")),
+                if !sha256::constant_time_eq(&self.received, &self.expected) {
+                    return Err("Git broker readiness authentication failed".into());
+                }
+                Ok(BrokerReadinessState::Ready)
             }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                Ok(BrokerReadinessState::Pending)
+            }
+            Err(error) => Err(format!("read Git broker readiness: {error}")),
         }
     }
 }
@@ -87,9 +91,6 @@ fn broker_readiness_pair(
 ) -> Result<(BrokerReadinessReader, OwnedFd), String> {
     let (reader, writer) = UnixStream::pair()
         .map_err(|error| format!("create Git broker readiness channel: {error}"))?;
-    reader
-        .set_nonblocking(true)
-        .map_err(|error| format!("set Git broker readiness channel nonblocking: {error}"))?;
     Ok((
         BrokerReadinessReader {
             stream: reader,
@@ -5256,6 +5257,104 @@ fn drain_broker_stderr(child: &mut Child) {
     }
 }
 
+fn broker_readiness_deadline() -> Duration {
+    crate::channel::env_ms(
+        "RELAY_BROKER_READINESS_TIMEOUT_MS",
+        BROKER_READINESS_DEADLINE.as_millis() as u64,
+    )
+}
+
+fn kill_reap_broker(child: &mut Child) -> (String, String) {
+    let _ = child.kill();
+    let status = child
+        .wait()
+        .map(|status| status.to_string())
+        .unwrap_or_else(|error| format!("wait failed: {error}"));
+    (status, take_broker_stderr(child))
+}
+
+fn wait_for_broker_readiness(
+    readiness: &mut BrokerReadinessReader,
+    child: &mut Child,
+    deadline: Duration,
+) -> Result<(), String> {
+    let started = Instant::now();
+    loop {
+        let Some(remaining) = deadline.checked_sub(started.elapsed()) else {
+            break;
+        };
+        if remaining.is_zero() {
+            break;
+        }
+        let poll_for = remaining.min(Duration::from_millis(100));
+        let timeout_ms = poll_for.as_millis().clamp(1, i32::MAX as u128) as i32;
+        let mut pollfd = libc::pollfd {
+            fd: readiness.stream.as_raw_fd(),
+            events: libc::POLLIN | libc::POLLHUP,
+            revents: 0,
+        };
+        let polled = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
+        match polled {
+            1.. => match readiness.observe() {
+                Ok(BrokerReadinessState::Ready) => {
+                    match child.try_wait() {
+                        Ok(Some(status)) => {
+                            let stderr = take_broker_stderr(child);
+                            return Err(format!(
+                                "Git broker exited after publishing readiness ({status}): {stderr}"
+                            ));
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            let (_, stderr) = kill_reap_broker(child);
+                            return Err(format!("inspect Git broker: {error}: {stderr}"));
+                        }
+                    }
+                    drain_broker_stderr(child);
+                    return Ok(());
+                }
+                Ok(BrokerReadinessState::Pending) => {}
+                Ok(BrokerReadinessState::Closed) => {
+                    let (status, stderr) = kill_reap_broker(child);
+                    return Err(format!(
+                        "Git broker closed readiness without publishing ({status}): {stderr}"
+                    ));
+                }
+                Err(error) => {
+                    let (_, stderr) = kill_reap_broker(child);
+                    return Err(format!("{error}: {stderr}"));
+                }
+            },
+            0 => {}
+            _ => {
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::Interrupted {
+                    let (_, stderr) = kill_reap_broker(child);
+                    return Err(format!("poll Git broker readiness: {error}: {stderr}"));
+                }
+            }
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let stderr = take_broker_stderr(child);
+                return Err(format!(
+                    "Git broker exited before publishing readiness ({status}): {stderr}"
+                ));
+            }
+            Ok(None) => {}
+            Err(error) => {
+                let (_, stderr) = kill_reap_broker(child);
+                return Err(format!("inspect Git broker: {error}: {stderr}"));
+            }
+        }
+    }
+    let (_, stderr) = kill_reap_broker(child);
+    Err(format!(
+        "Git broker did not publish authenticated readiness within {} ms: {stderr}",
+        deadline.as_millis()
+    ))
+}
+
 struct GitBrokerStartContext<'a> {
     roots: &'a AuthorityRoots,
     relay_file: &'a File,
@@ -5365,57 +5464,7 @@ fn start_git_broker(context: GitBrokerStartContext<'_>) -> Result<(), String> {
         return Err(error);
     }
     drop(ready_writer);
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while Instant::now() < deadline {
-        match readiness.observe() {
-            Ok(BrokerReadinessState::Ready) => {
-                if let Some(status) = child
-                    .try_wait()
-                    .map_err(|error| format!("inspect Git broker: {error}"))?
-                {
-                    let stderr = take_broker_stderr(&mut child);
-                    return Err(format!(
-                        "Git broker exited after publishing readiness ({status}): {stderr}"
-                    ));
-                }
-                drain_broker_stderr(&mut child);
-                return Ok(());
-            }
-            Ok(BrokerReadinessState::Pending) => {}
-            Ok(BrokerReadinessState::Closed) => {
-                let _ = child.kill();
-                let status = child
-                    .wait()
-                    .map_err(|error| format!("wait for failed Git broker: {error}"))?;
-                let stderr = take_broker_stderr(&mut child);
-                return Err(format!(
-                    "Git broker closed readiness without publishing ({status}): {stderr}"
-                ));
-            }
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let stderr = take_broker_stderr(&mut child);
-                return Err(format!("{error}: {stderr}"));
-            }
-        }
-        if let Some(status) = child
-            .try_wait()
-            .map_err(|error| format!("inspect Git broker: {error}"))?
-        {
-            let stderr = take_broker_stderr(&mut child);
-            return Err(format!(
-                "Git broker exited before publishing readiness ({status}): {stderr}"
-            ));
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
-    let _ = child.kill();
-    let _ = child.wait();
-    let stderr = take_broker_stderr(&mut child);
-    Err(format!(
-        "Git broker did not publish authenticated readiness within three seconds: {stderr}"
-    ))
+    wait_for_broker_readiness(&mut readiness, &mut child, broker_readiness_deadline())
 }
 
 fn set_spawn_inheritance(fds: &[RawFd], inheritable: bool) -> Result<Vec<(RawFd, i32)>, String> {
@@ -6753,6 +6802,163 @@ fn runtime_bare_request(
         ),
     ]))
 }
+#[cfg(target_os = "linux")]
+// A stop is the one runtime action whose responder legitimately works before it answers: the guardian
+// may spend `custody::STOP_EXCHANGE_DEADLINE` reaching its reply, and then still has `confirm_empty`
+// and persistence to do. A client bound below that turns a healthy slow stop into the retained-custody
+// diagnostic, which is the same inversion `STOP_EXCHANGE_DEADLINE` exists to remove one layer down. So
+// derive it from that budget rather than pick a second number.
+const RUNTIME_STOP_CLIENT_IO_DEADLINE: Duration =
+    custody::STOP_EXCHANGE_DEADLINE.saturating_add(RUNTIME_CLIENT_IO_DEADLINE);
+
+#[cfg(target_os = "linux")]
+fn runtime_client_io_deadline(action: &str) -> Duration {
+    match action {
+        "quiesce" | "terminate" => RUNTIME_STOP_CLIENT_IO_DEADLINE,
+        _ => RUNTIME_CLIENT_IO_DEADLINE,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn configure_runtime_client_io(stream: &UnixStream, action: &str) -> Result<(), String> {
+    let deadline = runtime_client_io_deadline(action);
+    stream
+        .set_write_timeout(Some(deadline))
+        .map_err(|error| format!("set custody runtime write deadline: {error}"))?;
+    stream
+        .set_read_timeout(Some(deadline))
+        .map_err(|error| format!("set custody runtime read deadline: {error}"))
+}
+
+#[cfg(target_os = "linux")]
+fn configure_runtime_responder_io(stream: &UnixStream) -> Result<(), String> {
+    stream
+        .set_read_timeout(Some(RUNTIME_COMMAND_IO_DEADLINE))
+        .map_err(|error| format!("set custody runtime request deadline: {error}"))?;
+    stream
+        .set_write_timeout(Some(RUNTIME_COMMAND_IO_DEADLINE))
+        .map_err(|error| format!("set custody runtime response deadline: {error}"))
+}
+
+#[cfg(target_os = "linux")]
+enum RuntimeCommandIoError {
+    Socket(std::io::Error),
+    Heartbeat(String),
+}
+
+#[cfg(target_os = "linux")]
+fn runtime_command_deadline_error() -> RuntimeCommandIoError {
+    RuntimeCommandIoError::Socket(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        format!(
+            "custody runtime command deadline elapsed after {} ms",
+            RUNTIME_COMMAND_IO_DEADLINE.as_millis()
+        ),
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn read_runtime_command_with_heartbeat(
+    stream: &mut UnixStream,
+    mut heartbeat: impl FnMut() -> Result<(), String>,
+) -> Result<Vec<u8>, RuntimeCommandIoError> {
+    const MAX_COMMAND_BYTES: usize = 64 * 1024;
+    let deadline = Instant::now() + RUNTIME_COMMAND_IO_DEADLINE;
+    let mut next_heartbeat = Instant::now() + RUNTIME_COMMAND_IO_SLICE;
+    let mut bytes = Vec::new();
+    let mut buffer = [0_u8; 8192];
+    while bytes.len() < MAX_COMMAND_BYTES {
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(runtime_command_deadline_error());
+        }
+        if now >= next_heartbeat {
+            heartbeat().map_err(RuntimeCommandIoError::Heartbeat)?;
+            next_heartbeat = Instant::now() + RUNTIME_COMMAND_IO_SLICE;
+            continue;
+        }
+        stream
+            .set_read_timeout(Some(
+                deadline
+                    .saturating_duration_since(now)
+                    .min(next_heartbeat.saturating_duration_since(now)),
+            ))
+            .map_err(RuntimeCommandIoError::Socket)?;
+        let available = (MAX_COMMAND_BYTES - bytes.len()).min(buffer.len());
+        match stream.read(&mut buffer[..available]) {
+            Ok(0) => return Ok(bytes),
+            Ok(read) => bytes.extend_from_slice(&buffer[..read]),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                if Instant::now() >= deadline {
+                    return Err(RuntimeCommandIoError::Socket(error));
+                }
+                heartbeat().map_err(RuntimeCommandIoError::Heartbeat)?;
+                next_heartbeat = Instant::now() + RUNTIME_COMMAND_IO_SLICE;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(RuntimeCommandIoError::Socket(error)),
+        }
+    }
+    Ok(bytes)
+}
+
+#[cfg(target_os = "linux")]
+fn write_runtime_response_with_heartbeat(
+    stream: &mut UnixStream,
+    bytes: &[u8],
+    mut heartbeat: impl FnMut() -> Result<(), String>,
+) -> Result<(), RuntimeCommandIoError> {
+    let deadline = Instant::now() + RUNTIME_COMMAND_IO_DEADLINE;
+    let mut next_heartbeat = Instant::now() + RUNTIME_COMMAND_IO_SLICE;
+    let mut written = 0;
+    while written < bytes.len() {
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(runtime_command_deadline_error());
+        }
+        if now >= next_heartbeat {
+            heartbeat().map_err(RuntimeCommandIoError::Heartbeat)?;
+            next_heartbeat = Instant::now() + RUNTIME_COMMAND_IO_SLICE;
+            continue;
+        }
+        stream
+            .set_write_timeout(Some(
+                deadline
+                    .saturating_duration_since(now)
+                    .min(next_heartbeat.saturating_duration_since(now)),
+            ))
+            .map_err(RuntimeCommandIoError::Socket)?;
+        match stream.write(&bytes[written..]) {
+            Ok(0) => {
+                return Err(RuntimeCommandIoError::Socket(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "failed to write custody runtime response",
+                )));
+            }
+            Ok(count) => written += count,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                if Instant::now() >= deadline {
+                    return Err(RuntimeCommandIoError::Socket(error));
+                }
+                heartbeat().map_err(RuntimeCommandIoError::Heartbeat)?;
+                next_heartbeat = Instant::now() + RUNTIME_COMMAND_IO_SLICE;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(RuntimeCommandIoError::Socket(error)),
+        }
+    }
+    Ok(())
+}
 
 fn runtime_exchange(
     session_dir: &Path,
@@ -6784,12 +6990,7 @@ fn runtime_exchange(
     bytes.push(b'\n');
     let mut stream = UnixStream::connect(custody_socket_path(session_dir))
         .map_err(|error| format!("connect custody runtime: {error}"))?;
-    stream
-        .set_write_timeout(Some(RUNTIME_EXCHANGE_DEADLINE))
-        .map_err(|error| format!("set custody runtime write deadline: {error}"))?;
-    stream
-        .set_read_timeout(Some(RUNTIME_EXCHANGE_DEADLINE))
-        .map_err(|error| format!("set custody runtime read deadline: {error}"))?;
+    configure_runtime_client_io(&stream, action)?;
     stream
         .write_all(&bytes)
         .map_err(|error| format!("write custody runtime command: {error}"))?;
@@ -6807,7 +7008,7 @@ fn runtime_exchange(
             ) {
                 format!(
                     "custody runtime {action} response deadline elapsed after {} ms; custody is retained and explicit recovery is required",
-                    RUNTIME_EXCHANGE_DEADLINE.as_millis(),
+                    runtime_client_io_deadline(action).as_millis(),
                 )
             } else {
                 format!("read custody runtime response: {error}")
@@ -6881,6 +7082,29 @@ fn peer_is_current_euid(stream: &UnixStream) -> Result<(), String> {
 }
 
 #[cfg(target_os = "linux")]
+fn service_runtime_guardian_heartbeat(
+    controller: &mut custody::CustodyController,
+    retained_fault: &mut Option<RetainedRuntimeFault>,
+    retain_fault: impl FnOnce(&str) -> Result<RetainedRuntimeFault, String>,
+) -> Result<(), String> {
+    if retained_fault.is_some()
+        || !matches!(
+            controller.phase(),
+            custody::CustodyPhase::Active
+                | custody::CustodyPhase::Empty
+                | custody::CustodyPhase::ReleasePrepared
+                | custody::CustodyPhase::LeaseClosed
+        )
+    {
+        return Ok(());
+    }
+    if let Err(error) = controller.heartbeat() {
+        *retained_fault = Some(retain_fault(&error)?);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
 fn run_guardian_commands(context: &mut GuardianRuntimeContext<'_>) -> Result<(), String> {
     use custody::PayloadValue;
     let session_dir = context.session_dir;
@@ -6912,29 +7136,27 @@ fn run_guardian_commands(context: &mut GuardianRuntimeContext<'_>) -> Result<(),
                             | custody::CustodyPhase::LeaseClosed
                     )
                 {
-                    if let Err(error) = controller.heartbeat() {
+                    service_runtime_guardian_heartbeat(controller, &mut retained_fault, |error| {
                         let worker_root = worker_root.ok_or_else(|| {
-                            format!(
-                                "custody supervisor failed outside Running without worker identity: {error}"
-                            )
-                        })?;
-                        retained_fault =
-                            Some(retain_runtime_custody_fault(RuntimeCustodyFaultContext {
-                                roots,
-                                session_dir,
-                                session_id,
-                                cgroup,
-                                worker_root,
-                                guardian: guardian_identity,
-                                supervisor: supervisor_identity,
-                                lease: guardian_lease.as_ref().ok_or_else(|| {
-                                    "custody supervisor failed after guardian lease close"
-                                        .to_string()
-                                })?,
-                                supervisor_child: supervisor,
-                                error: &error,
-                            })?);
-                    }
+                                format!(
+                                    "custody supervisor failed outside Running without worker identity: {error}"
+                                )
+                            })?;
+                        retain_runtime_custody_fault(RuntimeCustodyFaultContext {
+                            roots,
+                            session_dir,
+                            session_id,
+                            cgroup,
+                            worker_root,
+                            guardian: guardian_identity,
+                            supervisor: supervisor_identity,
+                            lease: guardian_lease.as_ref().ok_or_else(|| {
+                                "custody supervisor failed after guardian lease close".to_string()
+                            })?,
+                            supervisor_child: supervisor,
+                            error,
+                        })
+                    })?;
                     thread::sleep(custody::HEARTBEAT_INTERVAL);
                 } else {
                     thread::sleep(Duration::from_millis(20));
@@ -6945,18 +7167,37 @@ fn run_guardian_commands(context: &mut GuardianRuntimeContext<'_>) -> Result<(),
                 return Err(format!("accept custody runtime command: {error}"));
             }
         };
-        stream
-            .set_read_timeout(Some(RUNTIME_COMMAND_IO_DEADLINE))
-            .map_err(|error| format!("set custody runtime request deadline: {error}"))?;
-        stream
-            .set_write_timeout(Some(RUNTIME_COMMAND_IO_DEADLINE))
-            .map_err(|error| format!("set custody runtime response deadline: {error}"))?;
+        configure_runtime_responder_io(&stream)?;
         peer_is_current_euid(&stream)?;
-        let mut bytes = Vec::new();
-        std::io::Read::by_ref(&mut stream)
-            .take(64 * 1024)
-            .read_to_end(&mut bytes)
-            .map_err(|error| format!("read custody runtime command: {error}"))?;
+        let bytes = read_runtime_command_with_heartbeat(&mut stream, || {
+            service_runtime_guardian_heartbeat(controller, &mut retained_fault, |error| {
+                let worker_root = worker_root.ok_or_else(|| {
+                    format!(
+                        "custody supervisor failed outside Running without worker identity: {error}"
+                    )
+                })?;
+                retain_runtime_custody_fault(RuntimeCustodyFaultContext {
+                    roots,
+                    session_dir,
+                    session_id,
+                    cgroup,
+                    worker_root,
+                    guardian: guardian_identity,
+                    supervisor: supervisor_identity,
+                    lease: guardian_lease.as_ref().ok_or_else(|| {
+                        "custody supervisor failed after guardian lease close".to_string()
+                    })?,
+                    supervisor_child: supervisor,
+                    error,
+                })
+            })
+        })
+        .map_err(|error| match error {
+            RuntimeCommandIoError::Socket(error) => {
+                format!("read custody runtime command: {error}")
+            }
+            RuntimeCommandIoError::Heartbeat(error) => error,
+        })?;
         let value = schema::parse_jcs(&bytes, true)?;
         let object = closed_object(
             &value,
@@ -7112,7 +7353,38 @@ fn run_guardian_commands(context: &mut GuardianRuntimeContext<'_>) -> Result<(),
         let response = runtime_response(&request_id, result);
         let mut response_bytes = schema::serialize_jcs(&response).into_bytes();
         response_bytes.push(b'\n');
-        if let Err(error) = stream.write_all(&response_bytes) {
+        let response_delivery = write_runtime_response_with_heartbeat(
+            &mut stream,
+            &response_bytes,
+            || {
+                service_runtime_guardian_heartbeat(controller, &mut retained_fault, |error| {
+                    let worker_root = worker_root.ok_or_else(|| {
+                        format!(
+                            "custody supervisor failed outside Running without worker identity: {error}"
+                        )
+                    })?;
+                    retain_runtime_custody_fault(RuntimeCustodyFaultContext {
+                        roots,
+                        session_dir,
+                        session_id,
+                        cgroup,
+                        worker_root,
+                        guardian: guardian_identity,
+                        supervisor: supervisor_identity,
+                        lease: guardian_lease.as_ref().ok_or_else(|| {
+                            "custody supervisor failed after guardian lease close".to_string()
+                        })?,
+                        supervisor_child: supervisor,
+                        error,
+                    })
+                })
+            },
+        );
+        if let Err(error) = response_delivery {
+            let error = match error {
+                RuntimeCommandIoError::Socket(error) => error,
+                RuntimeCommandIoError::Heartbeat(error) => return Err(error),
+            };
             eprintln!(
                 "custody runtime response delivery failed after durable {action}: {error}; durable custody remains recoverable"
             );
@@ -8651,6 +8923,59 @@ mod tests {
         assert_eq!(reader.observe().unwrap(), BrokerReadinessState::Closed);
     }
     #[test]
+    fn broker_readiness_waits_on_event_and_still_expires() {
+        let capability = readiness_capability(&capability::encode_base64url(&[7; 32]));
+        let (mut ready_reader, ready_writer) = broker_readiness_pair(&capability).unwrap();
+        let published_capability = capability.clone();
+        let publisher = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(25));
+            publish_broker_ready(ready_writer.into_raw_fd(), &published_capability).unwrap();
+        });
+        let mut ready_child = Command::new("/bin/sh")
+            .args(["-c", "exec sleep 60"])
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let event_ceiling = Duration::from_secs(10);
+        let started = Instant::now();
+        assert_eq!(
+            wait_for_broker_readiness(&mut ready_reader, &mut ready_child, event_ceiling),
+            Ok(())
+        );
+        assert!(started.elapsed() < event_ceiling / 2);
+        publisher.join().unwrap();
+        let _ = ready_child.kill();
+        ready_child.wait().unwrap();
+
+        const OVERRIDE: &str = "RELAY_BROKER_READINESS_TIMEOUT_MS";
+        let prior = std::env::var_os(OVERRIDE);
+        unsafe {
+            std::env::set_var(OVERRIDE, "100");
+        }
+        let expiry_ceiling = broker_readiness_deadline();
+        unsafe {
+            match prior {
+                Some(value) => std::env::set_var(OVERRIDE, value),
+                None => std::env::remove_var(OVERRIDE),
+            }
+        }
+        assert_eq!(expiry_ceiling, Duration::from_millis(100));
+
+        let (mut silent_reader, _silent_writer) = broker_readiness_pair(&capability).unwrap();
+        let mut silent_child = Command::new("/bin/sh")
+            .args(["-c", "echo silent-broker >&2; exec sleep 60"])
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let error =
+            wait_for_broker_readiness(&mut silent_reader, &mut silent_child, expiry_ceiling)
+                .unwrap_err();
+        assert!(error.contains(
+            "Git broker did not publish authenticated readiness within 100 ms: silent-broker"
+        ));
+        assert!(silent_child.try_wait().unwrap().is_some());
+    }
+    #[test]
     fn exact_router_is_closed() {
         let args = vec![
             "preserve".into(),
@@ -9114,6 +9439,108 @@ mod tests {
             "supervisor_control_fault"
         );
     }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn runtime_exchange_bounds_send_and_receive_symmetrically() {
+        // An ordinary action is bounded symmetrically on both ends of the socket.
+        let (client, responder) = UnixStream::pair().unwrap();
+        configure_runtime_client_io(&client, "activate").unwrap();
+        configure_runtime_responder_io(&responder).unwrap();
+
+        assert!(RUNTIME_CLIENT_IO_DEADLINE > RUNTIME_EXCHANGE_DEADLINE);
+        assert!(RUNTIME_COMMAND_IO_DEADLINE > Duration::from_millis(200));
+        assert_eq!(RUNTIME_CLIENT_IO_DEADLINE, RUNTIME_COMMAND_IO_DEADLINE);
+        let expected = Some(RUNTIME_CLIENT_IO_DEADLINE);
+        assert_eq!(client.write_timeout().unwrap(), expected);
+        assert_eq!(client.read_timeout().unwrap(), expected);
+        assert_eq!(responder.read_timeout().unwrap(), expected);
+        assert_eq!(responder.write_timeout().unwrap(), expected);
+
+        // A stop is the exception, and it is an exception in ONE direction only: the client must
+        // outlive a guardian that legitimately works before replying. Symmetry within the client is
+        // still required, because a send that expires early aborts the same exchange as a read that does.
+        // The kernel rounds SO_SNDTIMEO/SO_RCVTIMEO up to its own granularity, so a read-back is not
+        // byte-equal to what was set: 27.25 s comes back as 27.252 s here. Assert the direction that is
+        // load-bearing - never SHORTER than the budget - rather than an equality the platform does not owe us.
+        for action in ["quiesce", "terminate"] {
+            let (stop_client, _stop_responder) = UnixStream::pair().unwrap();
+            configure_runtime_client_io(&stop_client, action).unwrap();
+            let send = stop_client.write_timeout().unwrap().unwrap();
+            let read = stop_client.read_timeout().unwrap().unwrap();
+            assert!(
+                send >= RUNTIME_STOP_CLIENT_IO_DEADLINE,
+                "{action} send bound: {send:?}"
+            );
+            assert!(
+                read >= RUNTIME_STOP_CLIENT_IO_DEADLINE,
+                "{action} read bound: {read:?}"
+            );
+            assert_eq!(send, read, "{action} client bounds must stay symmetric");
+        }
+        assert!(
+            RUNTIME_STOP_CLIENT_IO_DEADLINE > custody::STOP_EXCHANGE_DEADLINE,
+            "a stop client must outlive the guardian reply deadline it waits on",
+        );
+        assert_eq!(
+            runtime_client_io_deadline("activate"),
+            RUNTIME_CLIENT_IO_DEADLINE
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stalled_runtime_client_does_not_silence_the_guardian() {
+        let (mut client, mut responder) = UnixStream::pair().unwrap();
+        configure_runtime_responder_io(&responder).unwrap();
+        client.write_all(b"{\"schema\":").unwrap();
+
+        let started = Instant::now();
+        let mut heartbeats = Vec::new();
+        let error = match read_runtime_command_with_heartbeat(&mut responder, || {
+            heartbeats.push(Instant::now());
+            Ok(())
+        }) {
+            Ok(_) => panic!("stalled runtime request unexpectedly completed"),
+            Err(RuntimeCommandIoError::Socket(error)) => error,
+            Err(RuntimeCommandIoError::Heartbeat(error)) => {
+                panic!("heartbeat driver failed: {error}")
+            }
+        };
+        let finished = Instant::now();
+        let elapsed = finished.duration_since(started);
+
+        assert!(matches!(
+            error.kind(),
+            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+        ));
+        assert_eq!(RUNTIME_COMMAND_IO_SLICE, custody::HEARTBEAT_INTERVAL);
+        assert_eq!(RUNTIME_COMMAND_IO_DEADLINE, Duration::from_secs(10));
+        assert!(elapsed >= RUNTIME_COMMAND_IO_DEADLINE);
+        assert!(
+            elapsed < RUNTIME_COMMAND_IO_DEADLINE + custody::CONTROL_EXCHANGE_DEADLINE,
+            "stalled request exceeded its total deadline: {elapsed:?}"
+        );
+        assert!(
+            !heartbeats.is_empty(),
+            "stalled request silenced guardian heartbeats for {elapsed:?}"
+        );
+        assert!(
+            heartbeats[0].duration_since(started) < custody::CONTROL_EXCHANGE_DEADLINE,
+            "first heartbeat missed the control deadline"
+        );
+        assert!(
+            heartbeats
+                .windows(2)
+                .all(|pair| pair[1].duration_since(pair[0]) < custody::CONTROL_EXCHANGE_DEADLINE),
+            "heartbeat gap exceeded the control deadline"
+        );
+        assert!(
+            finished.duration_since(heartbeats[heartbeats.len() - 1])
+                < custody::CONTROL_EXCHANGE_DEADLINE,
+            "guardian fell silent before the runtime request expired"
+        );
+    }
+
     #[test]
     fn broker_socket_path_is_private_and_bounded_for_unix_domain_sockets() {
         let repository_id = sha256::hex_digest(crate::store::uuid_v4().as_bytes());

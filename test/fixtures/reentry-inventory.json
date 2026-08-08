@@ -55,6 +55,7 @@
       "src/supervisor.rs::run_workspace_supervisor_release_protocol",
       "src/supervisor.rs::signal_owned_child",
       "src/workspace.rs::create_retention_proof",
+      "src/workspace.rs::kill_reap_broker",
       "src/workspace.rs::retain_runtime_custody_fault",
       "src/workspace.rs::run_guardian",
       "src/workspace.rs::start_custody_runtime",
@@ -1355,6 +1356,14 @@
       "anchor": "libc::geteuid("
     },
     {
+      "id": "platform:src/workspace.rs:wait_for_broker_readiness:libc_poll:1",
+      "file": "src/workspace.rs",
+      "function": "wait_for_broker_readiness",
+      "category": "platform",
+      "operation": "libc_poll",
+      "anchor": "libc::poll("
+    },
+    {
       "id": "platform:src/workspace.rs:wait_pipe_record:libc_poll:1",
       "file": "src/workspace.rs",
       "function": "wait_pipe_record",
@@ -2467,9 +2476,9 @@
       "anchor": "libc::write("
     },
     {
-      "id": "platform:src/workspace/repository_gate.rs:acquire_ranked_lock:libc_flock:1",
+      "id": "platform:src/workspace/repository_gate.rs:acquire_ranked_lock_with_budgets:libc_flock:1",
       "file": "src/workspace/repository_gate.rs",
-      "function": "acquire_ranked_lock",
+      "function": "acquire_ranked_lock_with_budgets",
       "category": "platform",
       "operation": "libc_flock",
       "anchor": "libc::flock("
@@ -2963,6 +2972,14 @@
       "anchor": ".kill()"
     },
     {
+      "id": "signal:src/workspace.rs:kill_reap_broker:child_kill:1",
+      "file": "src/workspace.rs",
+      "function": "kill_reap_broker",
+      "category": "signal",
+      "operation": "child_kill",
+      "anchor": ".kill()"
+    },
+    {
       "id": "signal:src/workspace.rs:retain_runtime_custody_fault:kill_and_wait_empty:1",
       "file": "src/workspace.rs",
       "function": "retain_runtime_custody_fault",
@@ -2980,30 +2997,6 @@
     },
     {
       "id": "signal:src/workspace.rs:start_git_broker:child_kill:1",
-      "file": "src/workspace.rs",
-      "function": "start_git_broker",
-      "category": "signal",
-      "operation": "child_kill",
-      "anchor": ".kill()"
-    },
-    {
-      "id": "signal:src/workspace.rs:start_git_broker:child_kill:2",
-      "file": "src/workspace.rs",
-      "function": "start_git_broker",
-      "category": "signal",
-      "operation": "child_kill",
-      "anchor": ".kill()"
-    },
-    {
-      "id": "signal:src/workspace.rs:start_git_broker:child_kill:3",
-      "file": "src/workspace.rs",
-      "function": "start_git_broker",
-      "category": "signal",
-      "operation": "child_kill",
-      "anchor": ".kill()"
-    },
-    {
-      "id": "signal:src/workspace.rs:start_git_broker:child_kill:4",
       "file": "src/workspace.rs",
       "function": "start_git_broker",
       "category": "signal",
