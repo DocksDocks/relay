@@ -95,9 +95,16 @@ The split branch head was `161d045f6d0e3ec36f692bcf662444b3506a28ae`. Per-file h
 
 ## Context tree
 
-The repository has two context nodes:
+The repository has three context nodes:
 
 - Root `AGENTS.md` with root `CLAUDE.md`
 - `plugin/AGENTS.md` with `plugin/CLAUDE.md`
+- `docs/plans/AGENTS.md` with `docs/plans/CLAUDE.md`
 
 The `CLAUDE.md` files exist because Claude Code descends `CLAUDE.md`, not `AGENTS.md`.
+
+## Plans
+
+Use direct implementation for one clear reversible low-risk local diff with one bounded acceptance path; it creates no plan, reviewer, or automatic commit. Canonical plans live in `docs/plans/active/`; lifecycle is frontmatter, and `docs/plans/finished/` is terminal. Exactly three skills own the workflow: `plan-workspace` maintains the workspace, main-context `plan-manager` owns classify → draft/class-bounded review and repair → start → implement/delegate → observed acceptance → finish/archive, and internal `plan-reviewer` returns read-only `PlanReviewV1` evidence from one immutable bundle. Only the reviewer has wrappers.
+
+The current record is one compact-JCS `Plan-run: PlanRunV1` line. Exact current-user authority may preserve a terminal predecessor as append-only `Plan-attempt-history` and install a fresh run at the same stable path; never create `v2`/`vN` plans to reset review. Schemas 1–6 are historical only. Every Steps row has `Effect: local|probe|production_access|publish|push|release|deploy`; persisted intent is never live authority. The complete contract lives in `docs/plans/AGENTS.md`; `docs/plans/CLAUDE.md` contains only `@AGENTS.md`.
