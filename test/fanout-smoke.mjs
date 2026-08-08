@@ -8,8 +8,8 @@ import { fileURLToPath } from 'node:url';
 import { scaledTimeout } from './lib/time-factor.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const plugin = path.resolve(here, '..');
-const bin = path.join(plugin, 'rust', 'target', 'debug', 'relay');
+const root = path.resolve(here, '..');
+const bin = path.join(root, 'target', 'debug', 'relay');
 assert.ok(fs.existsSync(bin), `missing development relay binary: ${bin}`);
 
 const home = fs.mkdtempSync(path.join(os.tmpdir(), 'session-relay-fanout-'));

@@ -1,0 +1,107 @@
+name: validate
+
+# Triggers:
+#   - pull_request: validate before merge into main
+#   - push to main: validate the integrated branch
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+# Least privilege: the validation job is read-only.
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    name: "gate (scripts/gate.mjs)"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          # Depth 1 cannot resolve the commit literals some checks pin.
+          fetch-depth: 0
+      - name: "setup Node 24"
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: '24'
+      - name: "enable corepack"
+        run: corepack enable
+      - name: "configure deterministic pnpm store"
+        run: pnpm config set store-dir "$HOME/.pnpm-store"
+      - name: "cache pnpm store"
+        id: pnpm-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.pnpm-store
+          key: pnpm-v11-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pnpm-lock.yaml', 'package.json') }}
+          restore-keys: pnpm-v11-${{ runner.os }}-${{ runner.arch }}-
+      - name: "install pnpm dependencies (--frozen-lockfile)"
+        run: pnpm install --frozen-lockfile
+      - name: "install native musl tools"
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
+      - name: "provision the pinned Rust toolchain and the musl target"
+        run: |
+          set -euo pipefail
+          rustup toolchain install
+          rustup target add x86_64-unknown-linux-musl
+      - name: "cache Cargo dependencies and target outputs"
+        id: cargo-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml') }}-${{ hashFiles('src/**/*.rs') }}
+          restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml') }}-
+      - name: "run the gate under a delegated cgroup"
+        run: |
+          CURRENT_CGROUP=
+          while IFS=: read -r HIERARCHY CONTROLLERS CGROUP_PATH; do
+            if [ "$HIERARCHY" = 0 ] && [ -z "$CONTROLLERS" ]; then
+              CURRENT_CGROUP="$CGROUP_PATH"
+              break
+            fi
+          done < /proc/self/cgroup
+          test -n "$CURRENT_CGROUP"
+          CGROUP="/sys/fs/cgroup${CURRENT_CGROUP%/}/session-relay-test-$(id -u)-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-gate"
+          sudo -n mkdir "$CGROUP"
+          cleanup() {
+            status=$?
+            trap - EXIT
+            for _ in {1..100}; do
+              grep -qx 'populated 0' "$CGROUP/cgroup.events" && break
+              sleep 0.05
+            done
+            if ! grep -qx 'populated 0' "$CGROUP/cgroup.events"; then
+              echo "Session Relay cgroup delegation leaked live processes: $CGROUP" >&2
+              status=1
+              if [ -f "$CGROUP/cgroup.kill" ]; then
+                printf '1\n' | sudo -n tee "$CGROUP/cgroup.kill" >/dev/null
+                for _ in {1..100}; do
+                  grep -qx 'populated 0' "$CGROUP/cgroup.events" && break
+                  sleep 0.05
+                done
+              fi
+            fi
+            if ! grep -qx 'populated 0' "$CGROUP/cgroup.events" || ! sudo -n rmdir "$CGROUP"; then
+              echo "Session Relay cgroup delegation did not cleanly close: $CGROUP" >&2
+              status=1
+            fi
+            exit "$status"
+          }
+          trap cleanup EXIT
+          sudo -n chown "$(id -u):$(id -g)" "$CGROUP"
+          sudo -n chown "$(id -u):$(id -g)" \
+            "$CGROUP/cgroup.procs" "$CGROUP/cgroup.threads" "$CGROUP/cgroup.subtree_control"
+          (
+            test_pid=$BASHPID
+            sudo -n tee "$CGROUP/cgroup.procs" >/dev/null <<<"$test_pid"
+            SESSION_RELAY_TEST_CGROUP_ROOT="$CGROUP" node scripts/gate.mjs
+          )

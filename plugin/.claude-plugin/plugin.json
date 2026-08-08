@@ -5,8 +5,8 @@
   "author": {
     "name": "Eduardo Marquez"
   },
-  "homepage": "https://github.com/DocksDocks/docks",
-  "repository": "https://github.com/DocksDocks/docks",
+  "homepage": "https://github.com/DocksDocks/session-relay",
+  "repository": "https://github.com/DocksDocks/session-relay",
   "license": "MIT",
   "keywords": [
     "multi-agent",

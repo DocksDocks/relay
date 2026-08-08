@@ -1407,7 +1407,7 @@ mod tests {
     fn parses_claude_fixture_usage_line() {
         let line = wake_usage_line(
             "claude",
-            include_str!("../../test/fixtures/wake-usage-claude.json").as_bytes(),
+            include_str!("../test/fixtures/wake-usage-claude.json").as_bytes(),
         );
         assert_eq!(
             line,
@@ -1419,7 +1419,7 @@ mod tests {
     fn parses_codex_fixture_usage_line() {
         let line = wake_usage_line(
             "codex",
-            include_str!("../../test/fixtures/wake-usage-codex.jsonl").as_bytes(),
+            include_str!("../test/fixtures/wake-usage-codex.jsonl").as_bytes(),
         );
         assert_eq!(
             line,

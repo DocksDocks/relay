@@ -35,7 +35,7 @@ export const EXPECTED_LABELS = [
 ];
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-const PLUGIN = path.resolve(HERE, '..');
+const ROOT = path.resolve(HERE, '..');
 
 export async function run({ bin, home, emit }) {
   const fixture = createFixture({ bin, home });
@@ -1087,8 +1087,8 @@ export async function run({ bin, home, emit }) {
     });
 
     check('detached lifecycle supervisor preserves PTY and flood-disconnect custody', () => {
-      const result = spawnSync(process.execPath, [path.join(PLUGIN, 'test', 'supervisor-custody.mjs'), '--matrix'], {
-        cwd: path.resolve(PLUGIN, '..', '..'),
+      const result = spawnSync(process.execPath, [path.join(HERE, 'supervisor-custody.mjs'), '--matrix'], {
+        cwd: ROOT,
         env: { ...process.env, RELAY_BIN: BIN },
         encoding: 'utf8',
         timeout: 20000,

@@ -1,1206 +1,250 @@
 #!/usr/bin/env node
+// Distribution contract for the standalone session-relay repository.
+//
+// This file replaces the large monorepo contract suite that guarded release
+// evidence, promotion, and publication records. Those records no longer exist
+// here, so this suite keeps only the four properties that still bind what a
+// consumer receives.
+//
+// 1. Launcher resolution. The suite executes `plugin/bin/relay` in child
+//    processes with controlled environments. The launcher is the only entry
+//    point a consumer installs, so its order, its hard failures, and its
+//    self-recursion refusal must stay behavioural facts, not prose.
+// 2. Version lockstep. Four files declare the shipped version. A consumer sees
+//    a coherent product only when all four agree.
+// 3. Asset-set closure. The release workflow must build exactly two Linux musl
+//    targets and stage exactly three assets. The forbidden-token assertion
+//    stops a non-Linux leg from reappearing.
+// 4. Payload boundary. Only allowlisted directories may ship inside `plugin/`,
+//    because an installer copies that directory into every consumer cache.
 
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
-import { parse as parseYaml } from 'yaml';
-import { PLUGINS } from '../../../scripts/lib/plugins.mjs';
-import {
-  INTEL_DARWIN_DEPRECATION,
-  PRERELEASE_BODY,
-  VERSION as RELEASE_CORE_VERSION,
-  STABLE_BODY,
-} from '../../../scripts/lib/session-relay-release-core.mjs';
-import { resolveHistoricalPublicationPlanPath, resolveReleasePlanPath } from './historical-plan-path.mjs';
+import url from 'node:url';
 import { resolveShippedRelayVersion } from './version.mjs';
 
-const HERE = path.dirname(fileURLToPath(import.meta.url));
-const REPO = path.resolve(HERE, '../../..');
-const HELPER = path.join(REPO, 'scripts/capture-tdd-red.mjs');
-const LAUNCHER = path.join(REPO, 'plugins/session-relay/bin/relay');
-const RELEASE = path.join(REPO, 'scripts/release.mjs');
-const WORKFLOW = path.join(REPO, '.github/workflows/build-binaries.yml');
-const COMPANION = path.join(REPO, 'plugins/session-relay/test/companion-distribution-contract.mjs');
-const DOCKS_PLAN = 'docs/plans/active/session-relay-linux-workspace-recertification.md';
-const RELEASE_VERSION = '0.13.0';
-const RELEASE_TAG = `session-relay--v${RELEASE_VERSION}`;
-const PUBLIC_REF = /^refs\/heads\/preflight\/session-relay-cli-0\.13\.0-[0-9a-f]{12}$/;
-const COMMIT = /^[0-9a-f]{40}$/;
-const { version: CURRENT_RELEASE_VERSION, tag: CURRENT_RELEASE_TAG } = resolveShippedRelayVersion(REPO);
-// DELIBERATELY PINNED - do not "clean up" into `loadReleaseInstance`. Every other
-// release suite now derives its identity from the instance file, which makes those
-// assertions instance-against-itself: they catch a library reading the wrong group,
-// but they cannot catch a WRONG VALUE written into the instance. These two literals
-// are the last independent oracle for that, so an unintended edit to the 0.16.0
-// instance fails here. Update them by hand, as a deliberate act, when the release
-// identity legitimately changes.
-const CURRENT_DOCKS_PLAN_TEMPLATE = resolveReleasePlanPath(REPO, CURRENT_RELEASE_VERSION);
-const CURRENT_DOCKS_RUN_ID = '5a4c1c26-4084-4488-8ced-f49c85848080';
-// The public child plan the current docks plan itself declares: the reviewed
-// docks-kit 0.14.0 child archive that pins the three 0.16.0 assets. The instance
-// now binds that completed child; this pin checks the plan text names the same
-// archive, by suffix rather than by the day the child happened to finish.
-// Date-free by construction. The archive prefix is the child's own FINISH date, which this
-// repository cannot know when the parent plan is written, so pinning it couples a parent
-// assertion to the day a different repository happens to land. The suffix is the stable part.
-const CURRENT_PUBLIC_PLAN_SUFFIX = '-session-relay-0.16.0-docks-kit-0.14.0-release.md';
-const HISTORICAL_RELEASE_PLAN = resolveHistoricalPublicationPlanPath(REPO);
-const HISTORICAL_RECEIPT_SHA256 = Object.freeze([
-  '419b23ccdcf0ca21672e81c05ae9d22c55bc67781839ffb6a29e7eecc2b59396',
-  '87a6260ae20280712ebb2d76d39667b128c8f6cf687141ebd779d8eca16c2262',
-  '31d096d31702b66d7e97085a82d8b7da1b75155f828b1d2382a0ac8427ba7ea2',
-  '7cf02781a2ed3c75423321492fb2cd4c4944f6da6d6d41290e26a5f3ca0cf902',
-]);
-// The CURRENT-generation ordinary asset list (three targets). The retired
-// x86_64-apple-darwin binary survives only in retained historical evidence
-// (companion-distribution-contract, captured 0.13 fixtures), never here.
-const ASSETS = [
-  'session-relay-aarch64-apple-darwin',
-  'session-relay-aarch64-unknown-linux-musl',
-  'session-relay-x86_64-unknown-linux-musl',
-];
-const sha256 = (value) => createHash('sha256').update(value).digest('hex');
-const run = (command, args, options = {}) =>
-  spawnSync(command, args, {
-    cwd: options.cwd ?? REPO,
-    env: options.env ?? process.env,
-    encoding: options.encoding ?? 'utf8',
-    input: options.input,
-    shell: false,
-    stdio: options.stdio,
+const REPO = path.resolve(path.dirname(url.fileURLToPath(import.meta.url)), '..');
+const LAUNCHER = path.join(REPO, 'plugin', 'bin', 'relay');
+const SEMVER = /^\d+\.\d+\.\d+$/;
+const BASE_PATH = '/usr/bin:/bin';
+
+function pass(name, detail) {
+  process.stdout.write(`PASS ${name} ${detail}\n`);
+}
+
+function readJson(relative) {
+  return JSON.parse(fs.readFileSync(path.join(REPO, relative), 'utf8'));
+}
+
+// --- 1. Launcher resolution -------------------------------------------------
+
+function writeStub(file, marker) {
+  fs.writeFileSync(
+    file,
+    [
+      '#!/bin/sh',
+      `printf 'MARKER=%s\\n' ${JSON.stringify(marker)}`,
+      'for argument in "$@"; do',
+      `  printf 'ARG=%s\\n' "$argument"`,
+      'done',
+      '',
+    ].join('\n'),
+    { mode: 0o755 },
+  );
+}
+
+function runLauncher(env, args = []) {
+  return spawnSync('sh', [LAUNCHER, ...args], {
+    cwd: REPO,
+    encoding: 'utf8',
+    env,
   });
-const git = (cwd, args) => {
-  const result = run('git', args, { cwd });
-  assert.equal(result.status, 0, `git ${args.join(' ')}: ${result.stderr}`);
-  return result.stdout.trim();
-};
-const canonicalize = (value) => {
-  if (value === null || typeof value !== 'object') return JSON.stringify(value);
-  if (Array.isArray(value)) return `[${value.map(canonicalize).join(',')}]`;
-  return `{${Object.keys(value)
-    .sort()
-    .map((key) => `${JSON.stringify(key)}:${canonicalize(value[key])}`)
-    .join(',')}}`;
-};
-const exactKeys = (object, expected, label) =>
-  assert.deepEqual(Object.keys(object).sort(), [...expected].sort(), label);
-let passed = 0;
-const check = (label, fn) => {
+}
+
+function checkLauncher() {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-distribution-'));
   try {
-    fn();
-    passed += 1;
-    process.stdout.write(`  ok: ${label}\n`);
-  } catch (error) {
-    error.message = `${label}: ${error.message}`;
-    throw error;
-  }
-};
-
-function parseCli(argv) {
-  const result = {
-    releaseFixtures: null,
-    publicRemote: null,
-    publicRef: null,
-    publicCommit: null,
-    detachedClone: false,
-  };
-  const singleton = new Set();
-  for (let index = 0; index < argv.length; index += 1) {
-    const option = argv[index];
-    if (option === '--detached-clone') {
-      assert.ok(!singleton.has(option), `duplicate ${option}`);
-      singleton.add(option);
-      result.detachedClone = true;
-      continue;
-    }
-    const field = {
-      '--release-fixtures': 'releaseFixtures',
-      '--public-remote': 'publicRemote',
-      '--public-ref': 'publicRef',
-      '--public-commit': 'publicCommit',
-    }[option];
-    assert.ok(field, `unknown option ${option}`);
-    assert.ok(!singleton.has(option), `duplicate ${option}`);
-    singleton.add(option);
-    assert.ok(argv[index + 1] && !argv[index + 1].startsWith('--'), `missing value for ${option}`);
-    result[field] = argv[index + 1];
-    index += 1;
-  }
-  const companionValues = [result.publicRemote, result.publicRef, result.publicCommit];
-  if (companionValues.some(Boolean) || result.detachedClone) {
-    assert.ok(
-      companionValues.every(Boolean) && result.detachedClone,
-      'public verification requires remote, ref, commit, and --detached-clone',
-    );
-    assert.match(result.publicCommit, COMMIT);
-  }
-  if (result.releaseFixtures) {
-    assert.equal(path.isAbsolute(result.releaseFixtures), true, '--release-fixtures must be absolute');
-    assert.equal(
-      fs.realpathSync.native(result.releaseFixtures),
-      result.releaseFixtures,
-      '--release-fixtures must be canonical',
-    );
-  }
-  return result;
-}
-const cli = parseCli(process.argv.slice(2));
-
-function makeHelperFixture() {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'capture-tdd-red-fixture-'));
-  fs.mkdirSync(path.join(root, 'scripts'), { recursive: true });
-  fs.mkdirSync(path.join(root, 'test'), { recursive: true });
-  fs.copyFileSync(HELPER, path.join(root, 'scripts/capture-tdd-red.mjs'));
-  fs.chmodSync(path.join(root, 'scripts/capture-tdd-red.mjs'), 0o755);
-  fs.writeFileSync(path.join(root, 'test/a.mjs'), 'export const a = 1;\n');
-  fs.writeFileSync(path.join(root, 'test/z.mjs'), 'export const z = 1;\n');
-  fs.symlinkSync('a.mjs', path.join(root, 'test/link.mjs'));
-  git(root, ['init', '-q']);
-  git(root, ['config', 'user.email', 'fixture@example.invalid']);
-  git(root, ['config', 'user.name', 'Fixture']);
-  git(root, ['add', 'scripts/capture-tdd-red.mjs', 'test/a.mjs', 'test/z.mjs', 'test/link.mjs']);
-  git(root, ['commit', '-qm', 'fixture']);
-  return {
-    root: fs.realpathSync.native(root),
-    helper: path.join(root, 'scripts/capture-tdd-red.mjs'),
-    commit: git(root, ['rev-parse', 'HEAD']),
-  };
-}
-
-function helperArgs(fixture, receipt, command, extra = []) {
-  return [
-    '--repo',
-    fixture.root,
-    '--repository-id',
-    'Fixture/example',
-    '--pre-production-commit',
-    fixture.commit,
-    '--test',
-    'test/z.mjs',
-    '--test',
-    'test/a.mjs',
-    '--receipt-out',
-    receipt,
-    ...extra,
-    '--',
-    ...command,
-  ];
-}
-
-function testCaptureHelper() {
-  const fixture = makeHelperFixture();
-  try {
-    const receiptPath = path.join(fixture.root, 'red.json');
-    const exactTokens = ['white space', '$(touch NEVER)', ';', '*', '--', '--flag=value', 'line\nbreak'];
-    const source =
-      'process.stdout.write(JSON.stringify(process.argv.slice(1)));process.stderr.write("frozen stderr");process.exit(17)';
-    const result = run(
-      process.execPath,
-      [fixture.helper, ...helperArgs(fixture, receiptPath, [process.execPath, '-e', source, ...exactTokens])],
-      { cwd: '/' },
-    );
-    assert.equal(result.status, 0, result.stderr);
-    assert.match(result.stdout, /^[0-9a-f]{64}\n$/);
-    assert.equal(result.stderr, '');
-    assert.equal(fs.statSync(receiptPath).mode & 0o777, 0o600);
-    const bytes = fs.readFileSync(receiptPath);
-    assert.equal(result.stdout.trim(), sha256(bytes));
-    const receipt = JSON.parse(bytes);
-    assert.equal(bytes.toString(), canonicalize(receipt), 'receipt must be RFC 8785 canonical UTF-8 without a newline');
-    exactKeys(
-      receipt,
-      [
-        'schema',
-        'type',
-        'repository_id',
-        'pre_production_commit',
-        'test_paths',
-        'command',
-        'exit_code',
-        'stdout_sha256',
-        'stderr_sha256',
-        'captured_at',
-        'producer',
-      ],
-      'receipt schema is closed',
-    );
-    exactKeys(receipt.command, ['cwd', 'argv'], 'command schema is closed');
-    exactKeys(receipt.producer, ['path', 'blob_id', 'version'], 'producer schema is closed');
-    for (const bound of receipt.test_paths) exactKeys(bound, ['path', 'blob_id'], 'test binding schema is closed');
-    assert.equal(receipt.schema, 1);
-    assert.equal(receipt.type, 'TddRedReceiptV1');
-    assert.equal(receipt.repository_id, 'Fixture/example');
-    assert.equal(receipt.pre_production_commit, fixture.commit);
-    assert.deepEqual(
-      receipt.test_paths.map(({ path: testPath }) => testPath),
-      ['test/a.mjs', 'test/z.mjs'],
-    );
-    assert.deepEqual(
-      receipt.test_paths.map(({ blob_id: blob }) => blob),
-      [
-        git(fixture.root, ['rev-parse', `${fixture.commit}:test/a.mjs`]),
-        git(fixture.root, ['rev-parse', `${fixture.commit}:test/z.mjs`]),
-      ],
-    );
-    assert.deepEqual(receipt.command, { cwd: fixture.root, argv: [process.execPath, '-e', source, ...exactTokens] });
-    assert.equal(receipt.exit_code, 17);
-    assert.equal(receipt.stdout_sha256, sha256(JSON.stringify(exactTokens)));
-    assert.equal(receipt.stderr_sha256, sha256('frozen stderr'));
-    assert.match(receipt.captured_at, /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/);
-    assert.deepEqual(receipt.producer, {
-      path: 'scripts/capture-tdd-red.mjs',
-      blob_id: git(fixture.root, ['rev-parse', `${fixture.commit}:scripts/capture-tdd-red.mjs`]),
-      version: '1',
-    });
-
-    const verbosePath = path.join(fixture.root, 'verbose-red.json');
-    const verboseSource = 'require("node:fs").writeSync(1,Buffer.alloc(2*1024*1024,0x61));process.exit(23)';
-    const verboseRun = run(process.execPath, [
-      fixture.helper,
-      ...helperArgs(fixture, verbosePath, [process.execPath, '-e', verboseSource]),
-    ]);
-    assert.equal(verboseRun.status, 0, verboseRun.stderr);
-    const verboseReceipt = JSON.parse(fs.readFileSync(verbosePath));
-    assert.equal(verboseReceipt.exit_code, 23);
-    assert.equal(verboseReceipt.stdout_sha256, sha256(Buffer.alloc(2 * 1024 * 1024, 0x61)));
-    assert.equal(verboseRun.stdout.trim(), sha256(fs.readFileSync(verbosePath)));
-
-    const failureCases = [
-      ['unknown option', ['--wat', 'x']],
-      ['duplicate singleton', ['--repo', fixture.root]],
-      ['missing singleton value', ['--repository-id']],
-    ];
-    for (const [name, extra] of failureCases) {
-      const output = path.join(fixture.root, `failure-${name.replaceAll(' ', '-')}.json`);
-      const failed = run(process.execPath, [
-        fixture.helper,
-        ...helperArgs(fixture, output, [process.execPath, '-e', 'process.exit(1)'], extra),
-      ]);
-      assert.notEqual(failed.status, 0, name);
-      assert.equal(fs.existsSync(output), false, `${name} must not create a receipt`);
-    }
-
-    const mutate = (args, name) => {
-      const output = path.join(fixture.root, `reject-${name}.json`);
-      const failed = run(process.execPath, [fixture.helper, ...args(output)]);
-      assert.notEqual(failed.status, 0, `${name} unexpectedly succeeded`);
-      assert.equal(fs.existsSync(output), false, `${name} created a receipt`);
-    };
-    const base = (output) => helperArgs(fixture, output, [process.execPath, '-e', 'process.exit(9)']);
-    mutate(
-      (output) => base(output).filter((token, i, all) => !(token === '--' && i === all.lastIndexOf('--'))),
-      'missing-separator',
-    );
-    mutate((output) => [...base(output).slice(0, -3), '--'], 'empty-command');
-    mutate(
-      (output) => base(output).map((token) => (token === 'Fixture/example' ? 'not-an-id' : token)),
-      'repository-id',
-    );
-    mutate(
-      (output) => base(output).map((token) => (token === fixture.commit ? fixture.commit.toUpperCase() : token)),
-      'uppercase-commit',
-    );
-    const treeObject = git(fixture.root, ['rev-parse', 'HEAD^{tree}']);
-    mutate(
-      (output) => base(output).map((token) => (token === fixture.commit ? treeObject : token)),
-      'non-commit-object',
-    );
-    mutate(
-      (output) => base(output).map((token) => (token === 'test/z.mjs' ? './test/z.mjs' : token)),
-      'noncanonical-test',
-    );
-    mutate((output) => base(output).map((token) => (token === 'test/z.mjs' ? 'test/a.mjs' : token)), 'duplicate-test');
-    mutate(
-      (output) => base(output).map((token) => (token === fixture.root ? `${fixture.root}/` : token)),
-      'noncanonical-repo',
-    );
-
-    fs.writeFileSync(path.join(fixture.root, 'test/untracked.mjs'), 'x\n');
-    mutate(
-      (output) => base(output).map((token) => (token === 'test/z.mjs' ? 'test/untracked.mjs' : token)),
-      'untracked-test',
-    );
-    mutate(
-      (output) => base(output).map((token) => (token === 'test/z.mjs' ? 'test/link.mjs' : token)),
-      'nonregular-test',
-    );
-    fs.writeFileSync(path.join(fixture.root, 'test/a.mjs'), 'dirty\n');
-    mutate((output) => base(output), 'dirty-test');
-    fs.writeFileSync(path.join(fixture.root, 'test/a.mjs'), 'export const a = 1;\n');
-
-    const existing = path.join(fixture.root, 'existing.json');
-    fs.writeFileSync(existing, 'sentinel');
-    const existingRun = run(process.execPath, [fixture.helper, ...base(existing)]);
-    assert.notEqual(existingRun.status, 0);
-    assert.equal(fs.readFileSync(existing, 'utf8'), 'sentinel');
-
-    mutate((output) => helperArgs(fixture, output, [process.execPath, '-e', 'process.exit(0)']), 'zero-exit');
-    mutate(
-      (output) => helperArgs(fixture, output, [process.execPath, '-e', 'process.kill(process.pid,"SIGTERM")']),
-      'signal-exit',
-    );
-    mutate((output) => helperArgs(fixture, output, [path.join(fixture.root, 'missing-command')]), 'missing-executable');
-
-    fs.appendFileSync(fixture.helper, '\n');
-    mutate((output) => base(output), 'dirty-producer');
-  } finally {
-    fs.rmSync(fixture.root, { recursive: true, force: true });
-  }
-}
-
-check('capture helper is shell-free, canonical, blob-bound, atomic, and fail-closed', testCaptureHelper);
-
-function makeExecutable(file, body) {
-  fs.writeFileSync(file, `#!/usr/bin/env node\n${body}\n`, { mode: 0o755 });
-}
-
-function launcherRun(env, args = ['--version']) {
-  return run(LAUNCHER, args, { env: { ...process.env, ...env }, cwd: REPO });
-}
-
-function testLauncher() {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'session-relay-launcher-'));
-  try {
-    const envDir = path.join(root, 'env');
+    const explicitDir = path.join(root, 'explicit');
     const pathDir = path.join(root, 'path');
+    const emptyDir = path.join(root, 'empty');
     const home = path.join(root, 'home');
-    fs.mkdirSync(envDir);
-    fs.mkdirSync(pathDir);
-    fs.mkdirSync(path.join(home, '.local/bin'), { recursive: true });
-    const record = path.join(root, 'record.json');
-    const stubBody = (name) =>
-      `require('node:fs').writeFileSync(process.env.RELAY_RECORD, JSON.stringify({name:${JSON.stringify(name)},argv:process.argv.slice(2)}));process.stdout.write(${JSON.stringify(`${name} ${RELEASE_VERSION}\n`)});`;
-    const explicit = path.join(envDir, 'explicit');
-    makeExecutable(explicit, stubBody('explicit'));
-    makeExecutable(path.join(pathDir, 'session-relay'), stubBody('path'));
-    makeExecutable(path.join(home, '.local/bin/session-relay'), stubBody('home'));
-    const common = {
-      HOME: home,
-      PATH: `${pathDir}${path.delimiter}${path.dirname(process.execPath)}${path.delimiter}/usr/bin:/bin`,
-      RELAY_RECORD: record,
-    };
+    const homeBin = path.join(home, '.local', 'bin');
+    for (const directory of [explicitDir, pathDir, emptyDir, homeBin]) {
+      fs.mkdirSync(directory, { recursive: true });
+    }
 
-    let result = launcherRun({ ...common, SESSION_RELAY_BIN: explicit }, ['send', 'agent', '--', 'a b', '--flag']);
-    assert.equal(result.status, 0, result.stderr);
-    assert.equal(result.stdout, `explicit ${RELEASE_VERSION}\n`);
-    assert.deepEqual(JSON.parse(fs.readFileSync(record, 'utf8')), {
-      name: 'explicit',
-      argv: ['send', 'agent', '--', 'a b', '--flag'],
-    });
+    const explicit = path.join(explicitDir, 'explicit-relay');
+    const onPath = path.join(pathDir, 'session-relay');
+    const inHome = path.join(homeBin, 'session-relay');
+    writeStub(explicit, 'explicit');
+    writeStub(onPath, 'path');
+    writeStub(inHome, 'home');
 
-    fs.rmSync(record, { force: true });
-    result = launcherRun({ ...common, SESSION_RELAY_BIN: '' });
-    assert.equal(result.status, 0, result.stderr);
-    assert.equal(JSON.parse(fs.readFileSync(record, 'utf8')).name, 'path');
+    const fullPath = `${pathDir}${path.delimiter}${BASE_PATH}`;
+    const barePath = `${emptyDir}${path.delimiter}${BASE_PATH}`;
 
-    fs.rmSync(path.join(pathDir, 'session-relay'));
-    fs.rmSync(record, { force: true });
-    result = launcherRun({ ...common, SESSION_RELAY_BIN: '' });
-    assert.equal(result.status, 0, result.stderr);
-    assert.equal(JSON.parse(fs.readFileSync(record, 'utf8')).name, 'home');
+    // (a) An executable SESSION_RELAY_BIN wins, and argv passes through verbatim.
+    const argv = ['send', 'agent', '--', 'a b', '--flag'];
+    const explicitRun = runLauncher({ HOME: home, PATH: fullPath, SESSION_RELAY_BIN: explicit }, argv);
+    assert.equal(explicitRun.status, 0, explicitRun.stderr);
+    assert.deepEqual(
+      explicitRun.stdout.split('\n').filter(Boolean),
+      ['MARKER=explicit', ...argv.map((argument) => `ARG=${argument}`)],
+      'SESSION_RELAY_BIN must win and receive argv verbatim',
+    );
+    pass('launcher-explicit-override', 'SESSION_RELAY_BIN wins and passes argv verbatim');
 
-    result = launcherRun({ ...common, SESSION_RELAY_BIN: path.join(root, 'absent') });
-    assert.notEqual(result.status, 0, 'an explicit invalid override must fail rather than silently fall through');
-    assert.match(result.stderr, /SESSION_RELAY_BIN|not.*executable|not found/i);
+    // (b) A non-executable SESSION_RELAY_BIN is a hard failure with no fallback.
+    const notExecutable = path.join(explicitDir, 'not-executable');
+    fs.writeFileSync(notExecutable, '#!/bin/sh\nprintf MARKER=bad\n', { mode: 0o644 });
+    const invalidRun = runLauncher({ HOME: home, PATH: fullPath, SESSION_RELAY_BIN: notExecutable });
+    assert.equal(invalidRun.status, 1, 'a non-executable override must exit 1');
+    assert.match(invalidRun.stderr, /SESSION_RELAY_BIN is not an executable file/);
+    assert.equal(invalidRun.stdout, '', 'a non-executable override must not fall back to PATH or to HOME');
+    pass('launcher-invalid-override', 'a non-executable SESSION_RELAY_BIN fails hard without fallback');
 
-    const recursePath = path.join(root, 'relay-link');
-    fs.symlinkSync(LAUNCHER, recursePath);
-    result = launcherRun({ ...common, SESSION_RELAY_BIN: recursePath });
-    assert.notEqual(result.status, 0);
-    assert.match(result.stderr, /recurs|itself/i);
+    // (c) Without an override, PATH resolves the executable.
+    const pathRun = runLauncher({ HOME: home, PATH: fullPath });
+    assert.equal(pathRun.status, 0, pathRun.stderr);
+    assert.match(pathRun.stdout, /^MARKER=path\n/);
+    pass('launcher-path-resolution', 'PATH resolves session-relay when no override exists');
 
-    fs.rmSync(path.join(home, '.local/bin/session-relay'));
-    result = launcherRun({ ...common, PATH: pathDir, SESSION_RELAY_BIN: '' });
-    assert.notEqual(result.status, 0);
-    assert.match(result.stderr, /docks-kit sync/);
-    assert.match(result.stderr, /docks-kit toolchain ensure session-relay/);
+    // (d) Without an override and with nothing on PATH, HOME resolves it.
+    const homeRun = runLauncher({ HOME: home, PATH: barePath });
+    assert.equal(homeRun.status, 0, homeRun.stderr);
+    assert.match(homeRun.stdout, /^MARKER=home\n/);
+    pass('launcher-home-resolution', '$HOME/.local/bin/session-relay resolves as the last candidate');
+
+    // (e) A launcher that resolves to itself is refused.
+    const firstLink = path.join(root, 'relay-link-1');
+    const secondLink = path.join(root, 'relay-link-2');
+    fs.symlinkSync(LAUNCHER, firstLink);
+    fs.symlinkSync(firstLink, secondLink);
+    const recursionRun = runLauncher({ HOME: home, PATH: fullPath, SESSION_RELAY_BIN: secondLink });
+    assert.notEqual(recursionRun.status, 0, 'a self-resolving launcher must fail');
+    assert.match(recursionRun.stderr, /refusing to execute itself recursively/);
+    pass('launcher-recursion-refusal', 'a symlink chain back to the launcher is refused');
+
+    // (f) Nothing found anywhere exits 1 with the not-found message.
+    fs.rmSync(inHome);
+    const missingRun = runLauncher({ HOME: home, PATH: barePath });
+    assert.equal(missingRun.status, 1, 'a missing executable must exit 1');
+    assert.match(missingRun.stderr, /session-relay executable not found\./);
+    pass('launcher-not-found', 'an unresolvable executable exits 1 with the not-found message');
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
 }
 
-check('launcher resolves explicit, PATH, and home executables without recursion or fallback', testLauncher);
+// --- 2. Version lockstep ----------------------------------------------------
 
-check('only the launcher remains tracked in the plugin bin directory', () => {
-  assert.deepEqual(git(REPO, ['ls-files', 'plugins/session-relay/bin']).split('\n').filter(Boolean), [
-    'plugins/session-relay/bin/relay',
-  ]);
-});
-
-check('Cargo and plugin manifests expose exact synchronized release version', () => {
-  const cargo = fs
-    .readFileSync(path.join(REPO, 'plugins/session-relay/rust/Cargo.toml'), 'utf8')
-    .match(/^version\s*=\s*"([^"]+)"/m)?.[1];
-  const claude = JSON.parse(
-    fs.readFileSync(path.join(REPO, 'plugins/session-relay/.claude-plugin/plugin.json')),
-  ).version;
-  const codex = JSON.parse(fs.readFileSync(path.join(REPO, 'plugins/session-relay/.codex-plugin/plugin.json'))).version;
-  const market = JSON.parse(fs.readFileSync(path.join(REPO, '.claude-plugin/marketplace.json'))).plugins.find(
+function checkVersionLockstep() {
+  const shipped = resolveShippedRelayVersion(REPO);
+  const cargo = fs.readFileSync(path.join(REPO, 'Cargo.toml'), 'utf8').match(/^version\s*=\s*"([^"]+)"/m)?.[1];
+  const marketplace = readJson('.claude-plugin/marketplace.json').plugins.find(
     ({ name }) => name === 'session-relay',
-  ).version;
-  assert.equal(cargo, CURRENT_RELEASE_VERSION);
-  assert.equal(claude, CURRENT_RELEASE_VERSION);
-  assert.equal(codex, CURRENT_RELEASE_VERSION);
-  assert.equal(market, CURRENT_RELEASE_VERSION);
-});
-
-function assertNativeWorkflowBoundary(document) {
-  const build = document.jobs.build;
-  assert.equal(build.needs, 'identity');
-  assert.equal(build['runs-on'], '${{ matrix.runner }}');
-  exactKeys(build.strategy.matrix, ['include'], 'native matrix is closed');
-  for (const leg of build.strategy.matrix.include)
-    exactKeys(leg, ['runner', 'runner_os', 'runner_arch', 'target', 'asset'], 'native matrix leg is closed');
-  assert.deepEqual(build.strategy.matrix.include, [
-    {
-      runner: 'ubuntu-24.04',
-      runner_os: 'Linux',
-      runner_arch: 'X64',
-      target: 'x86_64-unknown-linux-musl',
-      asset: 'session-relay-x86_64-unknown-linux-musl',
-    },
-    {
-      runner: 'ubuntu-24.04-arm',
-      runner_os: 'Linux',
-      runner_arch: 'ARM64',
-      target: 'aarch64-unknown-linux-musl',
-      asset: 'session-relay-aarch64-unknown-linux-musl',
-    },
-    {
-      runner: 'macos-15',
-      runner_os: 'macOS',
-      runner_arch: 'ARM64',
-      target: 'aarch64-apple-darwin',
-      asset: 'session-relay-aarch64-apple-darwin',
-    },
-  ]);
-
-  const names = build.steps.map((step) => step.name ?? step.uses);
-  const evidenceSteps = [
-    'build locked native release',
-    'prove Linux managed-workspace custody',
-    'prove macOS managed-workspace admission STOP',
-    'smoke explicit fresh Linux workspace binary',
-    'attest native release binary',
-    'upload stable executable and canonical attestation',
+  )?.version;
+  const declarations = [
+    { file: 'Cargo.toml', version: cargo },
+    { file: 'plugin/.claude-plugin/plugin.json', version: shipped.version },
+    { file: 'plugin/.codex-plugin/plugin.json', version: readJson('plugin/.codex-plugin/plugin.json').version },
+    { file: '.claude-plugin/marketplace.json', version: marketplace },
   ];
-  const firstEvidence = names.indexOf(evidenceSteps[0]);
-  assert.notEqual(firstEvidence, -1, 'native evidence steps are absent');
+
+  for (const { file, version } of declarations) {
+    assert.match(version ?? '', SEMVER, `${file} must declare a semver version, found ${JSON.stringify(version)}`);
+  }
+
+  const counts = new Map();
+  for (const { version } of declarations) counts.set(version, (counts.get(version) ?? 0) + 1);
+  const [majority] = [...counts.entries()].sort((left, right) => right[1] - left[1])[0];
+  const disagreeing = declarations.filter(({ version }) => version !== majority);
   assert.deepEqual(
-    evidenceSteps.map((name) => names.indexOf(name)),
-    evidenceSteps.map((_, index) => firstEvidence + index),
-    'native custody, refusal, smoke, and attestation steps must remain contiguous and ordered',
+    disagreeing,
+    [],
+    `the shipped version must be identical in all four files; majority is ${majority} and these disagree: ${disagreeing
+      .map(({ file, version }) => `${file}=${version}`)
+      .join(', ')}`,
   );
-  const byName = new Map(build.steps.map((step) => [step.name, step]));
-  const linuxCustody = byName.get('prove Linux managed-workspace custody');
-  assert.equal(linuxCustody.if, "runner.os == 'Linux'");
-  assert.match(
-    linuxCustody.run,
-    /SESSION_RELAY_TEST_BIN="\$RUNNER_TEMP\/session-relay\/\$TARGET\/\$ASSET_NAME"[\s\S]*workspace_lease_process[\s\S]*linux_cgroup_pidfd_guardian_kills_hostile_descendants[\s\S]*--exact --nocapture/,
-  );
-  const linuxSmoke = byName.get('smoke explicit fresh Linux workspace binary');
-  assert.equal(linuxSmoke.if, "runner.os == 'Linux'");
-  assert.match(
-    linuxSmoke.run,
-    /bin="\$RUNNER_TEMP\/session-relay\/\$TARGET\/\$ASSET_NAME"[\s\S]*--case single-session-compat --bin "\$bin"[\s\S]*--case docs-contract --bin "\$bin"/,
-  );
-  const macosRefusal = byName.get('prove macOS managed-workspace admission STOP');
-  assert.equal(macosRefusal.if, "runner.os == 'macOS'");
-  assert.match(
-    macosRefusal.run,
-    /test "\$filesystem_type" = apfs[\s\S]*workspace_lease_process[\s\S]*macos_process_group_recursive_guardian_kills_hostile_descendants[\s\S]*--exact --nocapture/,
-  );
-  assert.doesNotMatch(macosRefusal.name, /custody|support/i);
+  pass('version-lockstep', `four files declare ${majority}`);
+}
 
-  const upload = byName.get('upload stable executable and canonical attestation');
-  assert.match(upload.with.path, /\$\{\{ matrix\.asset \}\}/);
-  assert.match(upload.with.path, /attestation-\$\{\{ matrix\.target \}\}\.json/);
-  assert.deepEqual(document.jobs.aggregate.needs, ['identity', 'build']);
-  const aggregate = document.jobs.aggregate.steps.find(
-    ({ name }) => name === 'validate closed attestations and generate SHA256SUMS',
-  );
-  assert.ok(aggregate, 'aggregate attestation closure is absent');
-  assert.match(aggregate.run, /const attestationName = `attestation-\$\{target\}\.json`;/);
-  assert.match(aggregate.run, /expectedFiles\.push\(assetName, attestationName\)/);
-  for (const target of build.strategy.matrix.include.map(({ target }) => target)) {
-    assert.match(
-      aggregate.run,
-      new RegExp(`['"]${target}['"]\\s*:`),
-      `aggregate does not declare attestation row ${target}`,
-    );
+// --- 3. Asset-set closure ---------------------------------------------------
+
+function jobSection(document, job) {
+  const lines = document.split('\n');
+  const start = lines.indexOf(`  ${job}:`);
+  assert.notEqual(start, -1, `.github/workflows/release.yml must define the ${job} job`);
+  let end = lines.length;
+  for (let index = start + 1; index < lines.length; index += 1) {
+    if (/^ {2}\S/.test(lines[index])) {
+      end = index;
+      break;
+    }
   }
-  const checksumRows = aggregate.run
-    .match(/sha256sum \\\n([\s\S]*?)> SHA256SUMS/)?.[1]
-    ?.match(/session-relay-[a-z0-9_-]+/g);
-  assert.deepEqual(checksumRows, ASSETS, 'checksum manifest must contain exactly the three ordinary native assets');
-  assert.match(aggregate.run, /test "\$\(wc -l < SHA256SUMS\)" -eq 3/);
+  return lines.slice(start, end).join('\n');
 }
 
-function workflowContract() {
-  const document = parseYaml(fs.readFileSync(WORKFLOW, 'utf8'));
-  exactKeys(document.on, ['push', 'workflow_dispatch'], 'workflow triggers are closed');
-  assert.deepEqual(document.on.push.tags, ['session-relay--v*']);
-  const inputs = document.on.workflow_dispatch.inputs;
-  exactKeys(inputs, ['mode', 'expected_commit', 'expected_tag'], 'dispatch inputs are closed');
-  assert.equal(inputs.mode.required, true);
-  assert.equal(inputs.mode.type, 'choice');
-  assert.deepEqual(inputs.mode.options, ['validate-only', 'publish-existing-tag']);
-  assert.equal(inputs.expected_commit.required, true);
-  assert.equal(inputs.expected_tag.required, false);
-  assert.equal(inputs.expected_tag.default, '');
-  assert.deepEqual(document.permissions, { contents: 'read' });
+function checkAssetSet() {
+  const workflow = path.join(REPO, '.github', 'workflows', 'release.yml');
+  const document = fs.readFileSync(workflow, 'utf8');
 
-  const jobs = Object.values(document.jobs);
-  const publishing = jobs.filter((job) => job.permissions?.contents === 'write');
-  assert.equal(publishing.length, 1, 'only one publisher may receive contents: write');
-  for (const job of jobs.filter((job) => !publishing.includes(job)))
-    assert.notEqual(job.permissions?.contents, 'write');
-  assertNativeWorkflowBoundary(document);
-
-  const supportSubstitution = structuredClone(document);
-  supportSubstitution.jobs.build.steps.find(
-    ({ name }) => name === 'prove macOS managed-workspace admission STOP',
-  ).name = 'prove macOS managed-workspace custody';
-  assert.throws(
-    () => assertNativeWorkflowBoundary(supportSubstitution),
-    /contiguous|ordered|absent/,
-    'macOS support substitution was accepted',
-  );
-  const missingDarwin = structuredClone(document);
-  missingDarwin.jobs.build.strategy.matrix.include = missingDarwin.jobs.build.strategy.matrix.include.filter(
-    ({ target }) => target !== 'aarch64-apple-darwin',
-  );
-  assert.throws(() => assertNativeWorkflowBoundary(missingDarwin), /deep-equal/, 'missing Darwin asset was accepted');
-  const substitutedDarwin = structuredClone(document);
-  substitutedDarwin.jobs.build.strategy.matrix.include[2].asset = 'session-relay-x86_64-unknown-linux-musl';
-  assert.throws(
-    () => assertNativeWorkflowBoundary(substitutedDarwin),
-    /deep-equal/,
-    'substituted Darwin asset was accepted',
+  const targets = [...new Set(document.match(/[A-Za-z0-9_]+-unknown-linux-musl/g) ?? [])].sort();
+  assert.deepEqual(
+    targets,
+    ['aarch64-unknown-linux-musl', 'x86_64-unknown-linux-musl'],
+    'the release workflow must build exactly the two Linux musl targets',
   );
 
-  for (const match of fs.readFileSync(WORKFLOW, 'utf8').matchAll(/uses:\s*([^\s#]+)/g)) {
-    assert.match(match[1], /@[0-9a-f]{40}$/i, `action is not pinned by full commit: ${match[1]}`);
-  }
-}
-check(
-  'binary workflow publishes three native, attested, checksummed prerelease assets with least privilege',
-  workflowContract,
-);
+  const publish = jobSection(document, 'publish');
+  const assets = [...new Set(publish.match(/session-relay-(?:x86_64|aarch64)[A-Za-z0-9_.-]*/g) ?? [])].sort();
+  assert.deepEqual(
+    assets,
+    ['session-relay-aarch64-unknown-linux-musl', 'session-relay-x86_64-unknown-linux-musl'],
+    'the publish job must stage exactly the two binary assets',
+  );
+  assert.match(publish, /\bSHA256SUMS\b/, 'the publish job must stage SHA256SUMS beside the two binaries');
+  assert.equal(assets.length + 1, 3, 'the publish job must stage exactly three assets');
 
-const RECEIPT_TYPES = {
-  'materialize-tdd-red': 'TddRedReceiptV1',
-  'verify-source-ci': 'SourceCiReceiptV1',
-  'check-prepared': 'SourcePreparationCandidateV1',
-  'bind-completion': 'SourcePreparationProofV1',
-  'publish-reviewed': 'SessionRelayPublicationReceiptV1',
-  'promote-reviewed': 'PromotionReceiptV1',
-  'resume-promotion': 'PromotionReceiptV1',
-  'finalize-reviewed': 'SessionRelayPublicationReceiptV1',
-};
-const PUBLICATION_CASES = [
-  ['tag-absent', 'prerelease'],
-  ['tag-no-run', 'prerelease'],
-  ['bound-run-no-release', 'prerelease'],
-  ['partial-prerelease', 'prerelease'],
-  ['complete-prerelease', 'prerelease'],
-  ['premature-stable', 'conflict'],
-  ['tag-conflict', 'conflict'],
-  ['run-conflict', 'conflict'],
-  ['release-conflict', 'conflict'],
-  ['asset-conflict', 'conflict'],
-  ['digest-conflict', 'conflict'],
-];
-const PROMOTION_CASES = [
-  ['success', 'success'],
-  ['expected-main-drift', 'manual_incident'],
-  ['lock-contention', 'failure'],
-  ['prepush-failure', 'failure'],
-  ['postpush-live-failure', 'restored_failure'],
-  ['restore-failure', 'failure'],
-  ['unknown-authoritative-state', 'manual_incident'],
-  ['transaction-gap', 'conflict'],
-  ['terminal-rewrite', 'conflict'],
-  ['closed-set-drift', 'conflict'],
-  ['resume-after-initialized', 'success'],
-  ['resume-after-locked', 'success'],
-  ['resume-after-prepush', 'success'],
-  ['resume-after-main-push', 'success'],
-  ['recover-success-receipt', 'success'],
-  ['recover-restored-failure-receipt', 'restored_failure'],
-  ['recover-failure-receipt', 'failure'],
-  ['recover-manual-incident-receipt', 'manual_incident'],
-  ['retry-restored-failure', 'success'],
-  ['retry-old-receipt', 'conflict'],
-  ['retry-success', 'conflict'],
-  ['retry-manual-incident', 'conflict'],
-  ['retry-second-attempt-failure', 'conflict'],
-];
-
-function releaseFixtureRoot() {
-  if (cli.releaseFixtures) return { root: cli.releaseFixtures, owned: false };
-  return { root: fs.mkdtempSync(path.join(os.tmpdir(), 'session-relay-release-fixtures-')), owned: true };
+  const forbidden = document.match(/darwin|apple|windows|msvc|-gnu\b/gi) ?? [];
+  assert.deepEqual(forbidden, [], `the release workflow must name no non-Linux target: ${forbidden.join(', ')}`);
+  pass('asset-set-closure', 'two musl targets, three staged assets, no non-Linux token');
 }
 
-function runReleaseFixture(root, mode, scenario, fixtureOutcome, releaseArgs, effectiveOutcome = fixtureOutcome) {
-  const directory = path.join(root, `${mode}-${scenario}`);
-  fs.mkdirSync(directory, { recursive: true });
-  const fixture = {
-    schema: 1,
-    type: 'SessionRelayReleaseFixtureV1',
-    scenario,
-    repository_id: 'DocksDocks/docks',
-    source_commit: '1'.repeat(40),
-    promoted_commit: '2'.repeat(40),
-    expected_origin_main: '3'.repeat(40),
-    tag: RELEASE_TAG,
-    assets: [...ASSETS, 'SHA256SUMS'].map((name, index) => ({
-      name,
-      digest: String(index + 4)
-        .repeat(64)
-        .slice(0, 64),
-      database_id: 100 + index,
-    })),
-    expected_outcome: fixtureOutcome,
-  };
-  const fixturePath = path.join(directory, 'fixture.json');
-  const reportPath = path.join(directory, 'report.json');
-  fs.writeFileSync(fixturePath, `${JSON.stringify(fixture, null, 2)}\n`);
-  const result = run(process.execPath, [RELEASE, ...releaseArgs], {
-    env: {
-      ...process.env,
-      SESSION_RELAY_RELEASE_FIXTURE: fixturePath,
-      SESSION_RELAY_RELEASE_REPORT: reportPath,
-    },
+// --- 4. Payload boundary ----------------------------------------------------
+
+const PAYLOAD_ALLOWLIST = new Set([
+  '.claude-plugin',
+  '.codex-plugin',
+  'skills',
+  'hooks',
+  'commands',
+  'agents',
+  'bin',
+  'README.md',
+  'AGENTS.md',
+  'CLAUDE.md',
+  'LICENSE',
+]);
+
+function checkPayloadBoundary() {
+  const listed = spawnSync('git', ['ls-files', 'plugin'], { cwd: REPO, encoding: 'utf8' });
+  assert.equal(listed.status, 0, `git ls-files plugin must succeed: ${listed.stderr}`);
+  const tracked = listed.stdout.split('\n').filter(Boolean);
+  assert.ok(tracked.length > 0, 'the payload must contain tracked files');
+
+  const offending = tracked.filter((file) => {
+    const segments = file.split('/');
+    return segments[0] !== 'plugin' || !PAYLOAD_ALLOWLIST.has(segments[1] ?? '');
   });
-  const unsuccessful = ['conflict', 'failure', 'manual_incident', 'restored_failure'].includes(effectiveOutcome);
-  assert.equal(result.status, unsuccessful ? 1 : 0, `${mode}/${scenario}: ${result.stderr}`);
-  assert.equal(fs.existsSync(reportPath), true, `${mode}/${scenario} did not emit a fixture report`);
-  const report = JSON.parse(fs.readFileSync(reportPath));
-  exactKeys(
-    report,
-    ['schema', 'type', 'scenario', 'outcome', 'calls', 'mutations', 'journal', 'receipt', 'state'],
-    `${mode}/${scenario} report schema`,
-  );
-  assert.equal(report.schema, 1);
-  assert.equal(report.type, 'SessionRelayReleaseFixtureReportV1');
-  assert.equal(report.scenario, scenario);
-  assert.equal(report.outcome, effectiveOutcome);
-  assert.ok(Array.isArray(report.calls));
-  assert.ok(report.state && typeof report.state === 'object' && !Array.isArray(report.state));
-  assert.ok(Array.isArray(report.mutations));
-  if (report.receipt) {
-    assert.equal(report.receipt.schema, 1);
-    if (RECEIPT_TYPES[mode]) assert.equal(report.receipt.type, RECEIPT_TYPES[mode]);
-    const receiptIndex = releaseArgs.indexOf('--receipt-out');
-    if (receiptIndex >= 0) {
-      const output = releaseArgs[receiptIndex + 1];
-      assert.equal(fs.statSync(output).mode & 0o777, 0o600, `${mode}/${scenario} receipt mode`);
-      const receiptBytes = fs.readFileSync(output);
-      assert.equal(receiptBytes.toString(), canonicalize(report.receipt), `${mode}/${scenario} noncanonical receipt`);
-      assert.equal(
-        result.stdout.trim().split('\n').at(-1),
-        sha256(receiptBytes),
-        `${mode}/${scenario} receipt digest output`,
-      );
-    }
-  }
-  return report;
+  assert.deepEqual(offending, [], `these payload paths are outside the allowlist: ${offending.join(', ')}`);
+  pass('payload-boundary', `${tracked.length} tracked payload paths stay inside the allowlist`);
 }
 
-function releaseContracts() {
-  const fixtureRoot = releaseFixtureRoot();
-  const inPath = (name) => path.join(fixtureRoot.root, `${name}.json`);
-  const outPath = (name) => path.join(fixtureRoot.root, `${name}.receipt.json`);
-  const pair = (name, digest, flag = name) => [inPath(name), `--${flag}-sha256`, digest.repeat(64)];
-  try {
-    for (const [scenario, outcome] of PUBLICATION_CASES) {
-      const args = [
-        '--publish-reviewed',
-        '--plugin',
-        'session-relay',
-        RELEASE_VERSION,
-        '--source-proof',
-        ...pair('source-proof', 'a'),
-        '--receipt-out',
-        outPath(`publication-${scenario}`),
-      ];
-      if (scenario === 'partial-prerelease' || scenario === 'complete-prerelease') {
-        args.push('--resume-publication', ...pair('prior-publication', 'b', 'resume-publication'));
-      }
-      const report = runReleaseFixture(fixtureRoot.root, 'publish-reviewed', scenario, outcome, args);
-      if (outcome === 'prerelease') {
-        assert.deepEqual(report.receipt.assets.map(({ name }) => name).sort(), [...ASSETS, 'SHA256SUMS'].sort());
-        assert.equal(report.receipt.release_state, 'prerelease');
-        assert.doesNotMatch(report.state.release.body, /docks-kit sync|plugin install/i);
-      }
-    }
-
-    for (const [scenario, outcome] of PROMOTION_CASES) {
-      const resume = scenario.startsWith('resume') || scenario.startsWith('recover');
-      const mode = resume ? 'resume-promotion' : 'promote-reviewed';
-      const args = [
-        `--${mode}`,
-        '--plugin',
-        'session-relay',
-        RELEASE_VERSION,
-        ...(resume ? ['--transaction-ref', `refs/heads/transactions/session-relay-${RELEASE_VERSION}`] : []),
-        '--source-proof',
-        ...pair('source-proof', 'a'),
-        '--publication',
-        ...pair('publication', 'b'),
-        '--public-release',
-        ...pair('public-release', 'd'),
-        '--docks-kit-release',
-        'cli-v0.9.0',
-        '--expected-origin-main',
-        '3'.repeat(40),
-        '--receipt-out',
-        outPath(`promotion-${scenario}`),
-      ];
-      if (scenario.startsWith('retry-')) args.push('--retry-failed', ...pair('failed-promotion', 'c', 'retry-failed'));
-      const report = runReleaseFixture(fixtureRoot.root, mode, scenario, outcome, args);
-      const keys = report.journal.map(({ attempt, sequence }) => `${attempt}:${sequence}`);
-      assert.deepEqual(
-        keys,
-        [...keys].sort((a, b) => a.localeCompare(b, undefined, { numeric: true })),
-        `${scenario} journal keys regress`,
-      );
-      assert.equal(new Set(keys).size, keys.length, `${scenario} journal key reused`);
-      if (report.receipt) assert.equal(report.receipt.outcome, outcome);
-    }
-
-    for (const terminal of ['success', 'restored-failure', 'failure', 'manual-incident']) {
-      const outcome = terminal === 'restored-failure' ? 'restored_failure' : terminal.replace('-', '_');
-      const resumeArgs = (receipt) => [
-        '--resume-promotion',
-        '--plugin',
-        'session-relay',
-        RELEASE_VERSION,
-        '--transaction-ref',
-        `refs/heads/transactions/session-relay-${RELEASE_VERSION}`,
-        '--source-proof',
-        ...pair('source-proof', 'a'),
-        '--publication',
-        ...pair('publication', 'b'),
-        '--public-release',
-        ...pair('public-release', 'd'),
-        '--docks-kit-release',
-        'cli-v0.9.0',
-        '--expected-origin-main',
-        '3'.repeat(40),
-        '--receipt-out',
-        receipt,
-      ];
-      const uninterrupted = runReleaseFixture(
-        fixtureRoot.root,
-        'resume-promotion',
-        `terminal-${terminal}-uninterrupted`,
-        outcome,
-        resumeArgs(outPath(`terminal-${terminal}-uninterrupted`)),
-      );
-      const recovered = runReleaseFixture(
-        fixtureRoot.root,
-        'resume-promotion',
-        `terminal-${terminal}-recover`,
-        outcome,
-        resumeArgs(outPath(`terminal-${terminal}-recover`)),
-      );
-      assert.equal(
-        canonicalize(recovered.receipt),
-        canonicalize(uninterrupted.receipt),
-        `${terminal} recovered receipt differs`,
-      );
-      assert.deepEqual(recovered.mutations, [], `${terminal} terminal recovery mutated state`);
-    }
-
-    for (const [scenario, outcome] of [
-      ['finalize-prerelease', 'stable'],
-      ['finalize-already-stable', 'stable'],
-      ['finalize-resume', 'stable'],
-      ['finalize-partial', 'conflict'],
-      ['finalize-failed-promotion', 'conflict'],
-    ]) {
-      const args = [
-        '--finalize-reviewed',
-        '--plugin',
-        'session-relay',
-        RELEASE_VERSION,
-        '--source-proof',
-        ...pair('source-proof', 'a'),
-        '--publication',
-        ...pair('publication', 'b'),
-        '--promotion',
-        ...pair('promotion', 'c'),
-        '--receipt-out',
-        outPath(scenario),
-      ];
-      if (scenario === 'finalize-resume')
-        args.push('--resume-finalization', ...pair('prior-final-publication', 'd', 'resume-finalization'));
-      const report = runReleaseFixture(fixtureRoot.root, 'finalize-reviewed', scenario, outcome, args);
-      if (outcome === 'stable') {
-        assert.equal(report.receipt.release_state, 'stable');
-        assert.equal(report.state.release.body.match(/```\n([^\n]+)\n```/)?.[1], 'docks-kit sync');
-        assert.doesNotMatch(report.state.release.body, /plugin install session-relay/i);
-      }
-    }
-
-    const preparation = [
-      ['prepare', ['--prepare', '--plugin', 'session-relay', RELEASE_VERSION]],
-      [
-        'materialize-tdd-red',
-        [
-          '--materialize-tdd-red',
-          '--plugin',
-          'session-relay',
-          RELEASE_VERSION,
-          '--plan',
-          DOCKS_PLAN,
-          '--docks-red-out',
-          outPath('docks-red'),
-          '--public-red-out',
-          outPath('public-red'),
-        ],
-      ],
-      [
-        'verify-embedded-preparation',
-        ['--verify-embedded-preparation', '--plugin', 'session-relay', RELEASE_VERSION, '--plan', DOCKS_PLAN],
-      ],
-      [
-        'verify-source-ci',
-        [
-          '--verify-source-ci',
-          '--plugin',
-          'session-relay',
-          RELEASE_VERSION,
-          '--run-id',
-          '12345',
-          '--expected-commit',
-          '1'.repeat(40),
-          '--receipt-out',
-          outPath('source-ci'),
-        ],
-      ],
-      [
-        'check-prepared',
-        [
-          '--check-prepared',
-          '--plugin',
-          'session-relay',
-          RELEASE_VERSION,
-          '--source-commit',
-          '1'.repeat(40),
-          '--docks-red',
-          ...pair('docks-red', 'a'),
-          '--public-red',
-          ...pair('public-red', 'b'),
-          '--preflight',
-          ...pair('preflight', 'c'),
-          '--source-ci',
-          ...pair('source-ci', 'd'),
-          '--receipt-out',
-          outPath('candidate'),
-        ],
-      ],
-      [
-        'bind-completion',
-        [
-          '--bind-completion',
-          '--plugin',
-          'session-relay',
-          RELEASE_VERSION,
-          '--finished-plan',
-          inPath('finished-plan'),
-          '--embedded-candidate-sha256',
-          'e'.repeat(64),
-          '--receipt-out',
-          outPath('source-proof'),
-        ],
-      ],
-    ];
-    for (const [mode, args] of preparation) {
-      runReleaseFixture(fixtureRoot.root, mode, 'valid', 'success', args);
-    }
-
-    for (const { name: plugin } of PLUGINS.filter(({ release }) => release.kind === 'generic')) {
-      for (const bump of ['patch', 'minor', 'major', '9.8.7']) {
-        const report = runReleaseFixture(fixtureRoot.root, 'legacy-release', `${plugin}-${bump}`, 'success', [
-          '--plugin',
-          plugin,
-          bump,
-        ]);
-        assert.equal(report.state.tag, `${plugin}--v${report.state.version}`);
-        assert.ok(report.calls.some((call) => call.argv?.includes('scripts/ci.mjs')));
-      }
-    }
-
-    const before = new Map([
-      ['status', git(REPO, ['status', '--porcelain=v1', '--untracked-files=all'])],
-      ...[
-        '.claude-plugin/marketplace.json',
-        'plugins/session-relay/.claude-plugin/plugin.json',
-        'plugins/session-relay/.codex-plugin/plugin.json',
-        'plugins/session-relay/rust/Cargo.toml',
-        'plugins/session-relay/rust/Cargo.lock',
-      ].map((relative) => [relative, fs.readFileSync(path.join(REPO, relative))]),
-    ]);
-    const dry = runReleaseFixture(fixtureRoot.root, 'prepare', 'dry-run', 'success', [
-      '--prepare',
-      '--plugin',
-      'session-relay',
-      RELEASE_VERSION,
-      '--dry-run',
-    ]);
-    assert.equal(
-      dry.calls.some((call) => /ci\.mjs/.test(JSON.stringify(call))),
-      false,
-      'dry-run executed CI',
-    );
-    assert.deepEqual(dry.mutations, []);
-    assert.match(JSON.stringify(dry), /real release|changed tree|gate/i);
-    assert.equal(git(REPO, ['status', '--porcelain=v1', '--untracked-files=all']), before.get('status'));
-    for (const [relative, bytes] of before)
-      if (relative !== 'status') assert.deepEqual(fs.readFileSync(path.join(REPO, relative)), bytes);
-
-    const validPublish = [
-      '--publish-reviewed',
-      '--plugin',
-      'session-relay',
-      RELEASE_VERSION,
-      '--source-proof',
-      ...pair('source-proof', 'a'),
-      '--receipt-out',
-      outPath('grammar'),
-    ];
-    const malformedCases = new Map([
-      ['unknown-argument', [...validPublish, '--unknown']],
-      ['duplicate-argument', [...validPublish, '--plugin', 'session-relay']],
-      ['missing-argument', ['--prepare', '--plugin']],
-      [
-        'orphan-receipt-digest',
-        [
-          '--publish-reviewed',
-          '--plugin',
-          'session-relay',
-          RELEASE_VERSION,
-          '--source-proof-sha256',
-          'a'.repeat(64),
-          '--receipt-out',
-          outPath('orphan'),
-        ],
-      ],
-      ['existing-output', validPublish],
-      ['noncanonical-input', validPublish],
-      ['wrong-input-digest', validPublish],
-      ['receipt-unknown-field', validPublish],
-      ['receipt-missing-field', validPublish],
-    ]);
-    for (const [scenario, args] of malformedCases) {
-      if (scenario === 'existing-output') {
-        fs.writeFileSync(outPath('grammar'), 'existing receipt must survive', { mode: 0o600 });
-      }
-      const report = runReleaseFixture(fixtureRoot.root, 'grammar', scenario, 'conflict', args);
-      assert.deepEqual(report.mutations, [], `${scenario} mutated before rejection`);
-      if (scenario === 'existing-output') {
-        assert.equal(fs.readFileSync(outPath('grammar'), 'utf8'), 'existing receipt must survive');
-        fs.rmSync(outPath('grammar'));
-      }
-    }
-    const parseConflict = runReleaseFixture(
-      fixtureRoot.root,
-      'grammar',
-      'parse-error-overrides-success',
-      'success',
-      ['--prepare', '--plugin', 'session-relay', RELEASE_VERSION, '--unknown'],
-      'conflict',
-    );
-    assert.deepEqual(parseConflict.mutations, [], 'parse failure reported a successful fixture mutation');
-    const positionalRelay = runReleaseFixture(fixtureRoot.root, 'grammar', 'session-relay-positional', 'conflict', [
-      '--plugin',
-      'session-relay',
-      RELEASE_VERSION,
-    ]);
-    assert.deepEqual(positionalRelay.mutations, []);
-  } finally {
-    if (fixtureRoot.owned) fs.rmSync(fixtureRoot.root, { recursive: true, force: true });
-  }
-}
-check(
-  'release prepare, evidence, publication, promotion, recovery, finalization, dry-run, and legacy grammar are fixture-complete',
-  releaseContracts,
-);
-
-function currentCorrelatedReleaseContract() {
-  const historicalPlan = fs.readFileSync(path.join(REPO, HISTORICAL_RELEASE_PLAN), 'utf8');
-  for (const digest of HISTORICAL_RECEIPT_SHA256) {
-    assert.match(historicalPlan, new RegExp(digest), `historical Session Relay 0.13.0 receipt ${digest} changed`);
-  }
-
-  const cargo = fs
-    .readFileSync(path.join(REPO, 'plugins/session-relay/rust/Cargo.toml'), 'utf8')
-    .match(/^version\s*=\s*"([^"]+)"/m)?.[1];
-  const claude = JSON.parse(
-    fs.readFileSync(path.join(REPO, 'plugins/session-relay/.claude-plugin/plugin.json'), 'utf8'),
-  ).version;
-  const codex = JSON.parse(
-    fs.readFileSync(path.join(REPO, 'plugins/session-relay/.codex-plugin/plugin.json'), 'utf8'),
-  ).version;
-  const claudeMarket = JSON.parse(
-    fs.readFileSync(path.join(REPO, '.claude-plugin/marketplace.json'), 'utf8'),
-  ).plugins.find(({ name }) => name === 'session-relay')?.version;
-  const agentsRelay = JSON.parse(
-    fs.readFileSync(path.join(REPO, '.agents/plugins/marketplace.json'), 'utf8'),
-  ).plugins.find(({ name }) => name === 'session-relay');
-  assert.deepEqual(
-    [cargo, claude, codex, claudeMarket],
-    Array(4).fill(CURRENT_RELEASE_VERSION),
-    'all version-bearing current Session Relay manifests must bind 0.16.0',
-  );
-  assert.deepEqual(agentsRelay.source, { source: 'local', path: './plugins/session-relay' });
-  assert.match(
-    fs.readFileSync(path.join(REPO, 'plugins/session-relay/rust/Cargo.lock'), 'utf8'),
-    /\[\[package\]\]\nname = "session-relay"\nversion = "0\.16\.0"/,
-    'Cargo.lock must bind Session Relay 0.16.0',
-  );
-
-  assert.equal(
-    RELEASE_CORE_VERSION,
-    CURRENT_RELEASE_VERSION,
-    'release-core VERSION must equal the synchronized current Session Relay manifest identity',
-  );
-  const coreSource = fs.readFileSync(path.join(REPO, 'scripts/lib/session-relay-release-core.mjs'), 'utf8');
-  const currentVersionReaderStart = coreSource.indexOf('function currentRelayVersion() {');
-  const currentVersionReaderEnd = coreSource.indexOf('\nexport const VERSION =', currentVersionReaderStart);
-  assert.notEqual(currentVersionReaderStart, -1, 'release core must define the current manifest version reader');
-  assert.notEqual(
-    currentVersionReaderEnd,
-    -1,
-    'release core must export VERSION after the current manifest version reader',
-  );
-  const currentVersionReader = coreSource.slice(currentVersionReaderStart, currentVersionReaderEnd);
-  assert.match(currentVersionReader, /const claudePath = claudeManifest\(plugin\);/);
-  assert.match(currentVersionReader, /const codexPath = codexManifest\(plugin\);/);
-  assert.match(currentVersionReader, /const claude = readReleaseIdentityJson\(claudePath\);/);
-  assert.match(currentVersionReader, /const codex = readReleaseIdentityJson\(codexPath\);/);
-  assert.match(currentVersionReader, /const marketplace = readReleaseIdentityJson\(CLAUDE_MARKETPLACE\);/);
-  assert.match(currentVersionReader, /return synchronizedRelayVersion\(\[/);
-  assert.match(currentVersionReader, /\{ source: claudePath, name: claude\?\.name, version: claude\?\.version \},/);
-  assert.match(currentVersionReader, /\{ source: codexPath, name: codex\?\.name, version: codex\?\.version \},/);
-  assert.match(currentVersionReader, /source: CLAUDE_MARKETPLACE,/);
-  assert.match(currentVersionReader, /version: marketEntryVersion\(marketplace, PLUGIN\),/);
-  const escapedCurrentReleaseVersion = CURRENT_RELEASE_VERSION.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  assert.doesNotMatch(
-    currentVersionReader,
-    new RegExp(String.raw`["'\x60]${escapedCurrentReleaseVersion}["'\x60]`),
-    'currentRelayVersion must not contain a hardcoded live version',
-  );
-  assert.match(coreSource, /export const VERSION = currentRelayVersion\(\);/);
-  assert.doesNotMatch(
-    coreSource,
-    /export const VERSION\s*=\s*['"`]/,
-    'release-core VERSION must not duplicate the live version as a literal',
-  );
-  assert.match(coreSource, /Session Relay \$\{VERSION\} is staged for compatibility validation/);
-  assert.match(coreSource, /Session Relay \$\{VERSION\} is available through docks-kit/);
-  // The exact retirement sentence is pinned here as an independent oracle; the
-  // release-core constant and the workflow-rendered prerelease body must both
-  // carry it byte-for-byte, and the two bodies must stay byte-identical.
-  const deprecationSentence =
-    'x86_64-apple-darwin is no longer published as of Session Relay 0.16.0; macOS support is aarch64-apple-darwin.';
-  assert.equal(INTEL_DARWIN_DEPRECATION, deprecationSentence);
-  assert.ok(PRERELEASE_BODY.endsWith(`\n\n${deprecationSentence}`), 'prerelease body must end with the deprecation');
-  assert.ok(STABLE_BODY.endsWith(`\n\n${deprecationSentence}`), 'stable body must end with the deprecation');
-  const promotionSource = fs.readFileSync(path.join(REPO, 'scripts/lib/session-relay-release-promotion.mjs'), 'utf8');
-  assert.match(promotionSource, /const INSTANCE = loadReleaseInstance\(CURRENT_VERSION, \{/);
-  assert.match(promotionSource, /require: \['current_attempt', 'planrun_attempt', 'public_child'\],/);
-  assert.match(promotionSource, /const PUBLIC_VERSION = INSTANCE\.public_child\.version;/);
-  assert.match(promotionSource, /const PUBLIC_TAG = INSTANCE\.public_child\.tag;/);
-  assert.match(promotionSource, /const CURRENT_DOCKS_KIT_RELEASE = PUBLIC_TAG;/);
-  assert.doesNotMatch(promotionSource, /const PUBLIC_VERSION\s*=\s*['"`]/);
-  assert.doesNotMatch(promotionSource, /const CURRENT_DOCKS_KIT_RELEASE\s*=\s*['"`]/);
-  assert.match(promotionSource, /session-relay-\$\{CURRENT_VERSION\}-docks-kit-\$\{PUBLIC_VERSION\}-release/);
-
-  const document = parseYaml(fs.readFileSync(WORKFLOW, 'utf8'));
-  const matrixAssets = document.jobs.build.strategy.matrix.include.map(({ asset }) => asset);
-  assert.deepEqual(matrixAssets.sort(), [...ASSETS].sort(), '0.16 producer must publish exactly three native binaries');
-  assert.equal(
-    matrixAssets.some((name) => /windows|win32|\.exe$/i.test(name)),
-    false,
-    'Windows is unsupported',
-  );
-  assert.deepEqual(document.jobs.aggregate.needs, ['identity', 'build']);
-  assert.deepEqual(document.jobs.publish.needs, ['identity', 'aggregate']);
-  const aggregate = document.jobs.aggregate.steps.find(
-    ({ name }) => name === 'validate closed attestations and generate SHA256SUMS',
-  );
-  assert.match(aggregate.env.WORKFLOW_RUN_ID, /\{\{\s*github\.run_id\s*\}\}/);
-  assert.match(aggregate.env.WORKFLOW_RUN_ATTEMPT, /\{\{\s*github\.run_attempt\s*\}\}/);
-  assert.match(aggregate.run, /record\.sha256,\s*crypto\.createHash\('sha256'\)\.update\(asset\)\.digest\('hex'\)/);
-  assert.match(aggregate.run, /record\.workflow_run_id,\s*Number\(process\.env\.WORKFLOW_RUN_ID\)/);
-  assert.match(aggregate.run, /record\.workflow_run_attempt,\s*Number\(process\.env\.WORKFLOW_RUN_ATTEMPT\)/);
-  const publish = document.jobs.publish.steps.find(
-    ({ name }) => name === 'create or reconcile public prerelease from exactly four same-run assets',
-  );
-  assert.match(publish.run, /local_digest\["\$name"\]="\$\(sha256sum "\$file"/);
-  assert.match(publish.run, /"sha256:\$\{local_digest\[\$name\]\}" = "\$digest"/);
-  const stage = document.jobs.publish.steps.find(
-    ({ name }) => name === 'validate and stage exactly four release assets',
-  );
-  assert.match(stage.run, /sha256sum --check --strict SHA256SUMS/);
-  const printfFormat = stage.run.match(
-    /printf '([^']+)' \\\n\s+"\$EXPECTED_VERSION" > "\$RUNNER_TEMP\/session-relay-prerelease\.md"/,
-  )?.[1];
-  assert.ok(printfFormat, 'staged prerelease body printf must be present');
-  assert.equal(
-    printfFormat.replace('%s', CURRENT_RELEASE_VERSION).replace(/\\n/g, '\n'),
-    PRERELEASE_BODY,
-    'workflow prerelease body must stay byte-identical to the release-core expected body',
-  );
-
-  const currentPlan = fs.readFileSync(path.join(REPO, CURRENT_DOCKS_PLAN_TEMPLATE), 'utf8');
-  assert.match(currentPlan, new RegExp(`"run_id":"${CURRENT_DOCKS_RUN_ID}"`));
-  assert.match(currentPlan, /"draft_review":\{[^}]*"state":"passed"/);
-  assert.match(currentPlan, new RegExp(CURRENT_RELEASE_TAG.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
-  assert.match(currentPlan, /docks-kit[^\n]*0\.13\.0/);
-  assert.match(currentPlan, new RegExp(CURRENT_PUBLIC_PLAN_SUFFIX.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
-  const stageIndex = currentPlan.search(/\| \d+ \| tag_stage \|/);
-  const childIndex = currentPlan.search(/\| \d+ \| read_child \|/);
-  const promoteIndex = currentPlan.search(/\| \d+ \| promote_stable \|/);
-  assert.ok(
-    stageIndex >= 0 && childIndex > stageIndex && promoteIndex > childIndex,
-    'the current release plan must stage the prerelease, accept the completed child, then promote stable',
-  );
-}
-
-function verifyCompanion() {
-  if (!cli.publicRemote) return;
-  assert.equal(cli.publicRemote, 'https://github.com/DocksDocks/public.git');
-  assert.match(cli.publicRef, PUBLIC_REF);
-  assert.equal(
-    cli.publicRef,
-    `refs/heads/preflight/session-relay-cli-${RELEASE_VERSION}-${cli.publicCommit.slice(0, 12)}`,
-    'companion validation ref must be derived from the exact public commit',
-  );
-  const result = run(process.execPath, [
-    COMPANION,
-    '--public-remote',
-    cli.publicRemote,
-    '--public-ref',
-    cli.publicRef,
-    '--public-commit',
-    cli.publicCommit,
-    '--detached-clone',
-  ]);
-  assert.equal(result.status, 0, result.stderr || result.stdout);
-}
-check('companion validation ref is a clean detached, receipt-bound installer contract', verifyCompanion);
-check(
-  'current Relay 0.16.0 three-target release chain is exact while 0.13 receipts stay immutable',
-  currentCorrelatedReleaseContract,
-);
-
-process.stdout.write(`\nPASS: session-relay distribution contract — ${passed} checks\n`);
+checkLauncher();
+checkVersionLockstep();
+checkAssetSet();
+checkPayloadBoundary();

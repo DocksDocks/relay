@@ -14,14 +14,14 @@ import { EXPECTED_LABELS as HOOKS_IDENTITY_LABELS } from './scenario-hooks-ident
 import { EXPECTED_LABELS as SPAWN_WAKE_SUPERVISOR_LABELS } from './scenario-spawn-wake-supervisor.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-const PLUGIN = path.resolve(HERE, '..');
+const ROOT = path.resolve(HERE, '..');
 const MAX_CAPTURE_BYTES = 16 * 1024 * 1024;
 const MAX_RESULT_BYTES = 1024 * 1024;
 // SIGTERM politeness budget. Expiring only escalates to SIGKILL, so it is never a verdict on the
 // child - a slow-to-schedule exit on a saturated box costs an extra signal, not a failed run.
 const TERMINATE_GRACE_MS = 300;
 // SIGKILL backstop. Only a process that genuinely refuses to die can consume this - see
-// rust/tests/support/mod.rs, where stubs that ignore TERM/HUP/INT were observed outliving their
+// src/tests/support/mod.rs, where stubs that ignore TERM/HUP/INT were observed outliving their
 // run by 16 hours - so it is deliberately generous: a SIGKILLed process merely waiting to be
 // scheduled through exit must never be reported as an infrastructure failure.
 const TERMINATE_KILL_MS = 15_000;
@@ -56,7 +56,7 @@ export const LABEL_CONTRACT_OWNERS = Object.freeze(
     SCENARIOS.map(({ name, modulePath, expectedLabels }) => [
       name,
       Object.freeze({
-        owner: path.relative(path.resolve(HERE, '../../..'), modulePath).split(path.sep).join('/'),
+        owner: path.relative(ROOT, modulePath).split(path.sep).join('/'),
         label_count: expectedLabels.length,
       }),
     ]),
@@ -205,7 +205,7 @@ function requireTestBinary(configuredBin) {
   } catch {
     throw new Error('SESSION_RELAY_TEST_BIN must resolve to an executable file');
   }
-  const launcher = fs.realpathSync(path.join(PLUGIN, 'bin', 'relay'));
+  const launcher = fs.realpathSync(path.join(ROOT, 'plugin', 'bin', 'relay'));
   if (bin === launcher) throw new Error('SESSION_RELAY_TEST_BIN must not resolve to the plugin launcher');
   return bin;
 }
@@ -889,7 +889,7 @@ export async function main({ env = process.env, stdout = process.stdout, stderr 
     }
     stdout.write(result.stdout);
     const bin = fs.realpathSync(env.SESSION_RELAY_TEST_BIN);
-    stdout.write(`\nPASS: session-relay self-test — 133 checks (binary: ${path.relative(PLUGIN, bin)})\n`);
+    stdout.write(`\nPASS: session-relay self-test — 133 checks (binary: ${path.relative(ROOT, bin)})\n`);
     return 0;
   } catch (error) {
     writeFailure(error, stderr);

@@ -1,0 +1,571 @@
+name: release
+
+# Produces the Session Relay release assets. Validation-only dispatches prove a
+# reviewed commit without publishing; tag pushes and publish-existing-tag
+# dispatches stage a release from artifacts created by this exact run.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Closed producer mode
+        required: true
+        type: choice
+        options:
+          - validate-only
+          - publish-existing-tag
+      expected_commit:
+        description: Exact 40-character lowercase source commit
+        required: true
+        type: string
+      expected_tag:
+        description: Exact existing tag for publication; empty for validation
+        required: false
+        default: ''
+        type: string
+
+# Every job is read-only unless it explicitly narrows this default.
+permissions:
+  contents: read
+
+jobs:
+  identity:
+    name: validate producer identity
+    runs-on: ubuntu-24.04
+    outputs:
+      publish: ${{ steps.identity.outputs.publish }}
+      source_commit: ${{ steps.identity.outputs.source_commit }}
+      tag: ${{ steps.identity.outputs.tag }}
+      version: ${{ steps.identity.outputs.version }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: '24'
+      - name: validate event, commit, tag, and synchronized version
+        id: identity
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_MODE: ${{ inputs.mode }}
+          EXPECTED_COMMIT: ${{ inputs.expected_commit }}
+          EXPECTED_TAG: ${{ inputs.expected_tag }}
+        run: |
+          set -euo pipefail
+
+          version="$(
+            node <<'NODE'
+          const fs = require('node:fs');
+
+          const claude = JSON.parse(fs.readFileSync('plugin/.claude-plugin/plugin.json', 'utf8'));
+          const codex = JSON.parse(fs.readFileSync('plugin/.codex-plugin/plugin.json', 'utf8'));
+          const marketplace = JSON.parse(fs.readFileSync('.claude-plugin/marketplace.json', 'utf8'));
+          const listed = marketplace.plugins.find(({ name }) => name === 'session-relay');
+          const cargoText = fs.readFileSync('Cargo.toml', 'utf8');
+          const cargo = /^version\s*=\s*"([^"]+)"/m.exec(cargoText)?.[1];
+          const versions = [claude.version, codex.version, listed?.version, cargo];
+          if (!versions.every((value) => value === versions[0])) {
+            throw new Error(`Session Relay versions are not synchronized: ${versions.join(', ')}`);
+          }
+          if (!/^\d+\.\d+\.\d+$/.test(versions[0])) {
+            throw new Error(`invalid Session Relay version: ${versions[0]}`);
+          }
+          process.stdout.write(versions[0]);
+          NODE
+          )"
+          source_commit="$(git rev-parse HEAD)"
+          test "$source_commit" = "$GITHUB_SHA"
+          tag=''
+          publish=false
+
+          case "$EVENT_NAME" in
+            push)
+              test "$GITHUB_REF_TYPE" = tag
+              tag="v$version"
+              test "$GITHUB_REF_NAME" = "$tag"
+              test "$(git rev-parse "refs/tags/$tag^{commit}")" = "$source_commit"
+              publish=true
+              ;;
+            workflow_dispatch)
+              [[ "$EXPECTED_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+              test "$EXPECTED_COMMIT" = "$source_commit"
+              case "$EVENT_MODE" in
+                validate-only)
+                  test -z "$EXPECTED_TAG"
+                  ;;
+                publish-existing-tag)
+                  tag="v$version"
+                  test "$EXPECTED_TAG" = "$tag"
+                  git show-ref --verify --quiet "refs/tags/$tag"
+                  test "$(git rev-parse "refs/tags/$tag^{commit}")" = "$source_commit"
+                  publish=true
+                  ;;
+                *)
+                  echo "unsupported workflow_dispatch mode: $EVENT_MODE" >&2
+                  exit 1
+                  ;;
+              esac
+              ;;
+            *)
+              echo "unsupported event: $EVENT_NAME" >&2
+              exit 1
+              ;;
+          esac
+
+          {
+            printf 'publish=%s\n' "$publish"
+            printf 'source_commit=%s\n' "$source_commit"
+            printf 'tag=%s\n' "$tag"
+            printf 'version=%s\n' "$version"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    name: build ${{ matrix.target }} on ${{ matrix.runner }}
+    needs: identity
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            runner_os: Linux
+            runner_arch: X64
+            target: x86_64-unknown-linux-musl
+            asset: session-relay-x86_64-unknown-linux-musl
+          - runner: ubuntu-24.04-arm
+            runner_os: Linux
+            runner_arch: ARM64
+            target: aarch64-unknown-linux-musl
+            asset: session-relay-aarch64-unknown-linux-musl
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: setup Node 24 for the native smoke
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: '24'
+      - name: cache Cargo dependencies and target outputs
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml') }}-${{ hashFiles('src/**/*.rs', 'build.rs', '.cargo/config', '.cargo/config.toml') }}
+          restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml') }}-
+      - name: install native musl tools
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
+      - name: install pinned Rust toolchain and native target
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          rustup toolchain install
+          rustup target add "$TARGET"
+      - name: build locked native release
+        env:
+          ASSET_NAME: ${{ matrix.asset }}
+          EXPECTED_RUNNER_ARCH: ${{ matrix.runner_arch }}
+          EXPECTED_RUNNER_OS: ${{ matrix.runner_os }}
+          EXPECTED_VERSION: ${{ needs.identity.outputs.version }}
+          RUNNER_ARCH_VALUE: ${{ runner.arch }}
+          RUNNER_OS_VALUE: ${{ runner.os }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          test "$RUNNER_OS_VALUE" = "$EXPECTED_RUNNER_OS"
+          test "$RUNNER_ARCH_VALUE" = "$EXPECTED_RUNNER_ARCH"
+          cargo build --release --locked --target "$TARGET"
+          out="$RUNNER_TEMP/session-relay/$TARGET"
+          mkdir -p "$out"
+          cp "target/$TARGET/release/relay" "$out/$ASSET_NAME"
+          chmod 0755 "$out/$ASSET_NAME"
+          test "$("$out/$ASSET_NAME" --version)" = "session-relay $EXPECTED_VERSION"
+      - name: prove Linux managed-workspace custody
+        env:
+          ASSET_NAME: ${{ matrix.asset }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          test "$(uname -s)" = Linux
+          case "$(uname -m):$TARGET" in
+            x86_64:x86_64-unknown-linux-musl|aarch64:aarch64-unknown-linux-musl) ;;
+            *) echo "target is not native to this Linux runner" >&2; exit 1 ;;
+          esac
+          test -x "$RUNNER_TEMP/session-relay/$TARGET/$ASSET_NAME"
+          CURRENT_CGROUP=
+          while IFS=: read -r HIERARCHY CONTROLLERS CGROUP_PATH; do
+            if [ "$HIERARCHY" = 0 ] && [ -z "$CONTROLLERS" ]; then
+              CURRENT_CGROUP="$CGROUP_PATH"
+              break
+            fi
+          done < /proc/self/cgroup
+          test -n "$CURRENT_CGROUP"
+          CGROUP="/sys/fs/cgroup${CURRENT_CGROUP%/}/session-relay-producer-$(id -u)-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${RUNNER_ARCH}"
+          cleanup() { sudo -n rmdir "$CGROUP" 2>/dev/null || true; }
+          trap cleanup EXIT
+          sudo -n mkdir "$CGROUP"
+          sudo -n chown "$(id -u):$(id -g)" "$CGROUP"
+          sudo -n chown "$(id -u):$(id -g)" \
+            "$CGROUP/cgroup.procs" "$CGROUP/cgroup.threads" "$CGROUP/cgroup.subtree_control"
+          (
+            test_pid=$BASHPID &&
+              sudo -n tee "$CGROUP/cgroup.procs" >/dev/null <<<"$test_pid" &&
+              SESSION_RELAY_TEST_BIN="$RUNNER_TEMP/session-relay/$TARGET/$ASSET_NAME" \
+                SESSION_RELAY_TEST_CGROUP_ROOT="$CGROUP" cargo test \
+                --locked --test workspace_lease_process \
+                linux_cgroup_pidfd_guardian_kills_hostile_descendants \
+                -- --exact --nocapture
+          )
+          sudo -n rmdir "$CGROUP"
+          trap - EXIT
+      - name: smoke explicit fresh Linux workspace binary
+        env:
+          ASSET_NAME: ${{ matrix.asset }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          bin="$RUNNER_TEMP/session-relay/$TARGET/$ASSET_NAME"
+          test -x "$bin"
+          node test/workspace-smoke.mjs --case single-session-compat --bin "$bin"
+          node test/workspace-smoke.mjs --case docs-contract --bin "$bin"
+      - name: attest native release binary
+        env:
+          ASSET_NAME: ${{ matrix.asset }}
+          INPUT_EXPECTED_COMMIT: ${{ inputs.expected_commit }}
+          INPUT_EXPECTED_TAG: ${{ inputs.expected_tag }}
+          INPUT_MODE: ${{ inputs.mode }}
+          RUNNER_ARCH_VALUE: ${{ runner.arch }}
+          RUNNER_OS_VALUE: ${{ runner.os }}
+          SOURCE_COMMIT: ${{ needs.identity.outputs.source_commit }}
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.identity.outputs.version }}
+          WORKFLOW_RUN_ATTEMPT: ${{ github.run_attempt }}
+          WORKFLOW_RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/session-relay/$TARGET"
+          version_stdout="$("$out/$ASSET_NAME" --version)"
+          test "$version_stdout" = "session-relay $VERSION"
+          sha256="$(shasum -a 256 "$out/$ASSET_NAME" | cut -d ' ' -f 1)"
+          [[ "$sha256" =~ ^[0-9a-f]{64}$ ]]
+          export ATTESTATION_OUT="$out/attestation-$TARGET.json"
+          export SHA256="$sha256"
+          export VERSION_STDOUT="$version_stdout"
+          node <<'NODE'
+          const fs = require('node:fs');
+
+          const record = {
+            asset_name: process.env.ASSET_NAME,
+            inputs: {
+              expected_commit: process.env.INPUT_EXPECTED_COMMIT,
+              expected_tag: process.env.INPUT_EXPECTED_TAG,
+              mode: process.env.INPUT_MODE,
+            },
+            runner_arch: process.env.RUNNER_ARCH_VALUE,
+            runner_os: process.env.RUNNER_OS_VALUE,
+            schema: 'SessionRelayBinaryAttestationV1',
+            sha256: process.env.SHA256,
+            source_commit: process.env.SOURCE_COMMIT,
+            target: process.env.TARGET,
+            version_stdout: process.env.VERSION_STDOUT,
+            workflow_run_attempt: Number(process.env.WORKFLOW_RUN_ATTEMPT),
+            workflow_run_id: Number(process.env.WORKFLOW_RUN_ID),
+          };
+          fs.writeFileSync(process.env.ATTESTATION_OUT, JSON.stringify(record), { mode: 0o600 });
+          NODE
+      - name: upload stable executable and canonical attestation
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: session-relay-binary-${{ matrix.target }}
+          path: |
+            ${{ runner.temp }}/session-relay/${{ matrix.target }}/${{ matrix.asset }}
+            ${{ runner.temp }}/session-relay/${{ matrix.target }}/attestation-${{ matrix.target }}.json
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  aggregate:
+    name: verify two native assets and generate checksums
+    needs: [identity, build]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: '24'
+      - name: download same-run native artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: session-relay-binary-*
+          path: ${{ runner.temp }}/session-relay-collected
+          merge-multiple: true
+      - name: validate closed attestations and generate SHA256SUMS
+        env:
+          ARTIFACT_DIR: ${{ runner.temp }}/session-relay-collected
+          EXPECTED_VERSION: ${{ needs.identity.outputs.version }}
+          INPUT_EXPECTED_COMMIT: ${{ inputs.expected_commit }}
+          INPUT_EXPECTED_TAG: ${{ inputs.expected_tag }}
+          INPUT_MODE: ${{ inputs.mode }}
+          SOURCE_COMMIT: ${{ needs.identity.outputs.source_commit }}
+          WORKFLOW_RUN_ATTEMPT: ${{ github.run_attempt }}
+          WORKFLOW_RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const assert = require('node:assert/strict');
+          const crypto = require('node:crypto');
+          const fs = require('node:fs');
+          const path = require('node:path');
+
+          const targets = {
+            'aarch64-unknown-linux-musl': { runner_arch: 'ARM64', runner_os: 'Linux' },
+            'x86_64-unknown-linux-musl': { runner_arch: 'X64', runner_os: 'Linux' },
+          };
+          const keys = [
+            'asset_name', 'inputs', 'runner_arch', 'runner_os', 'schema',
+            'sha256', 'source_commit', 'target', 'version_stdout',
+            'workflow_run_attempt', 'workflow_run_id',
+          ];
+          const expectedFiles = [];
+
+          for (const [target, runner] of Object.entries(targets)) {
+            const assetName = `session-relay-${target}`;
+            const attestationName = `attestation-${target}.json`;
+            expectedFiles.push(assetName, attestationName);
+            const asset = fs.readFileSync(path.join(process.env.ARTIFACT_DIR, assetName));
+            const raw = fs.readFileSync(path.join(process.env.ARTIFACT_DIR, attestationName), 'utf8');
+            const record = JSON.parse(raw);
+            assert.deepEqual(Object.keys(record), keys);
+            assert.equal(raw, JSON.stringify(record), `${attestationName} is not canonical JSON`);
+            assert.equal(record.asset_name, assetName);
+            assert.deepEqual(record.inputs, {
+              expected_commit: process.env.INPUT_EXPECTED_COMMIT,
+              expected_tag: process.env.INPUT_EXPECTED_TAG,
+              mode: process.env.INPUT_MODE,
+            });
+            assert.equal(record.runner_arch, runner.runner_arch);
+            assert.equal(record.runner_os, runner.runner_os);
+            assert.equal(record.schema, 'SessionRelayBinaryAttestationV1');
+            assert.equal(record.sha256, crypto.createHash('sha256').update(asset).digest('hex'));
+            assert.equal(record.source_commit, process.env.SOURCE_COMMIT);
+            assert.equal(record.target, target);
+            assert.equal(record.version_stdout, `session-relay ${process.env.EXPECTED_VERSION}`);
+            assert.equal(record.workflow_run_attempt, Number(process.env.WORKFLOW_RUN_ATTEMPT));
+            assert.equal(record.workflow_run_id, Number(process.env.WORKFLOW_RUN_ID));
+          }
+
+          assert.equal(expectedFiles.length, 4);
+          assert.deepEqual(fs.readdirSync(process.env.ARTIFACT_DIR).sort(), expectedFiles.sort());
+          NODE
+
+          cd "$ARTIFACT_DIR"
+          sha256sum \
+            session-relay-aarch64-unknown-linux-musl \
+            session-relay-x86_64-unknown-linux-musl \
+            > SHA256SUMS
+          test "$(wc -l < SHA256SUMS)" -eq 2
+      - name: upload same-run checksum manifest
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: session-relay-checksums
+          path: ${{ runner.temp }}/session-relay-collected/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: publish release
+    needs: [identity, aggregate]
+    if: needs.identity.outputs.publish == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: download same-run native assets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: session-relay-binary-*
+          path: ${{ runner.temp }}/session-relay-publish
+          merge-multiple: true
+      - name: download same-run checksum manifest
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: session-relay-checksums
+          path: ${{ runner.temp }}/session-relay-publish
+      - name: validate and stage exactly three release assets
+        env:
+          EXPECTED_COMMIT: ${{ needs.identity.outputs.source_commit }}
+          EXPECTED_TAG: ${{ needs.identity.outputs.tag }}
+          EXPECTED_VERSION: ${{ needs.identity.outputs.version }}
+        run: |
+          set -euo pipefail
+          test "$EXPECTED_TAG" = "v$EXPECTED_VERSION"
+          test "$(git rev-parse "refs/tags/$EXPECTED_TAG^{commit}")" = "$EXPECTED_COMMIT"
+
+          collected="$RUNNER_TEMP/session-relay-publish"
+          release="$RUNNER_TEMP/session-relay-release"
+          mkdir -p "$release"
+          assets=(
+            session-relay-aarch64-unknown-linux-musl
+            session-relay-x86_64-unknown-linux-musl
+          )
+          for asset in "${assets[@]}"; do
+            test -f "$collected/$asset"
+            cp "$collected/$asset" "$release/$asset"
+            chmod 0755 "$release/$asset"
+          done
+          cp "$collected/SHA256SUMS" "$release/SHA256SUMS"
+          chmod 0644 "$release/SHA256SUMS"
+          (cd "$release" && sha256sum --check --strict SHA256SUMS)
+
+          shopt -s nullglob
+          staged=("$release"/*)
+          test "${#staged[@]}" -eq 3
+      - name: create or reconcile the public release from exactly three same-run assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.identity.outputs.tag }}
+          VERSION: ${{ needs.identity.outputs.version }}
+        run: |
+          set -euo pipefail
+          release="$RUNNER_TEMP/session-relay-release"
+          title="session-relay $VERSION"
+          assets=(
+            session-relay-aarch64-unknown-linux-musl
+            session-relay-x86_64-unknown-linux-musl
+            SHA256SUMS
+          )
+
+          declare -A local_size=()
+          declare -A local_digest=()
+          local_paths=()
+          for name in "${assets[@]}"; do
+            file="$release/$name"
+            test -f "$file"
+            local_paths+=("$file")
+            local_size["$name"]="$(stat --format='%s' "$file")"
+            local_digest["$name"]="$(sha256sum "$file" | cut -d ' ' -f 1)"
+          done
+          expected_assets="$(printf '%s\n' "${assets[@]}" | jq --raw-input --slurp 'split("\n")[:-1]')"
+
+          query_release() {
+            local output="$1"
+            local response="$output.http"
+            local errors="$output.stderr"
+            local command_status=0
+            local http_status
+
+            gh api --include \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2022-11-28' \
+              "/repos/$GITHUB_REPOSITORY/releases/tags/$TAG" \
+              > "$response" 2> "$errors" || command_status=$?
+            http_status="$(awk 'NR == 1 { print $2 }' "$response")"
+
+            if test "$command_status" -eq 0 && test "$http_status" = 200; then
+              awk 'body { print } /^\r?$/ { body = 1 }' "$response" > "$output"
+              jq -e 'type == "object"' "$output" > /dev/null
+              return 0
+            fi
+            if test "$command_status" -ne 0 && test "$http_status" = 404; then
+              return 44
+            fi
+            cat "$errors" >&2
+            echo "authoritative release query failed (HTTP ${http_status:-unavailable})" >&2
+            return 1
+          }
+
+          missing_paths=()
+          validate_release() {
+            local document="$1"
+            local require_complete="$2"
+            local expected_id="${3:-}"
+            local actual_id
+            local name
+            local size
+            local digest
+            declare -A seen=()
+
+            jq -e \
+              --arg tag "$TAG" \
+              --arg title "$title" \
+              --argjson expected "$expected_assets" \
+              '
+                type == "object"
+                and (.id | type == "number" and . > 0 and floor == .)
+                and .tag_name == $tag
+                and .draft == false
+                and .prerelease == false
+                and .name == $title
+                and ((.body // "") == "")
+                and (.assets | type == "array")
+                and all(.assets[];
+                  (.name | type == "string")
+                  and (.size | type == "number" and . >= 0 and floor == .)
+                  and (.digest | type == "string" and test("^sha256:[0-9a-f]{64}$"))
+                  and (. as $asset | ($expected | index($asset.name)) != null)
+                )
+                and ([.assets[].name] | length) == ([.assets[].name] | unique | length)
+              ' "$document" > /dev/null
+
+            actual_id="$(jq -r '.id' "$document")"
+            if test -n "$expected_id"; then
+              test "$actual_id" = "$expected_id"
+            fi
+
+            while IFS=$'\t' read -r name size digest; do
+              test -n "$name"
+              test "${local_size[$name]}" = "$size"
+              test "sha256:${local_digest[$name]}" = "$digest"
+              seen["$name"]=1
+            done < <(jq -r '.assets[] | [.name, (.size | tostring), .digest] | @tsv' "$document")
+
+            missing_paths=()
+            for name in "${assets[@]}"; do
+              if [[ ! -v seen["$name"] ]]; then
+                missing_paths+=("$release/$name")
+              fi
+            done
+            if test "$require_complete" = true; then
+              test "${#missing_paths[@]}" -eq 0
+              test "$(jq '.assets | length' "$document")" -eq "${#assets[@]}"
+            fi
+          }
+
+          initial="$RUNNER_TEMP/session-relay-release-initial.json"
+          release_id=''
+          query_status=0
+          query_release "$initial" || query_status=$?
+          case "$query_status" in
+            0)
+              validate_release "$initial" false
+              release_id="$(jq -r '.id' "$initial")"
+              if test "${#missing_paths[@]}" -gt 0; then
+                gh release upload "$TAG" "${missing_paths[@]}"
+              fi
+              ;;
+            44)
+              gh release create "$TAG" \
+                "${local_paths[@]}" \
+                --verify-tag \
+                --title "$title" \
+                --notes ''
+              ;;
+            *)
+              exit "$query_status"
+              ;;
+          esac
+
+          final="$RUNNER_TEMP/session-relay-release-final.json"
+          query_release "$final"
+          validate_release "$final" true "$release_id"

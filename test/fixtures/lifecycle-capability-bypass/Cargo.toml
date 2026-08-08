@@ -5,7 +5,7 @@ edition = "2024"
 publish = false
 
 [dependencies]
-relay = { path = "../../../rust" }
+relay = { path = "../../.." }
 
 [[bin]]
 name = "guardless"

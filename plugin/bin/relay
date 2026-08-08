@@ -68,8 +68,9 @@ else
     printf '%s\n' \
       'session-relay executable not found.' \
       'Install it with one of:' \
-      '  docks-kit sync' \
-      '  docks-kit toolchain ensure session-relay' >&2
+      '  docks-kit toolchain ensure session-relay' \
+      "  download session-relay-$(uname -m)-unknown-linux-musl from" \
+      '  https://github.com/DocksDocks/session-relay/releases/latest and install it as ~/.local/bin/session-relay' >&2
     exit 1
   fi
 fi

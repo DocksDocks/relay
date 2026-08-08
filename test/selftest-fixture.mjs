@@ -6,7 +6,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-const PLUGIN = path.resolve(HERE, '..');
+const ROOT = path.resolve(HERE, '..');
 const SCRUBBED_ENV = [
   'AGENT_RELAY_HOME',
   'AGENT_RELAY_GC_DAYS',
@@ -75,7 +75,7 @@ function validateBinary(configuredBin) {
     failTestBin('must resolve to an executable file');
   }
 
-  const launcher = fs.realpathSync(path.join(PLUGIN, 'bin', 'relay'));
+  const launcher = fs.realpathSync(path.join(ROOT, 'plugin', 'bin', 'relay'));
   if (bin === launcher) failTestBin('must not resolve to the plugin launcher');
   return bin;
 }
@@ -209,7 +209,7 @@ export function createFixture({ bin: configuredBin, home }) {
   if (typeof home !== 'string' || !path.isAbsolute(home)) throw new Error('fixture home must be an absolute path');
   if (fs.existsSync(home)) throw new Error('fixture home must not already exist');
 
-  const cargoManifest = fs.readFileSync(path.join(PLUGIN, 'rust', 'Cargo.toml'), 'utf8');
+  const cargoManifest = fs.readFileSync(path.join(ROOT, 'Cargo.toml'), 'utf8');
   const packageSection = cargoManifest.split(/^\[package\]\s*$/m)[1]?.split(/^\[/m)[0];
   const cargoVersion = packageSection?.match(/^version\s*=\s*"([^"]+)"\s*$/m)?.[1];
   assert.ok(cargoVersion, 'Cargo package version is present');

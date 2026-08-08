@@ -6,8 +6,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const plugin = path.resolve(here, '..');
-const rust = path.join(plugin, 'rust');
+const repoRoot = path.resolve(here, '..');
 const fixturePath = path.join(here, 'fixtures', 'rust-test-inventory.json');
 const fixture = JSON.parse(fs.readFileSync(fixturePath, 'utf8'));
 const workspaceTargets = [
@@ -16,77 +15,37 @@ const workspaceTargets = [
   'workspace_coordination_process',
   'workspace_resources',
 ];
-const featureTargets = ['protocol', 'fanout', 'fanout_reap', 'lifecycle_supervisor'];
+const featureTargets = [
+  'bus_smoke',
+  'fanout',
+  'fanout_reap',
+  'lifecycle_admission',
+  'lifecycle_managed',
+  'lifecycle_release',
+  'lifecycle_supervisor',
+  'lock_race',
+  'protocol',
+];
 const runnableTargets = [...featureTargets, ...workspaceTargets];
-const omittedTargets = {
-  bus_smoke: {
-    owner: 'plugins/session-relay/test/rust-test-inventory.mjs',
-    reason: 'Not selected by the orchestrated source-check target set; review for explicit gate inclusion.',
-    expires: '2027-08-05',
-  },
-  lifecycle_admission: {
-    owner: 'plugins/session-relay/test/rust-test-inventory.mjs',
-    reason: 'Not selected by the orchestrated source-check target set; review for explicit gate inclusion.',
-    expires: '2027-08-05',
-  },
-  lifecycle_managed: {
-    owner: 'plugins/session-relay/test/rust-test-inventory.mjs',
-    reason: 'Not selected by the orchestrated source-check target set; review for explicit gate inclusion.',
-    expires: '2027-08-05',
-  },
-  lifecycle_release: {
-    owner: 'plugins/session-relay/test/rust-test-inventory.mjs',
-    reason: 'Not selected by the orchestrated source-check target set; review for explicit gate inclusion.',
-    expires: '2027-08-05',
-  },
-  lock_race: {
-    owner: 'plugins/session-relay/test/rust-test-inventory.mjs',
-    reason: 'Not selected by the orchestrated source-check target set; review for explicit gate inclusion.',
-    expires: '2027-08-05',
-  },
-};
+// Every integration target is gated. The mechanism stays so that a future omission must be
+// declared with an owner, a reason, and an expiry instead of disappearing silently.
+const omittedTargets = {};
+// The library unit tests were never executed by any gate in the monorepo: the Rust gate
+// formatted, linted, and built, and this harness ran integration targets only. The `unit`
+// case closes that hole. The floor is a measured count, so a silent loss of tests fails.
+const UNIT_CASE = 'unit';
+const UNIT_TEST_FLOOR = 137;
+const SUMMARY_PATTERN = /test result: ok\. (\d+) passed; 0 failed; (\d+) ignored; 0 measured; (\d+) filtered out/;
 const discoveredTargets = fs
-  .readdirSync(path.join(rust, 'tests'), { withFileTypes: true })
+  .readdirSync(path.join(repoRoot, 'src', 'tests'), { withFileTypes: true })
   .filter((entry) => entry.isFile() && entry.name.endsWith('.rs'))
   .map((entry) => entry.name.slice(0, -3))
   .sort();
 const discoveredOmittedTargets = discoveredTargets.filter((target) => !runnableTargets.includes(target));
-const acceptanceOwners = {
-  A01: 'workspace_lease_process::two_writers_same_worktree_exactly_one_lease',
-  A02: 'workspace_lease_process::separate_worktrees_both_hold_leases',
-  A03: 'workspace_lease_process::read_only_spawn_coexists_with_writer',
-  A04: 'workspace_lease_process::crashed_writer_recovers_only_after_empty_proof',
-  A05: 'workspace_identity::symlink_relative_case_aliases_share_one_identity',
-  A06: 'workspace_coordination_process::unexpected_branch_switch_is_refused',
-  A07: 'workspace_identity::unexpected_head_or_base_drift_is_refused',
-  A08: 'workspace_identity::unowned_dirty_path_blocks_handback',
-  A09: 'workspace_lease_process::worker_merge_rebase_reset_and_force_push_are_refused',
-  A10: 'workspace_coordination_process::overlapping_path_claims_are_atomic_and_refused',
-  A11: 'workspace_coordination_process::coordinator_integrates_commits_serially',
-  A12: 'workspace_coordination_process::conflicting_commits_settle_once_needs_user_action',
-  A13: 'scripts/tests/plan-orchestration.mjs --case historical',
-  A14: 'workspace_resources::all_six_resource_kinds_are_isolated_and_receipted',
-  A15: 'workspace_coordination_process::cleanup_refuses_dirty_or_unretained_work',
-  A16: 'workspace_identity::integration_checkout_refuses_supported_writer',
-  A17: 'workspace_identity::failed_preflight_or_lease_changes_no_source_bytes',
-  A18: 'workspace_identity::preserve_commit_mode_uses_temp_index_ref_and_no_source_mutation',
-  A19: 'workspace_identity::preserve_artifact_mode_round_trips_binary_and_untracked_pax',
-  A20: 'workspace_coordination_process::applied_wip_is_first_produced_and_integrated_commit',
-  A21: 'workspace_coordination_process::workspace_and_legacy_fanout_share_repository_gate',
-  A22: 'workspace_lease_process::linux_cgroup_pidfd_guardian_kills_hostile_descendants',
-  A23: 'workspace_lease_process::macos_process_group_recursive_guardian_kills_hostile_descendants',
-  A24: 'workspace_identity::sha1_and_sha256_object_formats_validate_reported_oid_width',
-  A25: 'workspace_coordination_process::coordinator_bootstrap_worker_scope_and_replay_are_closed',
-  A26: 'workspace_coordination_process::recovery_matrix_has_no_unproven_progress',
-  A27: 'test/selftest.mjs::fresh-binary-jobs-parity',
-  A28: 'test/workspace-smoke.mjs::single-session-compat',
-  A29: 'test/workspace-smoke.mjs::docs-contract',
-};
-const pendingApiGaps = {};
 
 function listTests(target) {
   const run = spawnSync('cargo', ['test', '--locked', '--test', target, '--', '--list'], {
-    cwd: rust,
+    cwd: repoRoot,
     encoding: 'utf8',
   });
   assert.equal(run.status, 0, `${target}: cargo test --list failed\n${run.stdout}\n${run.stderr}`);
@@ -105,9 +64,7 @@ if (process.argv.includes('--generate')) {
     fixturePath,
     `${JSON.stringify(
       {
-        schema_version: 5,
-        acceptance_owners: acceptanceOwners,
-        pending_api_gaps: pendingApiGaps,
+        schema_version: 1,
         omitted_targets: omittedTargets,
         cases,
       },
@@ -119,16 +76,8 @@ if (process.argv.includes('--generate')) {
   process.exit(0);
 }
 
-assert.deepEqual(Object.keys(fixture).sort(), [
-  'acceptance_owners',
-  'cases',
-  'omitted_targets',
-  'pending_api_gaps',
-  'schema_version',
-]);
-assert.equal(fixture.schema_version, 5);
-assert.deepEqual(fixture.acceptance_owners, acceptanceOwners, 'A01-A29 owner matrix drifted');
-assert.deepEqual(fixture.pending_api_gaps, pendingApiGaps, 'declared production API gaps drifted');
+assert.deepEqual(Object.keys(fixture).sort(), ['cases', 'omitted_targets', 'schema_version']);
+assert.equal(fixture.schema_version, 1);
 assert.deepEqual(fixture.omitted_targets, omittedTargets, 'omitted Rust target ownership drifted');
 assert.deepEqual(
   Object.keys(fixture.omitted_targets).sort(),
@@ -136,26 +85,6 @@ assert.deepEqual(
   'every unselected Rust target must have an explicit owner, reason, and expiry',
 );
 assert.deepEqual(Object.keys(fixture.cases).sort(), [...runnableTargets].sort(), 'Rust targets drifted');
-assert.deepEqual(
-  Object.keys(fixture.acceptance_owners),
-  Array.from({ length: 29 }, (_, index) => `A${String(index + 1).padStart(2, '0')}`),
-);
-for (const [acceptance, owner] of Object.entries(fixture.acceptance_owners)) {
-  if (!owner.startsWith('workspace_')) continue;
-  const [target, test] = owner.split('::');
-  assert.ok(workspaceTargets.includes(target), `${acceptance}: invalid Rust target owner`);
-  const present = fixture.cases[target].tests.includes(test);
-  assert.equal(
-    present,
-    !Object.hasOwn(fixture.pending_api_gaps, acceptance),
-    `${acceptance}: executable owner/pending API classification differs`,
-  );
-}
-const attachmentOwners = Object.entries(fixture.acceptance_owners).filter(
-  ([acceptance]) => Number(acceptance.slice(1)) <= 17,
-);
-assert.equal(attachmentOwners.length, 17);
-assert.equal(new Set(attachmentOwners.map(([, owner]) => owner)).size, 17, 'A01-A17 owners must be one-to-one');
 for (const target of runnableTargets) {
   const tests = fixture.cases[target].tests;
   assert.ok(tests.length > 0, `${target}: frozen test set is empty`);
@@ -166,12 +95,32 @@ for (const target of runnableTargets) {
 const caseIndex = process.argv.indexOf('--case');
 assert.ok(caseIndex >= 0 && process.argv[caseIndex + 1], 'usage: node rust-test-inventory.mjs --case <name>');
 const name = process.argv[caseIndex + 1];
-assert.ok(runnableTargets.includes(name), `unknown rust test inventory case: ${name}`);
+assert.ok(runnableTargets.includes(name) || name === UNIT_CASE, `unknown rust test inventory case: ${name}`);
 // Widen the Rust poll-wait deadlines for this whole case. Mutating `process.env` rather than a
 // derived object is deliberate: every downstream spawn either passes `process.env` directly or
 // spreads it (including the `systemd-run` re-exec below, which builds an explicit `env`), so a
 // value set here survives both branches and cannot be dropped by one of them.
 process.env.SESSION_RELAY_TEST_TIME_FACTOR ||= '4';
+
+if (name === UNIT_CASE) {
+  // The library tests run in-process and need no cgroup delegation, so this case bypasses the
+  // delegation branch and the frozen per-target inventory, neither of which describes it.
+  const executed = spawnSync('cargo', ['test', '--locked', '--lib'], {
+    cwd: repoRoot,
+    encoding: 'utf8',
+    env: process.env,
+  });
+  assert.equal(executed.status, 0, `${executed.stdout}\n${executed.stderr}`);
+  const unitSummary = `${executed.stdout}\n${executed.stderr}`.match(SUMMARY_PATTERN);
+  assert.ok(unitSummary, `${UNIT_CASE}: missing executable test summary`);
+  const passed = Number(unitSummary[1]);
+  assert.ok(passed >= UNIT_TEST_FLOOR, `${UNIT_CASE}: ${passed} passed, expected at least ${UNIT_TEST_FLOOR}`);
+  assert.equal(Number(unitSummary[2]), 0, `${UNIT_CASE}: ignored library tests`);
+  assert.equal(Number(unitSummary[3]), 0, `${UNIT_CASE}: filtered library tests`);
+  console.log(`PASS rust_test_inventory case=${UNIT_CASE} tests=${passed}`);
+  process.exit(0);
+}
+
 let testEnv = process.env;
 // Three cases exercise real cgroup-v2 custody, so they need a delegated subtree this runner owns.
 // `unavailableDelegation` is non-null only when no such subtree exists; it is answered below,
@@ -191,7 +140,7 @@ if (
   const provided = process.env.SESSION_RELAY_TEST_CGROUP_ROOT;
   if (provided) {
     // An explicit override wins over everything: .github/workflows/ci.yml provisions the
-    // delegation for the hosted runner and scripts/ci.mjs canonicalises it, so under CI this
+    // delegation for the hosted runner and scripts/gate.mjs canonicalises it, so under CI this
     // branch is the one that runs and this change does not touch that path.
     assert.ok(path.isAbsolute(provided), 'SESSION_RELAY_TEST_CGROUP_ROOT must be absolute');
   } else if (process.env.SESSION_RELAY_TEST_CGROUP_SCOPE === '1') {
@@ -264,21 +213,14 @@ if (unavailableDelegation) {
   process.exit(0);
 }
 const executed = spawnSync('cargo', ['test', '--locked', '--test', name, '--', '--nocapture', '--test-threads=1'], {
-  cwd: rust,
+  cwd: repoRoot,
   encoding: 'utf8',
   env: testEnv,
 });
 assert.equal(executed.status, 0, `${executed.stdout}\n${executed.stderr}`);
-const summary = `${executed.stdout}\n${executed.stderr}`.match(
-  /test result: ok\. (\d+) passed; 0 failed; (\d+) ignored; 0 measured; (\d+) filtered out/,
-);
+const summary = `${executed.stdout}\n${executed.stderr}`.match(SUMMARY_PATTERN);
 assert.ok(summary, `${name}: missing executable test summary`);
 assert.equal(Number(summary[1]), actual.length, `${name}: listed/executed test count differs`);
 assert.equal(Number(summary[2]), 0, `${name}: ignored required tests`);
 assert.equal(Number(summary[3]), 0, `${name}: filtered required tests`);
 console.log(`PASS rust_test_inventory case=${name} tests=${actual.length} executed=${summary[1]}`);
-for (const [acceptance, owner] of Object.entries(acceptanceOwners)) {
-  if (owner.startsWith(`${name}::`)) {
-    console.log(`PASS acceptance=${acceptance} owner=${owner}`);
-  }
-}

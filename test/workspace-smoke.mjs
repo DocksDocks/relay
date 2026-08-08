@@ -9,7 +9,8 @@ import { fileURLToPath } from 'node:url';
 import { scaledTimeout } from './lib/time-factor.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const plugin = path.resolve(here, '..');
+const root = path.resolve(here, '..');
+const payload = path.join(root, 'plugin');
 const caseIndex = process.argv.indexOf('--case');
 const binIndex = process.argv.indexOf('--bin');
 assert.ok(
@@ -25,13 +26,13 @@ const bin = process.argv[binIndex + 1];
 assert.ok(['single-session-compat', 'docs-contract'].includes(requested), `unknown workspace smoke case: ${requested}`);
 assert.ok(path.isAbsolute(bin), '--bin must be an absolute path');
 assert.equal(fs.realpathSync(bin), bin, '--bin must name the canonical fresh binary directly');
-assert.notEqual(bin, path.join(plugin, 'bin', 'relay'), '--bin may not be the compatibility launcher');
+assert.notEqual(bin, path.join(payload, 'bin', 'relay'), '--bin may not be the compatibility launcher');
 assert.ok(fs.statSync(bin).isFile(), `--bin is not a regular file: ${bin}`);
 fs.accessSync(bin, fs.constants.X_OK);
 
 const run = (args, options = {}) =>
   spawnSync(bin, args, {
-    cwd: options.cwd ?? plugin,
+    cwd: options.cwd ?? root,
     input: options.input,
     encoding: 'utf8',
     env: options.env ?? process.env,
@@ -631,9 +632,9 @@ function docsContract() {
     assert.ok(text.includes(command), `runtime usage omits workspace ${command}`);
   }
 
-  const skill = fs.readFileSync(path.join(plugin, 'skills', 'productivity', 'session-relay', 'SKILL.md'), 'utf8');
+  const skill = fs.readFileSync(path.join(payload, 'skills', 'productivity', 'session-relay', 'SKILL.md'), 'utf8');
   const reference = fs.readFileSync(
-    path.join(plugin, 'skills', 'productivity', 'session-relay', 'references', 'workspace.md'),
+    path.join(payload, 'skills', 'productivity', 'session-relay', 'references', 'workspace.md'),
     'utf8',
   );
   const docs = `${skill}\n${reference}`;

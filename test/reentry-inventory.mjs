@@ -7,8 +7,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const plugin = path.resolve(here, '..');
-const repo = path.resolve(plugin, '..', '..');
+const repo = path.resolve(here, '..');
 const fixturePath = path.join(here, 'fixtures', 'reentry-inventory.json');
 const fixture = JSON.parse(fs.readFileSync(fixturePath, 'utf8'));
 const expectedKeys = [
@@ -24,15 +23,20 @@ const expectedKeys = [
   'schema_version',
 ];
 
+// The census covers crate library and binary sources only. `src/tests/` holds the
+// integration targets, which Cargo builds as separate crates and which the monorepo
+// layout kept outside this walk as `rust/tests/`. Excluding it preserves that scope.
+const CENSUS_EXCLUDED = new Set([path.join(repo, 'src', 'tests')]);
+
 function rustSources(root) {
   return fs.readdirSync(root, { withFileTypes: true }).flatMap((entry) => {
     const child = path.join(root, entry.name);
-    if (entry.isDirectory()) return rustSources(child);
+    if (entry.isDirectory()) return CENSUS_EXCLUDED.has(child) ? [] : rustSources(child);
     return entry.isFile() && entry.name.endsWith('.rs') ? [child] : [];
   });
 }
 
-const sources = rustSources(path.join(plugin, 'rust', 'src'))
+const sources = rustSources(path.join(repo, 'src'))
   .sort()
   .map((file) => ({ file: path.relative(repo, file), text: fs.readFileSync(file, 'utf8') }));
 
@@ -124,7 +128,7 @@ function compileFail() {
   try {
     for (const name of actualBins) {
       const run = spawnSync('cargo', ['check', '--locked', '--manifest-path', manifest, '--bin', name], {
-        cwd: path.join(plugin, 'rust'),
+        cwd: repo,
         encoding: 'utf8',
         env: { ...process.env, CARGO_TARGET_DIR: target },
       });
@@ -241,13 +245,13 @@ for (const rule of fixture.forbidden_calls) {
 }
 assert.deepEqual(findings, [], `unguarded lifecycle mutators remain:\n${findings.join('\n')}`);
 
-const lifecycleSource = sourceByName('plugins/session-relay/rust/src/lifecycle.rs');
+const lifecycleSource = sourceByName('src/lifecycle.rs');
 assert.doesNotMatch(
   lifecycleSource.text,
   /admit_operation_with_appserver/,
   'app-server selector must be materialized before sealed admission',
 );
-const cliRun = functionByName(sourceByName('plugins/session-relay/rust/src/cli.rs'), 'run');
+const cliRun = functionByName(sourceByName('src/cli.rs'), 'run');
 assert.match(cliRun.text, /RELAY_APP_SERVER/, 'wake env fallback is missing');
 assert.match(
   cliRun.text,
@@ -256,7 +260,7 @@ assert.match(
 );
 const drain = functionByName(lifecycleSource, 'drain_with_guard');
 assert.match(drain.text, /guard\.with_authorized/, 'mailbox validation and removal must share one store lock');
-const rollback = functionByName(sourceByName('plugins/session-relay/rust/src/store.rs'), 'rollback');
+const rollback = functionByName(sourceByName('src/store.rs'), 'rollback');
 assert.doesNotMatch(
   rollback.text,
   /recipient|session_id|target/,
@@ -267,7 +271,7 @@ assert.match(
   /self\.raw[\s\S]*push_str\(&current\)/,
   'receipt rollback must restore exact original lines',
 );
-const appserverSource = sourceByName('plugins/session-relay/rust/src/appserver.rs');
+const appserverSource = sourceByName('src/appserver.rs');
 const guardedRequest = functionByName(appserverSource, 'request_with_guard');
 assert.match(guardedRequest.text, /Duration::from_secs\(RPC_TIMEOUT_SECS\)/, 'guarded RPC must preserve timeout');
 assert.match(guardedRequest.text, /recv_text_with_guard/, 'guarded RPC must poll lifecycle cancellation');

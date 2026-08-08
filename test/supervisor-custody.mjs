@@ -11,10 +11,8 @@ if (process.argv[2] !== '--matrix') {
   process.exit(2);
 }
 
-const ROOT = path.resolve(import.meta.dirname, '..', '..', '..');
-const BIN = process.env.RELAY_BIN
-  ? path.resolve(process.env.RELAY_BIN)
-  : path.join(ROOT, 'plugins/session-relay/rust/target/debug/relay');
+const ROOT = path.resolve(import.meta.dirname, '..');
+const BIN = process.env.RELAY_BIN ? path.resolve(process.env.RELAY_BIN) : path.join(ROOT, 'target', 'debug', 'relay');
 assert.ok(fs.existsSync(BIN), `missing test binary: ${BIN}`);
 
 function fresh(tag) {
@@ -207,7 +205,7 @@ while :; do printf '0123456789abcdef0123456789abcdef0123456789abcdef0123456789ab
   fs.rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
 }
 
-const spawnSource = fs.readFileSync(path.join(ROOT, 'plugins/session-relay/rust/src/spawn.rs'), 'utf8');
+const spawnSource = fs.readFileSync(path.join(ROOT, 'src', 'spawn.rs'), 'utf8');
 assert.doesNotMatch(spawnSource, /run_child_with_guard_legacy/);
 assert.match(spawnSource, /crate::supervisor::run_child_with_guard\(guard, spec\)/);
 
