@@ -90,6 +90,11 @@ jobs:
                 done
               fi
             fi
+            # `populated 0` proves no live process remains, which is the leak question.
+            # It does NOT make the leaf rmdir-able: the custody tests create one nested
+            # cgroup per managed workspace, and an EMPTY child directory still returns
+            # EBUSY on the parent. Sweep the debris depth-first, then remove the leaf.
+            sudo -n find "$CGROUP" -mindepth 1 -depth -type d -exec rmdir {} + 2>/dev/null || true
             if ! grep -qx 'populated 0' "$CGROUP/cgroup.events" || ! sudo -n rmdir "$CGROUP"; then
               echo "Session Relay cgroup delegation did not cleanly close: $CGROUP" >&2
               status=1

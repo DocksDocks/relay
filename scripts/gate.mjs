@@ -300,6 +300,11 @@ section('delegation');
     process.env.SESSION_RELAY_TEST_CGROUP_ROOT = leaf;
     releaseDelegationLeaf = () => {
       delete process.env.SESSION_RELAY_TEST_CGROUP_ROOT;
+      // The custody tests create one nested cgroup per managed workspace and leave the empty
+      // directory behind. An empty child still returns EBUSY on the parent, so `rmdir` alone
+      // fails on a run whose every check passed. Sweep depth-first first; that removes debris
+      // without hiding a leak, because a cgroup holding a live process will not rmdir either.
+      sudo(['find', leaf, '-mindepth', '1', '-depth', '-type', 'd', '-exec', 'rmdir', '{}', '+']);
       const removed = sudo(['rmdir', leaf]);
       // A leaf that will not close is a leaked cgroup on a shared runner: the gate fails.
       return failed(removed) ? `cgroup delegation did not cleanly close: ${detailOf(removed)}` : null;

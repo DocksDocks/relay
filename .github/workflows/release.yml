@@ -209,7 +209,14 @@ jobs:
           done < /proc/self/cgroup
           test -n "$CURRENT_CGROUP"
           CGROUP="/sys/fs/cgroup${CURRENT_CGROUP%/}/session-relay-producer-$(id -u)-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${RUNNER_ARCH}"
-          cleanup() { sudo -n rmdir "$CGROUP" 2>/dev/null || true; }
+          # The custody test creates one nested cgroup per managed workspace and leaves the
+          # empty directory behind, and an empty child still returns EBUSY on the parent.
+          # Sweep depth-first before removing the leaf, on both the trap and the happy path.
+          sweep() { sudo -n find "$CGROUP" -mindepth 1 -depth -type d -exec rmdir {} + 2>/dev/null || true; }
+          cleanup() {
+            sweep
+            sudo -n rmdir "$CGROUP" 2>/dev/null || true
+          }
           trap cleanup EXIT
           sudo -n mkdir "$CGROUP"
           sudo -n chown "$(id -u):$(id -g)" "$CGROUP"
@@ -224,6 +231,7 @@ jobs:
                 linux_cgroup_pidfd_guardian_kills_hostile_descendants \
                 -- --exact --nocapture
           )
+          sweep
           sudo -n rmdir "$CGROUP"
           trap - EXIT
       - name: smoke explicit fresh Linux workspace binary
