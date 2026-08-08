@@ -2361,17 +2361,6 @@ fn open_verified_provider_files(
     })
 }
 
-#[cfg(not(target_os = "linux"))]
-fn invoke_provider_with_files(
-    provider: &ResourceProviderRegistrationV1,
-    request: ProviderRequestV1,
-    files: VerifiedProviderFiles,
-) -> Result<ProviderReceiptV1, String> {
-    let _ = (provider, request, files);
-    Err("external resource provider execution requires Linux process-tree containment".into())
-}
-
-#[cfg(target_os = "linux")]
 fn invoke_provider_with_files(
     provider: &ResourceProviderRegistrationV1,
     request: ProviderRequestV1,
@@ -3072,7 +3061,6 @@ fn preflight_private_tree(path: &Path, euid: u32) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
 fn prove_recorded_port_released(value: &str) -> Result<(), String> {
     const PROC_TCP_MAX: u64 = 1024 * 1024;
     let address: SocketAddr = value
@@ -3118,11 +3106,6 @@ fn prove_recorded_port_released(value: &str) -> Result<(), String> {
         }
     }
     Ok(())
-}
-
-#[cfg(not(target_os = "linux"))]
-fn prove_recorded_port_released(_value: &str) -> Result<(), String> {
-    Err("held-port release proof is available only on Linux".into())
 }
 
 fn remove_private_tree(path: &Path, euid: u32) -> Result<(), String> {

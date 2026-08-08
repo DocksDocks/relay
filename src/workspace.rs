@@ -672,7 +672,6 @@ fn broker_socket_path(euid: u32, repository_id: &str, session_id: &str) -> Resul
     authority::ensure_private_directory(directory, euid)?;
     Ok(path)
 }
-#[cfg(target_os = "linux")]
 fn custody_socket_path(session_dir: &Path) -> PathBuf {
     let euid = unsafe { libc::geteuid() };
     let root = PathBuf::from(format!("/tmp/sr-custody-{euid}"));
@@ -685,10 +684,6 @@ fn custody_socket_path(session_dir: &Path) -> PathBuf {
         .as_slice(),
     );
     root.join(identity).join("command.sock")
-}
-#[cfg(not(target_os = "linux"))]
-fn custody_socket_path(session_dir: &Path) -> PathBuf {
-    session_dir.join("custody-command-v1.sock")
 }
 
 pub struct StartedWorkspace {
@@ -1000,7 +995,6 @@ fn verify_open_file_identity(path: &Path, file: &File, label: &str) -> Result<()
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
 fn adopt_running_relay_fd(fd: RawFd) -> Result<File, String> {
     if fd <= libc::STDERR_FILENO {
         return Err("sealed relay FD is not above stdio".into());
@@ -1036,12 +1030,6 @@ fn adopt_running_relay_fd(fd: RawFd) -> Result<File, String> {
         ));
     }
     Ok(file)
-}
-
-#[cfg(not(target_os = "linux"))]
-fn adopt_running_relay_fd(fd: RawFd) -> Result<File, String> {
-    let _ = fd;
-    Err(platform::MACOS_STOP_REASON.into())
 }
 
 pub fn start_workspace_with_roots_and_verified_executable(
@@ -3163,17 +3151,10 @@ fn prepare_cleanup_evidence(
     cleanup_fault(session_dir, session_id, "before_empty")?;
     wait_for_durable_file(&broker_close_path, "broker close proof")?;
     if !empty_path.exists() {
-        #[cfg(not(target_os = "linux"))]
-        {
-            return Err(platform::MACOS_STOP_REASON.into());
-        }
-        #[cfg(target_os = "linux")]
-        {
-            if dead_custody_identities(session_dir, session_id)?.is_some() {
-                recover_dead_custody_empty(session_dir, session_id)?;
-            } else {
-                runtime_exchange(session_dir, "terminate", None)?;
-            }
+        if dead_custody_identities(session_dir, session_id)?.is_some() {
+            recover_dead_custody_empty(session_dir, session_id)?;
+        } else {
+            runtime_exchange(session_dir, "terminate", None)?;
         }
     }
     wait_for_durable_file(&empty_path, "custody EMPTY proof")?;
@@ -3991,9 +3972,6 @@ fn closed_cleanup_replay(
         return Err("cleanup receipt belongs to a different coordinator request".into());
     }
     let receipt_sha256 = sha256::hex_digest(&capability::read_secure_bytes(&receipt_path)?);
-    #[cfg(not(target_os = "linux"))]
-    return Err(platform::MACOS_STOP_REASON.into());
-    #[cfg(target_os = "linux")]
     reconcile_closed_custody(roots, repository, session_dir, session_id, &receipt_sha256)?;
     Ok(Some(receipt))
 }
@@ -4238,17 +4216,10 @@ fn finalize_closed(
     cleanup_fault(session_dir, &session_id, "before_lease_close")?;
     let lease_close_path = session_dir.join("custody-lease-closed-v1.json");
     if !lease_close_path.exists() {
-        #[cfg(not(target_os = "linux"))]
-        {
-            return Err(platform::MACOS_STOP_REASON.into());
-        }
-        #[cfg(target_os = "linux")]
-        {
-            if dead_custody_identities(session_dir, &session_id)?.is_some() {
-                close_dead_custody_leases(session_dir, &session_id)?;
-            } else {
-                runtime_exchange(session_dir, "close_lease", None)?;
-            }
+        if dead_custody_identities(session_dir, &session_id)?.is_some() {
+            close_dead_custody_leases(session_dir, &session_id)?;
+        } else {
+            runtime_exchange(session_dir, "close_lease", None)?;
         }
     }
     wait_for_durable_file(&lease_close_path, "custody lease close proof")?;
@@ -4316,9 +4287,6 @@ fn finalize_closed(
     if intent_object["request_id"].as_str()? != request_id {
         return Err("cleanup intent request changed before Closed reconciliation".into());
     }
-    #[cfg(not(target_os = "linux"))]
-    return Err(platform::MACOS_STOP_REASON.into());
-    #[cfg(target_os = "linux")]
     reconcile_closed_custody(roots, repository, session_dir, &session_id, &receipt_sha256)?;
     Ok(receipt)
 }
@@ -4370,17 +4338,10 @@ fn retain_abort_and_close(
     revoke_worker_if_needed(roots, repository, session_dir, manifest, created_at)?;
     let session_id = manifest.object()?["session_id"].as_str()?;
     if !session_dir.join("custody-empty-v1.json").exists() {
-        #[cfg(not(target_os = "linux"))]
-        {
-            return Err(platform::MACOS_STOP_REASON.into());
-        }
-        #[cfg(target_os = "linux")]
-        {
-            if dead_custody_identities(session_dir, session_id)?.is_some() {
-                recover_dead_custody_empty(session_dir, session_id)?;
-            } else {
-                runtime_exchange(session_dir, "terminate", None)?;
-            }
+        if dead_custody_identities(session_dir, session_id)?.is_some() {
+            recover_dead_custody_empty(session_dir, session_id)?;
+        } else {
+            runtime_exchange(session_dir, "terminate", None)?;
         }
     }
     wait_for_durable_file(
@@ -4736,256 +4697,246 @@ fn reconcile_ready_start_fault_for_retry(
     session_dir: &Path,
     manifest: &WorkspaceManifestRecord,
 ) -> Result<(PathBuf, String), String> {
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = (roots, repository, session_dir, manifest);
-        return Err(platform::MACOS_STOP_REASON.into());
+    if manifest.state()? != WorkspaceState::Ready {
+        return Err("Ready retry reconciliation requires exact Ready state".into());
     }
-    #[cfg(target_os = "linux")]
+    let value = schema::parse_jcs(
+        &capability::read_secure_bytes(&session_dir.join("workspace-start-fault-v1.json"))?,
+        true,
+    )?;
+    let object = closed_object(
+        &value,
+        &[
+            "schema",
+            "session_id",
+            "repository_id",
+            "phase",
+            "broker_started",
+            "broker_close_sha256",
+            "custody_fault_sha256",
+            "lease_path",
+            "lease_device",
+            "lease_inode",
+            "relay_executable",
+            "relay_executable_sha256",
+            "created_at",
+            "error",
+            "evidence_sha256",
+        ],
+        "WorkspaceStartFaultV1",
+    )?;
+    let manifest_object = manifest.object()?;
+    let session_id = manifest_object["session_id"].as_str()?;
+    if object["schema"].as_str()? != "WorkspaceStartFaultV1"
+        || object["session_id"].as_str()? != session_id
+        || object["repository_id"].as_str()? != repository.identity.repository_id
+        || manifest_object["last_error"].as_str()? != object["error"].as_str()?
     {
-        if manifest.state()? != WorkspaceState::Ready {
-            return Err("Ready retry reconciliation requires exact Ready state".into());
+        return Err("Ready start fault differs from durable session authority".into());
+    }
+    let mut bare = object.clone();
+    let evidence = bare
+        .insert("evidence_sha256".into(), JcsValue::Null)
+        .and_then(|value| value.as_str().ok().map(str::to_string))
+        .ok_or_else(|| "Ready start fault evidence is missing".to_string())?;
+    let expected = sha256::hex_digest(
+        [
+            b"session-relay/workspace-start-fault/v1\0".as_slice(),
+            schema::serialize_jcs(&JcsValue::Object(bare)).as_bytes(),
+        ]
+        .concat()
+        .as_slice(),
+    );
+    if !sha256::constant_time_eq(evidence.as_bytes(), expected.as_bytes()) {
+        return Err("Ready start fault evidence digest mismatch".into());
+    }
+    let relay_executable = PathBuf::from(object["relay_executable"].as_str()?);
+    let relay_executable_sha256 = object["relay_executable_sha256"].as_str()?.to_string();
+    resources::verify_executable(&relay_executable, &relay_executable_sha256)?;
+    revoke_worker_if_needed(
+        roots,
+        repository,
+        session_dir,
+        manifest,
+        &authority::now_timestamp()?,
+    )?;
+    let worker_path = PathBuf::from(manifest_object["worker_capability_file"].as_str()?);
+    let worker: WorkerCapabilityV1 = schema::read_jcs_file(&worker_path, None)?;
+    let capability_record: schema::CapabilityRecordV1 =
+        schema::read_jcs_file(&session_dir.join("worker-capability-record-v1.json"), None)?;
+    let revoked_at = capability_record
+        .revoked_at
+        .ok_or_else(|| "Ready recovery worker capability is not durably revoked".to_string())?;
+    let phase = object["phase"].as_str()?;
+    let broker_started = match object["broker_started"] {
+        JcsValue::Bool(value) => value,
+        _ => return Err("Ready start fault broker_started is not a boolean".into()),
+    };
+    let broker_close_path = session_dir.join("broker-close-v1.json");
+    if phase == "broker_start" && !broker_started {
+        if Path::new(&worker.broker_socket).exists() {
+            return Err("broker-start fault left a broker socket; retry remains fenced".into());
         }
-        let value = schema::parse_jcs(
-            &capability::read_secure_bytes(&session_dir.join("workspace-start-fault-v1.json"))?,
-            true,
+        let broker_close_sha256 = sha256::hex_digest(
+            format!(
+                "workspace-broker-close-v1\0{}\0{}\0{}",
+                worker.session_id, worker.capability_id, revoked_at
+            )
+            .as_bytes(),
+        );
+        persist_runtime_record(
+            session_dir,
+            "broker-close-v1.json",
+            JcsValue::Object(BTreeMap::from([
+                (
+                    "capability_id".into(),
+                    JcsValue::String(worker.capability_id.clone()),
+                ),
+                (
+                    "evidence_sha256".into(),
+                    JcsValue::String(broker_close_sha256),
+                ),
+                ("revoked_at".into(), JcsValue::String(revoked_at.clone())),
+                ("schema".into(), JcsValue::String("BrokerCloseV1".into())),
+                (
+                    "session_id".into(),
+                    JcsValue::String(worker.session_id.clone()),
+                ),
+            ])),
         )?;
-        let object = closed_object(
-            &value,
+        if custody_socket_path(session_dir).exists()
+            || session_dir.join("custody-fault-v1.json").exists()
+            || session_dir.join("custody-active-v1.json").exists()
+        {
+            return Err("broker-start fault has unexplained custody side effects".into());
+        }
+        let empty_sha256 = sha256::hex_digest(
+            format!("custody-ready-retry-empty-v1\0{session_id}\0no-custody").as_bytes(),
+        );
+        persist_runtime_record(
+            session_dir,
+            "custody-empty-v1.json",
+            JcsValue::Object(BTreeMap::from([
+                ("empty_sha256".into(), JcsValue::String(empty_sha256)),
+                (
+                    "mode".into(),
+                    JcsValue::String("ready_retry_no_custody".into()),
+                ),
+                ("schema".into(), JcsValue::String("CustodyEmptyV1".into())),
+            ])),
+        )?;
+    } else if phase == "custody_start" && broker_started {
+        wait_for_durable_file(&broker_close_path, "broker close proof")?;
+        let custody_fault_path = session_dir.join("custody-fault-v1.json");
+        let expected_fault = match &object["custody_fault_sha256"] {
+            JcsValue::String(value) => value,
+            _ => {
+                return Err(
+                    "custody-start fault lacks exact durable fault evidence; no redispatch".into(),
+                );
+            }
+        };
+        let custody_fault_value =
+            schema::parse_jcs(&capability::read_secure_bytes(&custody_fault_path)?, true)?;
+        if schema::jcs_sha256(&CanonicalRecord(custody_fault_value.clone())) != *expected_fault {
+            return Err("custody-start fault evidence changed before recovery".into());
+        }
+        let fault = closed_object(
+            &custody_fault_value,
             &[
                 "schema",
                 "session_id",
-                "repository_id",
-                "phase",
-                "broker_started",
-                "broker_close_sha256",
-                "custody_fault_sha256",
-                "lease_path",
+                "generation",
+                "cgroup_membership",
                 "lease_device",
                 "lease_inode",
-                "relay_executable",
-                "relay_executable_sha256",
-                "created_at",
+                "guardian_pid",
+                "guardian_start_token",
+                "supervisor_pid",
+                "supervisor_start_token",
+                "code",
                 "error",
                 "evidence_sha256",
+                "empty_sha256",
             ],
-            "WorkspaceStartFaultV1",
+            "CustodyFaultV1",
         )?;
-        let manifest_object = manifest.object()?;
-        let session_id = manifest_object["session_id"].as_str()?;
-        if object["schema"].as_str()? != "WorkspaceStartFaultV1"
-            || object["session_id"].as_str()? != session_id
-            || object["repository_id"].as_str()? != repository.identity.repository_id
-            || manifest_object["last_error"].as_str()? != object["error"].as_str()?
-        {
-            return Err("Ready start fault differs from durable session authority".into());
-        }
-        let mut bare = object.clone();
-        let evidence = bare
-            .insert("evidence_sha256".into(), JcsValue::Null)
-            .and_then(|value| value.as_str().ok().map(str::to_string))
-            .ok_or_else(|| "Ready start fault evidence is missing".to_string())?;
-        let expected = sha256::hex_digest(
-            [
-                b"session-relay/workspace-start-fault/v1\0".as_slice(),
-                schema::serialize_jcs(&JcsValue::Object(bare)).as_bytes(),
-            ]
-            .concat()
-            .as_slice(),
-        );
-        if !sha256::constant_time_eq(evidence.as_bytes(), expected.as_bytes()) {
-            return Err("Ready start fault evidence digest mismatch".into());
-        }
-        let relay_executable = PathBuf::from(object["relay_executable"].as_str()?);
-        let relay_executable_sha256 = object["relay_executable_sha256"].as_str()?.to_string();
-        resources::verify_executable(&relay_executable, &relay_executable_sha256)?;
-        revoke_worker_if_needed(
-            roots,
-            repository,
-            session_dir,
-            manifest,
-            &authority::now_timestamp()?,
-        )?;
-        let worker_path = PathBuf::from(manifest_object["worker_capability_file"].as_str()?);
-        let worker: WorkerCapabilityV1 = schema::read_jcs_file(&worker_path, None)?;
-        let capability_record: schema::CapabilityRecordV1 =
-            schema::read_jcs_file(&session_dir.join("worker-capability-record-v1.json"), None)?;
-        let revoked_at = capability_record
-            .revoked_at
-            .ok_or_else(|| "Ready recovery worker capability is not durably revoked".to_string())?;
-        let phase = object["phase"].as_str()?;
-        let broker_started = match object["broker_started"] {
-            JcsValue::Bool(value) => value,
-            _ => return Err("Ready start fault broker_started is not a boolean".into()),
-        };
-        let broker_close_path = session_dir.join("broker-close-v1.json");
-        if phase == "broker_start" && !broker_started {
-            if Path::new(&worker.broker_socket).exists() {
-                return Err("broker-start fault left a broker socket; retry remains fenced".into());
-            }
-            let broker_close_sha256 = sha256::hex_digest(
-                format!(
-                    "workspace-broker-close-v1\0{}\0{}\0{}",
-                    worker.session_id, worker.capability_id, revoked_at
-                )
-                .as_bytes(),
-            );
-            persist_runtime_record(
-                session_dir,
-                "broker-close-v1.json",
-                JcsValue::Object(BTreeMap::from([
-                    (
-                        "capability_id".into(),
-                        JcsValue::String(worker.capability_id.clone()),
-                    ),
-                    (
-                        "evidence_sha256".into(),
-                        JcsValue::String(broker_close_sha256),
-                    ),
-                    ("revoked_at".into(), JcsValue::String(revoked_at.clone())),
-                    ("schema".into(), JcsValue::String("BrokerCloseV1".into())),
-                    (
-                        "session_id".into(),
-                        JcsValue::String(worker.session_id.clone()),
-                    ),
-                ])),
-            )?;
-            if custody_socket_path(session_dir).exists()
-                || session_dir.join("custody-fault-v1.json").exists()
-                || session_dir.join("custody-active-v1.json").exists()
-            {
-                return Err("broker-start fault has unexplained custody side effects".into());
-            }
-            let empty_sha256 = sha256::hex_digest(
-                format!("custody-ready-retry-empty-v1\0{session_id}\0no-custody").as_bytes(),
-            );
-            persist_runtime_record(
-                session_dir,
-                "custody-empty-v1.json",
-                JcsValue::Object(BTreeMap::from([
-                    ("empty_sha256".into(), JcsValue::String(empty_sha256)),
-                    (
-                        "mode".into(),
-                        JcsValue::String("ready_retry_no_custody".into()),
-                    ),
-                    ("schema".into(), JcsValue::String("CustodyEmptyV1".into())),
-                ])),
-            )?;
-        } else if phase == "custody_start" && broker_started {
-            wait_for_durable_file(&broker_close_path, "broker close proof")?;
-            let custody_fault_path = session_dir.join("custody-fault-v1.json");
-            let expected_fault = match &object["custody_fault_sha256"] {
-                JcsValue::String(value) => value,
-                _ => {
-                    return Err(
-                        "custody-start fault lacks exact durable fault evidence; no redispatch"
-                            .into(),
-                    );
-                }
-            };
-            let custody_fault_value =
-                schema::parse_jcs(&capability::read_secure_bytes(&custody_fault_path)?, true)?;
-            if schema::jcs_sha256(&CanonicalRecord(custody_fault_value.clone())) != *expected_fault
-            {
-                return Err("custody-start fault evidence changed before recovery".into());
-            }
-            let fault = closed_object(
-                &custody_fault_value,
-                &[
-                    "schema",
-                    "session_id",
-                    "generation",
-                    "cgroup_membership",
-                    "lease_device",
-                    "lease_inode",
-                    "guardian_pid",
-                    "guardian_start_token",
-                    "supervisor_pid",
-                    "supervisor_start_token",
-                    "code",
-                    "error",
-                    "evidence_sha256",
-                    "empty_sha256",
-                ],
-                "CustodyFaultV1",
-            )?;
-            terminate_exact_fault_process(
-                fault["guardian_pid"]
-                    .as_str()?
-                    .parse()
-                    .map_err(|_| "retained guardian PID overflow".to_string())?,
-                fault["guardian_start_token"].as_str()?,
-            )?;
-            terminate_exact_fault_process(
-                fault["supervisor_pid"]
-                    .as_str()?
-                    .parse()
-                    .map_err(|_| "retained supervisor PID overflow".to_string())?,
-                fault["supervisor_start_token"].as_str()?,
-            )?;
-            let socket = custody_socket_path(session_dir);
-            if socket.exists() {
-                fs::remove_file(&socket)
-                    .map_err(|error| format!("remove fenced custody socket: {error}"))?;
-            }
-            if let Some(parent) = socket.parent() {
-                match fs::remove_dir(parent) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => {
-                        return Err(format!("remove fenced custody socket directory: {error}"));
-                    }
-                }
-            }
-            platform::linux::DelegatedCgroup::create(session_id)?.remove()?;
-        } else {
-            return Err("Ready start fault phase and broker proof are inconsistent".into());
-        }
-        let broker_close_sha256 = evidence_field(
-            &broker_close_path,
-            &[
-                "schema",
-                "session_id",
-                "capability_id",
-                "revoked_at",
-                "evidence_sha256",
-            ],
-            "BrokerCloseV1",
-            "evidence_sha256",
-        )?;
-        let empty_sha256 = evidence_field(
-            &session_dir.join("custody-empty-v1.json"),
-            &["schema", "empty_sha256", "mode"],
-            "CustodyEmptyV1",
-            "empty_sha256",
-        )?;
-        let lease = LeaseIdentity {
-            device: object["lease_device"]
+        terminate_exact_fault_process(
+            fault["guardian_pid"]
                 .as_str()?
                 .parse()
-                .map_err(|_| "Ready fault lease device overflow".to_string())?,
-            inode: object["lease_inode"]
+                .map_err(|_| "retained guardian PID overflow".to_string())?,
+            fault["guardian_start_token"].as_str()?,
+        )?;
+        terminate_exact_fault_process(
+            fault["supervisor_pid"]
                 .as_str()?
                 .parse()
-                .map_err(|_| "Ready fault lease inode overflow".to_string())?,
-        };
-        let probe = WorkspaceLeaseProbe::acquire(Path::new(object["lease_path"].as_str()?), lease)?;
-        probe.revalidate()?;
-        resources::release_resources(
-            roots,
-            &repository.identity.repository_id,
-            session_id,
-            &session_dir.join("resources"),
-            &resources::ResourceReleaseEvidenceV1 {
-                broker_close_sha256,
-                runtime_empty_sha256: empty_sha256,
-            },
-            &authority::now_timestamp()?,
+                .map_err(|_| "retained supervisor PID overflow".to_string())?,
+            fault["supervisor_start_token"].as_str()?,
         )?;
-        remove_revoked_worker_capability(&worker_path)?;
-        probe.revalidate()?;
-        Ok((relay_executable, relay_executable_sha256))
+        let socket = custody_socket_path(session_dir);
+        if socket.exists() {
+            fs::remove_file(&socket)
+                .map_err(|error| format!("remove fenced custody socket: {error}"))?;
+        }
+        if let Some(parent) = socket.parent() {
+            match fs::remove_dir(parent) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(format!("remove fenced custody socket directory: {error}"));
+                }
+            }
+        }
+        platform::linux::DelegatedCgroup::create(session_id)?.remove()?;
+    } else {
+        return Err("Ready start fault phase and broker proof are inconsistent".into());
     }
+    let broker_close_sha256 = evidence_field(
+        &broker_close_path,
+        &[
+            "schema",
+            "session_id",
+            "capability_id",
+            "revoked_at",
+            "evidence_sha256",
+        ],
+        "BrokerCloseV1",
+        "evidence_sha256",
+    )?;
+    let empty_sha256 = evidence_field(
+        &session_dir.join("custody-empty-v1.json"),
+        &["schema", "empty_sha256", "mode"],
+        "CustodyEmptyV1",
+        "empty_sha256",
+    )?;
+    let lease = LeaseIdentity {
+        device: object["lease_device"]
+            .as_str()?
+            .parse()
+            .map_err(|_| "Ready fault lease device overflow".to_string())?,
+        inode: object["lease_inode"]
+            .as_str()?
+            .parse()
+            .map_err(|_| "Ready fault lease inode overflow".to_string())?,
+    };
+    let probe = WorkspaceLeaseProbe::acquire(Path::new(object["lease_path"].as_str()?), lease)?;
+    probe.revalidate()?;
+    resources::release_resources(
+        roots,
+        &repository.identity.repository_id,
+        session_id,
+        &session_dir.join("resources"),
+        &resources::ResourceReleaseEvidenceV1 {
+            broker_close_sha256,
+            runtime_empty_sha256: empty_sha256,
+        },
+        &authority::now_timestamp()?,
+    )?;
+    remove_revoked_worker_capability(&worker_path)?;
+    probe.revalidate()?;
+    Ok((relay_executable, relay_executable_sha256))
 }
 
 fn resume_prelaunch(
@@ -5676,101 +5627,80 @@ fn start_custody_runtime(context: CustodyRuntimeStartContext<'_>) -> Result<Stri
         lease,
         resource_fds,
     } = context;
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = (
-            roots,
-            relay_executable,
-            relay_executable_sha256,
-            relay_file,
-            session_dir,
+    LowerUuidV4::parse(session_id)?;
+    let runtime_key = capability::random_secret()?;
+    write_private_bytes(&session_dir.join("runtime-control-key-v1"), &runtime_key)?;
+    let mut pipe = [-1; 2];
+    if unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return Err(format!(
+            "create custody activation pipe: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let read_end = unsafe { File::from_raw_fd(pipe[0]) };
+    let write_end = unsafe { OwnedFd::from_raw_fd(pipe[1]) };
+    let relay_fd = relay_file.as_raw_fd();
+    let lease_fd = lease.as_raw_fd();
+    if relay_fd <= libc::STDERR_FILENO || relay_fd == lease_fd || resource_fds.contains(&relay_fd) {
+        return Err("custody relay descriptor inventory is invalid".into());
+    }
+    let mut inherited = vec![relay_fd, lease_fd, write_end.as_raw_fd()];
+    inherited.extend_from_slice(resource_fds);
+    let prior = set_spawn_inheritance(&inherited, true)?;
+    let resource_text = encode_fd_list(resource_fds);
+    let relay_proc_path = format!("/proc/self/fd/{relay_fd}");
+    let spawned = Command::new(&relay_proc_path)
+        .args([
+            "workspace",
+            "__guardian",
+            "--authority-root",
+            roots
+                .authority
+                .to_str()
+                .ok_or_else(|| "authority root is not UTF-8".to_string())?,
+            "--data-root",
+            roots
+                .data
+                .to_str()
+                .ok_or_else(|| "data root is not UTF-8".to_string())?,
+            "--session-dir",
+            session_dir
+                .to_str()
+                .ok_or_else(|| "session dir is not UTF-8".to_string())?,
+            "--session-id",
             session_id,
-            tool_launch_file,
-            lease,
-            resource_fds,
-        );
-        return Err(platform::MACOS_STOP_REASON.into());
+            "--tool-launch-file",
+            tool_launch_file
+                .to_str()
+                .ok_or_else(|| "tool launch path is not UTF-8".to_string())?,
+            "--relay-executable",
+            relay_executable
+                .to_str()
+                .ok_or_else(|| "relay executable path is not UTF-8".to_string())?,
+            "--relay-executable-sha256",
+            relay_executable_sha256,
+            "--relay-fd",
+            &relay_fd.to_string(),
+            "--lease-fd",
+            &lease_fd.to_string(),
+            "--resource-fds",
+            &resource_text,
+            "--ready-fd",
+            &write_end.as_raw_fd().to_string(),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn();
+    let restore = restore_spawn_inheritance(&prior);
+    let child = spawned.map_err(|error| format!("spawn custody guardian: {error}"))?;
+    if let Err(error) = restore {
+        return Err(format!(
+            "{error}; custody guardian may hold retained proof and requires recovery"
+        ));
     }
-    #[cfg(target_os = "linux")]
-    {
-        LowerUuidV4::parse(session_id)?;
-        let runtime_key = capability::random_secret()?;
-        write_private_bytes(&session_dir.join("runtime-control-key-v1"), &runtime_key)?;
-        let mut pipe = [-1; 2];
-        if unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
-            return Err(format!(
-                "create custody activation pipe: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-        let read_end = unsafe { File::from_raw_fd(pipe[0]) };
-        let write_end = unsafe { OwnedFd::from_raw_fd(pipe[1]) };
-        let relay_fd = relay_file.as_raw_fd();
-        let lease_fd = lease.as_raw_fd();
-        if relay_fd <= libc::STDERR_FILENO
-            || relay_fd == lease_fd
-            || resource_fds.contains(&relay_fd)
-        {
-            return Err("custody relay descriptor inventory is invalid".into());
-        }
-        let mut inherited = vec![relay_fd, lease_fd, write_end.as_raw_fd()];
-        inherited.extend_from_slice(resource_fds);
-        let prior = set_spawn_inheritance(&inherited, true)?;
-        let resource_text = encode_fd_list(resource_fds);
-        let relay_proc_path = format!("/proc/self/fd/{relay_fd}");
-        let spawned = Command::new(&relay_proc_path)
-            .args([
-                "workspace",
-                "__guardian",
-                "--authority-root",
-                roots
-                    .authority
-                    .to_str()
-                    .ok_or_else(|| "authority root is not UTF-8".to_string())?,
-                "--data-root",
-                roots
-                    .data
-                    .to_str()
-                    .ok_or_else(|| "data root is not UTF-8".to_string())?,
-                "--session-dir",
-                session_dir
-                    .to_str()
-                    .ok_or_else(|| "session dir is not UTF-8".to_string())?,
-                "--session-id",
-                session_id,
-                "--tool-launch-file",
-                tool_launch_file
-                    .to_str()
-                    .ok_or_else(|| "tool launch path is not UTF-8".to_string())?,
-                "--relay-executable",
-                relay_executable
-                    .to_str()
-                    .ok_or_else(|| "relay executable path is not UTF-8".to_string())?,
-                "--relay-executable-sha256",
-                relay_executable_sha256,
-                "--relay-fd",
-                &relay_fd.to_string(),
-                "--lease-fd",
-                &lease_fd.to_string(),
-                "--resource-fds",
-                &resource_text,
-                "--ready-fd",
-                &write_end.as_raw_fd().to_string(),
-            ])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn();
-        let restore = restore_spawn_inheritance(&prior);
-        let child = spawned.map_err(|error| format!("spawn custody guardian: {error}"))?;
-        if let Err(error) = restore {
-            return Err(format!(
-                "{error}; custody guardian may hold retained proof and requires recovery"
-            ));
-        }
-        drop(write_end);
-        wait_pipe_record(read_end, child)
-    }
+    drop(write_end);
+    wait_pipe_record(read_end, child)
 }
 
 fn parse_fd_list(value: &str) -> Result<Vec<RawFd>, String> {
@@ -6824,7 +6754,6 @@ fn runtime_bare_request(
     ]))
 }
 
-#[cfg(target_os = "linux")]
 fn runtime_exchange(
     session_dir: &Path,
     action: &str,
@@ -6902,15 +6831,6 @@ fn runtime_exchange(
     let digest = object["evidence_sha256"].as_str()?;
     Sha256Digest::parse(digest)?;
     Ok(digest.into())
-}
-
-#[cfg(not(target_os = "linux"))]
-fn runtime_exchange(
-    _session_dir: &Path,
-    _action: &str,
-    _evidence_sha256: Option<&str>,
-) -> Result<String, String> {
-    Err(platform::MACOS_STOP_REASON.into())
 }
 
 #[cfg(target_os = "linux")]
@@ -8631,12 +8551,6 @@ fn run_broker_client(raw: &[String]) -> Result<i32, String> {
 }
 pub fn run(raw: Vec<String>) -> ! {
     if raw.first().map(String::as_str) == Some("__guardian") {
-        #[cfg(not(target_os = "linux"))]
-        {
-            eprintln!("{}", platform::MACOS_STOP_REASON);
-            std::process::exit(1)
-        }
-        #[cfg(target_os = "linux")]
         match run_guardian(&raw[1..]) {
             Ok(()) => std::process::exit(0),
             Err(error) => {
@@ -8646,12 +8560,6 @@ pub fn run(raw: Vec<String>) -> ! {
         }
     }
     if raw.first().map(String::as_str) == Some("__custody-supervisor") {
-        #[cfg(not(target_os = "linux"))]
-        {
-            eprintln!("{}", platform::MACOS_STOP_REASON);
-            std::process::exit(1)
-        }
-        #[cfg(target_os = "linux")]
         match run_custody_supervisor(&raw[1..]) {
             Ok(()) => std::process::exit(0),
             Err(error) => {

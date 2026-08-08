@@ -1043,14 +1043,6 @@
       "anchor": "libc::openpty("
     },
     {
-      "id": "platform:src/supervisor.rs:open_pty:libc_openpty:2",
-      "file": "src/supervisor.rs",
-      "function": "open_pty",
-      "category": "platform",
-      "operation": "libc_openpty",
-      "anchor": "libc::openpty("
-    },
-    {
       "id": "platform:src/supervisor.rs:prepare_detached_child:libc_fcntl:1",
       "file": "src/supervisor.rs",
       "function": "prepare_detached_child",
@@ -1137,22 +1129,6 @@
       "category": "platform",
       "operation": "libc_ioctl",
       "anchor": "libc::ioctl("
-    },
-    {
-      "id": "platform:src/supervisor.rs:verify_same_uid:libc_geteuid:1",
-      "file": "src/supervisor.rs",
-      "function": "verify_same_uid",
-      "category": "platform",
-      "operation": "libc_geteuid",
-      "anchor": "libc::geteuid("
-    },
-    {
-      "id": "platform:src/supervisor.rs:verify_same_uid:libc_getpeereid:1",
-      "file": "src/supervisor.rs",
-      "function": "verify_same_uid",
-      "category": "platform",
-      "operation": "libc_getpeereid",
-      "anchor": "libc::getpeereid("
     },
     {
       "id": "platform:src/workspace.rs:adopt_running_relay_fd:libc_fcntl:1",
@@ -1409,14 +1385,6 @@
       "category": "platform",
       "operation": "libc_fcntl",
       "anchor": "libc::fcntl("
-    },
-    {
-      "id": "platform:src/workspace/authority.rs:acquire:libc_flock:1",
-      "file": "src/workspace/authority.rs",
-      "function": "acquire",
-      "category": "platform",
-      "operation": "libc_flock",
-      "anchor": "libc::flock("
     },
     {
       "id": "platform:src/workspace/authority.rs:acquire:libc_geteuid:1",
@@ -2923,14 +2891,6 @@
       "anchor": ".spawn()"
     },
     {
-      "id": "signal:src/lifecycle.rs:process_observation_is_live:libc_kill:1",
-      "file": "src/lifecycle.rs",
-      "function": "process_observation_is_live",
-      "category": "signal",
-      "operation": "libc_kill",
-      "anchor": "libc::kill("
-    },
-    {
       "id": "signal:src/spawn.rs:run:child_kill:1",
       "file": "src/spawn.rs",
       "function": "run",
@@ -2969,14 +2929,6 @@
       "category": "signal",
       "operation": "kill_and_wait_empty",
       "anchor": "kill_and_wait_empty("
-    },
-    {
-      "id": "signal:src/supervisor.rs:pid_exists:libc_kill:1",
-      "file": "src/supervisor.rs",
-      "function": "pid_exists",
-      "category": "signal",
-      "operation": "libc_kill",
-      "anchor": "libc::kill("
     },
     {
       "id": "signal:src/supervisor.rs:reap_unpublished_child:child_kill:1",

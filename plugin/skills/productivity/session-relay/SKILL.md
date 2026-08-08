@@ -5,8 +5,8 @@ user-invocable: true
 allowed-tools: Bash, Read
 metadata:
   pattern: tool-wrapper
-  updated: "2026-07-25"
-  content_hash: "8830539e8d6e986a7adbfeb4156dd5dc7fe5e828f46dedc3cafcdd9f2d6b1ff4"
+  updated: "2026-08-07"
+  content_hash: "e7c71741b7b1872b16d85e0c1c3beb1806372ccbe3ba38d68d3873a6964c7017"
 ---
 
 # Session relay
@@ -39,7 +39,7 @@ The installed plugin's compatibility launcher resolves a non-empty `SESSION_RELA
 
 The launcher has no embedded relay binary and never compiles, builds, or downloads one at startup. For a missing CLI, run `docks-kit sync` and then `docks-kit toolchain ensure session-relay`; do not install a compiler. For a broken override, correct it or `unset SESSION_RELAY_BIN`.
 
-Official prebuilts support ordinary Relay on Linux and macOS on x86-64 or arm64. Managed writing is a separate Linux/ext4-only capability: shipped macOS binaries must prove its exact negative admission on GitHub-hosted native macOS runners, which is refusal evidence rather than macOS workspace success or a requirement for a physical Mac. Other operating systems and architectures are unsupported; use a supported host because retrying the launcher cannot add platform support.
+Official prebuilts support ordinary Relay on Linux only, on x86-64 or arm64. Managed writing is a separate Linux/ext4-only capability. Other operating systems and architectures are unsupported; use a supported host because retrying the launcher cannot add platform support.
 
 ## Pick the transport deliberately
 

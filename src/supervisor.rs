@@ -2572,19 +2572,6 @@ fn open_pty(rows: u16, cols: u16) -> Result<(File, File), String> {
         ws_ypixel: 0,
     };
     // SAFETY: output pointers are valid and initialized only on success.
-    #[cfg(target_vendor = "apple")]
-    let result = unsafe {
-        let mut winsize = winsize;
-        libc::openpty(
-            &mut master,
-            &mut slave,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            &mut winsize,
-        )
-    };
-    // SAFETY: output pointers are valid and initialized only on success.
-    #[cfg(not(target_vendor = "apple"))]
     let result = unsafe {
         libc::openpty(
             &mut master,
@@ -2640,7 +2627,6 @@ fn set_terminal_size(fd: i32, rows: u16, cols: u16) -> Result<(), String> {
 }
 
 pub(crate) fn observe_process(pid: u32) -> ProcessObservation {
-    #[cfg(target_os = "linux")]
     let start = fs::read_to_string(format!("/proc/{pid}/stat"))
         .ok()
         .and_then(|stat| {
@@ -2652,8 +2638,6 @@ pub(crate) fn observe_process(pid: u32) -> ProcessObservation {
         })
         .map(StartGeneration::LinuxProcStartTicks)
         .unwrap_or(StartGeneration::Unavailable);
-    #[cfg(not(target_os = "linux"))]
-    let start = StartGeneration::Unavailable;
     // SAFETY: getpgid is observation only; failure is represented as None.
     let pgid = unsafe { libc::getpgid(pid as i32) };
     ProcessObservation {
@@ -2664,24 +2648,16 @@ pub(crate) fn observe_process(pid: u32) -> ProcessObservation {
 }
 
 fn pid_exists(pid: u32) -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        fs::read_to_string(format!("/proc/{pid}/stat"))
-            .ok()
-            .and_then(|stat| {
-                let end = stat.rfind(") ")?;
-                stat[end + 2..]
-                    .split_whitespace()
-                    .next()
-                    .map(str::to_string)
-            })
-            .is_some_and(|state| state != "Z")
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        // SAFETY: signal 0 performs an observation-only existence probe.
-        unsafe { libc::kill(pid as i32, 0) == 0 }
-    }
+    fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|stat| {
+            let end = stat.rfind(") ")?;
+            stat[end + 2..]
+                .split_whitespace()
+                .next()
+                .map(str::to_string)
+        })
+        .is_some_and(|state| state != "Z")
 }
 
 fn normalized_exit_status(status: &ExitStatus) -> i32 {
@@ -2691,25 +2667,10 @@ fn normalized_exit_status(status: &ExitStatus) -> i32 {
         .unwrap_or(1)
 }
 
-#[cfg(target_os = "linux")]
 fn verify_same_uid(stream: &UnixStream) -> Result<(), String> {
     let credentials = rustix::net::sockopt::socket_peercred(stream)
         .map_err(|error| format!("read supervisor peer credentials: {error}"))?;
     if credentials.uid == rustix::process::getuid() {
-        Ok(())
-    } else {
-        Err("lifecycle supervisor peer uid mismatch".to_string())
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn verify_same_uid(stream: &UnixStream) -> Result<(), String> {
-    let mut uid = 0;
-    let mut gid = 0;
-    // SAFETY: uid/gid are valid output pointers and stream is a live Unix socket.
-    let result = unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) };
-    let _ = gid;
-    if result == 0 && uid == unsafe { libc::geteuid() } {
         Ok(())
     } else {
         Err("lifecycle supervisor peer uid mismatch".to_string())

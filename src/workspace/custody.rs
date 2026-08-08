@@ -1313,103 +1313,86 @@ pub fn worker_prepared_evidence(
 }
 
 pub fn create_control_key_memfd() -> Result<(OwnedFd, [u8; 32]), String> {
-    #[cfg(not(target_os = "linux"))]
-    {
-        return Err(crate::workspace::platform::macos::STOP_REASON.to_string());
+    let mut key = [0_u8; 32];
+    let got = unsafe { libc::getrandom(key.as_mut_ptr().cast(), key.len(), 0) };
+    if got != key.len() as isize {
+        return Err(format!(
+            "create custody control key: {}",
+            std::io::Error::last_os_error()
+        ));
     }
-    #[cfg(target_os = "linux")]
-    {
-        let mut key = [0_u8; 32];
-        let got = unsafe { libc::getrandom(key.as_mut_ptr().cast(), key.len(), 0) };
-        if got != key.len() as isize {
-            return Err(format!(
-                "create custody control key: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-        let name = b"session-relay-custody-key\0";
-        let raw = unsafe {
-            libc::memfd_create(
-                name.as_ptr().cast(),
-                libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
-            )
-        };
-        if raw < 0 {
-            return Err(format!(
-                "create custody key memfd: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
-        let duplicate = unsafe { libc::dup(fd.as_raw_fd()) };
-        if duplicate < 0 {
-            return Err(format!(
-                "duplicate custody key memfd: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-        let mut file = unsafe { File::from_raw_fd(duplicate) };
-        file.write_all(&key)
-            .map_err(|e| format!("write custody key memfd: {e}"))?;
-        file.sync_all()
-            .map_err(|e| format!("sync custody key memfd: {e}"))?;
-        let seals =
-            libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
-        if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_ADD_SEALS, seals) } != 0 {
-            return Err(format!(
-                "seal custody key memfd: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-        Ok((fd, key))
+    let name = b"session-relay-custody-key\0";
+    let raw = unsafe {
+        libc::memfd_create(
+            name.as_ptr().cast(),
+            libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+        )
+    };
+    if raw < 0 {
+        return Err(format!(
+            "create custody key memfd: {}",
+            std::io::Error::last_os_error()
+        ));
     }
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    let duplicate = unsafe { libc::dup(fd.as_raw_fd()) };
+    if duplicate < 0 {
+        return Err(format!(
+            "duplicate custody key memfd: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let mut file = unsafe { File::from_raw_fd(duplicate) };
+    file.write_all(&key)
+        .map_err(|e| format!("write custody key memfd: {e}"))?;
+    file.sync_all()
+        .map_err(|e| format!("sync custody key memfd: {e}"))?;
+    let seals = libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
+    if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_ADD_SEALS, seals) } != 0 {
+        return Err(format!(
+            "seal custody key memfd: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok((fd, key))
 }
 
 pub fn read_control_key_memfd(fd: RawFd) -> Result<[u8; 32], String> {
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = fd;
-        return Err(crate::workspace::platform::macos::STOP_REASON.to_string());
+    let expected = libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
+    let seals = unsafe { libc::fcntl(fd, libc::F_GET_SEALS) };
+    if seals < 0 || seals & expected != expected {
+        return Err("custody key memfd is not fully sealed".to_string());
     }
-    #[cfg(target_os = "linux")]
-    {
-        let expected =
-            libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
-        let seals = unsafe { libc::fcntl(fd, libc::F_GET_SEALS) };
-        if seals < 0 || seals & expected != expected {
-            return Err("custody key memfd is not fully sealed".to_string());
-        }
-        let duplicate = unsafe { libc::dup(fd) };
-        if duplicate < 0 {
-            return Err(format!(
-                "duplicate custody key memfd: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-        let mut file = unsafe { File::from_raw_fd(duplicate) };
-        if file
-            .metadata()
-            .map_err(|e| format!("stat custody key memfd: {e}"))?
-            .len()
-            != 32
-        {
-            return Err("custody key memfd is not exactly 32 bytes".to_string());
-        }
-        file.seek(SeekFrom::Start(0))
-            .map_err(|e| format!("seek custody key memfd: {e}"))?;
-        let mut key = [0; 32];
-        file.read_exact(&mut key)
-            .map_err(|e| format!("read custody key memfd: {e}"))?;
-        let mut extra = [0; 1];
-        if file
-            .read(&mut extra)
-            .map_err(|e| format!("read custody key tail: {e}"))?
-            != 0
-        {
-            return Err("custody key memfd contains trailing bytes".to_string());
-        }
-        Ok(key)
+    let duplicate = unsafe { libc::dup(fd) };
+    if duplicate < 0 {
+        return Err(format!(
+            "duplicate custody key memfd: {}",
+            std::io::Error::last_os_error()
+        ));
     }
+    let mut file = unsafe { File::from_raw_fd(duplicate) };
+    if file
+        .metadata()
+        .map_err(|e| format!("stat custody key memfd: {e}"))?
+        .len()
+        != 32
+    {
+        return Err("custody key memfd is not exactly 32 bytes".to_string());
+    }
+    file.seek(SeekFrom::Start(0))
+        .map_err(|e| format!("seek custody key memfd: {e}"))?;
+    let mut key = [0; 32];
+    file.read_exact(&mut key)
+        .map_err(|e| format!("read custody key memfd: {e}"))?;
+    let mut extra = [0; 1];
+    if file
+        .read(&mut extra)
+        .map_err(|e| format!("read custody key tail: {e}"))?
+        != 0
+    {
+        return Err("custody key memfd contains trailing bytes".to_string());
+    }
+    Ok(key)
 }
 
 fn validate_identity(session_id: &str, generation: u64, seq: u64) -> Result<(), String> {

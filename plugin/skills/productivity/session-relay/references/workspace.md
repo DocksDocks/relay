@@ -102,11 +102,7 @@ Legacy top-level `spawn`, `handback`, `collect`, `spawn --fanout`, and `spawn --
 
 Managed writing is supported only by the Linux `linux_cgroup_v2_pidfd` backend on an admitted native ext4 repository and authority store. It requires delegated cgroup v2 with `cgroup.kill` and recursive `populated 0`, pidfds, Landlock ABI 3 or newer, authenticated custody processes, and an activation barrier before worker code. Missing or ambiguous prerequisites refuse before worker execution.
 
-The macOS STOP is exact: managed writing is stopped, and the inactive `macos_pgroup_libproc` backend returns `process groups are escapable, kqueue is PID observation rather than durable containment, and no documented public primitive provides crash-durable descendant membership plus atomic kill/empty proof`. A macOS build, APFS check, process scan, or passing negative-admission test is not custody evidence and must not be attested or advertised as managed-workspace support.
-
-This STOP does not remove ordinary macOS Relay support or its x86-64 and arm64 release artifacts. Each GitHub-hosted native macOS release leg must run the exact negative-admission test against its fresh binary before attestation and upload. That runner evidence is sufficient to prove fail-closed managed-workspace refusal for an ordinary macOS artifact; it does not claim macOS custody, a successful macOS managed workspace, or testing on a physical Mac.
-
-Other operating systems; containers or overlay filesystems; NFS, SMB, FUSE, network, cloud, or removable filesystems; cross-UID/shared-service workspaces; and remote workers are unsupported.
+Session Relay supports Linux only. Other operating systems; containers or overlay filesystems; NFS, SMB, FUSE, network, cloud, or removable filesystems; cross-UID/shared-service workspaces; and remote workers are unsupported.
 
 ## Precedents, not compatibility claims
 
@@ -195,9 +191,8 @@ policy. Check that policy before diagnosing a silent channel:
 - Anthropic Console API authentication permits channels by default unless the
   organization deploys managed settings; then that managed key is required.
 - `channelsEnabled` is managed-only, not a user/project setting. File delivery
-  uses `/etc/claude-code/managed-settings.json` on Linux or
-  `/Library/Application Support/ClaudeCode/managed-settings.json` on macOS. The
-  admin console is the preferred organization-wide path.
+  uses `/etc/claude-code/managed-settings.json`. The admin console is the
+  preferred organization-wide path.
 
 The channel binds only to Claude's exact `CLAUDE_CODE_SESSION_ID`, waits at most
 five seconds for that UUID's hook registration, and fails closed on a missing,

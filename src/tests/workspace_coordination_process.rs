@@ -300,10 +300,6 @@ fn overlapping_path_claims_are_atomic_and_refused() {
 
 #[test]
 fn coordinator_bootstrap_worker_scope_and_replay_are_closed() {
-    if !cfg!(target_os = "linux") {
-        eprintln!("SKIP native-only: writable workspace custody requires Linux");
-        return;
-    }
     let mut repo = TestRepository::init("bootstrap-race");
     fs::write(repo.root.join("left.txt"), b"left\n").unwrap();
     fs::write(repo.root.join("right.txt"), b"right\n").unwrap();
@@ -545,7 +541,7 @@ fn recovery_matrix_has_no_unproven_progress() {
         !WorkspaceState::IntegrationBlocked.may_transition_to(WorkspaceState::IntegrationQueued)
     );
     assert!(WorkspaceState::Releasing.may_transition_to(WorkspaceState::Closed));
-    if cfg!(target_os = "linux") && std::env::var_os("SESSION_RELAY_TEST_CGROUP_ROOT").is_some() {
+    if std::env::var_os("SESSION_RELAY_TEST_CGROUP_ROOT").is_some() {
         for point in [
             "after_pre_index",
             "after_progress",
@@ -637,10 +633,6 @@ fn recovery_matrix_has_no_unproven_progress() {
 
 #[test]
 fn unexpected_branch_switch_is_refused() {
-    if !cfg!(target_os = "linux") {
-        eprintln!("SKIP native-only: writable workspace custody requires Linux");
-        return;
-    }
     fn git_state(worktree: &Path) -> (Vec<u8>, Vec<u8>, String, String, Vec<u8>) {
         let private = actual_private_git_dir(worktree).unwrap();
         (
@@ -743,10 +735,6 @@ fn unexpected_branch_switch_is_refused() {
 
 #[test]
 fn applied_wip_is_first_produced_and_integrated_commit() {
-    if !cfg!(target_os = "linux") {
-        eprintln!("SKIP native-only: writable workspace custody requires Linux");
-        return;
-    }
     for (label, mode, dirty) in [
         ("commit", "commit", true),
         ("artifact", "artifact", true),
@@ -873,10 +861,6 @@ fn applied_wip_is_first_produced_and_integrated_commit() {
 
 #[test]
 fn workspace_and_legacy_fanout_share_repository_gate() {
-    if !cfg!(target_os = "linux") {
-        eprintln!("SKIP native-only: writable workspace custody requires Linux");
-        return;
-    }
     let mut repo = TestRepository::init("repository-gate");
     let legacy_home = repo.home.join("legacy-store");
     fs::create_dir(&legacy_home).unwrap();
@@ -979,10 +963,6 @@ fn workspace_and_legacy_fanout_share_repository_gate() {
 
 #[test]
 fn coordinator_integrates_commits_serially() {
-    if !cfg!(target_os = "linux") {
-        eprintln!("SKIP native-only: writable workspace custody requires Linux");
-        return;
-    }
     let mut repo = TestRepository::init("ordered-integration");
     fs::write(repo.root.join("first.txt"), b"").unwrap();
     fs::write(repo.root.join("second.txt"), b"").unwrap();
@@ -1105,10 +1085,6 @@ fn coordinator_integrates_commits_serially() {
 
 #[test]
 fn conflicting_commits_settle_once_needs_user_action() {
-    if !cfg!(target_os = "linux") {
-        eprintln!("SKIP native-only: writable workspace custody requires Linux");
-        return;
-    }
     let repo = TestRepository::init("conflict-rollback");
     let roots = isolated_authority_roots(&repo, "conflict-rollback");
     let first = start_test_workspace(
@@ -1162,10 +1138,6 @@ fn conflicting_commits_settle_once_needs_user_action() {
 
 #[test]
 fn cleanup_refuses_dirty_or_unretained_work() {
-    if !cfg!(target_os = "linux") {
-        eprintln!("SKIP native-only: writable workspace custody requires Linux");
-        return;
-    }
     let repo = TestRepository::init("dirty-retention");
     let roots = isolated_authority_roots(&repo, "dirty-retention");
     let started = start_test_workspace(

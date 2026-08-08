@@ -659,9 +659,7 @@ function docsContract() {
     /clone.{0,40}worktree|worktree.{0,40}clone/is,
     /managed.{0,80}unmanaged/is,
     /Linux/,
-    /macOS.{0,80}(?:STOP|refus|unsupported)/is,
     /linux_cgroup_v2_pidfd/,
-    /macos_pgroup_libproc/,
   ]) {
     assert.match(docs, topic, `workspace documentation topic is missing: ${topic}`);
   }
@@ -678,8 +676,8 @@ function docsContract() {
   for (const forbidden of [
     'docks session',
     'spawn --workspace',
-    'macOS managed writing is supported',
     'controls arbitrary unmanaged same-UID',
+    'macOS managed writing is supported',
   ]) {
     assert.ok(!docs.includes(forbidden), `workspace documentation contains forbidden claim: ${forbidden}`);
   }

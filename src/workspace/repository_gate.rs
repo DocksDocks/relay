@@ -633,55 +633,47 @@ pub fn admit_ext4_path(path: &Path) -> Result<MountAdmission, String> {
     admit_ext4_fd(&file)
 }
 pub fn admit_ext4_fd(file: &File) -> Result<MountAdmission, String> {
-    #[cfg(target_os = "linux")]
-    {
-        let mount_id = super::platform::linux::statx_fd_mount_id(
-            file.as_raw_fd(),
-            "statx STATX_MNT_ID failed",
-            "statx did not report STATX_MNT_ID",
-        )?;
-        let mut text = String::new();
-        File::open("/proc/self/mountinfo")
-            .and_then(|mut f| f.read_to_string(&mut text))
-            .map_err(|e| format!("read /proc/self/mountinfo: {e}"))?;
-        let mut found = None;
-        for line in text.lines() {
-            let mut split = line.split(" - ");
-            let left = split.next().unwrap_or("");
-            let right = split.next();
-            if split.next().is_some() || right.is_none() {
-                continue;
-            }
-            let Some(id) = left
-                .split_whitespace()
-                .next()
-                .and_then(|v| v.parse::<u64>().ok())
-            else {
-                continue;
-            };
-            if id == mount_id {
-                let filesystem = right.unwrap().split_whitespace().next().unwrap_or("");
-                found = Some(filesystem.to_string());
-                break;
-            }
+    let mount_id = super::platform::linux::statx_fd_mount_id(
+        file.as_raw_fd(),
+        "statx STATX_MNT_ID failed",
+        "statx did not report STATX_MNT_ID",
+    )?;
+    let mut text = String::new();
+    File::open("/proc/self/mountinfo")
+        .and_then(|mut f| f.read_to_string(&mut text))
+        .map_err(|e| format!("read /proc/self/mountinfo: {e}"))?;
+    let mut found = None;
+    for line in text.lines() {
+        let mut split = line.split(" - ");
+        let left = split.next().unwrap_or("");
+        let right = split.next();
+        if split.next().is_some() || right.is_none() {
+            continue;
         }
-        let filesystem_type = found
-            .ok_or_else(|| format!("mount ID {mount_id} is absent from /proc/self/mountinfo"))?;
-        if filesystem_type != "ext4" {
-            return Err(format!(
-                "managed workspace requires exact ext4; mount ID {mount_id} is {filesystem_type}"
-            ));
+        let Some(id) = left
+            .split_whitespace()
+            .next()
+            .and_then(|v| v.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        if id == mount_id {
+            let filesystem = right.unwrap().split_whitespace().next().unwrap_or("");
+            found = Some(filesystem.to_string());
+            break;
         }
-        Ok(MountAdmission {
-            mount_id,
-            filesystem_type,
-        })
     }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = file;
-        Err("managed workspace filesystem admission is unavailable on this platform".into())
+    let filesystem_type =
+        found.ok_or_else(|| format!("mount ID {mount_id} is absent from /proc/self/mountinfo"))?;
+    if filesystem_type != "ext4" {
+        return Err(format!(
+            "managed workspace requires exact ext4; mount ID {mount_id} is {filesystem_type}"
+        ));
     }
+    Ok(MountAdmission {
+        mount_id,
+        filesystem_type,
+    })
 }
 
 #[cfg(test)]

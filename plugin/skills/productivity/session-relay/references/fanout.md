@@ -142,4 +142,4 @@ session-relay spawn <dir> --tool claude|codex --model <model> --effort <effort> 
   (Claude OAuth / ChatGPT login) — heavier than a wake; spawn deliberately, never
   in loops.
 
-For managed writing, use only the exact nine `session-relay workspace` commands after reading the Linux-only admission, exact macOS STOP, ordinary macOS release boundary, actors, recovery, integration, and unmanaged-process limits in [`references/workspace.md`](references/workspace.md); this is neither legacy fan-out nor Docks plan-review evidence.
+For managed writing, use only the exact nine `session-relay workspace` commands after reading the Linux-only admission, actors, recovery, integration, and unmanaged-process limits in [`references/workspace.md`](references/workspace.md); this is neither legacy fan-out nor Docks plan-review evidence.

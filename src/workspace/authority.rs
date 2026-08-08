@@ -179,14 +179,6 @@ impl AuthorityRootProvider for SystemAuthorityRootProvider {
     fn roots(&self) -> Result<AuthorityRoots, String> {
         let euid = unsafe { libc::geteuid() };
         let home = passwd_home(euid)?;
-        #[cfg(target_os = "macos")]
-        let (authority, data) = (
-            home.join("Library/Application Support/session-relay")
-                .join(AUTHORITY_COMPONENT),
-            home.join("Library/Application Support/session-relay")
-                .join(DATA_COMPONENT),
-        );
-        #[cfg(not(target_os = "macos"))]
         let (authority, data) = (
             home.join(".local/state/session-relay")
                 .join(AUTHORITY_COMPONENT),
@@ -614,33 +606,20 @@ impl WorkspaceLease {
             .open(path)
             .map_err(|error| format!("open workspace lease {}: {error}", path.display()))?;
         verify_regular(&file, path, 0o600, unsafe { libc::geteuid() })?;
-        #[cfg(target_os = "linux")]
-        {
-            let mut lock = libc::flock {
-                l_type: libc::F_WRLCK as i16,
-                l_whence: libc::SEEK_SET as i16,
-                l_start: 0,
-                l_len: 0,
-                l_pid: 0,
-            };
-            let result = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_OFD_SETLK, &mut lock) };
-            if result < 0 {
-                let error = std::io::Error::last_os_error();
-                if matches!(error.raw_os_error(), Some(libc::EAGAIN | libc::EACCES)) {
-                    return Err("workspace lease is already held".to_string());
-                }
-                return Err(format!("lock workspace lease: {error}"));
+        let mut lock = libc::flock {
+            l_type: libc::F_WRLCK as i16,
+            l_whence: libc::SEEK_SET as i16,
+            l_start: 0,
+            l_len: 0,
+            l_pid: 0,
+        };
+        let result = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_OFD_SETLK, &mut lock) };
+        if result < 0 {
+            let error = std::io::Error::last_os_error();
+            if matches!(error.raw_os_error(), Some(libc::EAGAIN | libc::EACCES)) {
+                return Err("workspace lease is already held".to_string());
             }
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-            if result < 0 {
-                return Err(format!(
-                    "lock workspace lease: {}",
-                    std::io::Error::last_os_error()
-                ));
-            }
+            return Err(format!("lock workspace lease: {error}"));
         }
         Ok(Self {
             file,
@@ -720,77 +699,66 @@ pub struct WorkspaceLeaseProbe {
 
 impl WorkspaceLeaseProbe {
     pub fn acquire(path: &Path, expected: LeaseIdentity) -> Result<Self, String> {
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = (path, expected);
-            return Err(super::platform::MACOS_STOP_REASON.to_string());
-        }
-        #[cfg(target_os = "linux")]
-        {
-            let euid = unsafe { libc::geteuid() };
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-                .open(path)
-                .map_err(|error| {
-                    format!(
-                        "securely open workspace lease probe {}: {error}",
-                        path.display()
-                    )
-                })?;
-            verify_regular(&file, path, 0o600, euid)?;
-            let opened = file
-                .metadata()
-                .map_err(|error| format!("fstat workspace lease probe: {error}"))?;
-            let named = fs::symlink_metadata(path)
-                .map_err(|error| format!("revalidate workspace lease probe path: {error}"))?;
-            let exact = |metadata: &fs::Metadata| {
-                metadata.is_file()
-                    && metadata.uid() == euid
-                    && metadata.nlink() == 1
-                    && metadata.mode() & 0o777 == 0o600
-                    && metadata.dev() == expected.device
-                    && metadata.ino() == expected.inode
-            };
-            if !exact(&opened) || !exact(&named) {
-                return Err(
-                    "workspace lease probe did not open the exact durable lease inode".into(),
-                );
-            }
-            let mut lock = libc::flock {
-                l_type: libc::F_WRLCK as i16,
-                l_whence: libc::SEEK_SET as i16,
-                l_start: 0,
-                l_len: 0,
-                l_pid: 0,
-            };
-            let result = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_OFD_SETLK, &mut lock) };
-            if result < 0 {
-                let error = std::io::Error::last_os_error();
-                if matches!(error.raw_os_error(), Some(libc::EAGAIN | libc::EACCES)) {
-                    return Err(
-                        "workspace lease custodians have not closed the exact lease inode".into(),
-                    );
-                }
-                return Err(format!(
-                    "acquire independent workspace lease probe: {error}"
-                ));
-            }
-            let named = fs::symlink_metadata(path).map_err(|error| {
-                format!("revalidate locked workspace lease probe path: {error}")
+        let euid = unsafe { libc::geteuid() };
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(path)
+            .map_err(|error| {
+                format!(
+                    "securely open workspace lease probe {}: {error}",
+                    path.display()
+                )
             })?;
-            if !exact(&named) {
+        verify_regular(&file, path, 0o600, euid)?;
+        let opened = file
+            .metadata()
+            .map_err(|error| format!("fstat workspace lease probe: {error}"))?;
+        let named = fs::symlink_metadata(path)
+            .map_err(|error| format!("revalidate workspace lease probe path: {error}"))?;
+        let exact = |metadata: &fs::Metadata| {
+            metadata.is_file()
+                && metadata.uid() == euid
+                && metadata.nlink() == 1
+                && metadata.mode() & 0o777 == 0o600
+                && metadata.dev() == expected.device
+                && metadata.ino() == expected.inode
+        };
+        if !exact(&opened) || !exact(&named) {
+            return Err("workspace lease probe did not open the exact durable lease inode".into());
+        }
+        let mut lock = libc::flock {
+            l_type: libc::F_WRLCK as i16,
+            l_whence: libc::SEEK_SET as i16,
+            l_start: 0,
+            l_len: 0,
+            l_pid: 0,
+        };
+        let result = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_OFD_SETLK, &mut lock) };
+        if result < 0 {
+            let error = std::io::Error::last_os_error();
+            if matches!(error.raw_os_error(), Some(libc::EAGAIN | libc::EACCES)) {
                 return Err(
-                    "workspace lease path changed while acquiring the exact probe inode".into(),
+                    "workspace lease custodians have not closed the exact lease inode".into(),
                 );
             }
-            Ok(Self {
-                file,
-                path: path.to_path_buf(),
-                identity: expected,
-            })
+            return Err(format!(
+                "acquire independent workspace lease probe: {error}"
+            ));
         }
+        let named = fs::symlink_metadata(path)
+            .map_err(|error| format!("revalidate locked workspace lease probe path: {error}"))?;
+        if !exact(&named) {
+            return Err(
+                "workspace lease path changed while acquiring the exact probe inode".into(),
+            );
+        }
+        Ok(Self {
+            file,
+            path: path.to_path_buf(),
+            identity: expected,
+        })
     }
     pub fn path(&self) -> &Path {
         &self.path
@@ -1306,39 +1274,26 @@ fn publish_bootstrap(
     }
 }
 fn rename_noreplace(source: &Path, target: &Path) -> Result<(), std::io::Error> {
-    #[cfg(target_os = "linux")]
-    {
-        let s = CString::new(source.as_os_str().as_bytes()).map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "source path contains NUL")
-        })?;
-        let t = CString::new(target.as_os_str().as_bytes()).map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "target path contains NUL")
-        })?;
-        let result = unsafe {
-            libc::syscall(
-                libc::SYS_renameat2,
-                libc::AT_FDCWD,
-                s.as_ptr(),
-                libc::AT_FDCWD,
-                t.as_ptr(),
-                libc::RENAME_NOREPLACE,
-            )
-        };
-        if result == 0 {
-            return Ok(());
-        }
-        Err(std::io::Error::last_os_error())
+    let s = CString::new(source.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "source path contains NUL")
+    })?;
+    let t = CString::new(target.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "target path contains NUL")
+    })?;
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            s.as_ptr(),
+            libc::AT_FDCWD,
+            t.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 {
+        return Ok(());
     }
-    #[cfg(not(target_os = "linux"))]
-    {
-        if target.exists() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::AlreadyExists,
-                "target exists",
-            ));
-        }
-        fs::rename(source, target)
-    }
+    Err(std::io::Error::last_os_error())
 }
 
 pub fn repository_id(euid: u32, dev: u64, ino: u64) -> String {

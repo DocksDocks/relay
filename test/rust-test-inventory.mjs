@@ -105,7 +105,14 @@ process.env.SESSION_RELAY_TEST_TIME_FACTOR ||= '4';
 if (name === UNIT_CASE) {
   // The library tests run in-process and need no cgroup delegation, so this case bypasses the
   // delegation branch and the frozen per-target inventory, neither of which describes it.
-  const executed = spawnSync('cargo', ['test', '--locked', '--lib'], {
+  //
+  // `--test-threads=1` for the same reason every integration target uses it. Several
+  // `workspace::resources` tests allocate an ephemeral loopback port and then assert release by
+  // scanning `/proc/net/tcp`, which is host-global: run in parallel, one test sees another's
+  // still-listening port and fails. Measured on an 8-core host, the default thread count failed
+  // 3 of 6 runs across two different tests; serial execution passed 8 of 8. The assertion is
+  // correct and stays untouched. Serializing is what the assertion always required.
+  const executed = spawnSync('cargo', ['test', '--locked', '--lib', '--', '--nocapture', '--test-threads=1'], {
     cwd: repoRoot,
     encoding: 'utf8',
     env: process.env,

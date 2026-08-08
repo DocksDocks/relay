@@ -1,3 +1,8 @@
+#[cfg(not(target_os = "linux"))]
+compile_error!(
+    "session-relay supports Linux only: managed workspace custody requires cgroup v2, pidfd, Landlock and seccomp"
+);
+
 pub(crate) mod appserver;
 pub mod bus;
 pub mod channel;

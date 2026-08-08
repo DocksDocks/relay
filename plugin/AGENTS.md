@@ -6,11 +6,10 @@ Session Relay is a cross-session, cross-project, cross-tool agent message bus fo
 
 | Path | Holds |
 |---|---|
-| `../src/` | the `relay` crate; `../rust-toolchain.toml` pins its compiler and `../Cargo.lock` locks dependencies |
+| repository root (outside this payload) | the `relay` crate under `../src/`, its pins `../rust-toolchain.toml` and `../Cargo.lock`, and the `../test/` harness of scenario self-tests, Rust inventories, reentry checks, workspace smokes, and distribution contracts; a consumer's plugin cache receives none of them |
 | `bin/` | the tracked POSIX launcher `relay` only; it resolves `SESSION_RELAY_BIN`, then `session-relay` on `PATH`, then `~/.local/bin/session-relay`, rejecting recursion and otherwise directing the user to `docks-kit` |
 | `hooks/` | `hooks.json` (Claude: SessionStart + UserPromptSubmit → `${CLAUDE_PLUGIN_ROOT}/bin/relay hook`) + `codex-hooks.json` (Codex parallel) |
 | `skills/` | the cross-tool `session-relay` skill (productivity) |
-| `../test/` | scenario self-tests, Rust inventories, reentry checks, workspace smokes, and distribution contracts |
 | `.claude-plugin/` + `.codex-plugin/` | manifests whose versions stay in lockstep with the repository catalogs and crate |
 
 ## Scenario self-test topology
@@ -63,7 +62,7 @@ byte-identical.
 
 ## Managed workspace boundary
 
-The exact public workspace surface is `relay workspace preserve|start|list|inspect|handback|integrate|recover|finish|abort`. Relay owns authority, deterministic worktrees/branches, repository gating, lifetime leases, capability-brokered Git, Linux worker-tree custody, claims/resources, integration, recovery, and cleanup. Claude, Codex, and OMP are untrusted launched workers. Managed writing is Linux/ext4 only. macOS remains supported for ordinary Relay commands and prebuilts, but managed-workspace admission stays the exact frozen refusal; that refusal does not block an ordinary cross-platform Relay release when the GitHub-hosted native Apple-Silicon macOS leg proves it before publishing its artifact. This is refusal evidence, not macOS custody, workspace success, or evidence from a physical Mac. Arbitrary same-UID shells, IDEs, old binaries, raw Git, and independently launched tools remain unmanaged.
+The exact public workspace surface is `relay workspace preserve|start|list|inspect|handback|integrate|recover|finish|abort`. Relay owns authority, deterministic worktrees/branches, repository gating, lifetime leases, capability-brokered Git, Linux worker-tree custody, claims/resources, integration, recovery, and cleanup. Claude, Codex, and OMP are untrusted launched workers. Session Relay supports Linux only, and managed writing additionally requires ext4. Arbitrary same-UID shells, IDEs, old binaries, raw Git, and independently launched tools remain unmanaged.
 
 The repository gate builds one fresh release binary for both smoke cases and the immutable self-test parity check. Every declared Rust inventory executes its complete listed case set. The recursive reentry inventory classifies every process, FD, signal, Git, filesystem, broker, and platform site. Never accept an ambient or committed binary, an ignored test, a filtered test, a hidden platform skip, or an unclassified nested site.
 
@@ -96,26 +95,14 @@ reason at the stderr boundary or delete a branch ref.
 ## Binary release discipline
 
 <constraint>
-Generated executables and `SHA256SUMS` are external release artifacts and MUST NOT be committed under `bin/`. `.github/workflows/build-binaries.yml` builds exactly Linux x64/arm64 and macOS arm64 natively with the pinned Rust toolchain and `cargo build --release --locked`. x86_64-apple-darwin is no longer published as of Session Relay 0.16.0; macOS support is aarch64-apple-darwin, while retained 0.13-0.15 receipts and fixtures keep their frozen four-binary shape as historical evidence. Each leg executes `--version` and emits a canonical same-run attestation. The aggregate independently hashes the three binaries, verifies the three checksum rows, rejects Windows, Intel Darwin, or any fifth asset, and stages exactly those binaries plus `SHA256SUMS`. Local Cargo output is for development gates only, never publication.
+Generated executables and `SHA256SUMS` are external release artifacts and MUST NOT be committed under `bin/`. `.github/workflows/release.yml` builds exactly `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl` natively, with the pinned Rust toolchain and `cargo build --release --locked`. Each leg runs `--version` against its own fresh binary and emits a canonical same-run attestation. The aggregate independently hashes the two binaries, verifies the two checksum rows, and rejects any third asset beyond `SHA256SUMS`. Publication stages exactly three assets: the two binaries plus `SHA256SUMS`. One tag publishes one final release; there is no staging tier and no follow-up publication step. Local Cargo output is for development gates only, never publication.
 </constraint>
 
-The current chain is Session Relay `0.14.0` plus companion
-`cli-v0.12.0` / `docks-kit@0.12.0`. Bind the reviewed continuation
-`PlanRunV1`, red-before-production evidence, implementation/completion review,
-and immutable 0.13 predecessor receipt digests. Push the reviewed tag and stage
-the four-asset prerelease first. Stable promotion is forbidden until the exact
-public child is released, finished, archived, remotely read back, and binds the
-same three independently observed Relay digests. Promotion must retain the tag
-commit, release database ID, workflow run/attempt, and byte-identical assets.
-Never force, retag, replace assets, accept mixed-run digests, add Windows, or
-use the generic plugin release path.
-
-Native producer legs must prove platform behavior before attestation or upload:
-both Linux runners execute positive cgroup/pidfd/Landlock custody plus smoke
-against that leg's explicit fresh binary; the Apple-Silicon macOS runner
-executes the exact negative-admission test. Preflight verifies the successful
-native job/runner/step order from GitHub evidence. The artifact contract
-remains three binary+attestation archives and one checksum artifact.
+Both Linux legs must prove platform behavior before attestation or upload: each
+runs positive cgroup, pidfd, and Landlock custody plus both workspace smokes
+against that leg's explicit fresh binary. Never force, retag, replace a
+published asset, accept mixed-run digests, or add a target beyond the two Linux
+musl legs.
 
 ## Repository gate
 

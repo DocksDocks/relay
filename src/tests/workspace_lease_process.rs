@@ -2,35 +2,24 @@ pub mod support;
 
 use relay::workspace::authority::WorkspaceLease;
 use relay::workspace::capability::WorkerCapabilityV1;
-#[cfg(target_os = "linux")]
 use relay::workspace::custody::{
     CONTROL_FRAME_MAX, ControlEndpoint, ControlPacket, ControlPayload, PacketKind, PeerIdentity,
     Sender,
 };
-#[cfg(target_os = "linux")]
 use relay::workspace::platform::linux::{
     DelegatedCgroup, LandlockPolicy, ProcessIdentity, WorkerLaunch, pidfd_open, probe_closed_lease,
     process_start_token, reconcile_empty_delegated_cgroup, require_ext4_fd, signal_pidfd,
     validate_bootstrap_fds, validate_pidfd_identity,
 };
-use relay::workspace::platform::{
-    MACOS_INADMISSIBLE_BACKEND, MACOS_STOP_REASON, admit_macos_writable_custody_for_test,
-};
-#[cfg(target_os = "linux")]
 use relay::workspace::recover_workspace_with_roots;
 use relay::workspace::schema::read_jcs_file;
 use relay::workspace::schema::{AbortRequestV1, PathClaimRequestV1, parse_jcs};
-#[cfg(target_os = "linux")]
 use relay::workspace::schema::{JcsValue, RecoverRequestV1, WorkspaceState};
 use relay::workspace::{abort_workspace_with_roots, start_workspace_with_roots_and_executable};
-#[cfg(target_os = "linux")]
 use std::collections::BTreeMap;
 use std::fs;
-#[cfg(target_os = "linux")]
 use std::fs::File;
-#[cfg(target_os = "linux")]
 use std::fs::OpenOptions;
-#[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -113,7 +102,6 @@ fn temp_dir_resource(started: &relay::workspace::StartedWorkspace) -> PathBuf {
     )
 }
 
-#[cfg(target_os = "linux")]
 fn isolation_child_if_requested() -> bool {
     let Ok(result_path) = std::env::var("SESSION_RELAY_ISOLATION_RESULT") else {
         return false;
@@ -152,7 +140,6 @@ fn isolation_child_if_requested() -> bool {
     true
 }
 
-#[cfg(target_os = "linux")]
 fn run_isolation_probe(
     test: &str,
     own_root: &Path,
@@ -221,7 +208,6 @@ fn run_isolation_probe(
     fs::remove_file(result).unwrap();
 }
 
-#[cfg(target_os = "linux")]
 fn git_bypass_child_if_requested() -> bool {
     let Ok(result_path) = std::env::var("SESSION_RELAY_GIT_BYPASS_RESULT") else {
         return false;
@@ -348,10 +334,6 @@ fn prepare_workspace_start_race(
 #[test]
 fn two_writers_same_worktree_exactly_one_lease() {
     if workspace_start_child_if_requested() {
-        return;
-    }
-    if !cfg!(target_os = "linux") {
-        eprintln!("SKIP native-only: writable workspace custody requires Linux");
         return;
     }
     let repository = TestRepository::init("same-worktree-process-race");
@@ -516,11 +498,6 @@ fn two_writers_same_worktree_exactly_one_lease() {
 
 #[test]
 fn separate_worktrees_both_hold_leases() {
-    if !cfg!(target_os = "linux") {
-        eprintln!("SKIP native-only: writable workspace custody requires Linux");
-        return;
-    }
-    #[cfg(target_os = "linux")]
     if isolation_child_if_requested() {
         return;
     }
@@ -596,53 +573,50 @@ fn separate_worktrees_both_hold_leases() {
     let first_index_before = exact_worktree_index(&first_root);
     let second_index_before = exact_worktree_index(&second_root);
     let first_ref_before = git_stdout(&first_root, ["rev-parse", &first.result.branch_ref]);
-    #[cfg(target_os = "linux")]
-    {
-        let first_index_path = PathBuf::from(git_stdout(
-            &first_root,
-            ["rev-parse", "--path-format=absolute", "--git-path", "index"],
-        ));
-        let second_index_path = PathBuf::from(git_stdout(
-            &second_root,
-            ["rev-parse", "--path-format=absolute", "--git-path", "index"],
-        ));
-        let first_ref_path = PathBuf::from(git_stdout(
-            &first_root,
-            [
-                "rev-parse",
-                "--path-format=absolute",
-                "--git-path",
-                &first.result.branch_ref,
-            ],
-        ));
-        let second_ref_path = PathBuf::from(git_stdout(
-            &second_root,
-            [
-                "rev-parse",
-                "--path-format=absolute",
-                "--git-path",
-                &second.result.branch_ref,
-            ],
-        ));
-        run_isolation_probe(
-            "separate_worktrees_both_hold_leases",
-            &first_root,
-            &first_resource,
-            &second_root,
-            &second_resource,
-            &second_index_path,
-            &second_ref_path,
-        );
-        run_isolation_probe(
-            "separate_worktrees_both_hold_leases",
-            &second_root,
-            &second_resource,
-            &first_root,
-            &first_resource,
-            &first_index_path,
-            &first_ref_path,
-        );
-    }
+    let first_index_path = PathBuf::from(git_stdout(
+        &first_root,
+        ["rev-parse", "--path-format=absolute", "--git-path", "index"],
+    ));
+    let second_index_path = PathBuf::from(git_stdout(
+        &second_root,
+        ["rev-parse", "--path-format=absolute", "--git-path", "index"],
+    ));
+    let first_ref_path = PathBuf::from(git_stdout(
+        &first_root,
+        [
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            &first.result.branch_ref,
+        ],
+    ));
+    let second_ref_path = PathBuf::from(git_stdout(
+        &second_root,
+        [
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            &second.result.branch_ref,
+        ],
+    ));
+    run_isolation_probe(
+        "separate_worktrees_both_hold_leases",
+        &first_root,
+        &first_resource,
+        &second_root,
+        &second_resource,
+        &second_index_path,
+        &second_ref_path,
+    );
+    run_isolation_probe(
+        "separate_worktrees_both_hold_leases",
+        &second_root,
+        &second_resource,
+        &first_root,
+        &first_resource,
+        &first_index_path,
+        &first_ref_path,
+    );
     let second_ref_before = git_stdout(&second_root, ["rev-parse", &second.result.branch_ref]);
 
     fs::write(first_root.join("first.txt"), b"first worker\n").unwrap();
@@ -741,10 +715,6 @@ fn separate_worktrees_both_hold_leases() {
 
 #[test]
 fn read_only_spawn_coexists_with_writer() {
-    if !cfg!(target_os = "linux") {
-        eprintln!("SKIP native-only: writable workspace custody requires Linux");
-        return;
-    }
     let repository = TestRepository::init("read-only-coexists");
     let roots = isolated_authority_roots(&repository, "read-only-coexists");
     let writer = start_test_workspace(
@@ -871,11 +841,6 @@ exit 0
 
 #[test]
 fn worker_merge_rebase_reset_and_force_push_are_refused() {
-    if !cfg!(target_os = "linux") {
-        eprintln!("SKIP native-only: writable workspace custody requires Linux");
-        return;
-    }
-    #[cfg(target_os = "linux")]
     if git_bypass_child_if_requested() {
         return;
     }
@@ -1005,79 +970,76 @@ fn worker_merge_rebase_reset_and_force_push_are_refused() {
         bytes_before_refusals
     );
 
-    #[cfg(target_os = "linux")]
-    {
-        fs::write(worktree.join("base.txt"), b"absolute Git bypass\n").unwrap();
-        let bypass_index_before = exact_worktree_index(&worktree);
-        let bypass_ref_before = git_stdout(&worktree, ["rev-parse", &writer.result.branch_ref]);
-        let bypass_result = worktree.join("absolute-git-bypass.result");
-        let bypass_release = worktree.join("absolute-git-bypass.release");
-        let cgroup = DelegatedCgroup::create(&request_id())
-            .expect("native runner must provide an owned delegated cgroup-v2 root");
-        let executable = std::env::current_exe().unwrap();
-        let pinned_readable = ["/etc/gitconfig", "/usr/share/git-core"]
-            .into_iter()
-            .map(PathBuf::from)
-            .filter(|path| path.is_file())
-            .collect();
-        let launch = WorkerLaunch {
-            executable,
-            arguments: vec![
-                "worker_merge_rebase_reset_and_force_push_are_refused".to_owned(),
-                "--exact".to_owned(),
-                "--nocapture".to_owned(),
-            ],
-            environment: BTreeMap::from([
-                (
-                    "SESSION_RELAY_GIT_BYPASS_RESULT".to_owned(),
-                    bypass_result.to_string_lossy().into_owned(),
-                ),
-                (
-                    "SESSION_RELAY_GIT_BYPASS_RELEASE".to_owned(),
-                    bypass_release.to_string_lossy().into_owned(),
-                ),
-            ]),
-            cwd: worktree.clone(),
-            resource_fds: Vec::new(),
-            sandbox: LandlockPolicy {
-                workspace: worktree.clone(),
-                readable: Vec::new(),
-                executable_runtime: vec![PathBuf::from("/usr/bin/git")],
-                pinned_readable,
-                writable_resources: Vec::new(),
-            },
-        };
-        let prepared = cgroup
-            .launch_worker(&launch)
-            .expect("prepare absolute-Git bypass worker");
-        let verified = prepared
-            .verify_activation()
-            .expect("activate absolute-Git bypass worker");
-        let (identity, _) = verified.release_after_ack(|_| Ok(())).unwrap();
-        wait_until("absolute Git bypass result", Duration::from_secs(5), || {
-            bypass_result.exists()
-        });
-        let bypass = fs::read_to_string(&bypass_result).unwrap();
-        assert_ne!(
-            bypass.lines().next().unwrap(),
-            "0",
-            "absolute /usr/bin/git bypass mutated the worker index"
-        );
-        assert!(
-            bypass.contains("Permission denied") || bypass.contains("Operation not permitted"),
-            "absolute Git bypass was not denied by worker custody: {bypass}"
-        );
-        assert_eq!(exact_worktree_index(&worktree), bypass_index_before);
-        assert_eq!(
-            git_stdout(&worktree, ["rev-parse", &writer.result.branch_ref]),
-            bypass_ref_before
-        );
-        let empty = cgroup.kill_and_wait_empty(&identity).unwrap();
-        assert!(!empty.populated);
-        cgroup.remove().unwrap();
-        fs::write(worktree.join("base.txt"), b"owned commit\n").unwrap();
-        fs::remove_file(&bypass_result).unwrap();
-    }
+    fs::write(worktree.join("base.txt"), b"absolute Git bypass\n").unwrap();
+    let bypass_index_before = exact_worktree_index(&worktree);
+    let bypass_ref_before = git_stdout(&worktree, ["rev-parse", &writer.result.branch_ref]);
+    let bypass_result = worktree.join("absolute-git-bypass.result");
+    let bypass_release = worktree.join("absolute-git-bypass.release");
+    let cgroup = DelegatedCgroup::create(&request_id())
+        .expect("native runner must provide an owned delegated cgroup-v2 root");
+    let executable = std::env::current_exe().unwrap();
+    let pinned_readable = ["/etc/gitconfig", "/usr/share/git-core"]
+        .into_iter()
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+        .collect();
+    let launch = WorkerLaunch {
+        executable,
+        arguments: vec![
+            "worker_merge_rebase_reset_and_force_push_are_refused".to_owned(),
+            "--exact".to_owned(),
+            "--nocapture".to_owned(),
+        ],
+        environment: BTreeMap::from([
+            (
+                "SESSION_RELAY_GIT_BYPASS_RESULT".to_owned(),
+                bypass_result.to_string_lossy().into_owned(),
+            ),
+            (
+                "SESSION_RELAY_GIT_BYPASS_RELEASE".to_owned(),
+                bypass_release.to_string_lossy().into_owned(),
+            ),
+        ]),
+        cwd: worktree.clone(),
+        resource_fds: Vec::new(),
+        sandbox: LandlockPolicy {
+            workspace: worktree.clone(),
+            readable: Vec::new(),
+            executable_runtime: vec![PathBuf::from("/usr/bin/git")],
+            pinned_readable,
+            writable_resources: Vec::new(),
+        },
+    };
+    let prepared = cgroup
+        .launch_worker(&launch)
+        .expect("prepare absolute-Git bypass worker");
+    let verified = prepared
+        .verify_activation()
+        .expect("activate absolute-Git bypass worker");
+    let (identity, _) = verified.release_after_ack(|_| Ok(())).unwrap();
+    wait_until("absolute Git bypass result", Duration::from_secs(5), || {
+        bypass_result.exists()
+    });
+    let bypass = fs::read_to_string(&bypass_result).unwrap();
+    assert_ne!(
+        bypass.lines().next().unwrap(),
+        "0",
+        "absolute /usr/bin/git bypass mutated the worker index"
+    );
+    assert!(
+        bypass.contains("Permission denied") || bypass.contains("Operation not permitted"),
+        "absolute Git bypass was not denied by worker custody: {bypass}"
+    );
+    assert_eq!(exact_worktree_index(&worktree), bypass_index_before);
+    assert_eq!(
+        git_stdout(&worktree, ["rev-parse", &writer.result.branch_ref]),
+        bypass_ref_before
+    );
+    let empty = cgroup.kill_and_wait_empty(&identity).unwrap();
+    assert!(!empty.populated);
+    cgroup.remove().unwrap();
+    fs::write(worktree.join("base.txt"), b"owned commit\n").unwrap();
+    fs::remove_file(&bypass_result).unwrap();
 
     assert!(WorkspaceLease::acquire(writer.lease.path()).is_err());
     let cleanup = abort_started_workspace(&repository, &roots, writer, "test cleanup");
@@ -1086,7 +1048,6 @@ fn worker_merge_rebase_reset_and_force_push_are_refused() {
     assert!(broker_close.is_file());
 }
 
-#[cfg(target_os = "linux")]
 fn duplicate(fd: RawFd) -> OwnedFd {
     let copied = unsafe { libc::dup(fd) };
     assert!(
@@ -1097,7 +1058,6 @@ fn duplicate(fd: RawFd) -> OwnedFd {
     unsafe { OwnedFd::from_raw_fd(copied) }
 }
 
-#[cfg(target_os = "linux")]
 fn raw_send(fd: RawFd, bytes: &[u8]) {
     let sent = unsafe { libc::send(fd, bytes.as_ptr().cast(), bytes.len(), 0) };
     assert_eq!(
@@ -1110,132 +1070,120 @@ fn raw_send(fd: RawFd, bytes: &[u8]) {
 
 #[test]
 fn custody_packets_reject_malformed_frames_replay_and_wrong_fds() {
-    #[cfg(not(target_os = "linux"))]
-    {
-        assert_eq!(
-            admit_macos_writable_custody_for_test().unwrap_err(),
-            MACOS_STOP_REASON,
-        );
-        return;
+    let key = [0x5a; 32];
+    for malformed in [
+        Vec::new(),
+        b"{}\n".to_vec(),
+        br#"{"generation":1,"kind":"HEARTBEAT","mac":"0000000000000000000000000000000000000000000000000000000000000000","payload":{},"sender":"guardian","seq":1,"session_id":"11111111-1111-4111-8111-111111111111","v":1,"x":null}"#.to_vec(),
+        br#"{"generation":1,"kind":"HEARTBEAT","mac":"0000000000000000000000000000000000000000000000000000000000000000","payload":{},"sender":"guardian","seq":1,"session_id":"11111111-1111-4111-8111-111111111111","v":1}"#.to_vec(),
+    ] {
+        assert!(ControlPacket::decode(&malformed, &key).is_err());
     }
-    #[cfg(target_os = "linux")]
-    {
-        let key = [0x5a; 32];
-        for malformed in [
-            Vec::new(),
-            b"{}\n".to_vec(),
-            br#"{"generation":1,"kind":"HEARTBEAT","mac":"0000000000000000000000000000000000000000000000000000000000000000","payload":{},"sender":"guardian","seq":1,"session_id":"11111111-1111-4111-8111-111111111111","v":1,"x":null}"#.to_vec(),
-            br#"{"generation":1,"kind":"HEARTBEAT","mac":"0000000000000000000000000000000000000000000000000000000000000000","payload":{},"sender":"guardian","seq":1,"session_id":"11111111-1111-4111-8111-111111111111","v":1}"#.to_vec(),
-        ] {
-            assert!(ControlPacket::decode(&malformed, &key).is_err());
+
+    let session = "11111111-1111-4111-8111-111111111111".to_owned();
+    let peer = PeerIdentity::current().unwrap();
+    let (guardian_fd, supervisor_fd) = ControlEndpoint::pair().unwrap();
+    let raw_guardian = duplicate(guardian_fd.as_raw_fd());
+    let mut guardian = ControlEndpoint::new(
+        guardian_fd,
+        key,
+        session.clone(),
+        1,
+        Sender::Guardian,
+        peer.clone(),
+    )
+    .unwrap();
+    let mut supervisor =
+        ControlEndpoint::new(supervisor_fd, key, session, 1, Sender::Supervisor, peer).unwrap();
+
+    guardian
+        .send(PacketKind::GuardianReady, ControlPayload::new(), &[])
+        .unwrap();
+    let first = supervisor.receive(Duration::from_secs(1), 0).unwrap();
+    assert_eq!(first.packet.kind, PacketKind::GuardianReady);
+    let exact = first.packet.encode().unwrap();
+    raw_send(raw_guardian.as_raw_fd(), &exact);
+    assert!(
+        supervisor
+            .receive(Duration::from_secs(1), 0)
+            .unwrap_err()
+            .contains("sequence")
+    );
+
+    let transferred = File::open("/dev/null").unwrap();
+    guardian
+        .send(
+            PacketKind::WorkerPrepared,
+            ControlPayload::new(),
+            &[transferred.as_raw_fd()],
+        )
+        .unwrap();
+    assert_eq!(
+        supervisor.receive(Duration::from_secs(1), 0).unwrap_err(),
+        "custody packet has 1 FDs; expected one of [0]"
+    );
+
+    let wrong_types: [OwnedFd; 4] =
+        std::array::from_fn(|_| File::open("/dev/null").unwrap().into());
+    assert_eq!(
+        validate_bootstrap_fds(&wrong_types).unwrap_err(),
+        "BOOTSTRAP cgroup FD access modes are not exact"
+    );
+
+    let trunc_peer = PeerIdentity::current().unwrap();
+    let (raw_truncated, truncated_receiver) = ControlEndpoint::pair().unwrap();
+    let mut truncated_receiver = ControlEndpoint::new(
+        truncated_receiver,
+        key,
+        "31111111-1111-4111-8111-111111111111".to_owned(),
+        1,
+        Sender::Supervisor,
+        trunc_peer,
+    )
+    .unwrap();
+    raw_send(
+        raw_truncated.as_raw_fd(),
+        &vec![b'x'; CONTROL_FRAME_MAX + 1],
+    );
+    assert!(
+        truncated_receiver
+            .receive(Duration::from_secs(1), 0)
+            .unwrap_err()
+            .contains("truncated")
+    );
+
+    let expected_parent = PeerIdentity::current().unwrap();
+    let (child_fd, parent_fd) = ControlEndpoint::pair().unwrap();
+    let mut parent = ControlEndpoint::new(
+        parent_fd,
+        key,
+        "21111111-1111-4111-8111-111111111111".to_owned(),
+        1,
+        Sender::Supervisor,
+        expected_parent,
+    )
+    .unwrap();
+    let pid = unsafe { libc::fork() };
+    assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
+    if pid == 0 {
+        let bytes = b"{}";
+        unsafe {
+            libc::send(child_fd.as_raw_fd(), bytes.as_ptr().cast(), bytes.len(), 0);
+            libc::_exit(0);
         }
-
-        let session = "11111111-1111-4111-8111-111111111111".to_owned();
-        let peer = PeerIdentity::current().unwrap();
-        let (guardian_fd, supervisor_fd) = ControlEndpoint::pair().unwrap();
-        let raw_guardian = duplicate(guardian_fd.as_raw_fd());
-        let mut guardian = ControlEndpoint::new(
-            guardian_fd,
-            key,
-            session.clone(),
-            1,
-            Sender::Guardian,
-            peer.clone(),
-        )
-        .unwrap();
-        let mut supervisor =
-            ControlEndpoint::new(supervisor_fd, key, session, 1, Sender::Supervisor, peer).unwrap();
-
-        guardian
-            .send(PacketKind::GuardianReady, ControlPayload::new(), &[])
-            .unwrap();
-        let first = supervisor.receive(Duration::from_secs(1), 0).unwrap();
-        assert_eq!(first.packet.kind, PacketKind::GuardianReady);
-        let exact = first.packet.encode().unwrap();
-        raw_send(raw_guardian.as_raw_fd(), &exact);
-        assert!(
-            supervisor
-                .receive(Duration::from_secs(1), 0)
-                .unwrap_err()
-                .contains("sequence")
-        );
-
-        let transferred = File::open("/dev/null").unwrap();
-        guardian
-            .send(
-                PacketKind::WorkerPrepared,
-                ControlPayload::new(),
-                &[transferred.as_raw_fd()],
-            )
-            .unwrap();
-        assert_eq!(
-            supervisor.receive(Duration::from_secs(1), 0).unwrap_err(),
-            "custody packet has 1 FDs; expected one of [0]"
-        );
-
-        let wrong_types: [OwnedFd; 4] =
-            std::array::from_fn(|_| File::open("/dev/null").unwrap().into());
-        assert_eq!(
-            validate_bootstrap_fds(&wrong_types).unwrap_err(),
-            "BOOTSTRAP cgroup FD access modes are not exact"
-        );
-
-        let trunc_peer = PeerIdentity::current().unwrap();
-        let (raw_truncated, truncated_receiver) = ControlEndpoint::pair().unwrap();
-        let mut truncated_receiver = ControlEndpoint::new(
-            truncated_receiver,
-            key,
-            "31111111-1111-4111-8111-111111111111".to_owned(),
-            1,
-            Sender::Supervisor,
-            trunc_peer,
-        )
-        .unwrap();
-        raw_send(
-            raw_truncated.as_raw_fd(),
-            &vec![b'x'; CONTROL_FRAME_MAX + 1],
-        );
-        assert!(
-            truncated_receiver
-                .receive(Duration::from_secs(1), 0)
-                .unwrap_err()
-                .contains("truncated")
-        );
-
-        let expected_parent = PeerIdentity::current().unwrap();
-        let (child_fd, parent_fd) = ControlEndpoint::pair().unwrap();
-        let mut parent = ControlEndpoint::new(
-            parent_fd,
-            key,
-            "21111111-1111-4111-8111-111111111111".to_owned(),
-            1,
-            Sender::Supervisor,
-            expected_parent,
-        )
-        .unwrap();
-        let pid = unsafe { libc::fork() };
-        assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
-        if pid == 0 {
-            let bytes = b"{}";
-            unsafe {
-                libc::send(child_fd.as_raw_fd(), bytes.as_ptr().cast(), bytes.len(), 0);
-                libc::_exit(0);
-            }
-        }
-        drop(child_fd);
-        assert!(
-            parent
-                .receive(Duration::from_secs(1), 0)
-                .unwrap_err()
-                .contains("credentials changed")
-        );
-        let mut status = 0;
-        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
-        assert!(libc::WIFEXITED(status));
     }
+    drop(child_fd);
+    assert!(
+        parent
+            .receive(Duration::from_secs(1), 0)
+            .unwrap_err()
+            .contains("credentials changed")
+    );
+    let mut status = 0;
+    assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+    assert!(libc::WIFEXITED(status));
 }
 
-#[cfg(target_os = "linux")]
 fn hostile_child_if_requested() -> bool {
     let Some(ready) = std::env::var_os("SESSION_RELAY_HOSTILE_READY") else {
         return false;
@@ -1262,7 +1210,6 @@ fn hostile_child_if_requested() -> bool {
     }
 }
 
-#[cfg(target_os = "linux")]
 fn recorded_custodian(active_path: &Path, actor: &str) -> ProcessIdentity {
     let active = parse_jcs(&fs::read(active_path).unwrap(), true)
         .unwrap()
@@ -1287,7 +1234,6 @@ fn recorded_custodian(active_path: &Path, actor: &str) -> ProcessIdentity {
     }
 }
 
-#[cfg(target_os = "linux")]
 fn recover_retain_abort(
     repository: &TestRepository,
     roots: &relay::workspace::authority::AuthorityRoots,
@@ -1328,7 +1274,6 @@ fn recover_retain_abort(
     .unwrap_or_else(|error| panic!("{label}: {error}"))
 }
 
-#[cfg(target_os = "linux")]
 fn assert_closed_recovery(value: relay::workspace::schema::JcsValue) {
     let receipt = value.object().unwrap();
     assert_eq!(receipt["outcome"].as_str().unwrap(), "closed");
@@ -1339,456 +1284,417 @@ fn assert_closed_recovery(value: relay::workspace::schema::JcsValue) {
 
 #[test]
 fn crashed_writer_recovers_only_after_empty_proof() {
-    #[cfg(not(target_os = "linux"))]
-    {
-        assert_eq!(
-            admit_macos_writable_custody_for_test().unwrap_err(),
-            MACOS_STOP_REASON
-        );
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let repository = TestRepository::init("crashed-writer-recovery");
-        let roots = isolated_authority_roots(&repository, "crashed-writer-recovery");
-        let writer = start_test_workspace(
-            &repository,
-            &roots,
-            "single-custodian-loss",
-            vec![PathClaimRequestV1 {
-                path: "base.txt".to_owned(),
-                path_type: "file".to_owned(),
-                mode: "exclusive".to_owned(),
-            }],
-            None,
-        );
-        let active_path = writer
-            .manifest_file
-            .with_file_name("custody-active-v1.json");
-        let fault_path = writer.manifest_file.with_file_name("custody-fault-v1.json");
-        let empty_path = writer.manifest_file.with_file_name("custody-empty-v1.json");
-        let broker_close = writer.manifest_file.with_file_name("broker-close-v1.json");
-        let capability_record = writer
-            .manifest_file
-            .with_file_name("worker-capability-record-v1.json");
-        let active = parse_jcs(&fs::read(&active_path).unwrap(), true)
-            .unwrap()
-            .object()
-            .unwrap();
-        let cgroup = Path::new("/sys/fs/cgroup").join(
-            active["cgroup_membership"]
-                .as_str()
-                .unwrap()
-                .trim_start_matches('/'),
-        );
-        let supervisor = recorded_custodian(&active_path, "supervisor");
-        let guardian_pid = active["guardian_pid"]
+    let repository = TestRepository::init("crashed-writer-recovery");
+    let roots = isolated_authority_roots(&repository, "crashed-writer-recovery");
+    let writer = start_test_workspace(
+        &repository,
+        &roots,
+        "single-custodian-loss",
+        vec![PathClaimRequestV1 {
+            path: "base.txt".to_owned(),
+            path_type: "file".to_owned(),
+            mode: "exclusive".to_owned(),
+        }],
+        None,
+    );
+    let active_path = writer
+        .manifest_file
+        .with_file_name("custody-active-v1.json");
+    let fault_path = writer.manifest_file.with_file_name("custody-fault-v1.json");
+    let empty_path = writer.manifest_file.with_file_name("custody-empty-v1.json");
+    let broker_close = writer.manifest_file.with_file_name("broker-close-v1.json");
+    let capability_record = writer
+        .manifest_file
+        .with_file_name("worker-capability-record-v1.json");
+    let active = parse_jcs(&fs::read(&active_path).unwrap(), true)
+        .unwrap()
+        .object()
+        .unwrap();
+    let cgroup = Path::new("/sys/fs/cgroup").join(
+        active["cgroup_membership"]
             .as_str()
             .unwrap()
-            .parse::<i32>()
-            .unwrap();
-        let guardian_token = active["guardian_start_token"].as_str().unwrap().to_owned();
-        let lease_path = writer.lease.path().to_owned();
-        let manifest_file = writer.manifest_file.clone();
-        let repository_id = writer.result.repository_id.clone();
-        let session_id = writer.result.session_id.clone();
-        let coordinator_capability = PathBuf::from(&writer.result.coordinator_capability_file);
-        let worker_capability = writer.worker_capability_file.clone();
-        let resource = temp_dir_resource(&writer);
+            .trim_start_matches('/'),
+    );
+    let supervisor = recorded_custodian(&active_path, "supervisor");
+    let guardian_pid = active["guardian_pid"]
+        .as_str()
+        .unwrap()
+        .parse::<i32>()
+        .unwrap();
+    let guardian_token = active["guardian_start_token"].as_str().unwrap().to_owned();
+    let lease_path = writer.lease.path().to_owned();
+    let manifest_file = writer.manifest_file.clone();
+    let repository_id = writer.result.repository_id.clone();
+    let session_id = writer.result.session_id.clone();
+    let coordinator_capability = PathBuf::from(&writer.result.coordinator_capability_file);
+    let worker_capability = writer.worker_capability_file.clone();
+    let resource = temp_dir_resource(&writer);
 
-        signal_pidfd(&supervisor, libc::SIGKILL).unwrap();
-        wait_until(
-            "single-custodian authenticated fault",
-            Duration::from_secs(10),
-            || fault_path.exists() && empty_path.exists(),
-        );
-        assert_eq!(process_start_token(guardian_pid).unwrap(), guardian_token);
-        assert!(
-            fs::read_to_string(cgroup.join("cgroup.events"))
-                .unwrap()
-                .lines()
-                .any(|line| line == "populated 0")
-        );
-        wait_until(
-            "crash capability revocation",
-            Duration::from_secs(10),
-            || {
-                read_jcs_file::<relay::workspace::schema::CapabilityRecordV1>(
-                    &capability_record,
-                    None,
-                )
+    signal_pidfd(&supervisor, libc::SIGKILL).unwrap();
+    wait_until(
+        "single-custodian authenticated fault",
+        Duration::from_secs(10),
+        || fault_path.exists() && empty_path.exists(),
+    );
+    assert_eq!(process_start_token(guardian_pid).unwrap(), guardian_token);
+    assert!(
+        fs::read_to_string(cgroup.join("cgroup.events"))
+            .unwrap()
+            .lines()
+            .any(|line| line == "populated 0")
+    );
+    wait_until(
+        "crash capability revocation",
+        Duration::from_secs(10),
+        || {
+            read_jcs_file::<relay::workspace::schema::CapabilityRecordV1>(&capability_record, None)
                 .is_ok_and(|record| record.revoked_at.is_some())
-                    && broker_close.exists()
-            },
-        );
-        assert!(!worker_capability.exists());
-        drop(writer.lease);
-        assert!(
-            WorkspaceLease::acquire(&lease_path).is_err(),
-            "surviving guardian released the lifetime lease before explicit recovery"
-        );
-        assert_eq!(
-            parse_jcs(&fs::read(&manifest_file).unwrap(), true)
-                .unwrap()
-                .object()
-                .unwrap()["state"]
-                .as_str()
-                .unwrap(),
-            "Running"
-        );
-
-        let recovered = recover_retain_abort(
-            &repository,
-            &roots,
-            &manifest_file,
-            &repository_id,
-            &session_id,
-            &coordinator_capability,
-            "single-custodian-loss",
-        );
-        assert_closed_recovery(recovered);
-        assert!(!cgroup.exists());
-        assert!(!resource.exists());
-        let independent = WorkspaceLease::acquire(&lease_path)
-            .expect("explicit recovery releases the retained lifetime lease");
-        drop(independent);
-
-        let dual = start_test_workspace(
-            &repository,
-            &roots,
-            "dual-custodian-loss",
-            vec![PathClaimRequestV1 {
-                path: "base.txt".to_owned(),
-                path_type: "file".to_owned(),
-                mode: "exclusive".to_owned(),
-            }],
-            Some(&coordinator_capability),
-        );
-        let dual_active = dual.manifest_file.with_file_name("custody-active-v1.json");
-        let guardian = recorded_custodian(&dual_active, "guardian");
-        let supervisor = recorded_custodian(&dual_active, "supervisor");
-        let active = parse_jcs(&fs::read(&dual_active).unwrap(), true)
+                && broker_close.exists()
+        },
+    );
+    assert!(!worker_capability.exists());
+    drop(writer.lease);
+    assert!(
+        WorkspaceLease::acquire(&lease_path).is_err(),
+        "surviving guardian released the lifetime lease before explicit recovery"
+    );
+    assert_eq!(
+        parse_jcs(&fs::read(&manifest_file).unwrap(), true)
             .unwrap()
             .object()
-            .unwrap();
-        let dual_cgroup = Path::new("/sys/fs/cgroup").join(
-            active["cgroup_membership"]
-                .as_str()
-                .unwrap()
-                .trim_start_matches('/'),
-        );
-        let dual_lease_path = dual.lease.path().to_owned();
-        let dual_manifest = dual.manifest_file.clone();
-        let dual_repository_id = dual.result.repository_id.clone();
-        let dual_session_id = dual.result.session_id.clone();
-        let dual_resource = temp_dir_resource(&dual);
-        signal_pidfd(&guardian, libc::SIGKILL).unwrap();
-        signal_pidfd(&supervisor, libc::SIGKILL).unwrap();
-        wait_until(
-            "dual-custodian worker EMPTY",
-            Duration::from_secs(10),
-            || {
-                fs::read_to_string(dual_cgroup.join("cgroup.events"))
-                    .is_ok_and(|events| events.lines().any(|line| line == "populated 0"))
-            },
-        );
-        drop(dual.lease);
-        assert!(
-            WorkspaceLease::acquire(&dual_lease_path).is_err(),
-            "dual custodian loss released the broker lifetime reference implicitly"
-        );
-        let recovered = recover_retain_abort(
-            &repository,
-            &roots,
-            &dual_manifest,
-            &dual_repository_id,
-            &dual_session_id,
-            &coordinator_capability,
-            "dual-custodian-loss",
-        );
-        assert_closed_recovery(recovered);
-        assert!(!dual_cgroup.exists());
-        assert!(!dual_resource.exists());
-        let independent = WorkspaceLease::acquire(&dual_lease_path)
-            .expect("explicit dual-crash recovery releases the lifetime lease");
-        drop(independent);
-    }
+            .unwrap()["state"]
+            .as_str()
+            .unwrap(),
+        "Running"
+    );
+
+    let recovered = recover_retain_abort(
+        &repository,
+        &roots,
+        &manifest_file,
+        &repository_id,
+        &session_id,
+        &coordinator_capability,
+        "single-custodian-loss",
+    );
+    assert_closed_recovery(recovered);
+    assert!(!cgroup.exists());
+    assert!(!resource.exists());
+    let independent = WorkspaceLease::acquire(&lease_path)
+        .expect("explicit recovery releases the retained lifetime lease");
+    drop(independent);
+
+    let dual = start_test_workspace(
+        &repository,
+        &roots,
+        "dual-custodian-loss",
+        vec![PathClaimRequestV1 {
+            path: "base.txt".to_owned(),
+            path_type: "file".to_owned(),
+            mode: "exclusive".to_owned(),
+        }],
+        Some(&coordinator_capability),
+    );
+    let dual_active = dual.manifest_file.with_file_name("custody-active-v1.json");
+    let guardian = recorded_custodian(&dual_active, "guardian");
+    let supervisor = recorded_custodian(&dual_active, "supervisor");
+    let active = parse_jcs(&fs::read(&dual_active).unwrap(), true)
+        .unwrap()
+        .object()
+        .unwrap();
+    let dual_cgroup = Path::new("/sys/fs/cgroup").join(
+        active["cgroup_membership"]
+            .as_str()
+            .unwrap()
+            .trim_start_matches('/'),
+    );
+    let dual_lease_path = dual.lease.path().to_owned();
+    let dual_manifest = dual.manifest_file.clone();
+    let dual_repository_id = dual.result.repository_id.clone();
+    let dual_session_id = dual.result.session_id.clone();
+    let dual_resource = temp_dir_resource(&dual);
+    signal_pidfd(&guardian, libc::SIGKILL).unwrap();
+    signal_pidfd(&supervisor, libc::SIGKILL).unwrap();
+    wait_until(
+        "dual-custodian worker EMPTY",
+        Duration::from_secs(10),
+        || {
+            fs::read_to_string(dual_cgroup.join("cgroup.events"))
+                .is_ok_and(|events| events.lines().any(|line| line == "populated 0"))
+        },
+    );
+    drop(dual.lease);
+    assert!(
+        WorkspaceLease::acquire(&dual_lease_path).is_err(),
+        "dual custodian loss released the broker lifetime reference implicitly"
+    );
+    let recovered = recover_retain_abort(
+        &repository,
+        &roots,
+        &dual_manifest,
+        &dual_repository_id,
+        &dual_session_id,
+        &coordinator_capability,
+        "dual-custodian-loss",
+    );
+    assert_closed_recovery(recovered);
+    assert!(!dual_cgroup.exists());
+    assert!(!dual_resource.exists());
+    let independent = WorkspaceLease::acquire(&dual_lease_path)
+        .expect("explicit dual-crash recovery releases the lifetime lease");
+    drop(independent);
 }
 
 #[test]
 fn cgroup_reconcile_removes_empty_orphan_and_refuses_nonempty_or_foreign_identity() {
-    #[cfg(target_os = "linux")]
-    {
-        if std::env::var_os("SESSION_RELAY_TEST_CGROUP_ROOT").is_none() {
-            return;
-        }
-
-        let empty_session = request_id();
-        let empty = DelegatedCgroup::create(&empty_session).unwrap();
-        let empty_path = empty.path().to_owned();
-        drop(empty);
-        reconcile_empty_delegated_cgroup(&empty_session).unwrap();
-        assert!(!empty_path.exists(), "empty orphan cgroup was retained");
-
-        let populated_session = request_id();
-        let populated = DelegatedCgroup::create(&populated_session).unwrap();
-        let populated_path = populated.path().to_owned();
-        let child = populated_path.join(request_id());
-        fs::create_dir(&child).unwrap();
-        drop(populated);
-        let error = reconcile_empty_delegated_cgroup(&populated_session).unwrap_err();
-        assert!(
-            error.contains("child cgroups") || error.contains("nonempty"),
-            "wrong nonempty cgroup refusal: {error}"
-        );
-        fs::remove_dir(&child).unwrap();
-        reconcile_empty_delegated_cgroup(&populated_session).unwrap();
-
-        let foreign = reconcile_empty_delegated_cgroup("../foreign").unwrap_err();
-        assert!(
-            foreign.contains("lowercase UUIDv4"),
-            "wrong foreign cgroup identity refusal: {foreign}"
-        );
+    if std::env::var_os("SESSION_RELAY_TEST_CGROUP_ROOT").is_none() {
+        return;
     }
+
+    let empty_session = request_id();
+    let empty = DelegatedCgroup::create(&empty_session).unwrap();
+    let empty_path = empty.path().to_owned();
+    drop(empty);
+    reconcile_empty_delegated_cgroup(&empty_session).unwrap();
+    assert!(!empty_path.exists(), "empty orphan cgroup was retained");
+
+    let populated_session = request_id();
+    let populated = DelegatedCgroup::create(&populated_session).unwrap();
+    let populated_path = populated.path().to_owned();
+    let child = populated_path.join(request_id());
+    fs::create_dir(&child).unwrap();
+    drop(populated);
+    let error = reconcile_empty_delegated_cgroup(&populated_session).unwrap_err();
+    assert!(
+        error.contains("child cgroups") || error.contains("nonempty"),
+        "wrong nonempty cgroup refusal: {error}"
+    );
+    fs::remove_dir(&child).unwrap();
+    reconcile_empty_delegated_cgroup(&populated_session).unwrap();
+
+    let foreign = reconcile_empty_delegated_cgroup("../foreign").unwrap_err();
+    assert!(
+        foreign.contains("lowercase UUIDv4"),
+        "wrong foreign cgroup identity refusal: {foreign}"
+    );
 }
 
 #[test]
 fn linux_cgroup_pidfd_guardian_kills_hostile_descendants() {
-    #[cfg(not(target_os = "linux"))]
-    {
-        assert_eq!(
-            admit_macos_writable_custody_for_test().unwrap_err(),
-            MACOS_STOP_REASON,
-        );
+    if hostile_child_if_requested() {
         return;
     }
-    #[cfg(target_os = "linux")]
-    {
-        if hostile_child_if_requested() {
-            return;
-        }
 
-        let repository = TestRepository::init("linux-custody");
-        let roots = isolated_authority_roots(&repository, "linux-custody");
-        let managed = start_test_workspace(
-            &repository,
-            &roots,
-            "native-runtime",
-            vec![PathClaimRequestV1 {
-                path: "base.txt".to_owned(),
-                path_type: "file".to_owned(),
-                mode: "exclusive".to_owned(),
-            }],
-            None,
-        );
-        assert_eq!(
-            manifest_fields(&managed).0,
-            relay::workspace::schema::WorkspaceState::Running
-        );
-        let active_path = managed
-            .manifest_file
-            .with_file_name("custody-active-v1.json");
-        let active = parse_jcs(&fs::read(&active_path).unwrap(), true).unwrap();
-        let active = active.object().unwrap();
-        assert_eq!(active["schema"].as_str().unwrap(), "CustodyActiveV1");
-        assert_eq!(
-            active["session_id"].as_str().unwrap(),
-            managed.result.session_id
-        );
-        for actor in ["guardian", "supervisor"] {
-            let pid = active[&format!("{actor}_pid")]
-                .as_str()
-                .unwrap()
-                .parse::<i32>()
-                .unwrap();
-            let expected_token = active[&format!("{actor}_start_token")].as_str().unwrap();
-            assert_eq!(process_start_token(pid).unwrap(), expected_token);
-            let pidfd = pidfd_open(pid).unwrap();
-            validate_pidfd_identity(pidfd.as_raw_fd(), pid, expected_token).unwrap();
-        }
-        let managed_cgroup = Path::new("/sys/fs/cgroup").join(
-            active["cgroup_membership"]
-                .as_str()
-                .unwrap()
-                .trim_start_matches('/'),
-        );
-        assert_eq!(
-            fs::read_to_string(managed_cgroup.join("cgroup.type"))
-                .unwrap()
-                .trim(),
-            "domain"
-        );
-        assert!(!active["prepared_sha256"].as_str().unwrap().is_empty());
-        assert!(!active["activated_sha256"].as_str().unwrap().is_empty());
+    let repository = TestRepository::init("linux-custody");
+    let roots = isolated_authority_roots(&repository, "linux-custody");
+    let managed = start_test_workspace(
+        &repository,
+        &roots,
+        "native-runtime",
+        vec![PathClaimRequestV1 {
+            path: "base.txt".to_owned(),
+            path_type: "file".to_owned(),
+            mode: "exclusive".to_owned(),
+        }],
+        None,
+    );
+    assert_eq!(
+        manifest_fields(&managed).0,
+        relay::workspace::schema::WorkspaceState::Running
+    );
+    let active_path = managed
+        .manifest_file
+        .with_file_name("custody-active-v1.json");
+    let active = parse_jcs(&fs::read(&active_path).unwrap(), true).unwrap();
+    let active = active.object().unwrap();
+    assert_eq!(active["schema"].as_str().unwrap(), "CustodyActiveV1");
+    assert_eq!(
+        active["session_id"].as_str().unwrap(),
+        managed.result.session_id
+    );
+    for actor in ["guardian", "supervisor"] {
+        let pid = active[&format!("{actor}_pid")]
+            .as_str()
+            .unwrap()
+            .parse::<i32>()
+            .unwrap();
+        let expected_token = active[&format!("{actor}_start_token")].as_str().unwrap();
+        assert_eq!(process_start_token(pid).unwrap(), expected_token);
+        let pidfd = pidfd_open(pid).unwrap();
+        validate_pidfd_identity(pidfd.as_raw_fd(), pid, expected_token).unwrap();
+    }
+    let managed_cgroup = Path::new("/sys/fs/cgroup").join(
+        active["cgroup_membership"]
+            .as_str()
+            .unwrap()
+            .trim_start_matches('/'),
+    );
+    assert_eq!(
+        fs::read_to_string(managed_cgroup.join("cgroup.type"))
+            .unwrap()
+            .trim(),
+        "domain"
+    );
+    assert!(!active["prepared_sha256"].as_str().unwrap().is_empty());
+    assert!(!active["activated_sha256"].as_str().unwrap().is_empty());
 
-        let common_git = repository.git_dir();
-        let managed_root = PathBuf::from(&managed.result.worktree_root);
-        let authoritative_paths = [
-            roots.authority.as_path(),
-            roots.data.as_path(),
-            common_git.as_path(),
-            repository.root.as_path(),
-            managed_root.as_path(),
-        ];
-        let mut admitted_mount_id = None;
-        for path in authoritative_paths {
-            let opened = File::open(path).unwrap();
-            let identity = require_ext4_fd(opened.as_raw_fd()).unwrap();
-            assert_eq!(identity.filesystem_type, "ext4");
-            if let Some(expected) = admitted_mount_id {
-                assert_eq!(
-                    identity.mount_id, expected,
-                    "authoritative paths crossed ext4 mount identities"
-                );
-            } else {
-                admitted_mount_id = Some(identity.mount_id);
-            }
-        }
-
-        let ready = repository.root.join("hostile-ready");
-        let session_id = request_id();
-        let cgroup = DelegatedCgroup::create(&session_id)
-            .expect("native runner must provide an owned delegated cgroup-v2 root");
-        assert_eq!(
-            fs::read_to_string(cgroup.path().join("cgroup.type"))
-                .unwrap()
-                .trim(),
-            "domain"
-        );
-        let executable = std::env::current_exe().unwrap();
-        let launch = WorkerLaunch {
-            executable,
-            arguments: vec![
-                "linux_cgroup_pidfd_guardian_kills_hostile_descendants".to_owned(),
-                "--exact".to_owned(),
-                "--nocapture".to_owned(),
-            ],
-            environment: BTreeMap::from([(
-                "SESSION_RELAY_HOSTILE_READY".to_owned(),
-                ready.to_string_lossy().into_owned(),
-            )]),
-            cwd: repository.root.clone(),
-            resource_fds: Vec::new(),
-            sandbox: LandlockPolicy {
-                workspace: repository.root.clone(),
-                readable: Vec::new(),
-                executable_runtime: Vec::new(),
-                pinned_readable: Vec::new(),
-                writable_resources: Vec::new(),
-            },
-        };
-        let prepared = cgroup
-            .launch_worker(&launch)
-            .expect("prepare confined worker");
-        assert!(prepared.prepared_evidence.sandbox_prepared);
-        assert_eq!(
-            prepared.prepared_evidence.cgroup_membership,
-            cgroup.membership()
-        );
-        let expected_pid = prepared.identity.pid;
-        let verified = prepared
-            .verify_activation()
-            .expect("verify confined worker activation");
-        let (identity, activated) = verified
-            .release_after_ack(|evidence| {
-                assert_eq!(evidence.pid, expected_pid);
-                Ok(())
-            })
-            .expect("release confined worker after activation ACK");
-        assert_eq!(activated.pid, identity.pid);
-        assert_eq!(
-            process_start_token(identity.pid).unwrap(),
-            identity.start_token
-        );
-        wait_until("hostile grandchild", Duration::from_secs(5), || {
-            ready.exists()
-        });
-
-        let pids = fs::read_to_string(cgroup.path().join("cgroup.procs")).unwrap();
-        let pids: Vec<i32> = pids.lines().map(|line| line.parse().unwrap()).collect();
-        assert!(
-            pids.len() >= 3,
-            "fork/setsid descendants escaped the delegated leaf"
-        );
-        for pid in &pids {
+    let common_git = repository.git_dir();
+    let managed_root = PathBuf::from(&managed.result.worktree_root);
+    let authoritative_paths = [
+        roots.authority.as_path(),
+        roots.data.as_path(),
+        common_git.as_path(),
+        repository.root.as_path(),
+        managed_root.as_path(),
+    ];
+    let mut admitted_mount_id = None;
+    for path in authoritative_paths {
+        let opened = File::open(path).unwrap();
+        let identity = require_ext4_fd(opened.as_raw_fd()).unwrap();
+        assert_eq!(identity.filesystem_type, "ext4");
+        if let Some(expected) = admitted_mount_id {
             assert_eq!(
-                fs::read_to_string(format!("/proc/{pid}/cgroup"))
-                    .unwrap()
-                    .lines()
-                    .find(|line| line.starts_with("0::"))
-                    .unwrap()
-                    .trim_start_matches("0::"),
-                cgroup.membership()
+                identity.mount_id, expected,
+                "authoritative paths crossed ext4 mount identities"
             );
-            let fd_dir = format!("/proc/{pid}/fd");
-            for entry in fs::read_dir(fd_dir).unwrap() {
-                let target = fs::read_link(entry.unwrap().path()).unwrap_or_default();
-                let target = target.to_string_lossy();
-                assert!(
-                    !target.contains("workspace-authority")
-                        && !target.contains("cgroup.events")
-                        && !target.contains("cgroup.procs")
-                        && !target.contains("cgroup.kill")
-                        && !target.contains("broker-v1.sock")
-                        && !target.contains("runtime-control-key"),
-                    "worker tree inherited custody/authority FD: {target}",
-                );
-            }
+        } else {
+            admitted_mount_id = Some(identity.mount_id);
         }
+    }
 
-        let empty = cgroup
-            .kill_and_wait_empty(&identity)
-            .expect("cgroup.kill and recursive populated=0");
-        assert!(!empty.populated);
-        assert_eq!(empty.cgroup_path, cgroup.membership());
-        assert!(
-            fs::read_to_string(cgroup.path().join("cgroup.events"))
+    let ready = repository.root.join("hostile-ready");
+    let session_id = request_id();
+    let cgroup = DelegatedCgroup::create(&session_id)
+        .expect("native runner must provide an owned delegated cgroup-v2 root");
+    assert_eq!(
+        fs::read_to_string(cgroup.path().join("cgroup.type"))
+            .unwrap()
+            .trim(),
+        "domain"
+    );
+    let executable = std::env::current_exe().unwrap();
+    let launch = WorkerLaunch {
+        executable,
+        arguments: vec![
+            "linux_cgroup_pidfd_guardian_kills_hostile_descendants".to_owned(),
+            "--exact".to_owned(),
+            "--nocapture".to_owned(),
+        ],
+        environment: BTreeMap::from([(
+            "SESSION_RELAY_HOSTILE_READY".to_owned(),
+            ready.to_string_lossy().into_owned(),
+        )]),
+        cwd: repository.root.clone(),
+        resource_fds: Vec::new(),
+        sandbox: LandlockPolicy {
+            workspace: repository.root.clone(),
+            readable: Vec::new(),
+            executable_runtime: Vec::new(),
+            pinned_readable: Vec::new(),
+            writable_resources: Vec::new(),
+        },
+    };
+    let prepared = cgroup
+        .launch_worker(&launch)
+        .expect("prepare confined worker");
+    assert!(prepared.prepared_evidence.sandbox_prepared);
+    assert_eq!(
+        prepared.prepared_evidence.cgroup_membership,
+        cgroup.membership()
+    );
+    let expected_pid = prepared.identity.pid;
+    let verified = prepared
+        .verify_activation()
+        .expect("verify confined worker activation");
+    let (identity, activated) = verified
+        .release_after_ack(|evidence| {
+            assert_eq!(evidence.pid, expected_pid);
+            Ok(())
+        })
+        .expect("release confined worker after activation ACK");
+    assert_eq!(activated.pid, identity.pid);
+    assert_eq!(
+        process_start_token(identity.pid).unwrap(),
+        identity.start_token
+    );
+    wait_until("hostile grandchild", Duration::from_secs(5), || {
+        ready.exists()
+    });
+
+    let pids = fs::read_to_string(cgroup.path().join("cgroup.procs")).unwrap();
+    let pids: Vec<i32> = pids.lines().map(|line| line.parse().unwrap()).collect();
+    assert!(
+        pids.len() >= 3,
+        "fork/setsid descendants escaped the delegated leaf"
+    );
+    for pid in &pids {
+        assert_eq!(
+            fs::read_to_string(format!("/proc/{pid}/cgroup"))
                 .unwrap()
                 .lines()
-                .any(|line| line == "populated 0")
+                .find(|line| line.starts_with("0::"))
+                .unwrap()
+                .trim_start_matches("0::"),
+            cgroup.membership()
         );
+        let fd_dir = format!("/proc/{pid}/fd");
+        for entry in fs::read_dir(fd_dir).unwrap() {
+            let target = fs::read_link(entry.unwrap().path()).unwrap_or_default();
+            let target = target.to_string_lossy();
+            assert!(
+                !target.contains("workspace-authority")
+                    && !target.contains("cgroup.events")
+                    && !target.contains("cgroup.procs")
+                    && !target.contains("cgroup.kill")
+                    && !target.contains("broker-v1.sock")
+                    && !target.contains("runtime-control-key"),
+                "worker tree inherited custody/authority FD: {target}",
+            );
+        }
+    }
 
-        let lease_path = repository.home.join("last-close.lease");
-        let lease = WorkspaceLease::acquire(&lease_path).unwrap();
-        assert!(
-            OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&lease_path)
-                .and_then(|probe| probe_closed_lease(probe.as_raw_fd())
-                    .map(|_| ())
-                    .map_err(std::io::Error::other))
-                .is_err(),
-            "independent lease probe succeeded before the last close"
-        );
-        drop(lease);
-        let probe = OpenOptions::new()
+    let empty = cgroup
+        .kill_and_wait_empty(&identity)
+        .expect("cgroup.kill and recursive populated=0");
+    assert!(!empty.populated);
+    assert_eq!(empty.cgroup_path, cgroup.membership());
+    assert!(
+        fs::read_to_string(cgroup.path().join("cgroup.events"))
+            .unwrap()
+            .lines()
+            .any(|line| line == "populated 0")
+    );
+
+    let lease_path = repository.home.join("last-close.lease");
+    let lease = WorkspaceLease::acquire(&lease_path).unwrap();
+    assert!(
+        OpenOptions::new()
             .read(true)
             .write(true)
             .open(&lease_path)
-            .unwrap();
-        let proof =
-            probe_closed_lease(probe.as_raw_fd()).expect("independent post-close lease probe");
-        assert_ne!(proof.dev, 0);
-        assert_ne!(proof.ino, 0);
-        cgroup.remove().expect("remove proven-empty delegated leaf");
-
-        let managed_cgroup_copy = managed_cgroup.clone();
-        let cleanup = abort_started_workspace(&repository, &roots, managed, "native test cleanup");
-        assert!(cleanup.capabilities_revoked);
-        assert!(cleanup.lease_released);
-        assert!(!managed_cgroup_copy.exists());
-    }
-}
-
-#[test]
-fn macos_process_group_recursive_guardian_kills_hostile_descendants() {
-    assert_eq!(MACOS_INADMISSIBLE_BACKEND, "macos_pgroup_libproc");
-    let error = admit_macos_writable_custody_for_test().unwrap_err();
-    assert_eq!(error, MACOS_STOP_REASON);
-    assert_eq!(
-        error,
-        "process groups are escapable, kqueue is PID observation rather than durable containment, and no documented public primitive provides crash-durable descendant membership plus atomic kill/empty proof",
+            .and_then(|probe| probe_closed_lease(probe.as_raw_fd())
+                .map(|_| ())
+                .map_err(std::io::Error::other))
+            .is_err(),
+        "independent lease probe succeeded before the last close"
     );
+    drop(lease);
+    let probe = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&lease_path)
+        .unwrap();
+    let proof = probe_closed_lease(probe.as_raw_fd()).expect("independent post-close lease probe");
+    assert_ne!(proof.dev, 0);
+    assert_ne!(proof.ino, 0);
+    cgroup.remove().expect("remove proven-empty delegated leaf");
+
+    let managed_cgroup_copy = managed_cgroup.clone();
+    let cleanup = abort_started_workspace(&repository, &roots, managed, "native test cleanup");
+    assert!(cleanup.capabilities_revoked);
+    assert!(cleanup.lease_released);
+    assert!(!managed_cgroup_copy.exists());
 }
 
 // Regression: the graceful-stop budget and the empty-proof budget are separate.
@@ -1805,7 +1711,6 @@ fn macos_process_group_recursive_guardian_kills_hostile_descendants() {
 // stop budget does not shorten the empty wait; the second proves the empty
 // budget is still honoured, so the first cannot pass by the deadline being
 // ignored altogether.
-#[cfg(target_os = "linux")]
 #[test]
 fn graceful_stop_keeps_the_empty_proof_off_the_stop_budget() {
     use std::time::Instant;

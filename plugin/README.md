@@ -10,7 +10,7 @@ docks-kit toolchain ensure session-relay
 session-relay --version
 ```
 
-Session Relay 0.14.0 supports ordinary Relay use on Linux and macOS, on x86-64 and arm64. Windows is unsupported. Managed writing remains Linux/ext4-only; the macOS binaries deliberately refuse that capability.
+Session Relay supports Linux only, on x86-64 and arm64. Other operating systems are unsupported. Managed writing additionally requires ext4.
 
 ## Legacy mail
 
@@ -91,15 +91,7 @@ Pre-0.14 fan-out records remain readable and preserve legacy handback/collect be
 
 ## Release discipline
 
-Session Relay is versioned independently as `session-relay--v0.14.0`. The reviewed release path:
-
-1. binds the current Docks `PlanRunV1`, red-before-production evidence, reviewed implementation commit, and the docks-kit 0.12.0 companion child;
-2. stages one prerelease containing exactly four native binaries—Linux x64/arm64 and macOS x64/arm64—plus `SHA256SUMS`;
-3. independently hashes producer artifacts and downloaded release assets and requires both maps to equal the checksum rows;
-4. publishes and remotely reads back `cli-v0.12.0` / `docks-kit@0.12.0` with the same four Relay digest pins and a finished archived public child; then
-5. promotes the same tag, release database identity, workflow run, and byte-identical five assets to stable.
-
-Windows assets, mixed workflow runs, changed digests, retags, asset replacement, unfinished public plans, missing red-first evidence, and mismatched receipt identities fail before stable promotion. Historical 0.13 tags, receipts, plans, and assets are immutable predecessors, not retry targets.
+Session Relay is versioned independently and released from its own repository. Push a `v<X.Y.Z>` tag. `.github/workflows/release.yml` then builds `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl` natively, hashes both binaries, and publishes exactly three assets: `session-relay-x86_64-unknown-linux-musl`, `session-relay-aarch64-unknown-linux-musl`, and `SHA256SUMS`.
 
 ## Trust boundary
 

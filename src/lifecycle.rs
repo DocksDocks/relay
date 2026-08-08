@@ -405,7 +405,6 @@ impl OperationKind {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StartGeneration {
     LinuxProcStartTicks(u64),
-    DarwinBsdStartTime { sec: i64, usec: i64 },
     Unavailable,
 }
 
@@ -5047,14 +5046,6 @@ impl ProcessObservation {
                 );
                 start.insert("ticks".into(), JsonValue::from(ticks.to_string()));
             }
-            StartGeneration::DarwinBsdStartTime { sec, usec } => {
-                start.insert(
-                    "kind".into(),
-                    JsonValue::from("DarwinBsdStartTime".to_string()),
-                );
-                start.insert("sec".into(), JsonValue::from(sec.to_string()));
-                start.insert("usec".into(), JsonValue::from(usec.to_string()));
-            }
             StartGeneration::Unavailable => {
                 start.insert("kind".into(), JsonValue::from("Unavailable".to_string()));
             }
@@ -5070,10 +5061,11 @@ impl ProcessObservation {
             "LinuxProcStartTicks" => {
                 StartGeneration::LinuxProcStartTicks(string(start, "ticks")?.parse().ok()?)
             }
-            "DarwinBsdStartTime" => StartGeneration::DarwinBsdStartTime {
-                sec: string(start, "sec")?.parse().ok()?,
-                usec: string(start, "usec")?.parse().ok()?,
-            },
+            // A record written by a macOS host is bytes that already exist on disk.
+            // A hard decode error makes a live workspace unrecoverable instead of
+            // merely unverifiable. Unavailable already means "no start-generation
+            // evidence", which is the truth about such a record on Linux.
+            "DarwinBsdStartTime" => StartGeneration::Unavailable,
             "Unavailable" => StartGeneration::Unavailable,
             _ => return None,
         };
@@ -6066,28 +6058,20 @@ fn json_contains_string(value: &JsonValue, needle: &str) -> bool {
 }
 
 pub(crate) fn process_observation_is_live(observation: &ProcessObservation) -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        let current = fs::read_to_string(format!("/proc/{}/stat", observation.pid))
-            .ok()
-            .and_then(|stat| {
-                let end = stat.rfind(") ")?;
-                let fields = stat[end + 2..].split_whitespace().collect::<Vec<_>>();
-                let state = *fields.first()?;
-                let start = fields.get(19)?.parse::<u64>().ok()?;
-                Some((state.to_string(), start))
-            });
-        match observation.start {
-            StartGeneration::LinuxProcStartTicks(expected) => {
-                current.is_some_and(|(state, start)| state != "Z" && start == expected)
-            }
-            _ => current.is_some_and(|(state, _)| state != "Z"),
+    let current = fs::read_to_string(format!("/proc/{}/stat", observation.pid))
+        .ok()
+        .and_then(|stat| {
+            let end = stat.rfind(") ")?;
+            let fields = stat[end + 2..].split_whitespace().collect::<Vec<_>>();
+            let state = *fields.first()?;
+            let start = fields.get(19)?.parse::<u64>().ok()?;
+            Some((state.to_string(), start))
+        });
+    match observation.start {
+        StartGeneration::LinuxProcStartTicks(expected) => {
+            current.is_some_and(|(state, start)| state != "Z" && start == expected)
         }
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        // SAFETY: signal 0 is an observation-only existence/permission probe.
-        unsafe { libc::kill(observation.pid as i32, 0) == 0 }
+        _ => current.is_some_and(|(state, _)| state != "Z"),
     }
 }
 

@@ -96,7 +96,6 @@ process.stdout.write(`${JSON.stringify(receipt)}\n`);
     atomic_create_jcs(&provider_registry_path(roots), &registry, 0o600).unwrap();
 }
 
-#[cfg(target_os = "linux")]
 fn install_timeout_provider(
     repo: &TestRepository,
     roots: &relay::workspace::authority::AuthorityRoots,
@@ -336,7 +335,6 @@ fn all_six_resource_kinds_are_isolated_and_receipted() {
     assert!(second.writable_paths().iter().all(|path| !path.exists()));
 }
 
-#[cfg(target_os = "linux")]
 #[test]
 fn provider_timeout_fences_setsid_and_terminates_inherited_pipe_descendant() {
     let repo = TestRepository::init("provider-timeout-tree");
