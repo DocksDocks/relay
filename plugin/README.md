@@ -4,9 +4,14 @@ Session Relay is a cross-session, cross-project, cross-tool message bus for Clau
 
 ## Install
 
+Download the binary for this machine from the
+[latest release](https://github.com/DocksDocks/session-relay/releases/latest), then install it and
+verify it:
+
 ```bash
-docks-kit sync
-docks-kit toolchain ensure session-relay
+target=x86_64-unknown-linux-musl   # use aarch64-unknown-linux-musl on arm64
+curl -fLO "https://github.com/DocksDocks/session-relay/releases/latest/download/session-relay-$target"
+install -Dm755 "session-relay-$target" "$HOME/.local/bin/session-relay"
 session-relay --version
 ```
 

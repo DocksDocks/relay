@@ -6,7 +6,7 @@ allowed-tools: Bash, Read
 metadata:
   pattern: tool-wrapper
   updated: "2026-08-07"
-  content_hash: "e7c71741b7b1872b16d85e0c1c3beb1806372ccbe3ba38d68d3873a6964c7017"
+  content_hash: "e3436e3783210a1be6d48c6aa037c396a2edb9e2bd166e930bb0eb4597af80c1"
 ---
 
 # Session relay
@@ -27,17 +27,18 @@ Relay children and doorbell wakes run unattended and can reprocess full transcri
 
 ## Install and resolve the CLI
 
-Consumer commands use the installed `session-relay` executable. Provision or refresh the plugin and its pinned companion executable, then verify it:
+Consumer commands use the installed `session-relay` executable. Install the prebuilt for this host from the [latest release](https://github.com/DocksDocks/session-relay/releases/latest), then verify it:
 
 ```bash
-docks-kit sync
-docks-kit toolchain ensure session-relay
+target=x86_64-unknown-linux-musl   # use aarch64-unknown-linux-musl on arm64
+curl -fLO "https://github.com/DocksDocks/session-relay/releases/latest/download/session-relay-$target"
+install -Dm755 "session-relay-$target" "$HOME/.local/bin/session-relay"
 session-relay --version
 ```
 
 The installed plugin's compatibility launcher resolves a non-empty `SESSION_RELAY_BIN` first, then `session-relay` on `PATH`, then `$HOME/.local/bin/session-relay`. An empty override falls through. A non-empty override is authoritative: missing or non-executable paths fail instead of silently falling back, and pointing it at the launcher itself fails as recursion.
 
-The launcher has no embedded relay binary and never compiles, builds, or downloads one at startup. For a missing CLI, run `docks-kit sync` and then `docks-kit toolchain ensure session-relay`; do not install a compiler. For a broken override, correct it or `unset SESSION_RELAY_BIN`.
+The launcher has no embedded relay binary and never compiles, builds, or downloads one at startup. For a missing CLI, install the release binary as above; do not install a compiler. For a broken override, correct it or `unset SESSION_RELAY_BIN`.
 
 Official prebuilts support ordinary Relay on Linux only, on x86-64 or arm64. Managed writing is a separate Linux/ext4-only capability. Other operating systems and architectures are unsupported; use a supported host because retrying the launcher cannot add platform support.
 

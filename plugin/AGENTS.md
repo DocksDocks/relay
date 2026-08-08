@@ -7,7 +7,7 @@ Session Relay is a cross-session, cross-project, cross-tool agent message bus fo
 | Path | Holds |
 |---|---|
 | repository root (outside this payload) | the `relay` crate under `../src/`, its pins `../rust-toolchain.toml` and `../Cargo.lock`, and the `../test/` harness of scenario self-tests, Rust inventories, reentry checks, workspace smokes, and distribution contracts; a consumer's plugin cache receives none of them |
-| `bin/` | the tracked POSIX launcher `relay` only; it resolves `SESSION_RELAY_BIN`, then `session-relay` on `PATH`, then `~/.local/bin/session-relay`, rejecting recursion and otherwise directing the user to `docks-kit` |
+| `bin/` | the tracked POSIX launcher `relay` only; it resolves `SESSION_RELAY_BIN`, then `session-relay` on `PATH`, then `~/.local/bin/session-relay`, rejecting recursion and otherwise directing the user to the GitHub release download |
 | `hooks/` | `hooks.json` (Claude: SessionStart + UserPromptSubmit → `${CLAUDE_PLUGIN_ROOT}/bin/relay hook`) + `codex-hooks.json` (Codex parallel) |
 | `skills/` | the cross-tool `session-relay` skill (productivity) |
 | `.claude-plugin/` + `.codex-plugin/` | manifests whose versions stay in lockstep with the repository catalogs and crate |

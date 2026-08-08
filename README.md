@@ -27,14 +27,6 @@ install -Dm755 "session-relay-$target" "$HOME/.local/bin/session-relay"
 
 Each release publishes `SHA256SUMS` alongside both binaries.
 
-## Install with docks-kit
-
-Use `docks-kit` as an alternative installer.
-
-```bash
-docks-kit toolchain ensure session-relay
-```
-
 ## Add the marketplace
 
 Add the Claude Code marketplace. Then install the plugin from its verified `session-relay` marketplace entry.
