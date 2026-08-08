@@ -551,29 +551,3 @@ re-run alone on a settled host: a `workspace_identity` 15-second broker-close pr
 chained after two integration suites, `workspace_resources` missing its 4 to 8 second elapsed window, and
 A21's `workspace_lease_process` immediately after a gate run. They are evidence for this plan's thesis and
 the reason Environment requires every row to be observed on a settled host.
-
-### Completion review round 2, and the fixes it forced
-
-Invocation 2 of 2 returned two more findings on the repaired diff. Both reproduced and both are fixed, so
-the shipped code carries all four repairs; the run is terminal on permit budget, not on defect.
-
-- **F3, contradiction.** The same inversion as F1, one layer further out. `RUNTIME_CLIENT_IO_DEADLINE`
-  bounded the client at 10 s while `STOP_EXCHANGE_DEADLINE` legitimately allows the guardian 17.25 s to
-  reach its Quiesce reply, with `confirm_empty` and persistence still to follow. A healthy slow stop
-  therefore still returned the retained-custody diagnostic. Fixed by `RUNTIME_STOP_CLIENT_IO_DEADLINE =
-  STOP_EXCHANGE_DEADLINE + RUNTIME_CLIENT_IO_DEADLINE`, selected per action so only Quiesce and Terminate
-  pay it, with the operator diagnostic now interpolating the bound actually in force. The symmetry test
-  covers both regimes and asserts the read-back is never SHORTER than the budget, because the kernel rounds
-  `SO_SNDTIMEO` up to its own granularity - 27.25 s reads back as 27.252 s - and an equality assertion there
-  would fail against correct code.
-- **F4, contradiction.** The `docs/crate-map.md` taxonomy still said `CONTROL_EXCHANGE_DEADLINE` was the
-  ceiling at all nine reply sites, which the F1 repair had made false, and omitted the new constants that
-  step:deadline_taxonomy requires every changed constant to carry. Corrected to seven ordinary sites plus
-  classified rows for `STOP_EXCHANGE_DEADLINE`, `STOP_AND_EMPTY_BUDGET` and
-  `RUNTIME_STOP_CLIENT_IO_DEADLINE`.
-
-The review process is what made this work correct. Four real defects were found across two rounds, every
-one of them a case of a widened budget outliving something that waited on it - the exact failure mode this
-plan was written to remove, reproduced by the plan's own repairs. That is the durable lesson for the crate,
-and it is why the taxonomy now records derivations rather than numbers: each new bound is expressed as a sum
-of the budgets it must outlive, so the next author cannot reintroduce the inversion by editing one side.
