@@ -67,47 +67,6 @@ fn register_identity(home: &Path, name: &str, id: &str, dir: &Path) {
     );
 }
 
-const LEGACY_INPUT_SCHEMAS: &str = r#"{
-  "whoami":{"type":"object","properties":{},"additionalProperties":false},
-  "register":{
-    "type":"object",
-    "properties":{
-      "name":{"type":"string","description":"Friendly name to claim, e.g. \"frontend\" or \"agent-A\"."},
-      "id":{"type":"string","description":"Override session id (defaults to this session, resolved from the project dir)."},
-      "dir":{"type":"string","description":"Override project dir (defaults to the launch dir)."},
-      "server":{"type":"string","description":"Codex app-server Unix socket for live delivery to this session."}
-    },
-    "required":["name"],
-    "additionalProperties":false
-  },
-  "roster":{"type":"object","properties":{},"additionalProperties":false},
-  "send":{
-    "type":"object",
-    "properties":{
-      "to":{"type":"string","description":"Recipient friendly name or session id (see roster)."},
-      "body":{"type":"string","description":"Message text."},
-      "from":{"type":"string","description":"Your own registered session id or name (see the identity line injected at session start). Pass it whenever this project dir may host more than one session — the dir-marker fallback mis-attributes the sender in shared dirs."}
-    },
-    "required":["to","body"],
-    "additionalProperties":false
-  },
-  "inbox":{
-    "type":"object",
-    "properties":{
-      "id":{"type":"string","description":"Your own registered session id or name (see the identity line injected at session start). Pass it whenever this project dir may host more than one session — the dir-marker fallback can drain another session's mailbox."}
-    },
-    "additionalProperties":false
-  },
-  "discover":{
-    "type":"object",
-    "properties":{
-      "activeWithinMin":{"type":"number","description":"Only sessions whose last activity is within this many minutes (default 60)."},
-      "tool":{"type":"string","enum":["claude","codex"],"description":"Restrict to one tool."}
-    },
-    "additionalProperties":false
-  }
-}"#;
-
 #[test]
 fn bus_lifecycle_tools_and_whoami() {
     let home = std::env::temp_dir().join(format!(
@@ -201,20 +160,6 @@ fn bus_lifecycle_tools_and_whoami() {
         ]
     );
 
-    let expected_schemas: JsonValue = LEGACY_INPUT_SCHEMAS
-        .parse()
-        .expect("legacy MCP schemas are valid JSON");
-    for tool in tools {
-        let tool = obj(tool);
-        let name = tool["name"].get::<String>().unwrap();
-        if let Some(expected) = obj(&expected_schemas).get(name) {
-            assert_eq!(
-                &tool["inputSchema"], expected,
-                "legacy {name} input schema changed"
-            );
-        }
-    }
-
     for (name, expected_properties, expected_required) in [
         ("request", vec!["body", "from", "to"], vec!["to", "body"]),
         (
@@ -304,6 +249,99 @@ fn bus_lifecycle_tools_and_whoami() {
     let status = child.wait().expect("bus exits");
     assert!(status.success());
     fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn bus_discover_omp_schema_and_session() {
+    let home = std::env::temp_dir().join(format!(
+        "relay-bus-omp-{}-{}",
+        std::process::id(),
+        relay::store::uuid_v4()
+    ));
+    let pdir = home.join("project");
+    let sessions = home.join("omp-sessions");
+    let bucket = sessions.join("project-bucket");
+    fs::create_dir_all(&pdir).unwrap();
+    fs::create_dir_all(&bucket).unwrap();
+    let id = relay::store::uuid_v4();
+    fs::write(
+        bucket.join("session.jsonl"),
+        format!(
+            "{{\"type\":\"title\",\"title\":\"Bus worker\"}}\n\
+             {{\"type\":\"session\",\"id\":\"{id}\",\"cwd\":{}}}\n",
+            JsonValue::String(pdir.to_string_lossy().into_owned())
+                .stringify()
+                .unwrap()
+        ),
+    )
+    .unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_relay"))
+        .arg("bus")
+        .env("AGENT_RELAY_HOME", &home)
+        .env_remove("SESSION_RELAY_HOME")
+        .env("RELAY_PROJECT_DIR", &pdir)
+        .env("RELAY_OMP_SESSIONS", &sessions)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn relay bus");
+    let mut stdin = child.stdin.take().unwrap();
+    for request in [
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"discover","arguments":{"tool":"omp"}}}"#,
+    ] {
+        writeln!(stdin, "{request}").unwrap();
+    }
+    drop(stdin);
+    let output = child.wait_with_output().expect("bus exits");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let replies: Vec<JsonValue> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| line.parse().expect("JSON-RPC reply"))
+        .collect();
+    assert_eq!(replies.len(), 3);
+    let tools = obj(&obj(&replies[1])["result"])["tools"]
+        .get::<Vec<JsonValue>>()
+        .unwrap();
+    let discover = tools
+        .iter()
+        .find(|tool| obj(tool)["name"].get::<String>().unwrap() == "discover")
+        .expect("discover tool is listed");
+    let properties = obj(&obj(&obj(discover)["inputSchema"])["properties"]);
+    let tools = obj(&properties["tool"])["enum"]
+        .get::<Vec<JsonValue>>()
+        .unwrap()
+        .iter()
+        .map(|value| value.get::<String>().unwrap().as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(tools, ["claude", "codex", "omp"]);
+
+    assert_eq!(
+        tool_result(&replies[2])["isError"].get::<bool>().copied(),
+        Some(false)
+    );
+    let discovered: JsonValue = tool_text(&replies[2]).parse().unwrap();
+    assert_eq!(obj(&discovered)["count"].get::<f64>().copied(), Some(1.0));
+    let sessions = obj(&discovered)["sessions"]
+        .get::<Vec<JsonValue>>()
+        .unwrap();
+    assert_eq!(sessions.len(), 1);
+    let session = obj(&sessions[0]);
+    assert_eq!(session["tool"].get::<String>().unwrap(), "omp");
+    assert_eq!(session["id"].get::<String>().unwrap(), &id);
+    assert_eq!(
+        session["cwd"].get::<String>().unwrap(),
+        pdir.to_str().unwrap()
+    );
+    fs::remove_dir_all(&home).unwrap();
 }
 
 fn tool_call_frame(id: u64, name: &str, arguments: &str) -> String {

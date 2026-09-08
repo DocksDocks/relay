@@ -741,6 +741,142 @@ fn worktree_handback_and_collect_merge_once_then_remove_exact_tree() {
 }
 
 #[test]
+fn omp_fanout_child_birth_handback_and_collection_preserve_managed_authority() {
+    const TEST: &str = "omp_fanout_child_birth_handback_and_collection_preserve_managed_authority";
+    const SESSION: &str = "01a08333-3333-7333-8333-333333333333";
+    use std::time::{Duration, Instant};
+
+    if let Some(home) = std::env::var_os("RELAY_TEST_OMP_FANOUT_CHILD") {
+        let home = PathBuf::from(home);
+        let cwd = std::env::current_dir().unwrap();
+        fs::write(
+            home.join("child-pgid"),
+            unsafe { libc::getpgrp() }.to_string(),
+        )
+        .unwrap();
+        support::fanout::register_omp_child(&cwd, SESSION);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !home.join("allow-work").exists() {
+            assert!(
+                Instant::now() < deadline,
+                "parent did not observe omp birth"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        fs::write(cwd.join("omp-result.txt"), "omp fanout result\n").unwrap();
+        git(&cwd, &["add", "omp-result.txt"]);
+        git(&cwd, &["commit", "-qm", "omp fanout result"]);
+        fanout::handback(
+            &FanoutStore::new(home),
+            SESSION,
+            "completed",
+            "committed omp fanout result",
+        )
+        .unwrap();
+        return;
+    }
+
+    let (home, _repo, fanout_store, root, root_session) = setup_root("omp-fanout");
+    let root_dir = Path::new(&root.worktree);
+    let fake = home.join("fake-omp");
+    support::write_executable(
+        &fake,
+        &format!("#!/bin/sh\nexec \"$RELAY_TEST_BINARY\" --exact {TEST} --nocapture\n"),
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_relay"))
+        .arg("spawn")
+        .arg(root_dir)
+        .args([
+            "--worktree",
+            "--from",
+            &root_session,
+            "--tool",
+            "omp",
+            "--timeout",
+            "15",
+            "--",
+            "commit the omp fanout result",
+        ])
+        .env("AGENT_RELAY_HOME", &home)
+        .env("RELAY_OMP_SESSIONS", home.join("omp-sessions"))
+        .env("RELAY_SPAWN_CMD_OMP", &fake)
+        .env("RELAY_TEST_OMP_FANOUT_CHILD", &home)
+        .env("RELAY_TEST_BINARY", std::env::current_exe().unwrap())
+        .env("RELAY_NO_WATCH", "1")
+        .output()
+        .unwrap();
+    let _reaper = fs::read_to_string(home.join("child-pgid"))
+        .ok()
+        .map(|pgid| support::SupervisorGroupReaper::arm(pgid.parse().unwrap()));
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains(SESSION));
+    let lifecycle = LifecycleStore::new(home.clone());
+    let binding = lifecycle.read_binding(SESSION).unwrap().unwrap();
+    let relay::lifecycle::BindingState::Managed {
+        worker_id,
+        generation,
+    } = binding.state
+    else {
+        panic!("omp fanout birth was not managed");
+    };
+    let worker = lifecycle.read_worker(&worker_id).unwrap().unwrap();
+    assert_eq!(worker.state, ManagedState::Active);
+    assert_eq!(worker.tool, "omp");
+    assert_eq!(worker.generation, generation);
+    assert_eq!(worker.runtime_session_id.as_deref(), Some(SESSION));
+    assert_ne!(Path::new(&worker.cwd), root_dir);
+    assert_eq!(
+        fanout_store
+            .active_leaf_count(&root.reservation_id)
+            .unwrap(),
+        1
+    );
+    assert!(!root_dir.join("omp-result.txt").exists());
+
+    fs::write(home.join("allow-work"), "").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let worker = lifecycle.read_worker(&worker_id).unwrap().unwrap();
+        if worker.state == ManagedState::TerminalReleasable {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "omp fanout did not hand back and reap: {:?}",
+            worker.state
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        fanout_store
+            .active_leaf_count(&root.reservation_id)
+            .unwrap(),
+        0
+    );
+    let collected = fanout::collect(&fanout_store, SESSION, &root_session).unwrap();
+    assert_eq!(collected.state, FanoutState::Collected);
+    assert_eq!(collected.worker_id.as_deref(), Some(worker_id.as_str()));
+    assert_eq!(collected.generation.as_deref(), Some(generation.as_str()));
+    assert_eq!(collected.runtime_session_id.as_deref(), Some(SESSION));
+    assert_eq!(
+        fs::read_to_string(root_dir.join("omp-result.txt")).unwrap(),
+        "omp fanout result\n"
+    );
+    assert!(!Path::new(&collected.worktree).exists());
+    assert!(
+        fanout_store
+            .result_delivery_ready(&collected.reservation_id)
+            .unwrap()
+    );
+    fs::remove_dir_all(home).ok();
+}
+
+#[test]
 fn worktree_head_changed_after_handback_is_refused_without_removal() {
     let (home, _repo, store, root, root_session) = setup_root("head-changed");
     let root_dir = PathBuf::from(&root.worktree);

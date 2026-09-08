@@ -71,7 +71,7 @@ const LEGACY_MCP_INPUT_SCHEMAS = {
         type: 'number',
         description: 'Only sessions whose last activity is within this many minutes (default 60).',
       },
-      tool: { type: 'string', enum: ['claude', 'codex'], description: 'Restrict to one tool.' },
+      tool: { type: 'string', enum: ['claude', 'codex', 'omp'], description: 'Restrict to one tool.' },
     },
     additionalProperties: false,
   },

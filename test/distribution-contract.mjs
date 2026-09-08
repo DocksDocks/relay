@@ -10,12 +10,12 @@
 //    processes with controlled environments. The launcher is the only entry
 //    point a consumer installs, so its order, its hard failures, and its
 //    self-recursion refusal must stay behavioural facts, not prose.
-// 2. Version lockstep. Four files declare the shipped version. A consumer sees
-//    a coherent product only when all four agree.
+// 2. Version lockstep. Three files declare the shipped version. A consumer sees
+//    a coherent product only when all three agree.
 // 3. Asset-set closure. The release workflow must build exactly two Linux musl
 //    targets and stage exactly three assets. The forbidden-token assertion
 //    stops a non-Linux leg from reappearing.
-// 4. Payload boundary. Only allowlisted directories may ship inside `plugin/`,
+// 4. Payload boundary. Only allowlisted entries may ship inside `plugin/`,
 //    because an installer copies that directory into every consumer cache.
 
 import assert from 'node:assert/strict';
@@ -144,14 +144,13 @@ function checkLauncher() {
 function checkVersionLockstep() {
   const shipped = resolveShippedRelayVersion(REPO);
   const cargo = fs.readFileSync(path.join(REPO, 'Cargo.toml'), 'utf8').match(/^version\s*=\s*"([^"]+)"/m)?.[1];
-  const marketplace = readJson('.claude-plugin/marketplace.json').plugins.find(
+  const marketplace = readJson('.omp-plugin/marketplace.json').plugins.find(
     ({ name }) => name === 'session-relay',
   )?.version;
   const declarations = [
     { file: 'Cargo.toml', version: cargo },
-    { file: 'plugin/.claude-plugin/plugin.json', version: shipped.version },
-    { file: 'plugin/.codex-plugin/plugin.json', version: readJson('plugin/.codex-plugin/plugin.json').version },
-    { file: '.claude-plugin/marketplace.json', version: marketplace },
+    { file: 'plugin/package.json', version: shipped.version },
+    { file: '.omp-plugin/marketplace.json', version: marketplace },
   ];
 
   for (const { file, version } of declarations) {
@@ -165,11 +164,11 @@ function checkVersionLockstep() {
   assert.deepEqual(
     disagreeing,
     [],
-    `the shipped version must be identical in all four files; majority is ${majority} and these disagree: ${disagreeing
+    `the shipped version must be identical in all three files; majority is ${majority} and these disagree: ${disagreeing
       .map(({ file, version }) => `${file}=${version}`)
       .join(', ')}`,
   );
-  pass('version-lockstep', `four files declare ${majority}`);
+  pass('version-lockstep', declarations.map(({ file, version }) => `${file}=${version}`).join(', '));
 }
 
 // --- 3. Asset-set closure ---------------------------------------------------
@@ -216,19 +215,7 @@ function checkAssetSet() {
 
 // --- 4. Payload boundary ----------------------------------------------------
 
-const PAYLOAD_ALLOWLIST = new Set([
-  '.claude-plugin',
-  '.codex-plugin',
-  'skills',
-  'hooks',
-  'commands',
-  'agents',
-  'bin',
-  'README.md',
-  'AGENTS.md',
-  'CLAUDE.md',
-  'LICENSE',
-]);
+const PAYLOAD_ALLOWLIST = new Set(['package.json', 'extension', 'skills', 'bin', 'README.md', 'AGENTS.md', 'LICENSE']);
 
 function checkPayloadBoundary() {
   const listed = spawnSync('git', ['ls-files', 'plugin'], { cwd: REPO, encoding: 'utf8' });
@@ -241,7 +228,10 @@ function checkPayloadBoundary() {
     return segments[0] !== 'plugin' || !PAYLOAD_ALLOWLIST.has(segments[1] ?? '');
   });
   assert.deepEqual(offending, [], `these payload paths are outside the allowlist: ${offending.join(', ')}`);
-  pass('payload-boundary', `${tracked.length} tracked payload paths stay inside the allowlist`);
+  pass(
+    'payload-boundary',
+    `${tracked.length} tracked payload paths stay inside the allowlist: ${[...PAYLOAD_ALLOWLIST].join(', ')}`,
+  );
 }
 
 checkLauncher();

@@ -12,6 +12,11 @@ const SCRUBBED_ENV = [
   'AGENT_RELAY_GC_DAYS',
   'RELAY_CLAUDE_PROJECTS',
   'RELAY_CODEX_SESSIONS',
+  'RELAY_OMP_SESSIONS',
+  'OMP_PROFILE',
+  'PI_PROFILE',
+  'PI_CONFIG_DIR',
+  'PI_CODING_AGENT_DIR',
   'CLAUDE_CONFIG_DIR',
   'CLAUDE_PROJECT_DIR',
   'CLAUDE_CODE_SESSION_ID',
@@ -26,6 +31,8 @@ const SCRUBBED_ENV = [
   'RELAY_SPAWN_CMD_CODEX',
   'RELAY_WAKE_CMD_CLAUDE',
   'RELAY_WAKE_CMD_CODEX',
+  'RELAY_SPAWN_CMD_OMP',
+  'RELAY_WAKE_CMD_OMP',
   'RELAY_SPAWN_TOOL',
   'STUB_RELAY_BIN',
   'STUB_TOOL',
@@ -220,10 +227,20 @@ export function createFixture({ bin: configuredBin, home }) {
   let passed = 0;
   let cleanupPromise;
 
+  // omp discovery defaults to the real `$HOME/.omp` tree; point it at an empty fixture root so
+  // live sessions on the host never leak into a scenario.
+  const ompSessions = path.join(home, 'omp-sessions');
+  fs.mkdirSync(ompSessions, { recursive: true });
   function envFor(extra = {}) {
     const env = { ...process.env };
     for (const key of SCRUBBED_ENV) delete env[key];
-    return { ...env, ...extra, SESSION_RELAY_HOME: home, AGENT_RELAY_HOME: extra.AGENT_RELAY_HOME ?? home };
+    return {
+      ...env,
+      RELAY_OMP_SESSIONS: ompSessions,
+      ...extra,
+      SESSION_RELAY_HOME: home,
+      AGENT_RELAY_HOME: extra.AGENT_RELAY_HOME ?? home,
+    };
   }
 
   const relay = (args, opts = {}) =>

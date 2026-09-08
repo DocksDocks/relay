@@ -63,13 +63,12 @@ jobs:
             node <<'NODE'
           const fs = require('node:fs');
 
-          const claude = JSON.parse(fs.readFileSync('plugin/.claude-plugin/plugin.json', 'utf8'));
-          const codex = JSON.parse(fs.readFileSync('plugin/.codex-plugin/plugin.json', 'utf8'));
-          const marketplace = JSON.parse(fs.readFileSync('.claude-plugin/marketplace.json', 'utf8'));
+          const plugin = JSON.parse(fs.readFileSync('plugin/package.json', 'utf8'));
+          const marketplace = JSON.parse(fs.readFileSync('.omp-plugin/marketplace.json', 'utf8'));
           const listed = marketplace.plugins.find(({ name }) => name === 'session-relay');
           const cargoText = fs.readFileSync('Cargo.toml', 'utf8');
           const cargo = /^version\s*=\s*"([^"]+)"/m.exec(cargoText)?.[1];
-          const versions = [claude.version, codex.version, listed?.version, cargo];
+          const versions = [plugin.version, listed?.version, cargo];
           if (!versions.every((value) => value === versions[0])) {
             throw new Error(`Session Relay versions are not synchronized: ${versions.join(', ')}`);
           }

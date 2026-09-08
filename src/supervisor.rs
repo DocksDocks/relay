@@ -2183,7 +2183,7 @@ fn derive_command(
                         resolved.canonical_cwd.clone(),
                     ]
                 }
-            } else if resolved.tool == "claude" {
+            } else if resolved.tool == "claude" || resolved.tool == "omp" {
                 vec![
                     "--resume".to_string(),
                     resolved.operation.runtime_session_id.clone(),
@@ -2205,6 +2205,8 @@ fn derive_command(
             if let Some(effort) = options.effort() {
                 if resolved.tool == "codex" {
                     args.extend(["-c".to_string(), format!("model_reasoning_effort={effort}")]);
+                } else if resolved.tool == "omp" {
+                    args.extend(["--thinking".to_string(), effort.to_string()]);
                 } else {
                     args.extend(["--effort".to_string(), effort.to_string()]);
                 }
@@ -2215,7 +2217,8 @@ fn derive_command(
             Ok((
                 resolved.tool.clone(),
                 args,
-                (resolved.tool == "claude").then(|| resolved.canonical_cwd.clone()),
+                matches!(resolved.tool.as_str(), "claude" | "omp")
+                    .then(|| resolved.canonical_cwd.clone()),
             ))
         }
         ChildLaunchSpec::WakeDoorbell(message) | ChildLaunchSpec::WatchWakeFallback(message) => {
@@ -2232,6 +2235,14 @@ fn derive_command(
                     "--resume".to_string(),
                     resolved.operation.runtime_session_id.clone(),
                     "--output-format".to_string(),
+                    "json".to_string(),
+                ]
+            } else if resolved.tool == "omp" {
+                vec![
+                    "-p".to_string(),
+                    "--resume".to_string(),
+                    resolved.operation.runtime_session_id.clone(),
+                    "--mode".to_string(),
                     "json".to_string(),
                 ]
             } else {
@@ -2251,6 +2262,8 @@ fn derive_command(
             if let Some(effort) = message.effort() {
                 if resolved.tool == "codex" {
                     args.extend(["-c".to_string(), format!("model_reasoning_effort={effort}")]);
+                } else if resolved.tool == "omp" {
+                    args.extend(["--thinking".to_string(), effort.to_string()]);
                 } else {
                     args.extend(["--effort".to_string(), effort.to_string()]);
                 }
@@ -2269,6 +2282,7 @@ fn wake_program(tool: &str) -> Result<String, String> {
     let key = match tool {
         "claude" => "RELAY_WAKE_CMD_CLAUDE",
         "codex" => "RELAY_WAKE_CMD_CODEX",
+        "omp" => "RELAY_WAKE_CMD_OMP",
         other => return Err(format!("unsupported supervised tool: {other}")),
     };
     Ok(std::env::var(key)
@@ -2953,5 +2967,98 @@ mod workspace_custody_tests {
             Some(&PayloadValue::String("activation_failed".to_string()))
         );
         assert_eq!(received.packet.payload.len(), 4);
+    }
+}
+
+#[cfg(test)]
+mod command_tests {
+    use super::*;
+    use crate::lifecycle::{
+        AttachOptions, DoorbellMessage, OperationKind, ServiceTier, ValidatedEffort, ValidatedModel,
+    };
+
+    fn omp_launch(spec: ChildLaunchSpec) -> ResolvedSupervisorLaunch {
+        let session = "11111111-1111-4111-8111-111111111111";
+        let root = std::env::temp_dir().join(format!("relay-omp-command-{}", store::uuid_v4()));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("registry.json"),
+            format!(
+                r#"{{"agents":{{"{session}":{{"id":"{session}","dir":"/tmp","tool":"omp","lastSeen":"{}"}}}},"names":{{}}}}"#,
+                store::iso_now()
+            ),
+        )
+        .unwrap();
+        let lifecycle = LifecycleStore::new(root.clone());
+        let guard = lifecycle
+            .admit_operation(session, OperationKind::AttachResume)
+            .unwrap()
+            .into_guard()
+            .unwrap();
+        let operation = lifecycle
+            .read_operations_for_session(session)
+            .unwrap()
+            .remove(0);
+        drop(guard);
+        fs::remove_dir_all(root).unwrap();
+        ResolvedSupervisorLaunch {
+            operation,
+            tool: "omp".to_string(),
+            canonical_cwd: "/tmp".to_string(),
+            server: Some("/tmp/unused-omp-server".to_string()),
+            spec,
+            stdio: StdioProfile {
+                stdin: StdioEndpointMode::Closed,
+                stdout: StdioEndpointMode::Pipe,
+                stderr: StdioEndpointMode::Pipe,
+            },
+        }
+    }
+
+    #[test]
+    fn omp_attach_resumes_in_session_cwd() {
+        let resolved = omp_launch(ChildLaunchSpec::AttachResume(AttachOptions::new(
+            None, None,
+        )));
+        let (program, args, cwd) = derive_command(&resolved).unwrap();
+        assert_eq!(program, "omp");
+        assert_eq!(args, ["--resume", &resolved.operation.runtime_session_id]);
+        assert_eq!(cwd.as_deref(), Some("/tmp"));
+    }
+
+    #[test]
+    fn omp_wake_uses_json_thinking_and_message_separator() {
+        let message = DoorbellMessage::parse("--message with spaces")
+            .unwrap()
+            .with_runtime_options(
+                Some(ValidatedModel::parse("test-model").unwrap()),
+                Some(ValidatedEffort::parse("high").unwrap()),
+            )
+            .with_service_tier(ServiceTier::Fast);
+        let mut resolved = omp_launch(ChildLaunchSpec::WakeDoorbell(message.clone()));
+        for spec in [
+            ChildLaunchSpec::WakeDoorbell(message.clone()),
+            ChildLaunchSpec::WatchWakeFallback(message),
+        ] {
+            resolved.spec = spec;
+            let (_, args, cwd) = derive_command(&resolved).unwrap();
+            assert_eq!(
+                args,
+                [
+                    "-p",
+                    "--resume",
+                    &resolved.operation.runtime_session_id,
+                    "--mode",
+                    "json",
+                    "--model",
+                    "test-model",
+                    "--thinking",
+                    "high",
+                    "--",
+                    "--message with spaces",
+                ]
+            );
+            assert_eq!(cwd.as_deref(), Some("/tmp"));
+        }
     }
 }

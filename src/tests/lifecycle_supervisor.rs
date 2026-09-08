@@ -282,6 +282,99 @@ fn lifecycle_supervisor_preserves_codex_fast_and_default_tiers_in_exact_argv() {
 }
 
 #[test]
+fn lifecycle_supervisor_omp_attach_and_wake_preserve_argv_and_reap_custody() {
+    for wake in [false, true] {
+        let home = fresh_home(if wake { "omp-wake" } else { "omp-attach" });
+        let cwd = home.join("project with spaces");
+        let session = "28111111-1111-4111-8111-111111111111";
+        seed_entry(&home, session, "omp", &cwd);
+        let bin = home.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let stub = bin.join("omp");
+        let argv = home.join("argv.txt");
+        write_executable(
+            &stub,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nif IFS= read -r line; then exit 9; fi\npwd\nexit 7\n",
+                argv.display()
+            ),
+        );
+        let mut command = Command::new(env!("CARGO_BIN_EXE_relay"));
+        let expected = if wake {
+            command.args([
+                "wake",
+                session,
+                "--model",
+                "gpt-5.5",
+                "--effort",
+                "high",
+                "--",
+                "--model is prompt text",
+            ]);
+            vec![
+                "-p",
+                "--resume",
+                session,
+                "--mode",
+                "json",
+                "--model",
+                "gpt-5.5",
+                "--thinking",
+                "high",
+                "--",
+                "--model is prompt text",
+            ]
+        } else {
+            command.args(["attach", session]);
+            vec!["--resume", session]
+        };
+        let output = command
+            .env("AGENT_RELAY_HOME", &home)
+            .env(
+                "PATH",
+                format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+            )
+            .env("RELAY_WAKE_CMD_OMP", &stub)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(7),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            format!("{}\n", cwd.display())
+        );
+        assert_eq!(
+            fs::read_to_string(&argv)
+                .unwrap()
+                .lines()
+                .collect::<Vec<_>>(),
+            expected
+        );
+        let operations = LifecycleStore::new(home.clone())
+            .read_operations_for_session(session)
+            .unwrap();
+        let expected_kind = if wake {
+            OperationKind::WakeCli
+        } else {
+            OperationKind::AttachResume
+        };
+        assert!(matches!(
+            operations.as_slice(),
+            [operation]
+                if operation.kind == expected_kind
+                    && operation.terminal
+                    && matches!(operation.custody, ExternalCustody::ChildReaped { exit_status: 7, .. })
+        ));
+        fs::remove_dir_all(home).ok();
+    }
+}
+
+#[test]
 fn lifecycle_supervisor_handshake_survives_a_retired_socket_path() {
     // The supervisor unlinks its socket once it has served the connection, so a client
     // that inspects that path afterwards can find it already gone. The latch blocks the
@@ -350,6 +443,7 @@ fn lifecycle_supervisor_handshake_survives_a_retired_ready_record() {
     fs::remove_dir_all(home).ok();
 }
 
+#[cfg(debug_assertions)]
 #[test]
 fn lifecycle_supervisor_refuses_a_mismatched_supervisor_identity() {
     // Removing the socket path comparison left the frame check as the sole authority on

@@ -3,7 +3,7 @@
 //
 //   relay discover [--within <min>] [--tool claude|codex] [--exclude <id>] [--cwd <path>] [--json]
 //   relay list
-//   relay register <name> --id <uuid> [--dir <path>] [--tool claude|codex]
+//   relay register <name> --id <uuid> [--dir <path>] [--tool claude|codex|omp]
 //   relay send <to> [--] <message...>            (or: send --id <id> [--] <message...>)
 //   relay request <to> [--from <registered>] [--json] [--] <message...>
 //   relay reply <correlation-id> [--from <registered>] --status completed|failed [--] <message...>
@@ -11,10 +11,11 @@
 //   relay peek <nameOrId>                        (read-only: inbox without draining)
 //   relay attach <nameOrId> [--exec]             (interactive human takeover)
 //   relay wake <nameOrId> [--model <m>] [--effort <e>] [--service-tier default|fast] [--dry] [message...]
-//   relay wake --id <id> --dir <cwd> --tool <claude|codex> [--model <m>] [--effort <e>] [--service-tier default|fast] [message...]
+//   relay wake --id <id> --dir <cwd> --tool <claude|codex|omp> [--model <m>] [--effort <e>] [--service-tier default|fast] [message...]
 //
 // `wake` is TOOL-AWARE: claude → `claude -p --resume <id> [--model m] [--effort e] --output-format json -- <nudge>`,
 // codex → `codex exec resume <id> [-m m] [-c model_reasoning_effort=e] --json -- <nudge>`,
+// omp → `omp -p --resume <id> --mode json [--model m] [--thinking e] -- <nudge>`,
 // run from the target's registered project dir. `--dry` prints the command
 // instead of spawning.
 
@@ -87,12 +88,18 @@ fn protocol_self_identity() -> store::Entry {
 pub(crate) struct Args(pub(crate) Vec<String>);
 
 impl Args {
+    fn sep_end(&self) -> usize {
+        self.0
+            .iter()
+            .position(|arg| arg == "--")
+            .unwrap_or(self.0.len())
+    }
     // --name <value>; an empty value counts as absent (Node truthiness parity).
     pub(crate) fn flag(&self, name: &str) -> Option<&str> {
         let key = format!("--{name}");
-        let i = self.0.iter().position(|a| *a == key)?;
-        self.0
-            .get(i + 1)
+        let args = &self.0[..self.sep_end()];
+        let i = args.iter().position(|a| *a == key)?;
+        args.get(i + 1)
             .map(String::as_str)
             .filter(|v| !v.is_empty())
     }
@@ -111,7 +118,8 @@ impl Args {
             .filter(|value| !value.is_empty())
     }
     pub(crate) fn has(&self, name: &str) -> bool {
-        self.0.iter().any(|a| a == &format!("--{name}"))
+        let key = format!("--{name}");
+        self.0[..self.sep_end()].iter().any(|a| a == &key)
     }
     // Boolean flag present before the `--` separator; text after the separator
     // is verbatim message body and never parsed as options.
@@ -124,32 +132,7 @@ impl Args {
     }
     pub(crate) fn unique_flag(&self, name: &str) -> Result<Option<&str>, String> {
         let key = format!("--{name}");
-        let positions = self
-            .0
-            .iter()
-            .enumerate()
-            .filter_map(|(index, value)| (value == &key).then_some(index))
-            .collect::<Vec<_>>();
-        if positions.len() > 1 {
-            return Err(format!("duplicate --{name}"));
-        }
-        let Some(index) = positions.first().copied() else {
-            return Ok(None);
-        };
-        self.0
-            .get(index + 1)
-            .map(String::as_str)
-            .filter(|value| !value.is_empty() && !value.starts_with("--"))
-            .map(Some)
-            .ok_or_else(|| format!("--{name} requires a value"))
-    }
-    pub(crate) fn unique_flag_before_sep(&self, name: &str) -> Result<Option<&str>, String> {
-        let key = format!("--{name}");
-        let end = self
-            .0
-            .iter()
-            .position(|value| value == "--")
-            .unwrap_or(self.0.len());
+        let end = self.sep_end();
         let mut positions = self.0[..end]
             .iter()
             .enumerate()
@@ -160,9 +143,8 @@ impl Args {
         if positions.next().is_some() {
             return Err(format!("duplicate --{name}"));
         }
-        self.0
+        self.0[..end]
             .get(index + 1)
-            .filter(|_| index + 1 < end)
             .map(String::as_str)
             .filter(|value| !value.is_empty() && !value.starts_with("--"))
             .map(Some)
@@ -172,13 +154,11 @@ impl Args {
     pub(crate) fn positionals(&self, from: usize) -> Vec<&str> {
         let mut out = Vec::new();
         let mut i = from;
-        while i < self.0.len() {
+        let end = self.sep_end();
+        while i < end {
             let a = &self.0[i];
-            if a == "--" {
-                break; // end-of-options: everything after is the verbatim message
-            }
             if let Some(name) = a.strip_prefix("--") {
-                if !BOOL_FLAGS.contains(&name) {
+                if !BOOL_FLAGS.contains(&name) && i + 1 < end {
                     i += 1; // value flags also skip their value
                 }
             } else {
@@ -331,10 +311,10 @@ fn attach(args: &Args) -> ! {
             target.id
         ));
     }
-    if !matches!(target.tool.as_str(), "claude" | "codex") {
+    if !matches!(target.tool.as_str(), "claude" | "codex" | "omp") {
         eprintln!("{ATTACH_WARNING}");
         die(&format!(
-            "attach target tool must be claude|codex, got: {}",
+            "attach target tool must be claude|codex|omp, got: {}",
             target.tool
         ));
     }
@@ -602,20 +582,21 @@ fn doctor(args: &Args) -> ! {
 }
 
 fn wake_cmd(tool: &str) -> String {
-    let var = if tool == "codex" {
-        "RELAY_WAKE_CMD_CODEX"
-    } else {
-        "RELAY_WAKE_CMD_CLAUDE"
+    let var = match tool {
+        "codex" => "RELAY_WAKE_CMD_CODEX",
+        "omp" => "RELAY_WAKE_CMD_OMP",
+        _ => "RELAY_WAKE_CMD_CLAUDE",
     };
     std::env::var(var)
         .ok()
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| {
-            if tool == "codex" {
-                "codex".to_string()
-            } else {
-                "claude".to_string()
+            match tool {
+                "codex" => "codex",
+                "omp" => "omp",
+                _ => "claude",
             }
+            .to_string()
         })
 }
 
@@ -629,6 +610,14 @@ fn doorbell_args(
 ) -> (String, Vec<String>) {
     let mut cargs = if tool == "codex" {
         vec!["exec".into(), "resume".into(), id.into()]
+    } else if tool == "omp" {
+        vec![
+            "-p".into(),
+            "--resume".into(),
+            id.into(),
+            "--mode".into(),
+            "json".into(),
+        ]
     } else {
         vec!["-p".into(), "--resume".into(), id.into()]
     };
@@ -641,20 +630,50 @@ fn doorbell_args(
             cargs.push("-c".into());
             cargs.push(format!("model_reasoning_effort={effort}"));
         } else {
-            cargs.push("--effort".into());
+            cargs.push(
+                if tool == "omp" {
+                    "--thinking"
+                } else {
+                    "--effort"
+                }
+                .into(),
+            );
             cargs.push(effort.into());
         }
     }
     if tool == "codex" {
         cargs.extend(service_tier.unwrap_or_default().codex_config_args());
         cargs.push("--json".into());
-    } else {
+    } else if tool != "omp" {
         cargs.push("--output-format".into());
         cargs.push("json".into());
     }
     cargs.push("--".into());
     cargs.push(message.into());
     (wake_cmd(tool), cargs)
+}
+
+fn wake_dry_json(tool: &str, cmd: &str, args: &[String], dir: &str) -> JsonValue {
+    let mut m: HashMap<String, JsonValue> = HashMap::new();
+    m.insert("tool".into(), JsonValue::from(tool.to_string()));
+    m.insert(
+        "cmd".into(),
+        JsonValue::from(if tool == "omp" {
+            format!("{cmd} {}", args.join(" "))
+        } else {
+            cmd.to_string()
+        }),
+    );
+    m.insert(
+        "args".into(),
+        JsonValue::from(
+            args.iter()
+                .map(|a| JsonValue::from(a.to_string()))
+                .collect::<Vec<_>>(),
+        ),
+    );
+    m.insert("cwd".into(), JsonValue::from(dir.to_string()));
+    JsonValue::from(m)
 }
 
 fn custom_wake_message(body: &str) -> JsonValue {
@@ -741,6 +760,9 @@ fn codex_usage_line(stdout: &str) -> Option<WakeUsage> {
 }
 
 fn wake_usage_line(tool: &str, stdout: &[u8]) -> Option<String> {
+    if tool == "omp" {
+        return None;
+    }
     let text = std::str::from_utf8(stdout).ok()?;
     let usage = if tool == "codex" {
         codex_usage_line(text)?
@@ -831,7 +853,7 @@ pub fn run(cmd: &str, raw: Vec<String>) -> ! {
             let pos = args.positionals(1);
             let (Some(name), Some(id)) = (pos.first(), args.flag("id")) else {
                 die(
-                    "usage: relay register <name> --id <uuid> [--dir <path>] [--tool claude|codex] [--server <unix-socket>]",
+                    "usage: relay register <name> --id <uuid> [--dir <path>] [--tool claude|codex|omp] [--server <unix-socket>]",
                 );
             };
             let dir = args
@@ -916,9 +938,7 @@ pub fn run(cmd: &str, raw: Vec<String>) -> ! {
             let body = args
                 .message_after_sep()
                 .unwrap_or_else(|| rest.iter().skip(1).copied().collect::<Vec<_>>().join(" "));
-            let from = args
-                .unique_flag_before_sep("from")
-                .unwrap_or_else(|error| die(&error));
+            let from = args.unique_flag("from").unwrap_or_else(|error| die(&error));
             let (Some(to), false) = (rest.first().copied(), body.is_empty()) else {
                 die("usage: relay request <to> [--from <registered>] [--json] [--] <message...>");
             };
@@ -951,11 +971,9 @@ pub fn run(cmd: &str, raw: Vec<String>) -> ! {
             let body = args
                 .message_after_sep()
                 .unwrap_or_else(|| rest.iter().skip(1).copied().collect::<Vec<_>>().join(" "));
-            let from = args
-                .unique_flag_before_sep("from")
-                .unwrap_or_else(|error| die(&error));
+            let from = args.unique_flag("from").unwrap_or_else(|error| die(&error));
             let status = args
-                .unique_flag_before_sep("status")
+                .unique_flag("status")
                 .unwrap_or_else(|error| die(&error));
             let (Some(correlation_id), Some(status), false) =
                 (rest.first().copied(), status, body.is_empty())
@@ -1055,7 +1073,7 @@ pub fn run(cmd: &str, raw: Vec<String>) -> ! {
             });
             let Some(target) = target else {
                 die(
-                    "usage: relay wake <nameOrId> [--model <m>] [--effort <e>] [--service-tier default|fast] [message...]  |  wake --id <id> --dir <cwd> --tool <claude|codex> [--model <m>] [--effort <e>] [--service-tier default|fast] [message...]",
+                    "usage: relay wake <nameOrId> [--model <m>] [--effort <e>] [--service-tier default|fast] [message...]  |  wake --id <id> --dir <cwd> --tool <claude|codex|omp> [--model <m>] [--effort <e>] [--service-tier default|fast] [message...]",
                 );
             };
             let requested_service_tier = args
@@ -1185,7 +1203,7 @@ pub fn run(cmd: &str, raw: Vec<String>) -> ! {
             // Per-tool headless-resume doorbell, run from the target's project
             // dir. The untrusted message goes AFTER a `--` end-of-options
             // marker so a dash-leading body can't be parsed as a flag on the
-            // child (both CLIs take the prompt as a trailing positional).
+            // child (all supported CLIs take the prompt as a trailing positional).
             let model = args.flag("model");
             let effort = args.flag("effort");
             if model.is_none() {
@@ -1202,22 +1220,9 @@ pub fn run(cmd: &str, raw: Vec<String>) -> ! {
                 (target.tool == "codex").then_some(service_tier),
             );
             if args.has("dry") {
-                let mut m: HashMap<String, JsonValue> = HashMap::new();
-                m.insert("tool".into(), JsonValue::from(target.tool.clone()));
-                m.insert("cmd".into(), JsonValue::from(cmd.clone()));
-                m.insert(
-                    "args".into(),
-                    JsonValue::from(
-                        cargs
-                            .iter()
-                            .map(|a| JsonValue::from(a.to_string()))
-                            .collect::<Vec<_>>(),
-                    ),
-                );
-                m.insert("cwd".into(), JsonValue::from(dir.clone()));
                 println!(
                     "{}",
-                    JsonValue::from(m)
+                    wake_dry_json(&target.tool, &cmd, &cargs, &dir)
                         .stringify()
                         .unwrap_or_else(|_| "{}".into())
                 );
@@ -1312,6 +1317,54 @@ mod tests {
     }
 
     #[test]
+    fn send_separator_keeps_flag_shaped_message_opaque() {
+        let args = Args(strings(&["send", "--from", "A", "B", "--", "--id", "X"]));
+        assert_eq!(args.message_after_sep().as_deref(), Some("--id X"));
+        assert_eq!(args.flag("id"), None);
+        assert!(!args.has("id"));
+        assert_eq!(args.positionals(1), vec!["B"]);
+        assert!(args.positionals(5).is_empty());
+    }
+
+    #[test]
+    fn wake_separator_keeps_explicit_tool() {
+        let args = Args(strings(&[
+            "wake", "--id", "A", "--dir", ".", "--tool", "omp", "--", "--tool", "codex",
+        ]));
+        assert_eq!(args.flag("tool"), Some("omp"));
+        assert_eq!(args.unique_flag("tool"), Ok(Some("omp")));
+    }
+
+    #[test]
+    fn wake_separator_ignores_message_service_tier() {
+        let args = Args(strings(&[
+            "wake",
+            "--id",
+            "A",
+            "--dir",
+            ".",
+            "--tool",
+            "codex",
+            "--",
+            "--service-tier",
+            "fast",
+        ]));
+        assert_eq!(args.unique_flag("service-tier"), Ok(None));
+    }
+
+    #[test]
+    fn separator_cannot_supply_a_flag_value() {
+        let args = Args(strings(&["send", "B", "--from", "--", "A"]));
+        assert_eq!(args.flag("from"), None);
+        assert_eq!(
+            args.unique_flag("from"),
+            Err("--from requires a value".to_string())
+        );
+        assert_eq!(args.positionals(1), vec!["B"]);
+        assert_eq!(args.message_after_sep().as_deref(), Some("A"));
+    }
+
+    #[test]
     fn wake_argv_defaults_codex_to_explicit_standard_and_leaves_claude_unchanged() {
         let (cmd, args) = doorbell_args(
             "codex",
@@ -1400,6 +1453,69 @@ mod tests {
                 "--",
                 "ping"
             ])
+        );
+    }
+
+    #[test]
+    fn omp_wake_argv_uses_json_mode_and_thinking_before_message() {
+        let (cmd, args) = doorbell_args(
+            "omp",
+            "u-1",
+            "--tool codex",
+            Some("model-name"),
+            Some("high"),
+            None,
+        );
+        assert_eq!(cmd, "omp");
+        assert_eq!(
+            args,
+            strings(&[
+                "-p",
+                "--resume",
+                "u-1",
+                "--mode",
+                "json",
+                "--model",
+                "model-name",
+                "--thinking",
+                "high",
+                "--",
+                "--tool codex",
+            ])
+        );
+    }
+
+    #[test]
+    fn omp_wake_dry_json_includes_full_command_and_preserves_argv() {
+        let (cmd, args) = doorbell_args("omp", "u-1", "ping", None, None, None);
+        let output = wake_dry_json("omp", &cmd, &args, ".");
+        let output = output.stringify().unwrap().parse::<JsonValue>().unwrap();
+        let output = obj(&output).unwrap();
+        assert_eq!(str_field(output, "tool"), Some("omp"));
+        assert_eq!(
+            str_field(output, "cmd"),
+            Some("omp -p --resume u-1 --mode json -- ping")
+        );
+        assert_eq!(
+            output.get("args"),
+            Some(&JsonValue::from(
+                strings(&["-p", "--resume", "u-1", "--mode", "json", "--", "ping"])
+                    .into_iter()
+                    .map(JsonValue::from)
+                    .collect::<Vec<_>>()
+            ))
+        );
+        assert_eq!(str_field(output, "cwd"), Some("."));
+    }
+
+    #[test]
+    fn omp_wake_does_not_report_claude_usage() {
+        assert_eq!(
+            wake_usage_line(
+                "omp",
+                include_str!("../test/fixtures/wake-usage-claude.json").as_bytes(),
+            ),
+            None
         );
     }
 
