@@ -29,7 +29,7 @@ The tracked top-level inventory and current working tree define this layout:
 ├── .claude-plugin/marketplace.json    Claude Code marketplace catalog
 ├── .agents/plugins/marketplace.json   Codex marketplace catalog
 ├── .github/workflows/                 CI and release workflows
-├── docs/crate-map.md                  crate map
+├── docs/                              plan record standard, routing node, crate map
 ├── scripts/gate.mjs                   authoritative repository gate
 ├── package.json                       Node commands and tool versions
 ├── biome.json                         JavaScript formatting and lint rules
@@ -99,12 +99,82 @@ The repository has three context nodes:
 
 - Root `AGENTS.md` with root `CLAUDE.md`
 - `plugin/AGENTS.md` with `plugin/CLAUDE.md`
-- `docs/plans/AGENTS.md` with `docs/plans/CLAUDE.md`
+- `docs/AGENTS.md` with `docs/CLAUDE.md`
 
 The `CLAUDE.md` files exist because Claude Code descends `CLAUDE.md`, not `AGENTS.md`.
 
 ## Plans
 
-Use direct implementation for one clear reversible low-risk local diff with one bounded acceptance path; it creates no plan, reviewer, or automatic commit. Canonical plans live in `docs/plans/active/`; lifecycle is frontmatter, and `docs/plans/finished/` is terminal. Exactly three skills own the workflow: `plan-workspace` maintains the workspace, main-context `plan-manager` owns classify → draft/class-bounded review and repair → start → implement/delegate → observed acceptance → finish/archive, and internal `plan-reviewer` returns read-only `PlanReviewV1` evidence from one immutable bundle. Only the reviewer has wrappers.
+Use direct implementation for one clear, reversible, low-risk local diff with one
+bounded acceptance path; it creates no plan issue, reviewer, or automatic
+commit. Use a canonical plan for explicit planning, multi-commit or
+cross-repository work, cold handoff, an unresolved decision, a cross-subsystem or
+public-contract change, security-sensitive or destructive work, or any
+non-`local` effect.
 
-The current record is one compact-JCS `Plan-run: PlanRunV1` line. Exact current-user authority may preserve a terminal predecessor as append-only `Plan-attempt-history` and install a fresh run at the same stable path; never create `v2`/`vN` plans to reset review. Schemas 1–6 are historical only. Every Steps row has `Effect: local|probe|production_access|publish|push|release|deploy`; persisted intent is never live authority. The complete contract lives in `docs/plans/AGENTS.md`; `docs/plans/CLAUDE.md` contains only `@AGENTS.md`.
+<constraint>
+The plan record is a GitHub issue. Its body starts with
+`<!-- plan-contract: v3 -->`, then a blank line and the exact eight `##`
+sections; it has no frontmatter. GitHub owns title, open-work phase, owner,
+timestamps, and completion, and no plan markdown is tracked in the repository.
+Exactly three skills own the workflow: `plan-workspace` maintains the workspace;
+main-context `plan-manager` runs six phases - decide, draft, research, plan
+review, implement, code review - with bounded repair and fresh re-review in both
+review phases, then archives; internal `plan-reviewer` returns one readable
+pre-implementation verdict block per round. Two read-only reviewer wrappers
+ship, `plan-reviewer` and `code-reviewer`, and nothing else in the lifecycle has
+a wrapper.
+</constraint>
+
+After the marker and blank line, the record carries exactly `## Goal`,
+`## Research`, `## Steps`, `## Acceptance`, `## Do not touch`,
+`## Open questions`, `## Review`, and `## Verification Results`, in that order
+and once each. `## Goal` carries exactly one mode line. Open-work phase is one
+of `drafting`, `planned`, `ongoing`, or `blocked` in a `plan:<phase>` label; a
+blocked plan starts `## Open questions` with `Blocked: <one-line reason>`.
+Closed completion derives from GitHub `state` and `stateReason`. `## Review`
+contains exactly `_Review records are stored in issue comments._`. Each reviewer
+returns one markdown block, and the manager posts that whole block as one issue
+comment. The latest trusted well-formed record per review kind wins; its author
+must equal the plan's sole assignee. A legacy body verdict is consulted only
+when no trusted comment record exists for that kind. Both review phases use
+fresh inputs and run at most five rounds, stopping on pass, no progress, a
+finding surviving its fix, or `repair` or `fixes-required` in round five. A
+plan-review `blocked` verdict always routes its user-only decision through
+`## Open questions` and `ask`.
+
+The record carries no hash, permit, run identity, lock, or bundle, and the
+`plan.mjs` shipped inside the installed `plan-lifecycle` plugin is the only
+lifecycle tool. An `export` writes the sha256 of the body it copied beside the
+copy so a stale copy cannot revert the record; that digest detects staleness and
+authorizes nothing. Routine plan issue publication, implement-start linked
+branch creation, commits, normal pushes, and the closing pull request carry the
+settled mode's authorization and need no repeated prompt. Before any branch
+checkout, including `gh issue develop --checkout`, require
+`git status --porcelain` to be empty. If it is dirty, never stash, move, or
+commit ambient work; set the plan `blocked` and name the dirty paths, or use an
+authorized clean worktree.
+Immediately after setting the plan `ongoing`, every `gh issue develop` call uses
+`--repo`; the manager reuses a linked branch or creates one with
+`--base <default> --checkout`, then re-lists and recovers after failure.
+Implementation stops when no linked branch can be verified; there is no local
+fallback. After the checks policy passes, the manager asks immediately before
+merge. Without a fresh `Merge now` answer, it leaves the pull request and issue
+open. `plan.mjs archive` verifies the latest trusted code-review result and
+merged closing pull request after landing.
+
+Every Steps row carries an `Effect` of exactly
+`local|probe|production_access|publish|push|release|deploy`. A step whose
+`Effect` is not `local` requires an in-session `ask` confirmation immediately
+before it runs; when `ask` is unavailable the step is set `blocked` and the plan
+reason becomes the first `## Open questions` line, `Blocked: <reason>`.
+Persisted effects record intent only. Routine issue publication and landing
+actions are outside the Steps table.
+
+Render a plan body verbatim only when the user names that plan and asks to see it. After a write, report the one-line header strip and the changed lines only; a write never re-renders the body.
+
+`docs/plans/finished/` is frozen pre-GitHub history. Humans may read it as
+history, but it is not a source of truth. No lifecycle command or workspace
+migration operation opens or inventories it. The complete contract lives in
+`docs/PLAN.md`; `docs/AGENTS.md` routes to it and `docs/CLAUDE.md` contains only
+`@AGENTS.md`.
