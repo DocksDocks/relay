@@ -86,7 +86,7 @@ export default function (pi: ExtensionAPI): void {
   async function poll(current: Live): Promise<void> {
     if (live?.generation !== current.generation || current.draining) return;
     if (!stillCurrent(current)) {
-      await reconcile(current.ctx);
+      inBackground(current.ctx, reconcile(current.ctx));
       return;
     }
     current.draining = true;
@@ -116,7 +116,8 @@ export default function (pi: ExtensionAPI): void {
       }
     } finally {
       current.draining = false;
-      if (!stillCurrent(current) && live?.generation === current.generation) void reconcile(current.ctx);
+      if (!stillCurrent(current) && live?.generation === current.generation)
+        inBackground(current.ctx, reconcile(current.ctx));
     }
   }
 
@@ -155,8 +156,8 @@ export default function (pi: ExtensionAPI): void {
     } finally {
       current.draining = false;
       if (live?.generation === current.generation) {
-        current.timer = ctx.setInterval(() => poll(current), 3000);
-        if (!stillCurrent(current)) void reconcile(ctx);
+        current.timer = ctx.setInterval(() => inBackground(ctx, poll(current)), 3000);
+        if (!stillCurrent(current)) inBackground(ctx, reconcile(ctx));
       }
     }
     return current;
@@ -169,11 +170,25 @@ export default function (pi: ExtensionAPI): void {
   }
 
   // Branching or forking changes the session id without a switch event; every delivery and
-  // tool path re-checks the runtime identity and reattaches when it moved.
-  async function reconcile(ctx: ExtensionContext): Promise<Live> {
-    if (live && live.sessionId === ctx.sessionManager.getSessionId()) return live;
+  // tool path re-checks the runtime identity and reattaches when it moved. One reattach runs
+  // at a time: concurrent callers share it instead of racing a second attach hook.
+  let reattaching: Promise<Live> | null = null;
+  function reconcile(ctx: ExtensionContext): Promise<Live> {
+    if (live && live.sessionId === ctx.sessionManager.getSessionId()) return Promise.resolve(live);
+    if (reattaching) return reattaching;
     detach(ctx);
-    return attach(ctx);
+    reattaching = attach(ctx).finally(() => {
+      reattaching = null;
+    });
+    return reattaching;
+  }
+
+  // Timer ticks and `finally` reattaches have no caller to reject into: a failed peek or
+  // attach hook is shown when there is a UI and otherwise dropped; the next tick retries.
+  function inBackground(ctx: ExtensionContext, work: Promise<unknown>): void {
+    work.catch((error: unknown) => {
+      if (ctx.hasUI) ctx.ui.notify(`relay: ${error instanceof Error ? error.message : String(error)}`, 'error');
+    });
   }
 
   pi.on('session_start', async (_event, ctx) => {
@@ -181,7 +196,7 @@ export default function (pi: ExtensionAPI): void {
   });
   pi.on('before_agent_start', async (_event, ctx) => {
     const current = await reconcile(ctx);
-    if (current.draining) return;
+    if (current.draining || !stillCurrent(current)) return;
     current.draining = true;
     try {
       const result = await run(
@@ -194,6 +209,7 @@ export default function (pi: ExtensionAPI): void {
       }
     } finally {
       current.draining = false;
+      if (!stillCurrent(current) && live?.generation === current.generation) inBackground(ctx, reconcile(ctx));
     }
   });
   pi.on('session_switch', async (_event, ctx) => {
