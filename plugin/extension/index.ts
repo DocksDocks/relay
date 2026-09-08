@@ -265,7 +265,7 @@ export default function (pi: ExtensionAPI): void {
       ) {
         throw new Error('relay peek returned no numeric count');
       }
-      if (live?.generation !== current.generation) return;
+      if (!stillCurrent(current)) return;
       const text = `${roster.stdout || roster.stderr}\nPending: ${pending.count}`;
       if (ctx.hasUI) ctx.ui.notify(text, 'info');
       else pi.sendMessage({ customType: 'relay_mail', content: text, display: true }, { triggerTurn: false });
