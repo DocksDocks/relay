@@ -86,7 +86,7 @@ export default function (pi: ExtensionAPI): void {
   async function poll(current: Live): Promise<void> {
     if (live?.generation !== current.generation || current.draining) return;
     if (!stillCurrent(current)) {
-      inBackground(current.ctx, reconcile(current.ctx));
+      await reconcile(current.ctx);
       return;
     }
     current.draining = true;
@@ -116,8 +116,7 @@ export default function (pi: ExtensionAPI): void {
       }
     } finally {
       current.draining = false;
-      if (!stillCurrent(current) && live?.generation === current.generation)
-        inBackground(current.ctx, reconcile(current.ctx));
+      if (!stillCurrent(current) && live?.generation === current.generation) await reconcile(current.ctx);
     }
   }
 
@@ -155,10 +154,9 @@ export default function (pi: ExtensionAPI): void {
       }
     } finally {
       current.draining = false;
-      if (live?.generation === current.generation) {
-        current.timer = ctx.setInterval(() => inBackground(ctx, poll(current)), 3000);
-        if (!stillCurrent(current)) inBackground(ctx, reconcile(ctx));
-      }
+      // `ctx.setInterval` contains a rejected `poll`; identity drift during this hook is
+      // reconciled by the first tick (awaiting `reconcile` here would wait on this attach).
+      if (live?.generation === current.generation) current.timer = ctx.setInterval(() => poll(current), 3000);
     }
     return current;
   }
@@ -183,14 +181,6 @@ export default function (pi: ExtensionAPI): void {
     return reattaching;
   }
 
-  // Timer ticks and `finally` reattaches have no caller to reject into: a failed peek or
-  // attach hook is shown when there is a UI and otherwise dropped; the next tick retries.
-  function inBackground(ctx: ExtensionContext, work: Promise<unknown>): void {
-    work.catch((error: unknown) => {
-      if (ctx.hasUI) ctx.ui.notify(`relay: ${error instanceof Error ? error.message : String(error)}`, 'error');
-    });
-  }
-
   pi.on('session_start', async (_event, ctx) => {
     await attach(ctx);
   });
@@ -209,7 +199,7 @@ export default function (pi: ExtensionAPI): void {
       }
     } finally {
       current.draining = false;
-      if (!stillCurrent(current) && live?.generation === current.generation) inBackground(ctx, reconcile(ctx));
+      if (!stillCurrent(current) && live?.generation === current.generation) await reconcile(ctx);
     }
   });
   pi.on('session_switch', async (_event, ctx) => {
@@ -233,12 +223,18 @@ export default function (pi: ExtensionAPI): void {
             throw new Error(`${key} must match ${identifier.source}`);
           }
         }
-        const sessionId = ctx.sessionManager.getSessionId();
         if (params.action === 'whoami') {
-          return { content: [{ type: 'text', text: JSON.stringify({ sessionId, cwd: ctx.cwd }) }] };
+          return {
+            content: [
+              { type: 'text', text: JSON.stringify({ sessionId: ctx.sessionManager.getSessionId(), cwd: ctx.cwd }) },
+            ],
+          };
         }
+        // The identity on argv must be the one the runtime reports now: a branch or fork
+        // between reconcile and run would otherwise send or claim as the previous session.
         const current = await reconcile(ctx);
-        const result = await run(argvFor(params.action, params, sessionId), current);
+        if (!stillCurrent(current)) throw new Error('session identity changed during reconcile; retry');
+        const result = await run(argvFor(params.action, params, current.sessionId), current);
         return {
           content: [{ type: 'text', text: result.stdout || result.stderr }],
           ...(result.code !== 0 ? { isError: true } : {}),
@@ -256,6 +252,7 @@ export default function (pi: ExtensionAPI): void {
     description: 'Show the relay roster and pending mail count',
     handler: async (_args, ctx) => {
       const current = await reconcile(ctx);
+      if (!stillCurrent(current)) throw new Error('session identity changed during reconcile; retry');
       const [roster, peek] = await Promise.all([run(['list'], current), run(['peek', current.sessionId], current)]);
       if (roster.code !== 0) throw new Error(roster.stderr || roster.stdout);
       if (peek.code !== 0) throw new Error(peek.stderr || peek.stdout);
