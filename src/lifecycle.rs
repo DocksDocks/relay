@@ -4978,10 +4978,10 @@ fn validate_uuid(name: &str, value: &str) -> Result<(), String> {
 }
 
 fn validate_tool(tool: &str) -> Result<(), String> {
-    if matches!(tool, "claude" | "codex") {
+    if matches!(tool, "claude" | "codex" | "omp") {
         Ok(())
     } else {
-        Err("managed tool must be claude or codex".to_string())
+        Err("managed tool must be claude, codex, or omp".to_string())
     }
 }
 

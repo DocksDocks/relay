@@ -4,6 +4,7 @@
   "cases": {
     "bus_smoke": {
       "tests": [
+        "bus_discover_omp_schema_and_session",
         "bus_lifecycle_tools_and_whoami",
         "bus_request_maps_protocol_store_failure_to_closed_domain_error",
         "bus_request_reply_contract_and_domain_errors"
@@ -33,6 +34,7 @@
         "invalid_remote_component_falls_back_to_portable_digest_key",
         "nested_record_round_trips_with_unchanged_serialized_key_set",
         "non_utf8_changed_path_is_refused_before_handback_authority_mutation",
+        "omp_fanout_child_birth_handback_and_collection_preserve_managed_authority",
         "pre_upgrade_record_without_result_fields_retains_legacy_handback_and_collect",
         "repository_gate_refuses_legacy_mode_before_fanout_mutation",
         "repository_identity_accepts_reported_sha1_and_sha256_oid_widths",
@@ -72,6 +74,7 @@
         "lifecycle_admission_drain_receipt_rolls_back_exact_lines_before_new_mail",
         "lifecycle_admission_drain_timeout_exact_cas_persists_active_operations",
         "lifecycle_admission_guard_a_cannot_name_or_mutate_b",
+        "lifecycle_admission_omp_drain_can_restore_mail_then_consume_it_once",
         "lifecycle_admission_publish_fence_precedes_exclusive_drain",
         "lifecycle_admission_reentry_matrix",
         "lifecycle_admission_revalidates_registry_tool_cwd_and_server_authority",
@@ -99,7 +102,8 @@
         "managed_gc_gcdel_wins_claimant_writes_nothing_and_exact_epoch_resumes",
         "managed_gc_live_lock_and_malformed_binding_are_fail_closed",
         "managed_gc_non_releasable_workers_pending_and_managed_bindings_survive_age",
-        "managed_gc_old_standalone_unmanaged_uses_gcdel_cas_and_removes_record_last"
+        "managed_gc_old_standalone_unmanaged_uses_gcdel_cas_and_removes_record_last",
+        "managed_spawn_omp_waits_for_new_session_and_exact_hook_claim"
       ]
     },
     "lifecycle_release": {
@@ -117,6 +121,7 @@
         "lifecycle_supervisor_disconnect_preserves_managed_worker_when_custody_intact",
         "lifecycle_supervisor_handshake_survives_a_retired_ready_record",
         "lifecycle_supervisor_handshake_survives_a_retired_socket_path",
+        "lifecycle_supervisor_omp_attach_and_wake_preserve_argv_and_reap_custody",
         "lifecycle_supervisor_pipe_preserves_bytes_eof_streams_and_reap_custody",
         "lifecycle_supervisor_preserves_codex_fast_and_default_tiers_in_exact_argv",
         "lifecycle_supervisor_refuses_a_mismatched_supervisor_identity",

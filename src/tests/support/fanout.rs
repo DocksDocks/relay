@@ -36,6 +36,36 @@ pub fn seed_entry(home: &Path, id: &str, cwd: &Path) {
     .unwrap();
 }
 
+pub fn register_omp_child(cwd: &Path, session_id: &str) {
+    let sessions =
+        std::path::PathBuf::from(std::env::var_os("RELAY_OMP_SESSIONS").unwrap()).join("fanout");
+    fs::create_dir_all(&sessions).unwrap();
+    let header = JsonValue::from(HashMap::from([
+        ("type".to_string(), JsonValue::from("session".to_string())),
+        ("id".to_string(), JsonValue::from(session_id.to_string())),
+        (
+            "cwd".to_string(),
+            JsonValue::from(cwd.to_str().unwrap().to_string()),
+        ),
+    ]));
+    fs::write(
+        sessions.join(format!("{session_id}.jsonl")),
+        header.stringify().unwrap() + "\n",
+    )
+    .unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_relay"))
+        .args(["hook", "omp", "--session", session_id, "--cwd"])
+        .arg(cwd)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "omp fanout hook failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 pub fn activate_worker(
     fanout: &FanoutStore,
     record_id: &str,

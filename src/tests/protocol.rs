@@ -437,20 +437,49 @@ fn message_uuid_fields_require_lowercase_v4_with_rfc_variant() {
         "10000000000040008000000000000001",
         "A0000000-0000-4000-8000-00000000000A",
     ];
-    for field in 0..4 {
+    for field in 0..2 {
         for value in invalid {
             let mut message = request_message();
             match field {
                 0 => message.id = value.into(),
-                1 => message.correlation_id = value.into(),
-                2 => message.from_session_id = value.into(),
-                _ => message.to_session_id = value.into(),
+                _ => message.correlation_id = value.into(),
             }
             assert!(
                 validate_record(&message).is_err(),
                 "UUID field {field} admitted {value}"
             );
         }
+    }
+
+    // Session ids are minted by the tool, not by relay: omp uses UUIDv7. Any lowercase UUID
+    // shape is a session id; malformed or uppercase values stay closed.
+    let invalid_session = [
+        "10000000-0000-4000-8000-00000000000G",
+        "10000000000040008000000000000001",
+        "A0000000-0000-4000-8000-00000000000A",
+    ];
+    for field in 0..2 {
+        for value in invalid_session {
+            let mut message = request_message();
+            match field {
+                0 => message.from_session_id = value.into(),
+                _ => message.to_session_id = value.into(),
+            }
+            assert!(
+                validate_record(&message).is_err(),
+                "session id field {field} admitted {value}"
+            );
+        }
+        let mut message = request_message();
+        let v7 = "01a082e0-10ae-7711-9710-37e44be35d48";
+        match field {
+            0 => message.from_session_id = v7.into(),
+            _ => message.to_session_id = v7.into(),
+        }
+        assert!(
+            validate_record(&message).is_ok(),
+            "session id field {field} rejected a UUIDv7"
+        );
     }
 
     for value in invalid {
@@ -797,21 +826,40 @@ fn claim_rejects_unknown_origin_state_delivery_and_digest_syntax() {
 #[test]
 fn worker_result_uuid_decimal_format_and_oid_fields_are_closed() {
     let invalid_uuid = "10000000-0000-1000-8000-000000000001";
-    for field in 0..8 {
+    for field in 0..6 {
         let mut result = worker_result();
         match field {
             0 => result.result_id = invalid_uuid.into(),
             1 => result.correlation_id = invalid_uuid.into(),
             2 => result.reservation_id = invalid_uuid.into(),
             3 => result.root_reservation_id = invalid_uuid.into(),
-            4 => result.parent_session_id = invalid_uuid.into(),
-            5 => result.worker_id = invalid_uuid.into(),
-            6 => result.generation = invalid_uuid.into(),
-            _ => result.runtime_session_id = invalid_uuid.into(),
+            4 => result.worker_id = invalid_uuid.into(),
+            _ => result.generation = invalid_uuid.into(),
         }
         assert!(
             validate_record(&result).is_err(),
             "UUID field {field} was open"
+        );
+    }
+    for field in 0..2 {
+        let mut result = worker_result();
+        match field {
+            0 => result.parent_session_id = "A0000000-0000-4000-8000-00000000000A".into(),
+            _ => result.runtime_session_id = "10000000000040008000000000000001".into(),
+        }
+        assert!(
+            validate_record(&result).is_err(),
+            "session id field {field} was open"
+        );
+        let mut result = worker_result();
+        let v7 = "01a082e0-10ae-7711-9710-37e44be35d48";
+        match field {
+            0 => result.parent_session_id = v7.into(),
+            _ => result.runtime_session_id = v7.into(),
+        }
+        assert!(
+            validate_record(&result).is_ok(),
+            "session id field {field} rejected a UUIDv7"
         );
     }
 

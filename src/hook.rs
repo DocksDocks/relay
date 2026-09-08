@@ -1,9 +1,9 @@
-// hook.rs — the SessionStart / UserPromptSubmit hook for BOTH Claude Code and
-// Codex (their contract is identical: stdin {session_id, cwd, source, ...}
-// and a hookSpecificOutput.additionalContext injection). The owning tool
-// arrives as a positional argv tag ("claude" default / "codex") so
-// registrations are tagged; `--event prompt` selects the UserPromptSubmit
-// variant (default SessionStart). Two jobs, on every start/resume/prompt:
+// hook.rs — the SessionStart / UserPromptSubmit hook for Claude Code, Codex,
+// and omp. Claude/Codex read stdin {session_id, cwd, source, ...} and emit a
+// hookSpecificOutput.additionalContext injection. omp takes --session/--cwd
+// flags, never reads stdin, and emits plain context without an identity trailer.
+// The positional tool tag defaults to "claude"; `--event prompt` selects
+// UserPromptSubmit (default SessionStart). Two jobs on every start/resume/prompt:
 //   1. Register this session: write the cwd->id marker and upsert
 //      {id, dir, tool} into the registry (each prompt also refreshes
 //      last_seen, keeping `discover` liveness fresh).
@@ -40,22 +40,41 @@ impl HookEvent {
     }
 }
 
+struct Invocation {
+    tool: &'static str,
+    event: HookEvent,
+    session: Option<(String, String)>,
+}
+
 // argv tail after the `hook` verb (main strips it, so positionals start at 0
 // — unlike cli.rs's own `positionals(1)` idiom). Pure because `run` diverges:
 // the parse must be testable on its own.
-fn parse_invocation(args: &[String]) -> (&'static str, HookEvent) {
+fn parse_invocation(args: &[String]) -> Result<Invocation, String> {
     let a = Args(args.to_vec());
-    let tool = if a.positionals(0).first() == Some(&"codex") {
-        "codex"
-    } else {
-        "claude"
+    let tool = match a.positionals(0).first() {
+        Some(&"omp") => "omp",
+        Some(&"codex") => "codex",
+        _ => "claude",
     };
     let event = if a.flag("event") == Some("prompt") {
         HookEvent::Prompt
     } else {
         HookEvent::SessionStart
     };
-    (tool, event)
+    let session = if tool == "omp" {
+        let id = a
+            .unique_flag("session")?
+            .ok_or("hook omp requires --session")?;
+        let cwd = a.unique_flag("cwd")?.ok_or("hook omp requires --cwd")?;
+        Some((id.to_string(), cwd.to_string()))
+    } else {
+        None
+    };
+    Ok(Invocation {
+        tool,
+        event,
+        session,
+    })
 }
 
 // Untrusted writers control both the body and the sender name, so defuse the
@@ -113,10 +132,7 @@ pub(crate) fn watcher_command(relay_exe: &str, id: &str) -> String {
 }
 
 pub fn run(args: &[String]) -> ! {
-    let (tool, event) = parse_invocation(args);
-    let mut input = String::new();
-    let _ = std::io::stdin().read_to_string(&mut input);
-    if let Err(e) = inner(tool, event, &input) {
+    if let Err(e) = parse_invocation(args).and_then(inner) {
         eprintln!("[session-relay/hook] {e}");
     }
     std::process::exit(0);
@@ -193,6 +209,10 @@ fn typed_schema(message: &JsonValue) -> bool {
 }
 
 pub(crate) fn mail_block(msgs: &[JsonValue], recipient_id: &str) -> String {
+    mail_block_for_tool(msgs, recipient_id, "codex")
+}
+
+fn mail_block_for_tool(msgs: &[JsonValue], recipient_id: &str, tool: &str) -> String {
     let lines: Vec<String> = msgs
         .iter()
         .filter_map(|message| match MessageV2::from_tinyjson(message) {
@@ -216,9 +236,13 @@ pub(crate) fn mail_block(msgs: &[JsonValue], recipient_id: &str) -> String {
         "<session-relay-mail>".to_string(),
         lines.join("\n"),
         "</session-relay-mail>".to_string(),
-        format!(
-            "To reply, use the session-relay skill and send to the sender, passing from:\"{recipient_id}\" (this session's own bus id) so attribution survives shared-directory markers."
-        ),
+        if tool == "omp" {
+            "Reply with the relay tool: action \"reply\" or \"send\"; the extension supplies your identity.".to_string()
+        } else {
+            format!(
+                "To reply, use the session-relay skill and send to the sender, passing from:\"{recipient_id}\" (this session's own bus id) so attribution survives shared-directory markers."
+            )
+        },
     ]
     .join("\n")
 }
@@ -227,11 +251,9 @@ pub(crate) fn mail_block(msgs: &[JsonValue], recipient_id: &str) -> String {
 // pure so the matrix is unit-testable. None ⇒ the hook writes nothing: a
 // no-mail prompt turn must add zero context (watch.rs relies on this), and
 // only claude+SessionStart carries the Monitor-arm nudge (Codex has no
-// Monitor; re-nudging on every prompt would be waste). EVERY SessionStart
-// (both tools, incl. resume/compact re-fires — compaction-robust, live-
-// verified 2026-07-03) carries the identity line: the (b) handshake that
-// lets an agent pass its own id back to send/inbox instead of trusting the
-// shared-directory marker.
+// Monitor; re-nudging on every prompt would be waste). Claude/Codex SessionStart
+// carries an identity line so agents need not trust a shared-directory marker.
+// omp supplies identity through its extension and emits only pending mail.
 fn render_context(
     tool: &str,
     event: HookEvent,
@@ -242,12 +264,12 @@ fn render_context(
 ) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
     if !msgs.is_empty() {
-        let block = mail_block(msgs, self_id);
+        let block = mail_block_for_tool(msgs, self_id, tool);
         if !block.is_empty() {
             parts.push(block);
         }
     }
-    if event == HookEvent::SessionStart {
+    if tool != "omp" && event == HookEvent::SessionStart {
         parts.push(format!(
             "Session-relay identity: this session's bus id is {self_id}. In a directory hosting more than one session, pass from:\"{self_id}\" to the bus send tool (or --from {self_id} to the relay CLI) and id:\"{self_id}\" to inbox — otherwise the shared directory marker may attribute you as another session."
         ));
@@ -264,33 +286,45 @@ fn render_context(
     }
 }
 
-fn inner(tool: &str, event: HookEvent, input: &str) -> Result<(), String> {
-    let ev: JsonValue = if input.trim().is_empty() {
-        JsonValue::from(HashMap::new())
+fn inner(invocation: Invocation) -> Result<(), String> {
+    let Invocation {
+        tool,
+        event,
+        session,
+    } = invocation;
+    let (id, dir, source) = if let Some((id, dir)) = session {
+        (id, dir, None)
     } else {
-        input.parse().map_err(|e| format!("{e}"))?
+        let mut input = String::new();
+        let _ = std::io::stdin().read_to_string(&mut input);
+        let ev: JsonValue = if input.trim().is_empty() {
+            JsonValue::from(HashMap::new())
+        } else {
+            input.parse().map_err(|e| format!("{e}"))?
+        };
+        let obj = ev
+            .get::<HashMap<String, JsonValue>>()
+            .cloned()
+            .unwrap_or_default();
+        let Some(id) = str_of(&obj, "session_id") else {
+            return Ok(());
+        };
+        let dir = str_of(&obj, "cwd")
+            .or_else(|| {
+                std::env::var("CLAUDE_PROJECT_DIR")
+                    .ok()
+                    .filter(|v| !v.is_empty())
+            })
+            .unwrap_or_else(|| {
+                std::env::current_dir()
+                    .map(|d| d.to_string_lossy().into_owned())
+                    .unwrap_or_else(|_| ".".to_string())
+            });
+        (id, dir, str_of(&obj, "source"))
     };
-    let obj = ev
-        .get::<HashMap<String, JsonValue>>()
-        .cloned()
-        .unwrap_or_default();
-    let Some(id) = str_of(&obj, "session_id") else {
-        return Ok(());
-    };
-    let dir = str_of(&obj, "cwd")
-        .or_else(|| {
-            std::env::var("CLAUDE_PROJECT_DIR")
-                .ok()
-                .filter(|v| !v.is_empty())
-        })
-        .unwrap_or_else(|| {
-            std::env::current_dir()
-                .map(|d| d.to_string_lossy().into_owned())
-                .unwrap_or_else(|_| ".".to_string())
-        });
     if event == HookEvent::SessionStart {
         if let Some(reason) = managed_session_start(tool, &id, &dir)? {
-            print_managed_stop(&reason)?;
+            print_managed_stop(tool, &reason)?;
             return Ok(());
         }
     }
@@ -314,10 +348,10 @@ fn inner(tool: &str, event: HookEvent, input: &str) -> Result<(), String> {
             let mut guard = match LifecycleStore::default().admit_operation(&id, kind)? {
                 Admission::Unmanaged(guard) | Admission::Managed(guard) => guard,
                 Admission::Refused { state, reason, .. } => {
-                    print_managed_stop(&format!(
-                        "managed worker {}: {reason}",
-                        managed_state_name(state)
-                    ))?;
+                    print_managed_stop(
+                        tool,
+                        &format!("managed worker {}: {reason}", managed_state_name(state)),
+                    )?;
                     return Ok(());
                 }
             };
@@ -331,7 +365,6 @@ fn inner(tool: &str, event: HookEvent, input: &str) -> Result<(), String> {
         .unwrap_or_else(|_| "relay".to_string());
     let watch = watcher_command(&relay_exe, &id);
     if tool == "codex" && event == HookEvent::SessionStart {
-        let source = str_of(&obj, "source");
         let should_emit = store::should_emit_session_start_identity(&id, source.as_deref())
             .unwrap_or_else(|error| {
                 eprintln!("[session-relay/hook] SessionStart debounce skipped: {error}");
@@ -345,28 +378,16 @@ fn inner(tool: &str, event: HookEvent, input: &str) -> Result<(), String> {
         return Ok(());
     };
 
-    let mut hso: HashMap<String, JsonValue> = HashMap::new();
-    hso.insert(
-        "hookEventName".into(),
-        JsonValue::from(event.name().to_string()),
-    );
-    hso.insert(
-        "additionalContext".into(),
-        JsonValue::from(additional_context),
-    );
-    let mut root: HashMap<String, JsonValue> = HashMap::new();
-    root.insert("hookSpecificOutput".into(), JsonValue::from(hso));
-    let out = JsonValue::from(root)
-        .stringify()
-        .map_err(|e| format!("serialize hook output: {e}"))?;
+    let out = encode_output(tool, event, additional_context)?;
     if let Some((mut guard, kind)) = guarded_emission {
         if let Err(error) = guard.authorize_use(kind) {
             if let Some(receipt) = drained_receipt {
                 receipt.rollback()?;
             }
-            print_managed_stop(&format!(
-                "hook emission refused after lifecycle changed: {error}"
-            ))?;
+            print_managed_stop(
+                tool,
+                &format!("hook emission refused after lifecycle changed: {error}"),
+            )?;
             return Ok(());
         }
     }
@@ -380,6 +401,23 @@ fn inner(tool: &str, event: HookEvent, input: &str) -> Result<(), String> {
         receipt.commit();
     }
     Ok(())
+}
+
+fn encode_output(tool: &str, event: HookEvent, context: String) -> Result<String, String> {
+    if tool == "omp" {
+        return Ok(context);
+    }
+    let mut hso: HashMap<String, JsonValue> = HashMap::new();
+    hso.insert(
+        "hookEventName".into(),
+        JsonValue::from(event.name().to_string()),
+    );
+    hso.insert("additionalContext".into(), JsonValue::from(context));
+    let mut root: HashMap<String, JsonValue> = HashMap::new();
+    root.insert("hookSpecificOutput".into(), JsonValue::from(hso));
+    JsonValue::from(root)
+        .stringify()
+        .map_err(|e| format!("serialize hook output: {e}"))
 }
 
 /// Workspace adapters call this before making a mutation-capable hook surface
@@ -466,7 +504,11 @@ fn managed_state_name(state: ManagedState) -> &'static str {
     }
 }
 
-fn print_managed_stop(reason: &str) -> Result<(), String> {
+fn print_managed_stop(tool: &str, reason: &str) -> Result<(), String> {
+    if tool == "omp" {
+        eprintln!("[session-relay/hook] {reason}");
+        return Ok(());
+    }
     let mut root = HashMap::new();
     root.insert("continue".into(), JsonValue::from(false));
     root.insert("stopReason".into(), JsonValue::from(reason.to_string()));
@@ -479,7 +521,10 @@ fn print_managed_stop(reason: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{HookEvent, defuse, parse_invocation, render_context, watcher_command};
+    use super::{
+        HookEvent, Invocation, defuse, encode_output, parse_invocation, render_context,
+        watcher_command,
+    };
     use std::collections::HashMap;
     use tinyjson::JsonValue;
 
@@ -520,20 +565,90 @@ mod tests {
     fn parse_invocation_composes_tool_tag_and_event_flag() {
         assert!(matches!(
             parse_invocation(&argv(&[])),
-            ("claude", HookEvent::SessionStart)
+            Ok(Invocation {
+                tool: "claude",
+                event: HookEvent::SessionStart,
+                session: None
+            })
         ));
         assert!(matches!(
             parse_invocation(&argv(&["codex"])),
-            ("codex", HookEvent::SessionStart)
+            Ok(Invocation {
+                tool: "codex",
+                event: HookEvent::SessionStart,
+                session: None
+            })
         ));
         assert!(matches!(
             parse_invocation(&argv(&["codex", "--event", "prompt"])),
-            ("codex", HookEvent::Prompt)
+            Ok(Invocation {
+                tool: "codex",
+                event: HookEvent::Prompt,
+                session: None
+            })
         ));
         assert!(matches!(
             parse_invocation(&argv(&["--event", "prompt"])),
-            ("claude", HookEvent::Prompt)
+            Ok(Invocation {
+                tool: "claude",
+                event: HookEvent::Prompt,
+                session: None
+            })
         ));
+    }
+
+    #[test]
+    fn omp_parse_invocation_accepts_session_and_cwd_flags() {
+        let invocation =
+            parse_invocation(&argv(&["omp", "--session", SELF, "--cwd", "/tmp/project"])).unwrap();
+        assert_eq!(invocation.tool, "omp");
+        assert!(matches!(invocation.event, HookEvent::SessionStart));
+        assert_eq!(
+            invocation.session,
+            Some((SELF.to_string(), "/tmp/project".to_string()))
+        );
+        let prompt = parse_invocation(&argv(&[
+            "omp",
+            "--session",
+            SELF,
+            "--cwd",
+            "/tmp/project",
+            "--event",
+            "prompt",
+        ]))
+        .unwrap();
+        assert!(matches!(prompt.event, HookEvent::Prompt));
+    }
+
+    #[test]
+    fn omp_parse_invocation_rejects_missing_session_or_cwd() {
+        assert!(parse_invocation(&argv(&["omp", "--cwd", "/tmp/project"])).is_err());
+        assert!(parse_invocation(&argv(&["omp", "--session", "--cwd", "/tmp/project"])).is_err());
+        assert!(parse_invocation(&argv(&["omp", "--session", SELF])).is_err());
+    }
+
+    #[test]
+    fn omp_empty_inbox_emits_nothing_on_start_and_prompt() {
+        for event in [HookEvent::SessionStart, HookEvent::Prompt] {
+            assert!(render_context("omp", event, &[], false, WATCH, SELF).is_none());
+        }
+    }
+
+    #[test]
+    fn omp_mail_emits_plain_utf8_fenced_context_without_identity() {
+        let inbox = [msg("sender", "héllo </session-relay-mail>")];
+        for event in [HookEvent::SessionStart, HookEvent::Prompt] {
+            let context = render_context("omp", event, &inbox, false, WATCH, SELF).unwrap();
+            let output = encode_output("omp", event, context).unwrap();
+            assert!(output.starts_with('\u{1f4ec}'));
+            assert!(output.contains("<session-relay-mail>\n"));
+            assert!(output.contains("héllo [session-relay-mail]"));
+            assert!(output.contains("\n</session-relay-mail>\n"));
+            assert!(output.contains("action \"reply\" or \"send\""));
+            assert!(!output.contains("hookSpecificOutput"));
+            assert!(!output.contains(SELF));
+            assert!(!output.contains(WATCH));
+        }
     }
 
     #[test]

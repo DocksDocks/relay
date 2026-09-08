@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // gate.mjs — the whole gate for this repository. Run it before pushing and before tagging.
-// Eight phases run in a fixed order: manifests, skill, shell, rust, delegation, checks,
-// selftest, javascript. The first failure names its phase and exits 1, so a red run always
+// Nine phases run in a fixed order: manifests, skill, extension, shell, rust, delegation,
+// checks, selftest, javascript. The first failure names its phase and exits 1, so a red run always
 // reports the earliest cause rather than a cascade.
 // Usage: node scripts/gate.mjs
 import { spawnSync } from 'node:child_process';
@@ -28,8 +28,7 @@ const CASES = [
   'unit',
 ];
 
-const PAYLOAD_ALLOWED_SKILLS = './skills/';
-const SKILL_PATH = 'plugin/skills/productivity/session-relay/SKILL.md';
+const SKILL_PATH = 'plugin/skills/session-relay/SKILL.md';
 const SKILL_DESCRIPTION_LIMIT = 1024;
 const SKILL_BODY_LINE_LIMIT = 500;
 
@@ -84,52 +83,42 @@ function readJSON(file) {
 // ── 1. manifests ────────────────────────────────────────────────────────────────────
 section('manifests');
 {
-  readJSON('plugin/.claude-plugin/plugin.json');
-  ok('plugin/.claude-plugin/plugin.json parses');
-
-  const codexManifest = readJSON('plugin/.codex-plugin/plugin.json');
-  const declaredSkills = codexManifest.skills;
-  if (declaredSkills !== PAYLOAD_ALLOWED_SKILLS) {
-    const found = JSON.stringify(declaredSkills);
-    fail(`plugin/.codex-plugin/plugin.json skills must be '${PAYLOAD_ALLOWED_SKILLS}' (found ${found})`);
+  const manifest = readJSON('plugin/package.json');
+  const extensions = manifest?.omp?.extensions;
+  if (!Array.isArray(extensions) || extensions.length === 0) {
+    fail('plugin/package.json must declare a non-empty omp.extensions array');
   }
-  ok(`plugin/.codex-plugin/plugin.json parses and declares skills '${PAYLOAD_ALLOWED_SKILLS}'`);
-
-  readJSON('plugin/hooks/codex-hooks.json');
-  readJSON('plugin/.codex-plugin/bus.mcp.json');
-  ok('plugin/hooks/codex-hooks.json and plugin/.codex-plugin/bus.mcp.json parse');
-
-  const soleEntry = (catalog, file) => {
-    const entries = catalog.plugins;
-    if (!Array.isArray(entries) || entries.length !== 1) {
-      fail(`${file} must list exactly one plugin (found ${Array.isArray(entries) ? entries.length : 'no array'})`);
+  const pluginRoot = path.join(REPO, 'plugin');
+  for (const entry of extensions) {
+    if (typeof entry !== 'string' || entry.length === 0) {
+      fail(`plugin/package.json extension must be a non-empty path (found ${JSON.stringify(entry)})`);
     }
-    if (entries[0].name !== 'session-relay') {
-      fail(`${file} plugin name must be 'session-relay' (found ${JSON.stringify(entries[0].name)})`);
+    const extensionPath = path.resolve(pluginRoot, entry);
+    if (!extensionPath.startsWith(`${pluginRoot}${path.sep}`) || !fs.existsSync(extensionPath)) {
+      fail(`plugin/package.json extension must exist under plugin/: ${JSON.stringify(entry)}`);
     }
-    return entries[0];
-  };
-
-  const claudeEntry = soleEntry(readJSON('.claude-plugin/marketplace.json'), '.claude-plugin/marketplace.json');
-  if (claudeEntry.source !== './plugin') {
-    fail(`.claude-plugin/marketplace.json source must be './plugin' (found ${JSON.stringify(claudeEntry.source)})`);
   }
-  ok(".claude-plugin/marketplace.json lists session-relay at source './plugin'");
+  ok(`plugin/package.json declares existing extensions: ${extensions.join(', ')}`);
 
-  const codexEntry = soleEntry(readJSON('.agents/plugins/marketplace.json'), '.agents/plugins/marketplace.json');
-  const codexSource = codexEntry.source;
-  const codexSourceMatches =
-    codexSource !== null &&
-    typeof codexSource === 'object' &&
-    !Array.isArray(codexSource) &&
-    Object.keys(codexSource).length === 2 &&
-    codexSource.source === 'local' &&
-    codexSource.path === './plugin';
-  if (!codexSourceMatches) {
-    const found = JSON.stringify(codexSource);
-    fail(`.agents/plugins/marketplace.json source must be {"source":"local","path":"./plugin"} (found ${found})`);
+  const catalogPath = '.omp-plugin/marketplace.json';
+  const catalog = readJSON(catalogPath);
+  if (typeof catalog?.name !== 'string' || catalog.name.length === 0) {
+    fail(`${catalogPath} must declare a name`);
   }
-  ok('.agents/plugins/marketplace.json lists session-relay at the local ./plugin source');
+  if (typeof catalog?.owner?.name !== 'string' || catalog.owner.name.length === 0) {
+    fail(`${catalogPath} must declare owner.name`);
+  }
+  const entries = catalog.plugins;
+  if (!Array.isArray(entries) || entries.length !== 1) {
+    fail(`${catalogPath} must list exactly one plugin (found ${Array.isArray(entries) ? entries.length : 'no array'})`);
+  }
+  if (entries[0]?.name !== 'session-relay') {
+    fail(`${catalogPath} plugin name must be 'session-relay' (found ${JSON.stringify(entries[0]?.name)})`);
+  }
+  if (entries[0].source !== './plugin') {
+    fail(`${catalogPath} source must be './plugin' (found ${JSON.stringify(entries[0].source)})`);
+  }
+  ok(`${catalogPath} lists session-relay at source './plugin'`);
 }
 
 // ── 2. skill ────────────────────────────────────────────────────────────────────────
@@ -193,7 +182,15 @@ section('skill');
   ok(`skill body is ${bodyLines} lines (limit ${SKILL_BODY_LINE_LIMIT})`);
 }
 
-// ── 3. shell ────────────────────────────────────────────────────────────────────────
+// ── 3. extension ────────────────────────────────────────────────────────────────────
+section('extension');
+{
+  const extension = run(['node', 'test/extension-smoke.mjs'], { stdio: 'inherit' });
+  if (failed(extension)) fail('extension smoke failed (run: node test/extension-smoke.mjs)');
+  ok('extension registration smoke passed');
+}
+
+// ── 4. shell ────────────────────────────────────────────────────────────────────────
 section('shell');
 {
   const launcher = 'plugin/bin/relay';
@@ -203,7 +200,7 @@ section('shell');
   else ok(`shellcheck -S warning clean (${launcher})`);
 }
 
-// ── 4. rust ─────────────────────────────────────────────────────────────────────────
+// ── 5. rust ─────────────────────────────────────────────────────────────────────────
 section('rust');
 const privateBinaryDirs = new Set();
 process.on('exit', () => {
@@ -262,7 +259,7 @@ const RUST_BINARY = (() => {
   return privateBinary;
 })();
 
-// ── 5. delegation ───────────────────────────────────────────────────────────────────
+// ── 6. delegation ───────────────────────────────────────────────────────────────────
 section('delegation');
 {
   const configured = process.env.SESSION_RELAY_TEST_CGROUP_ROOT;
@@ -314,7 +311,7 @@ section('delegation');
 }
 
 try {
-  // ── 6. checks ─────────────────────────────────────────────────────────────────────
+  // ── 7. checks ─────────────────────────────────────────────────────────────────────
   section('checks');
   {
     const childEnv = { ...process.env, SESSION_RELAY_TEST_BIN: RUST_BINARY };
@@ -333,7 +330,7 @@ try {
     }
   }
 
-  // ── 7. selftest ───────────────────────────────────────────────────────────────────
+  // ── 8. selftest ───────────────────────────────────────────────────────────────────
   section('selftest');
   {
     const baseEnv = { ...process.env, SESSION_RELAY_TEST_BIN: RUST_BINARY };
@@ -372,13 +369,17 @@ try {
     ok('self-test passed with byte-identical jobs-1/jobs-4 output');
   }
 
-  // ── 8. javascript ─────────────────────────────────────────────────────────────────
+  // ── 9. javascript ─────────────────────────────────────────────────────────────────
   section('javascript');
   {
-    const biome = run(['pnpm', 'exec', 'biome', 'ci', 'scripts', 'test', 'package.json', 'biome.json'], {
-      stdio: 'inherit',
-    });
-    if (failed(biome)) fail('biome ci failed (run: pnpm exec biome ci scripts test package.json biome.json)');
+    const biome = run(
+      ['pnpm', 'exec', 'biome', 'ci', 'scripts', 'test', 'plugin/extension', 'package.json', 'biome.json'],
+      {
+        stdio: 'inherit',
+      },
+    );
+    if (failed(biome))
+      fail('biome ci failed (run: pnpm exec biome ci scripts test plugin/extension package.json biome.json)');
     ok('biome ci clean');
   }
 } finally {

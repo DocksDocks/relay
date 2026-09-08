@@ -1,5 +1,5 @@
 // spawn.rs — `relay spawn <dir> … -- <task>`: birth a NEW persistent agent
-// session (Claude or Codex) in any project dir and hand it to the bus.
+// session (Claude, Codex, or omp) in any project dir and hand it to the bus.
 // Live-verified 2026-07-02 (claude 2.1.198, codex-cli 0.142.5):
 //   - headless `claude -p` and `codex exec` BOTH fire the SessionStart hook,
 //     so the child self-registers on the bus at birth;
@@ -21,6 +21,7 @@
 
 use crate::appserver;
 use crate::cli::Args;
+use crate::discover;
 use crate::fanout::{self, FanoutMode, FanoutState, FanoutStore};
 use crate::lifecycle::{
     ChildLaunchSpec, ClaimManagedAttach, ClaimOutcome, ExecutionBackend, LifecycleStore,
@@ -30,7 +31,7 @@ use crate::lifecycle::{
 use crate::store;
 use crate::workspace::schema::{JcsValue, serialize_jcs};
 use rustix::fs::{FlockOperation, flock};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::os::unix::process::*;
@@ -300,7 +301,7 @@ fn die(msg: &str) -> ! {
     std::process::exit(1);
 }
 
-const USAGE: &str = "usage: relay spawn <dir> [--fanout|--worktree --from <session>] [--tool claude|codex] [--model <m>] [--effort <e>] [--service-tier default|fast] [--name <busName>] [--server <unix-socket>] [--reply-to <nameOrId>] [--timeout <sec>] [--read-only] [--full-access] [--watch] [--dry] [--] <first task>";
+const USAGE: &str = "usage: relay spawn <dir> [--fanout|--worktree --from <session>] [--tool claude|codex|omp] [--model <m>] [--effort <e>] [--service-tier default|fast] [--name <busName>] [--server <unix-socket>] [--reply-to <nameOrId>] [--timeout <sec>] [--read-only] [--full-access] [--watch] [--dry] [--] <first task>";
 
 fn exit_code(status: &ExitStatus) -> i32 {
     status
@@ -426,6 +427,15 @@ fn perm_args(tool: &str, read_only: bool, full_access: bool) -> [String; 2] {
             "workspace-write"
         };
         ["--sandbox".into(), mode.into()]
+    } else if tool == "omp" {
+        let mode = if read_only {
+            "always-ask"
+        } else if full_access {
+            "yolo"
+        } else {
+            "write"
+        };
+        ["--approval-mode".into(), mode.into()]
     } else {
         let mode = if read_only {
             "plan"
@@ -453,7 +463,14 @@ fn append_model_effort_args(
             a.push("-c".into());
             a.push(format!("model_reasoning_effort={effort}"));
         } else {
-            a.push("--effort".into());
+            a.push(
+                if tool == "omp" {
+                    "--thinking"
+                } else {
+                    "--effort"
+                }
+                .into(),
+            );
             a.push(effort.into());
         }
     }
@@ -486,14 +503,14 @@ fn resolve_spawn_tool(
     codex_present: bool,
 ) -> Result<(String, Option<&'static str>), String> {
     match explicit {
-        Some(t @ ("claude" | "codex")) => Ok((t.to_string(), None)),
+        Some(t @ ("claude" | "codex" | "omp")) => Ok((t.to_string(), None)),
         Some(other) => Err(format!(
-            "unknown --tool: {other} (valid values: claude|codex)"
+            "unknown --tool: {other} (valid values: claude|codex|omp)"
         )),
         None => match env_default.as_deref() {
-            Some(t @ ("claude" | "codex")) => Ok((t.to_string(), None)),
+            Some(t @ ("claude" | "codex" | "omp")) => Ok((t.to_string(), None)),
             Some(other) => Err(format!(
-                "unknown RELAY_SPAWN_TOOL: {other} (valid values: claude|codex)"
+                "unknown RELAY_SPAWN_TOOL: {other} (valid values: claude|codex|omp)"
             )),
             None if codex_present => Ok((
                 "codex".to_string(),
@@ -949,6 +966,7 @@ fn run_appserver_spawn(options: AppServerSpawn<'_>) -> ! {
 // flags: the child is detached with null stdout — nothing ever reads it.
 fn child_args(
     tool: &str,
+    cwd: &str,
     perm: &[String; 2],
     premint: Option<&str>,
     skip_git_check: bool,
@@ -964,6 +982,10 @@ fn child_args(
         if skip_git_check {
             a.push("--skip-git-repo-check".into());
         }
+    } else if tool == "omp" {
+        a.extend(["-p".into(), "--cwd".into(), cwd.into()]);
+        a.extend(perm.iter().cloned());
+        append_model_effort_args(&mut a, tool, role.model, role.effort);
     } else {
         a.push("-p".into());
         if let Some(id) = premint {
@@ -979,15 +1001,68 @@ fn child_args(
 }
 
 fn child_cmd(tool: &str) -> String {
-    let var = if tool == "codex" {
-        "RELAY_SPAWN_CMD_CODEX"
-    } else {
-        "RELAY_SPAWN_CMD_CLAUDE"
+    let var = match tool {
+        "codex" => "RELAY_SPAWN_CMD_CODEX",
+        "omp" => "RELAY_SPAWN_CMD_OMP",
+        _ => "RELAY_SPAWN_CMD_CLAUDE",
     };
     std::env::var(var)
         .ok()
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| tool.to_string())
+}
+
+fn preminted_session_id(tool: &str) -> Option<String> {
+    (tool == "claude").then(store::uuid_v4)
+}
+
+fn omp_sessions() -> Vec<JsonValue> {
+    discover::discover(&discover::Options {
+        tool: Some("omp"),
+        // Birth must exclude every existing id, including old sessions.
+        active_within_min: f64::INFINITY,
+        limit: usize::MAX,
+        ..discover::Options::default()
+    })
+}
+
+fn omp_ids_before_launch(tool: &str) -> HashSet<String> {
+    if tool != "omp" {
+        return HashSet::new();
+    }
+    omp_sessions()
+        .iter()
+        .filter_map(|row| config_string(row.get()?, "id"))
+        .collect()
+}
+
+fn active_omp_birth(
+    lifecycle: &LifecycleStore,
+    birth: &ManagedBirth,
+    cwd: &str,
+    ids_before: &HashSet<String>,
+) -> Option<String> {
+    let worker = lifecycle.read_worker(&birth.worker_id).ok().flatten()?;
+    if worker.generation != birth.generation || worker.state != ManagedState::Active {
+        return None;
+    }
+    let id = worker.runtime_session_id?;
+    if ids_before.contains(&id) {
+        return None;
+    }
+    omp_sessions()
+        .iter()
+        .any(|row| {
+            let Some(fields) = row.get::<HashMap<String, JsonValue>>() else {
+                return false;
+            };
+            fields.get("id").and_then(JsonValue::get::<String>) == Some(&id)
+                && fields
+                    .get("cwd")
+                    .and_then(JsonValue::get::<String>)
+                    .is_some_and(|value| value == cwd)
+        })
+        .then_some(id)
 }
 
 // Default --reply-to: the bus identity of the session spawn was invoked from
@@ -1012,7 +1087,7 @@ fn run_fanout_spawn(options: FanoutLaunchOptions<'_>) -> ! {
         .correlation_id
         .clone()
         .unwrap_or_else(|| die("new fanout reservation has no correlation id"));
-    let preminted_session_id = (options.tool != "codex").then(store::uuid_v4);
+    let preminted_session_id = preminted_session_id(options.tool);
     let relay = std::env::current_exe()
         .ok()
         .map(|path| path.to_string_lossy().into_owned())
@@ -1031,6 +1106,7 @@ fn run_fanout_spawn(options: FanoutLaunchOptions<'_>) -> ! {
         command: child_cmd(options.tool),
         arguments: child_args(
             options.tool,
+            &reservation.worktree,
             options.permissions,
             preminted_session_id.as_deref(),
             false,
@@ -1344,6 +1420,7 @@ pub fn run_fanout_supervisor() -> ! {
         }
     };
     let marker_before = store::id_for_dir(&config.cwd);
+    let omp_ids_before = omp_ids_before_launch(&config.tool);
     let mut command = Command::new(&config.command);
     command
         .args(&config.arguments)
@@ -1405,6 +1482,9 @@ pub fn run_fanout_supervisor() -> ! {
     let id = loop {
         let born = match config.preminted_session_id.as_ref() {
             Some(id) => store::resolve(id).map(|entry| entry.id),
+            None if config.tool == "omp" => {
+                active_omp_birth(&lifecycle, &birth, &config.cwd, &omp_ids_before)
+            }
             None => match store::id_for_dir(&config.cwd) {
                 Some(id) if Some(&id) != marker_before.as_ref() && store::is_uuid(&id) => Some(id),
                 _ => None,
@@ -1550,7 +1630,7 @@ pub fn run(raw: Vec<String>) -> ! {
     let model = args.flag_before_sep("model");
     let effort = args.flag_before_sep("effort");
     let requested_service_tier = args
-        .unique_flag_before_sep("service-tier")
+        .unique_flag("service-tier")
         .unwrap_or_else(|error| die(&error));
     if tool != "codex" && requested_service_tier.is_some() {
         die("--service-tier is Codex-only");
@@ -1687,14 +1767,14 @@ pub fn run(raw: Vec<String>) -> ! {
         }
     }
 
-    // Claude accepts a pre-minted id (watch for exactly it); codex has no
-    // pre-set-id flag, so birth is detected by the dir marker changing.
-    let premint = (tool != "codex").then(store::uuid_v4);
+    // Only Claude accepts a pre-minted runtime session id.
+    let premint = preminted_session_id(&tool);
     let prompt = build_prompt(&reply_to, &abs_relay, premint.as_deref(), &task);
     let skip_git_check = tool == "codex" && !dir.join(".git").exists();
     let cmd = child_cmd(&tool);
     let cargs = child_args(
         &tool,
+        &dir_s,
         &perm,
         premint.as_deref(),
         skip_git_check,
@@ -1754,6 +1834,7 @@ pub fn run(raw: Vec<String>) -> ! {
     let (mut log_writer, log_stdin, log_path) = start_log_pump(&log_id).unwrap_or_else(|e| die(&e));
 
     let marker_before = store::id_for_dir(&dir_s);
+    let omp_ids_before = omp_ids_before_launch(&tool);
     let mut command = Command::new(&cmd);
     command
         .args(&cargs)
@@ -1786,6 +1867,9 @@ pub fn run(raw: Vec<String>) -> ! {
     let born: Option<String> = loop {
         let hit = match &premint {
             Some(id) => store::resolve(id).map(|e| e.id),
+            None if tool == "omp" => managed_birth
+                .as_ref()
+                .and_then(|birth| active_omp_birth(&lifecycle, birth, &dir_s, &omp_ids_before)),
             None => match store::id_for_dir(&dir_s) {
                 Some(cur) if Some(&cur) != marker_before.as_ref() && store::is_uuid(&cur) => {
                     Some(cur)
@@ -1954,10 +2038,106 @@ mod tests {
     }
 
     #[test]
+    fn omp_argv_maps_each_permission_mode_before_the_prompt_fence() {
+        for (read_only, full_access, mode) in [
+            (true, false, "always-ask"),
+            (false, false, "write"),
+            (false, true, "yolo"),
+        ] {
+            assert_eq!(
+                child_args(
+                    "omp",
+                    "/project with spaces",
+                    &perm_args("omp", read_only, full_access),
+                    None,
+                    false,
+                    ChildRole::default(),
+                    "--model is prompt text",
+                ),
+                [
+                    "-p",
+                    "--cwd",
+                    "/project with spaces",
+                    "--approval-mode",
+                    mode,
+                    "--",
+                    "--model is prompt text",
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn omp_argv_places_model_and_thinking_before_the_prompt() {
+        assert_eq!(
+            child_args(
+                "omp",
+                "/project",
+                &perm_args("omp", false, false),
+                None,
+                false,
+                ChildRole {
+                    model: Some("gpt-5.5"),
+                    effort: Some("high"),
+                    service_tier: None,
+                },
+                "task",
+            ),
+            [
+                "-p",
+                "--cwd",
+                "/project",
+                "--approval-mode",
+                "write",
+                "--model",
+                "gpt-5.5",
+                "--thinking",
+                "high",
+                "--",
+                "task",
+            ]
+        );
+    }
+
+    #[test]
+    fn omp_does_not_premint_a_runtime_session_id() {
+        assert_eq!(preminted_session_id("omp"), None);
+        assert_eq!(preminted_session_id("codex"), None);
+        assert!(store::is_uuid(&preminted_session_id("claude").unwrap()));
+        let argv = child_args(
+            "omp",
+            "/project",
+            &perm_args("omp", false, false),
+            Some("must-not-be-forwarded"),
+            false,
+            ChildRole::default(),
+            "task",
+        );
+        assert!(
+            !argv
+                .iter()
+                .any(|arg| arg == "--session-id" || arg == "must-not-be-forwarded")
+        );
+    }
+
+    #[test]
+    fn omp_spawn_tool_resolves_explicit_and_environment_choices() {
+        assert_eq!(
+            resolve_spawn_tool(Some("omp"), Some("claude".into()), true).unwrap(),
+            ("omp".into(), None)
+        );
+        assert_eq!(
+            resolve_spawn_tool(None, Some("omp".into()), false).unwrap(),
+            ("omp".into(), None)
+        );
+    }
+
+    #[test]
     fn claude_argv_premints_id_and_never_sets_output_format() {
         let perm = perm_args("claude", false, false);
         let a = child_args(
             "claude",
+            "/project",
             &perm,
             Some("u-1"),
             false,
@@ -1988,6 +2168,7 @@ mod tests {
         let perm = perm_args("codex", false, false);
         let with = child_args(
             "codex",
+            "/project",
             &perm,
             None,
             true,
@@ -2001,6 +2182,7 @@ mod tests {
         assert!(with.contains(&"--skip-git-repo-check".to_string()));
         let without = child_args(
             "codex",
+            "/project",
             &perm,
             None,
             false,
@@ -2019,6 +2201,7 @@ mod tests {
         let claude_perm = perm_args("claude", false, false);
         let claude = child_args(
             "claude",
+            "/project",
             &claude_perm,
             Some("u-1"),
             false,
@@ -2049,6 +2232,7 @@ mod tests {
         let codex_perm = perm_args("codex", false, false);
         let codex = child_args(
             "codex",
+            "/project",
             &codex_perm,
             None,
             true,
@@ -2085,6 +2269,7 @@ mod tests {
         let perm = perm_args("codex", false, false);
         let standard = child_args(
             "codex",
+            "/project",
             &perm,
             None,
             false,
@@ -2109,6 +2294,7 @@ mod tests {
 
         let fast = child_args(
             "codex",
+            "/project",
             &perm,
             None,
             false,
@@ -2154,15 +2340,7 @@ mod tests {
 
     #[test]
     fn spawn_tool_resolution_rejects_invalid_flag_or_env() {
-        assert!(
-            resolve_spawn_tool(Some("zed"), None, true)
-                .unwrap_err()
-                .contains("valid values: claude|codex")
-        );
-        assert!(
-            resolve_spawn_tool(None, Some("zed".to_string()), false)
-                .unwrap_err()
-                .contains("RELAY_SPAWN_TOOL")
-        );
+        assert!(resolve_spawn_tool(Some("zed"), None, true).is_err());
+        assert!(resolve_spawn_tool(None, Some("zed".to_string()), false).is_err());
     }
 }

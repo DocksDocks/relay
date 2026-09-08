@@ -1192,3 +1192,210 @@ fn managed_attach_hook_refusal_stops_before_register_marker_or_mailbox_drain() {
     );
     fs::remove_dir_all(home).ok();
 }
+
+#[test]
+fn managed_spawn_omp_waits_for_new_session_and_exact_hook_claim() {
+    const TEST: &str = "managed_spawn_omp_waits_for_new_session_and_exact_hook_claim";
+    const SESSION: &str = "f3333333-3333-4333-8333-333333333333";
+    const OLD: &str = "f4444444-4444-4444-8444-444444444444";
+    const DECOY: &str = "f5555555-5555-4555-8555-555555555555";
+
+    fn wait_for(path: &Path) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !path.exists() {
+            assert!(Instant::now() < deadline, "timed out waiting for {path:?}");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn session_file(root: &Path, id: &str, cwd: &Path) {
+        let header = JsonValue::from(std::collections::HashMap::from([
+            ("type".to_string(), JsonValue::from("session".to_string())),
+            ("id".to_string(), JsonValue::from(id.to_string())),
+            (
+                "cwd".to_string(),
+                JsonValue::from(cwd.to_str().unwrap().to_string()),
+            ),
+        ]));
+        fs::write(
+            root.join(format!("{id}.jsonl")),
+            header.stringify().unwrap() + "\n",
+        )
+        .unwrap();
+    }
+
+    struct Reap(std::process::Child);
+    impl Drop for Reap {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    if let Some(home) = std::env::var_os("RELAY_TEST_OMP_CHILD") {
+        let home = std::path::PathBuf::from(home);
+        let cwd = home.join("project");
+        let bucket = home.join("omp-sessions/bucket");
+        let worker = std::env::var("RELAY_MANAGED_WORKER_ID").unwrap();
+        let generation = std::env::var("RELAY_MANAGED_GENERATION").unwrap();
+        let token = std::env::var("RELAY_MANAGED_ATTACH_TOKEN").unwrap();
+        assert!(!token.is_empty());
+        fs::write(
+            home.join("identity"),
+            format!("{worker}\n{generation}\n{token}"),
+        )
+        .unwrap();
+        session_file(&bucket, DECOY, &home.join("other-project"));
+        session_file(&bucket, SESSION, &cwd);
+        fs::write(home.join("files-ready"), "").unwrap();
+        wait_for(&home.join("allow-hook"));
+        let mut hook = Reap(
+            Command::new(env!("CARGO_BIN_EXE_relay"))
+                .args(["hook", "omp", "--session", SESSION, "--cwd"])
+                .arg(&cwd)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .unwrap(),
+        );
+        let open_stdin = hook.0.stdin.take().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if let Some(status) = hook.0.try_wait().unwrap() {
+                assert!(status.success(), "omp hook failed: {status}");
+                break;
+            }
+            assert!(Instant::now() < deadline, "omp hook waited for stdin EOF");
+            thread::sleep(Duration::from_millis(10));
+        }
+        drop(open_stdin);
+        fs::write(home.join("hook-done"), "").unwrap();
+        wait_for(&home.join("finish"));
+        fs::write(home.join("child-done"), "").unwrap();
+        return;
+    }
+
+    let home = fresh_home("omp-managed-spawn");
+    let cwd = home.join("project");
+    let bucket = home.join("omp-sessions/bucket");
+    fs::create_dir_all(&cwd).unwrap();
+    fs::create_dir_all(&bucket).unwrap();
+    session_file(&bucket, OLD, &cwd);
+    let fake = home.join("fake-omp");
+    support::write_executable(
+        &fake,
+        &format!("#!/bin/sh\nexec \"$RELAY_TEST_BINARY\" --exact {TEST} --nocapture\n"),
+    );
+    let mut spawn = Reap(
+        Command::new(env!("CARGO_BIN_EXE_relay"))
+            .arg("spawn")
+            .arg(&cwd)
+            .args([
+                "--tool",
+                "omp",
+                "--reply-to",
+                "observer",
+                "--timeout",
+                "15",
+                "--",
+                "inspect this project",
+            ])
+            .env("AGENT_RELAY_HOME", &home)
+            .env("RELAY_OMP_SESSIONS", home.join("omp-sessions"))
+            .env("RELAY_SPAWN_CMD_OMP", &fake)
+            .env("RELAY_TEST_OMP_CHILD", &home)
+            .env("RELAY_TEST_BINARY", std::env::current_exe().unwrap())
+            .env("RELAY_NO_WATCH", "1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    wait_for(&home.join("files-ready"));
+    let identity = fs::read_to_string(home.join("identity")).unwrap();
+    let mut identity = identity.lines();
+    let worker = identity.next().unwrap();
+    let generation = identity.next().unwrap();
+    let token = identity.next().unwrap();
+    let store = LifecycleStore::new(home.clone());
+    let pending = store.read_pending_by_token(token).unwrap().unwrap();
+    assert_eq!(pending.worker_id, worker);
+    assert_eq!(pending.generation, generation);
+    assert_eq!(pending.expected_runtime_session_id, None);
+    assert_eq!(pending.expected_tool, "omp");
+    assert_eq!(pending.expected_cwd, cwd.to_str().unwrap());
+    assert_eq!(
+        store
+            .read_worker(worker)
+            .unwrap()
+            .unwrap()
+            .runtime_session_id,
+        None
+    );
+    assert!(store.read_binding(SESSION).unwrap().is_none());
+    let observation_deadline = Instant::now() + Duration::from_millis(400);
+    while Instant::now() < observation_deadline {
+        assert!(
+            spawn.0.try_wait().unwrap().is_none(),
+            "session file alone completed spawn before the managed hook claim"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    fs::write(home.join("allow-hook"), "").unwrap();
+    wait_for(&home.join("hook-done"));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = spawn.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "spawn did not return after omp hook"
+        );
+        thread::sleep(Duration::from_millis(10));
+    };
+    use std::io::Read as _;
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    spawn
+        .0
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut stdout)
+        .unwrap();
+    spawn
+        .0
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert!(status.success(), "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains(SESSION),
+        "spawn returned no matching session: {stdout}"
+    );
+    let active = store.read_worker(worker).unwrap().unwrap();
+    assert_eq!(active.state, ManagedState::Active);
+    assert_eq!(active.worker_id, worker);
+    assert_eq!(active.generation, generation);
+    assert_eq!(active.runtime_session_id.as_deref(), Some(SESSION));
+    assert_eq!(active.tool, "omp");
+    assert_eq!(active.cwd, cwd.to_str().unwrap());
+    let binding = store.read_binding(SESSION).unwrap().unwrap();
+    assert_eq!(binding.runtime_session_id, SESSION);
+    assert_eq!(
+        binding.state,
+        BindingState::Managed {
+            worker_id: worker.to_string(),
+            generation: generation.to_string(),
+        }
+    );
+    assert!(store.read_binding(OLD).unwrap().is_none());
+    assert!(store.read_binding(DECOY).unwrap().is_none());
+    fs::write(home.join("finish"), "").unwrap();
+    wait_for(&home.join("child-done"));
+    fs::remove_dir_all(home).ok();
+}

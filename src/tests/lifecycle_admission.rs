@@ -159,6 +159,43 @@ fn lifecycle_admission_unmanaged_guard_binds_target_kind_and_epoch() {
 }
 
 #[test]
+fn lifecycle_admission_omp_drain_can_restore_mail_then_consume_it_once() {
+    let home = fresh_home("omp-admission");
+    let cwd = home.join("project");
+    let session = "18111111-1111-4111-8111-111111111111";
+    seed_entry(&home, session, "omp", &cwd);
+    let mailbox = home.join("mailbox").join(format!("{session}.jsonl"));
+    let original = "{\"id\":\"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa\",\"body\":\"omp mail\"}\n";
+    fs::write(&mailbox, original).unwrap();
+    let store = LifecycleStore::new(home.clone());
+    let Admission::Unmanaged(mut guard) = store
+        .admit_operation(session, OperationKind::CliInboxDrain)
+        .unwrap()
+    else {
+        panic!("expected unmanaged omp admission");
+    };
+
+    let receipt = lifecycle::drain_with_guard(&mut guard).unwrap();
+    assert!(!mailbox.exists());
+    receipt.rollback().unwrap();
+    assert_eq!(fs::read_to_string(&mailbox).unwrap(), original);
+    assert_eq!(
+        lifecycle::drain_with_guard(&mut guard)
+            .unwrap()
+            .into_messages()
+            .len(),
+        1
+    );
+    assert!(
+        lifecycle::drain_with_guard(&mut guard)
+            .unwrap()
+            .into_messages()
+            .is_empty()
+    );
+    fs::remove_dir_all(home).ok();
+}
+
+#[test]
 fn lifecycle_admission_drain_receipt_rolls_back_exact_lines_before_new_mail() {
     let home = fresh_home("receipt-rollback");
     let cwd = home.join("project");

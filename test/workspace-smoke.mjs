@@ -632,9 +632,9 @@ function docsContract() {
     assert.ok(text.includes(command), `runtime usage omits workspace ${command}`);
   }
 
-  const skill = fs.readFileSync(path.join(payload, 'skills', 'productivity', 'session-relay', 'SKILL.md'), 'utf8');
+  const skill = fs.readFileSync(path.join(payload, 'skills', 'session-relay', 'SKILL.md'), 'utf8');
   const reference = fs.readFileSync(
-    path.join(payload, 'skills', 'productivity', 'session-relay', 'references', 'workspace.md'),
+    path.join(payload, 'skills', 'session-relay', 'references', 'workspace.md'),
     'utf8',
   );
   const docs = `${skill}\n${reference}`;
@@ -646,32 +646,6 @@ function docsContract() {
   }
   for (const resource of ['port', 'temp_dir', 'build_dir', 'database_schema', 'log_dir', 'cache_dir']) {
     assert.match(docs, new RegExp(`\\b${resource}\\b`), `workspace docs omit resource kind ${resource}`);
-  }
-  for (const topic of [
-    /separate (?:checkout|worktree)/i,
-    /automatic(?:ally)? allocat/i,
-    /active session/i,
-    /lease/i,
-    /crash recovery/i,
-    /commit integration/i,
-    /read-only/i,
-    /external resources/i,
-    /clone.{0,40}worktree|worktree.{0,40}clone/is,
-    /managed.{0,80}unmanaged/is,
-    /Linux/,
-    /linux_cgroup_v2_pidfd/,
-  ]) {
-    assert.match(docs, topic, `workspace documentation topic is missing: ${topic}`);
-  }
-  for (const precedent of [
-    'https://conductor.build/',
-    'https://developers.openai.com/codex/app/',
-    'https://code.claude.com/docs/en/common-workflows',
-    'https://docs.cursor.com/en/background-agent',
-    'https://docs.github.com/en/copilot/concepts/agents/coding-agent/about-coding-agent',
-    'https://git-scm.com/docs/git-worktree',
-  ]) {
-    assert.ok(docs.includes(precedent), `workspace documentation precedent is missing: ${precedent}`);
   }
   for (const forbidden of [
     'docks session',

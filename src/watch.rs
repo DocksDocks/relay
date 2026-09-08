@@ -130,8 +130,8 @@ fn decide(tool: &str, server: Option<&str>) -> Mode {
 }
 
 fn validate_tool(tool: &str) {
-    if !matches!(tool, "claude" | "codex") {
-        die(&format!("--tool must be claude|codex, got: {tool}"));
+    if !matches!(tool, "claude" | "codex" | "omp") {
+        die(&format!("--tool must be claude|codex|omp, got: {tool}"));
     }
 }
 
@@ -762,6 +762,12 @@ mod tests {
         assert_eq!(decide("codex", None), Mode::Wake);
         assert_eq!(decide("claude", Some("/s.sock")), Mode::Wake);
         assert_eq!(decide("claude", None), Mode::Wake);
+    }
+
+    #[test]
+    fn decide_routes_omp_to_wake_with_or_without_server() {
+        assert_eq!(decide("omp", Some("/s.sock")), Mode::Wake);
+        assert_eq!(decide("omp", None), Mode::Wake);
     }
 
     #[test]

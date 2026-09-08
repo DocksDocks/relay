@@ -26,8 +26,7 @@ The tracked top-level inventory and current working tree define this layout:
 │   └── tests/                         13 explicit [[test]] integration targets
 ├── test/                              Node scenario and contract harness
 ├── plugin/                            shipped plugin payload
-├── .claude-plugin/marketplace.json    Claude Code marketplace catalog
-├── .agents/plugins/marketplace.json   Codex marketplace catalog
+├── .omp-plugin/marketplace.json       omp marketplace catalog
 ├── .github/workflows/                 CI and release workflows
 ├── docs/                              plan record standard, routing node, crate map
 ├── scripts/gate.mjs                   authoritative repository gate
@@ -43,34 +42,29 @@ The tracked top-level inventory and current working tree define this layout:
 
 ## Payload boundary
 
-Consumers receive `plugin/`. Claude Code copies the plugin directory named by marketplace `source`, not the repository.
+Consumers receive `plugin/`. omp copies the plugin directory named by the catalog `source`, not the repository.
 
 Only these first-level entries are allowed under `plugin/`:
 
-- `.claude-plugin`
-- `.codex-plugin`
+- `package.json`
+- `extension`
 - `skills`
-- `hooks`
-- `commands`
-- `agents`
 - `bin`
 - `README.md`
 - `AGENTS.md`
-- `CLAUDE.md`
 - `LICENSE`
 
 `test/distribution-contract.mjs` enforces this boundary with `git ls-files`. It provides no exemption mechanism.
 
 ## Version
 
-Pin the version in exactly four files:
+Pin the version in exactly three files:
 
 - `Cargo.toml`
-- `plugin/.claude-plugin/plugin.json`
-- `plugin/.codex-plugin/plugin.json`
-- `.claude-plugin/marketplace.json`
+- `plugin/package.json`
+- `.omp-plugin/marketplace.json`
 
-Move all four pins together. `test/distribution-contract.mjs` asserts their lockstep.
+Move all three pins together. `test/distribution-contract.mjs` asserts their lockstep.
 
 ## Release
 
@@ -98,10 +92,10 @@ The split branch head was `161d045f6d0e3ec36f692bcf662444b3506a28ae`. Per-file h
 The repository has three context nodes:
 
 - Root `AGENTS.md` with root `CLAUDE.md`
-- `plugin/AGENTS.md` with `plugin/CLAUDE.md`
+- `plugin/AGENTS.md`
 - `docs/AGENTS.md` with `docs/CLAUDE.md`
 
-The `CLAUDE.md` files exist because Claude Code descends `CLAUDE.md`, not `AGENTS.md`.
+The `CLAUDE.md` files exist because Claude Code descends `CLAUDE.md`, not `AGENTS.md`. The payload ships no `CLAUDE.md`.
 
 ## Plans
 

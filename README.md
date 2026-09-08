@@ -1,6 +1,6 @@
 # Session Relay
 
-Session Relay is a cross-session, cross-project, cross-tool message bus for Claude Code and Codex. It provides hooks, MCP tools, a CLI, and an agent skill.
+Session Relay is a cross-session, cross-project message bus for omp sessions. It provides an omp extension with a `relay` tool and `/relay` command, a CLI, and an agent skill.
 
 ## Supported platforms
 
@@ -29,13 +29,12 @@ Each release publishes `SHA256SUMS` alongside both binaries.
 
 ## Add the marketplace
 
-Add the Claude Code marketplace. Then install the plugin from its verified `session-relay` marketplace entry.
+Add the omp marketplace from the repository URL or from a local checkout. Then install the plugin into the current project and restart the omp session.
 
-```text
-/plugin marketplace add DocksDocks/session-relay
-/plugin install session-relay@session-relay
+```bash
+omp plugin marketplace add https://github.com/DocksDocks/session-relay.git
+# Or: omp plugin marketplace add /path/to/session-relay
+omp plugin install session-relay@session-relay --scope project
 ```
 
-The repository ships its Codex catalog at `.agents/plugins/marketplace.json`.
-
-The plugin also remains reachable through the docks Claude marketplace by redirect.
+The repository ships its catalog at `.omp-plugin/marketplace.json`. omp copies the directory named by the catalog `source`, which is `plugin/`.

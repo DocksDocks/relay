@@ -157,6 +157,16 @@ fn validate_uuid(value: &str, label: &str) -> Result<(), String> {
         .map_err(|_| format!("{label} is not a lowercase UUID v4"))
 }
 
+/// Runtime session ids come from the tool, not from relay: Claude and Codex mint UUIDv4, omp
+/// mints UUIDv7. Accept any lowercase UUID shape; relay-generated ids stay strict v4.
+fn validate_session_id(value: &str, label: &str) -> Result<(), String> {
+    if store::is_uuid(value) && !value.bytes().any(|b| b.is_ascii_uppercase()) {
+        Ok(())
+    } else {
+        Err(format!("{label} is not a lowercase UUID"))
+    }
+}
+
 fn validate_timestamp(value: &str, label: &str) -> Result<(), String> {
     if valid_timestamp(value) {
         Ok(())
@@ -257,10 +267,14 @@ impl MessageV2 {
         for (label, value) in [
             ("message id", self.id.as_str()),
             ("correlation id", self.correlation_id.as_str()),
+        ] {
+            validate_uuid(value, label)?;
+        }
+        for (label, value) in [
             ("from session id", self.from_session_id.as_str()),
             ("to session id", self.to_session_id.as_str()),
         ] {
-            validate_uuid(value, label)?;
+            validate_session_id(value, label)?;
         }
         if let Some(value) = &self.reply_to {
             validate_uuid(value, "reply_to")?;
@@ -480,12 +494,12 @@ impl ClaimStatusV1 {
         if self.schema != 1 {
             return Err("ClaimStatusV1 schema mismatch".to_string());
         }
+        validate_uuid(&self.correlation_id, "claim correlation id")?;
         for (label, value) in [
-            ("claim correlation id", self.correlation_id.as_str()),
             ("claim requester", self.requester_session_id.as_str()),
             ("claim responder", self.responder_session_id.as_str()),
         ] {
-            validate_uuid(value, label)?;
+            validate_session_id(value, label)?;
         }
         validate_sha(&self.request_sha256, "request_sha256")?;
         if let Some(value) = &self.reply_sha256 {
@@ -687,12 +701,16 @@ impl WorkerResultV1 {
             ("result correlation", self.correlation_id.as_str()),
             ("reservation id", self.reservation_id.as_str()),
             ("root reservation id", self.root_reservation_id.as_str()),
-            ("parent session id", self.parent_session_id.as_str()),
             ("worker id", self.worker_id.as_str()),
             ("generation", self.generation.as_str()),
-            ("runtime session id", self.runtime_session_id.as_str()),
         ] {
             validate_uuid(value, label)?;
+        }
+        for (label, value) in [
+            ("parent session id", self.parent_session_id.as_str()),
+            ("runtime session id", self.runtime_session_id.as_str()),
+        ] {
+            validate_session_id(value, label)?;
         }
         validate_timestamp(&self.created_at, "worker result created_at")?;
         for (label, value) in [("repo_dev", &self.repo_dev), ("repo_ino", &self.repo_ino)] {
