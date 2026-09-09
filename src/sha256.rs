@@ -1,8 +1,6 @@
 // Minimal incremental SHA-256 for follow-file integrity checks. Keeping this
 // in-tree avoids adding a dependency to the single-static-binary relay crate.
 
-use std::fmt::Write as _;
-
 const INITIAL_STATE: [u32; 8] = [
     0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
 ];
@@ -54,10 +52,9 @@ impl Sha256 {
             }
         }
 
-        while input.len() >= 64 {
-            let block: &[u8; 64] = input[..64].try_into().expect("64-byte SHA-256 block");
+        while let Some((block, remaining)) = input.split_first_chunk::<64>() {
             self.compress(block);
-            input = &input[64..];
+            input = remaining;
         }
 
         self.buffer[..input.len()].copy_from_slice(input);
@@ -94,7 +91,7 @@ impl Sha256 {
     fn compress(&mut self, block: &[u8; 64]) {
         let mut words = [0_u32; 64];
         for (word, bytes) in words.iter_mut().zip(block.chunks_exact(4)) {
-            *word = u32::from_be_bytes(bytes.try_into().expect("four-byte SHA-256 word"));
+            *word = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
         }
         for i in 16..64 {
             let s0 = words[i - 15].rotate_right(7)
@@ -141,14 +138,17 @@ impl Sha256 {
 pub(crate) fn hex_digest(input: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(input);
-    hasher
-        .digest()
-        .iter()
-        .fold(String::with_capacity(64), |mut hex, byte| {
-            write!(hex, "{byte:02x}").expect("writing to a String cannot fail");
-            hex
-        })
+    let mut hex = String::with_capacity(64);
+    for byte in hasher.digest() {
+        hex.push(HEX_DIGITS[usize::from(byte >> 4)]);
+        hex.push(HEX_DIGITS[usize::from(byte & 0x0f)]);
+    }
+    hex
 }
+
+const HEX_DIGITS: [char; 16] = [
+    '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f',
+];
 
 pub(crate) fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     let mut difference = left.len() ^ right.len();

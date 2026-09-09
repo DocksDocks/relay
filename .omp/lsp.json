@@ -1,0 +1,8 @@
+{
+  "servers": {
+    "rust-analyzer": {
+      "command": "sh",
+      "args": ["-c", "exec \"${CARGO_HOME:-$HOME/.cargo}/bin/rust-analyzer\" \"$@\"", "rust-analyzer"]
+    }
+  }
+}

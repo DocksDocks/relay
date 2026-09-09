@@ -94,7 +94,8 @@ fn mtime_ms(file: &Path) -> i64 {
         .and_then(|m| m.modified())
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_millis() as i64)
+        // Millisecond timestamps above the signed range saturate at its upper bound.
+        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
         .unwrap_or(0)
 }
 
@@ -205,7 +206,7 @@ impl Default for Options<'_> {
 }
 
 /// One discovered session, as the JSON object the bus/CLI emit.
-pub fn discover(opts: &Options) -> Vec<JsonValue> {
+pub fn discover(opts: &Options<'_>) -> Vec<JsonValue> {
     let root = omp_sessions_root(
         &|key| {
             if key == "PWD" {
@@ -221,9 +222,14 @@ pub fn discover(opts: &Options) -> Vec<JsonValue> {
     discover_files(opts, list_omp_files(&root).into_iter())
 }
 
-fn discover_files(opts: &Options, files: impl Iterator<Item = Candidate>) -> Vec<JsonValue> {
+fn discover_files(opts: &Options<'_>, files: impl Iterator<Item = Candidate>) -> Vec<JsonValue> {
     let now = store::now_ms();
-    let cutoff = now - (opts.active_within_min * 60_000.0) as i64;
+    let window_ms = (opts.active_within_min * 60_000.0).clamp(i64::MIN as f64, i64::MAX as f64);
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "value is clamped to the target range above"
+    )]
+    let cutoff = now - window_ms as i64;
 
     // 1) cheap stat pass: enumerate + window-filter BEFORE reading any content.
     let mut files: Vec<Candidate> = files
@@ -252,7 +258,14 @@ fn discover_files(opts: &Options, files: impl Iterator<Item = Candidate>) -> Vec
             continue; // newest-first, so first occurrence wins
         }
         let known = named.get(&id);
-        let age_sec = ((now - f.last_activity_ms).max(0) as f64 / 1000.0).round() as i64;
+        let age_sec = ((now - f.last_activity_ms).max(0) as f64 / 1000.0)
+            .round()
+            .clamp(0.0, i64::MAX as f64);
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "value is clamped to the target range above"
+        )]
+        let age_sec = age_sec as i64;
         let cwd = fcwd.or_else(|| known.and_then(|k| k.dir.clone()));
         let mut m: HashMap<String, JsonValue> = HashMap::new();
         m.insert("tool".into(), JsonValue::from("omp".to_string()));

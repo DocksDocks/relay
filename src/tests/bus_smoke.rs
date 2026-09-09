@@ -1,6 +1,13 @@
 // Black-box MCP messaging smoke tests: spawn `relay bus` and speak real
 // newline-delimited JSON-RPC over its stdio.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    reason = "integration test crate: a panic is the intended failure signal"
+)]
+
 use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};

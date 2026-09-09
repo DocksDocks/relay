@@ -8,8 +8,22 @@ Run setup once. Then run the repository gate.
 
 ```bash
 corepack enable && pnpm install --frozen-lockfile
+rustup toolchain install
+sh scripts/install-cargo-deny.sh
 node scripts/gate.mjs
 ```
+
+`rustup toolchain install` reads `rust-toolchain.toml`. It installs `rustfmt`, `clippy`, and `rust-analyzer` for the pinned channel.
+
+`scripts/install-cargo-deny.sh` installs the pinned `cargo-deny` release:
+
+- It selects the x86-64 or arm64 tarball.
+- It verifies the pinned SHA-256.
+- It copies the binary into the cargo bin directory.
+
+`.github/workflows/ci.yml` calls the same script. The gate refuses any other `cargo-deny` version.
+
+`.omp/lsp.json` starts `rust-analyzer` from the cargo bin directory. The harness `lsp` tool then serves Rust even when the cargo bin directory is not on `PATH`.
 
 The gate is authoritative.
 
@@ -19,9 +33,12 @@ The tracked top-level inventory and current working tree define this layout:
 
 ```text
 .
-├── Cargo.toml                         Rust package and explicit integration targets
+├── Cargo.toml                         Rust package, lint policy, explicit integration targets
 ├── Cargo.lock                         locked Rust dependencies
-├── rust-toolchain.toml                pinned Rust toolchain
+├── rust-toolchain.toml                pinned Rust toolchain and components
+├── clippy.toml                        clippy test exemptions
+├── .omp/lsp.json                      rust-analyzer launch for the harness lsp tool
+├── deny.toml                          cargo-deny supply-chain policy
 ├── src/                               crate sources
 │   └── tests/                         five explicit [[test]] integration targets
 ├── test/                              Node scenario and contract harness
@@ -30,6 +47,7 @@ The tracked top-level inventory and current working tree define this layout:
 ├── .github/workflows/                 CI and release workflows
 ├── docs/                              plan record standard, routing node, crate map
 ├── scripts/gate.mjs                   authoritative repository gate
+├── scripts/install-cargo-deny.sh      pinned cargo-deny installer
 ├── package.json                       Node commands and tool versions
 ├── biome.json                         JavaScript formatting and lint rules
 ├── README.md                          installation guide
@@ -38,6 +56,54 @@ The tracked top-level inventory and current working tree define this layout:
 ```
 
 `Cargo.toml` sets `autotests = false`. It declares five integration targets with explicit `[[test]]` entries under `src/tests/`: `bus_smoke`, `protocol`, `lock_race`, `holds`, and `watch`.
+
+
+## Rust code
+
+The lint policy is machine-enforced:
+
+- `Cargo.toml` `[lints]` sets the lint levels.
+- `clippy.toml` exempts tests from the panic-family lints.
+- The gate runs clippy with `-D warnings`.
+
+When a rule below has a lint, the lint is the rule. The text explains the intent.
+
+### Toolchain and dependencies
+
+- Keep the toolchain and the crate `rust-version` on one channel. Move `rust-toolchain.toml` and `Cargo.toml` `rust-version` together.
+- The crate has three runtime dependencies: `tinyjson`, `libc`, and `rustix`.
+- Before you add a dependency, get an `ask` decision.
+- A new dependency must pass `cargo deny --locked --offline check`. The policy allows MIT or Apache-2.0 licenses, crates.io only, no wildcard versions, and no duplicate versions.
+
+### Suppressions
+
+- Do not write `#[allow(...)]`.
+- The five integration test roots under `src/tests/` carry the only crate-level `allow`.
+- For a justified exception, use `#[expect(lint, reason = "...")]`. The compiler reports the attribute when it becomes unnecessary.
+
+### Panics
+
+- Do not call `unwrap`, `expect`, `panic!`, `unreachable!`, `todo!`, or `unimplemented!` outside tests.
+- Library code returns `Result`. The CLI exits through the `die` helpers with a user-facing message.
+- Tests may panic. A failed assertion is the intended signal.
+- One exception exists. `store::uuid_v4` keeps two `expect` calls under `#[expect(clippy::expect_used, reason = ...)]`, because a failed entropy read is unrecoverable and the abort is intentional.
+- A new exception needs the same shape: an unrecoverable condition, one function, and a `reason` that names the invariant.
+
+### Unsafe and casts
+
+- Every `unsafe` block holds one operation.
+- Put a `// SAFETY:` comment directly above the block. The comment names the invariant.
+- The crate has two such blocks. Both are `libc` calls.
+- Numeric casts state their contract. Use `T::try_from(x)` with an error path or a commented saturating fallback.
+- Clamp a float before you narrow it. Add `#[expect(clippy::cast_possible_truncation, reason = "...")]` only on that clamped line.
+
+### Signatures and tools
+
+- Borrow what you do not consume. Take `&T` unless the function stores or moves the value.
+- Use the `lsp` tool for definitions, references, and renames. Text search misses shadowed and re-exported symbols.
+- Tests live in the five explicit `[[test]]` targets and in inline `#[cfg(test)]` modules.
+- After you add or remove a test, run `node test/rust-test-inventory.mjs --generate`. Commit the fixture.
+- Run `cargo fmt` before the gate. The gate runs `cargo fmt --check` first and fails on any difference.
 
 ## Payload boundary
 

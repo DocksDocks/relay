@@ -4,6 +4,7 @@ version = "0.18.0"
 edition = "2024"
 rust-version = "1.85"
 description = "session-relay: durable messaging between omp sessions, single static binary"
+license = "MIT"
 publish = false
 autotests = false
 
@@ -39,6 +40,34 @@ path = "src/tests/watch.rs"
 tinyjson = "2.5"
 libc = "0.2"
 rustix = { version = "1.1", features = ["fs", "net", "process"] }
+
+# Lint policy. `scripts/gate.mjs` runs clippy with `-D warnings`, so every `warn`
+# below fails the gate. Tests are exempt from the panic-family lints through
+# `clippy.toml`. Justify any exception with `#[expect(lint, reason = "...")]`.
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+unused_qualifications = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[lints.clippy]
+# Panics are not error handling. Return `Result` or exit through `die`.
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+unreachable = "warn"
+todo = "warn"
+unimplemented = "warn"
+dbg_macro = "warn"
+# Every unsafe block names the invariant that makes it sound and holds one operation.
+undocumented_unsafe_blocks = "deny"
+multiple_unsafe_ops_per_block = "deny"
+# Suppressions carry a reason so the next reader can retire them.
+allow_attributes_without_reason = "deny"
+# Numeric casts state their truncation or sign contract.
+cast_possible_truncation = "warn"
+cast_sign_loss = "warn"
+# Borrow what you do not consume.
+needless_pass_by_value = "warn"
 
 # Size-optimized static binary (min-sized-rust, all stable-channel).
 # codegen-units=1 is also a prerequisite for the reproducible-rebuild check.

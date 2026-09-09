@@ -5,6 +5,8 @@ outlives its process; registration, queued mail, holds, and correlated claims
 persist in the shared store. The shipped omp extension connects a running
 session to that store through the CLI.
 
+Coding rules for the crate (lint policy, panics, unsafe, casts, dependencies) live in the root `AGENTS.md` section "Rust code".
+
 ## Module map
 
 | Module | Responsibility |

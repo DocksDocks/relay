@@ -200,6 +200,24 @@ const RUST_BINARY = (() => {
   }
   ok('cargo clippy --release --all-targets --locked -D warnings clean');
 
+  // Supply chain: advisories, bans, licenses, sources from deny.toml. The tool is a
+  // prebuilt release pinned independently of the Rust toolchain. `cargo fetch` first so
+  // that every crate in Cargo.lock is present for the offline metadata pass.
+  const DENY_VERSION = 'cargo-deny 0.20.2';
+  const denyInstall = 'install it: sh scripts/install-cargo-deny.sh';
+  const denyVersion = run([cargo, 'deny', '--version'], { encoding: 'utf8' });
+  if (failed(denyVersion)) fail(`cargo deny is not available (${detailOf(denyVersion)}); ${denyInstall}`);
+  const denyVersionText = denyVersion.stdout.trim();
+  if (denyVersionText !== DENY_VERSION)
+    fail(`cargo deny is ${denyVersionText}, expected ${DENY_VERSION}; ${denyInstall}`);
+  if (failed(cargoRun(['fetch', '--locked']))) fail('cargo fetch --locked failed (run: cargo fetch --locked)');
+  if (failed(cargoRun(['deny', 'fetch'])))
+    fail('cargo deny fetch failed (advisory database refresh; run: cargo deny fetch)');
+  if (failed(cargoRun(['deny', '--locked', '--offline', 'check']))) {
+    fail('cargo deny check failed (run: cargo deny --locked --offline check)');
+  }
+  ok(`${DENY_VERSION}: advisories, bans, licenses, sources clean`);
+
   if (failed(cargoRun(['build', '--release', '--locked']))) {
     fail('release build failed (run: cargo build --release --locked)');
   }

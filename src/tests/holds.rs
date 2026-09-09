@@ -1,3 +1,10 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    reason = "integration test crate: a panic is the intended failure signal"
+)]
+
 pub mod support;
 
 use std::fs;

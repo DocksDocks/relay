@@ -32,8 +32,8 @@ fn die(msg: &str) -> ! {
     std::process::exit(1);
 }
 
-fn protocol_die(error: ProtocolError) -> ! {
-    let status = if matches!(&error, ProtocolError::CorrelationConflict) {
+fn protocol_die(error: &ProtocolError) -> ! {
+    let status = if matches!(error, ProtocolError::CorrelationConflict) {
         2
     } else {
         1
@@ -44,7 +44,7 @@ fn protocol_die(error: ProtocolError) -> ! {
 
 fn protocol_identity(identity: &str) -> store::Entry {
     store::resolve(identity).unwrap_or_else(|| {
-        protocol_die(ProtocolError::ProtocolStoreError(format!(
+        protocol_die(&ProtocolError::ProtocolStoreError(format!(
             "protocol identity is not registered: {identity}"
         )))
     })
@@ -56,7 +56,7 @@ fn protocol_identity(identity: &str) -> store::Entry {
 fn protocol_self_identity() -> store::Entry {
     let cwd = cwd_string();
     let Some(id) = store::id_for_dir(&cwd) else {
-        protocol_die(ProtocolError::ProtocolStoreError(format!(
+        protocol_die(&ProtocolError::ProtocolStoreError(format!(
             "protocol identity is not registered: no session marker for {cwd}"
         )));
     };
@@ -310,13 +310,11 @@ fn attach(args: &Args) -> ! {
         store::LockStatus::Dead | store::LockStatus::Never => {}
     }
 
-    let dir_exists = target
+    let dir = target
         .dir
         .as_deref()
-        .is_some_and(|dir| std::path::Path::new(dir).is_dir());
-    if !dir_exists {
-        die("attach refused: stored dir does not exist");
-    }
+        .filter(|dir| std::path::Path::new(dir).is_dir())
+        .unwrap_or_else(|| die("attach refused: stored dir does not exist"));
     eprintln!("{ATTACH_WARNING}");
     let cmd = wake_cmd();
     if parsed.execute {
@@ -338,7 +336,7 @@ fn attach(args: &Args) -> ! {
     };
     let status = Command::new(cmd)
         .args(["--resume", &target.id])
-        .current_dir(target.dir.as_deref().unwrap())
+        .current_dir(dir)
         .status()
         .unwrap_or_else(|error| die(&format!("cannot launch omp: {error}")));
     drop(guard);
@@ -363,7 +361,7 @@ fn lock_age(path: &std::path::Path) -> String {
 }
 
 fn progress_age(ms: i64) -> String {
-    let seconds = (ms.max(0) as u64) / 1000;
+    let seconds = ms.max(0).unsigned_abs() / 1000;
     if seconds < 60 {
         format!("{seconds}s")
     } else if seconds < 3600 {
@@ -640,12 +638,21 @@ pub fn run(cmd: &str, raw: Vec<String>) -> ! {
                 std::process::exit(0);
             }
             for r in &rows {
-                let o = r.get::<HashMap<String, JsonValue>>().expect("row object");
+                let o = r
+                    .get::<HashMap<String, JsonValue>>()
+                    .unwrap_or_else(|| die("row object"));
                 let s = |k: &str| o.get(k).and_then(|v| v.get::<String>().cloned());
                 let age = o
                     .get("ageSec")
                     .and_then(|v| v.get::<f64>().copied())
-                    .unwrap_or(0.0) as i64;
+                    .unwrap_or(0.0);
+                let age = if age.is_nan() { 0.0 } else { age };
+                let age = age.clamp(i64::MIN as f64, i64::MAX as f64);
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "value is clamped to the target range above"
+                )]
+                let age = age as i64;
                 let registered = o
                     .get("registered")
                     .and_then(|v| v.get::<bool>().copied())
@@ -773,13 +780,13 @@ pub fn run(cmd: &str, raw: Vec<String>) -> ! {
             let protocol = ProtocolStore::new(store::home_dir());
             let message = protocol
                 .request(&requester.id, &responder.id, &body)
-                .unwrap_or_else(|error| protocol_die(error));
+                .unwrap_or_else(|error| protocol_die(&error));
             if args.has_before_sep("json") {
                 // Documented machine mode: the complete canonical MessageV2 envelope.
                 println!(
                     "{}",
                     String::from_utf8(message.canonical_bytes())
-                        .expect("canonical MessageV2 is UTF-8")
+                        .unwrap_or_else(|_| die("canonical MessageV2 is UTF-8"))
                 );
             } else {
                 println!(
@@ -814,7 +821,7 @@ pub fn run(cmd: &str, raw: Vec<String>) -> ! {
             let protocol = ProtocolStore::new(store::home_dir());
             let outcome = protocol
                 .reply(correlation_id, &responder.id, status, &body)
-                .unwrap_or_else(|error| protocol_die(error));
+                .unwrap_or_else(|error| protocol_die(&error));
             println!(
                 r#"{{"correlation_id":"{}","message_id":"{}","outcome":"enqueued","status":"{}"}}"#,
                 outcome.message.correlation_id,
@@ -864,7 +871,12 @@ pub fn run(cmd: &str, raw: Vec<String>) -> ! {
                 );
                 out.insert("count".into(), JsonValue::from(receipt.count as f64));
                 out.insert("messages".into(), JsonValue::from(receipt.messages));
-                println!("{}", JsonValue::from(out).stringify().unwrap());
+                println!(
+                    "{}",
+                    JsonValue::from(out)
+                        .stringify()
+                        .unwrap_or_else(|error| die(&error.to_string()))
+                );
                 std::process::exit(0);
             }
             let msgs = store::drain_mailbox(&target.id)
