@@ -606,23 +606,36 @@ fn preserve_artifact_mode_round_trips_binary_and_untracked_pax() {
                 libc::makedev(1, 3),
             )
         } == 0;
-        let created = direct || {
-            let direct_error = std::io::Error::last_os_error();
-            let output = Command::new("sudo")
-                .args(["-n", "mknod", device.to_str().unwrap(), "c", "1", "3"])
-                .output()
-                .unwrap();
-            let privilege_missing = matches!(
-                direct_error.raw_os_error(),
-                Some(libc::EPERM) | Some(libc::EACCES)
-            );
-            assert!(
-                output.status.success() || privilege_missing,
-                "device fixture failed without a privilege error: mknod: {direct_error}; sudo: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            output.status.success()
-        };
+        let created = direct
+            || {
+                let direct_error = std::io::Error::last_os_error();
+                let privilege_missing = matches!(
+                    direct_error.raw_os_error(),
+                    Some(libc::EPERM) | Some(libc::EACCES)
+                );
+                // A host without sudo is a valid unprivileged host.
+                let sudo = Command::new("sudo")
+                    .args(["-n", "mknod", device.to_str().unwrap(), "c", "1", "3"])
+                    .output();
+                match sudo {
+                    Ok(output) if output.status.success() => true,
+                    Ok(output) => {
+                        assert!(
+                            privilege_missing,
+                            "device fixture failed without a privilege error: mknod: {direct_error}; sudo: {}",
+                            String::from_utf8_lossy(&output.stderr)
+                        );
+                        false
+                    }
+                    Err(error) => {
+                        assert!(
+                            privilege_missing,
+                            "device fixture failed without a privilege error: mknod: {direct_error}; sudo: {error}"
+                        );
+                        false
+                    }
+                }
+            };
         if created {
             if let Err(error) = artifact_preserve_refusal(&repo, "unsupported type") {
                 refusal_failures.push(format!("device type drift: {error}"));
