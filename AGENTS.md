@@ -102,7 +102,7 @@ When a rule below has a lint, the lint is the rule. The text explains the intent
 - Borrow what you do not consume. Take `&T` unless the function stores or moves the value.
 - Use the `lsp` tool for definitions, references, and renames. Text search misses shadowed and re-exported symbols.
 - Tests live in the five explicit `[[test]]` targets and in inline `#[cfg(test)]` modules.
-- After you add or remove a test, run `node test/rust-test-inventory.mjs --generate`. Commit the fixture.
+- After you add or remove a test in an integration target, run `node test/rust-test-inventory.mjs --generate`. Commit the fixture. Inline unit tests are discovered live and need no fixture change.
 - Run `cargo fmt` before the gate. The gate runs `cargo fmt --check` first and fails on any difference.
 
 ## Payload boundary
