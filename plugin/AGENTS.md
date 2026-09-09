@@ -24,10 +24,16 @@ Do not add a `from` field. Supply the active session identity automatically.
 Use `id` as the correlation ID for `reply`. Default reply status to `completed`.
 Show the roster and pending mail count through `/relay`.
 
-Invoke `bin/relay hook omp --session <id> --cwd <dir>` at session attachment.
-Use `--event prompt` for prompt-time delivery.
-Poll pending mail every 3 seconds.
-Deliver polled mail as `relay_mail` with `deliverAs: 'followUp'` and `triggerTurn: true`.
+Invoke `bin/relay hook omp --session <id> --cwd <dir> --hold` at session attachment.
+Use `--event prompt --hold` for prompt-time delivery.
+Both `SessionStart` and `Prompt` accept `--hold [<seconds>]`; the default is 30 s.
+Poll pending mail every 3 seconds. Use a hold for every drain, including tool `inbox`.
+Re-check runtime identity, then append bounded `session-relay.mail` chunk entries
+without an intervening await. Flush the session and verify chunk length and SHA-256.
+Only then run `ack <token>`. Roll back on identity drift or persistence failure.
+Deliver pending entries from the active branch as `relay_mail` at the next prompt.
+Send a content-free doorbell only when the running session is idle.
+Retry dropped prompt injection from durable entries; no mail is lost.
 Stop the old poll when the session switches or shuts down.
 Pass `RELAY_OMP_SESSIONS` from the active session root to every child.
 
@@ -89,6 +95,16 @@ Preserve jobs-1/jobs-4 byte parity.
 The shared store defaults to `~/.agent-relay`.
 `AGENT_RELAY_HOME` overrides the default.
 The legacy `SESSION_RELAY_HOME` override has lower precedence.
+Holds live in `holds/<token>.jsonl` with a `holds/<token>.json` manifest.
+`inbox --hold [<seconds>] <id>` returns `{ token, expires_at, count, messages }`.
+An empty inbox creates no hold and returns null token and expiry, zero count, and no messages.
+A non-empty held omp hook prints the token before the existing fenced mail block.
+An empty hook prints nothing. Relay mints lowercase UUID-v4 tokens.
+`ack <token>` commits held mail; `rollback <token>` restores it before later mail.
+Both exit 0 on success. Unknown or expired tokens exit 1 with `unknown_hold` or
+`expired_hold`. Recovery can safely repeat either operation.
+A second live hold for one session exits 1 with `hold_conflict`.
+The next drain, peek, or GC restores expired holds.
 `relay hook` and `relay bus` run a sweep at most once per six hours.
 The sweep considers abandoned fan-out worktrees after one day.
 The shared-store inactivity threshold defaults to 14 days.
@@ -130,8 +146,8 @@ It does not change the legacy JSONL path.
 Keep claim persistence and crash recovery under the existing store lock.
 Never add a second lock hierarchy.
 Reject unknown or malformed typed data.
-Preserve legacy `send`, `inbox`, `peek`, mail rendering, `handback`, and default
-`collect` bytes as compatibility fixtures.
+Preserve legacy `send`, `inbox` without `--hold`, `peek`, mail rendering,
+`handback`, and default `collect` bytes as compatibility fixtures.
 
 One correlation has one logical terminal claim.
 Only the exact responder can claim it.
@@ -139,7 +155,11 @@ A byte-identical retry is idempotent.
 Another claimant or payload conflicts without delivery.
 Pending files embed the complete envelope.
 Recovery deduplicates by message ID.
-Drain marks typed delivery consumed before mailbox removal.
+An unheld drain marks typed delivery consumed before mailbox removal.
+A hold leaves typed claims unchanged until ack; rollback restores delivery eligibility.
+Held or restored requests remain eligible in `Open`, `ReplyPending`,
+`ReplyEnqueued`, and `ReplyConsumed` when the exact request matches the claim.
+Update request delivery in the claim's current directory without changing reply state.
 This does not promise exactly-once consumer process execution.
 Preserve correlation, reply, and result identity in typed hook, watch, and
 extension delivery.

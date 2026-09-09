@@ -5,7 +5,7 @@ user-invocable: true
 metadata:
   pattern: tool-wrapper
   updated: "2026-09-08"
-  content_hash: "8939031df07dcb3d3e0749c299ad9762179664e1ef23392e576ea785d301ed89"
+  content_hash: "3a065679e1202fcac60398895c72ee98bbbbfae0304b3bb722bc7fbaab2f5682"
 ---
 
 # Session relay
@@ -101,15 +101,17 @@ The running extension receives queued mail without a separate resume process.
 | `relay` tool | Supplies the current session identity for mail actions |
 | `/relay` command | Shows the roster and the current pending-mail count |
 | Extension lifecycle | Registers at session start and switch; clears its timer at switch and shutdown |
-| Prompt hook | Drains mail before an agent turn |
-| Poll | Checks the inbox every 3 s and delivers non-empty mail as `relay_mail` |
-| Shared store | Holds registry entries, inboxes, claims, lifecycle authority, locks, and logs |
-| Doorbell | Resumes an idle session with `omp -p --resume <id> --mode json -- <message>` |
+| Prompt hook | Holds new mail and injects durable pending mail before an agent turn |
+| Poll | Checks the inbox every 3 s and reconciles pending session mail |
+| Shared store | Holds registry entries, inboxes, holds, claims, lifecycle authority, locks, and logs |
+| Doorbell | Starts a prompt in the idle running session without carrying mail content |
 
-The extension runs `hook omp --session <id> --cwd <dir>` at attachment.
+The extension runs `hook omp --session <id> --cwd <dir> --hold` at attachment.
 It adds `--event prompt` for a prompt or poll drain.
+Both `SessionStart` and `Prompt` accept `--hold [<seconds>]`; the default is 30 s.
 The hook reads no stdin for this form.
-An empty inbox produces no mail message.
+A held hook prints the token on its first line, then the existing fenced mail block.
+An empty inbox produces no output and creates no hold.
 
 The extension derives the session root from the active omp session file or bucket.
 It passes that root as `RELAY_OMP_SESSIONS` to each CLI child.
@@ -126,7 +128,7 @@ Call the `relay` tool with one action:
 | `roster` | None | Registered sessions |
 | `discover` | None | Recent sessions from local session stores |
 | `send` | `to`, `text` | Queues a note |
-| `inbox` | None | Reads and clears the current inbox |
+| `inbox` | None | Holds, persists, and returns pending mail for this session |
 | `request` | `to`, `text` | Queues a correlated request |
 | `reply` | `id`, `text`, optional `status` | Claims a terminal reply for that correlation ID |
 | `wake` | `to`, `text` | Resumes the target with the message |
@@ -188,10 +190,10 @@ Discovered metadata is only as trustworthy as the local session files.
 ```
 
 `send` queues mail in the shared store.
-A running extension polls every 3 s and delivers mail as `relay_mail` on the next poll.
-It requests a follow-up turn with `triggerTurn: true`.
+A running extension polls every 3 s and holds new mail.
+It starts an automatic doorbell prompt when the session is idle.
+Pending session mail is injected at that prompt; streaming delays the doorbell.
 Without a running extension, mail remains queued until a later drain.
-Use a doorbell only when the recipient is idle and needs an immediate turn.
 
 ## Correlated request and terminal reply
 
@@ -206,6 +208,9 @@ Only the exact registered responder can claim the correlation.
 The first valid terminal reply wins.
 A byte-identical retry is idempotent.
 A changed reply or competing claim fails without another terminal delivery.
+A held or restored request remains deliverable even after its responder replies.
+Ack consumes that request; rollback or expiry restores its delivery eligibility.
+These updates preserve the reply state and the single terminal reply.
 The CLI reports `correlation_conflict` with exit 2.
 Unknown correlations and validation failures exit 1.
 CLI `request --json` emits the complete canonical `MessageV2`.
@@ -215,11 +220,32 @@ Legacy JSONL mail keeps its existing rendering.
 
 ## Receive
 
-Mail arrives at session attachment, before an agent turn, or through the 3 s poll.
-Call `inbox` to read and clear pending mail immediately.
+Mail is held at session attachment, before an agent turn, or through the 3 s poll.
+Call `inbox` to persist and read pending mail immediately.
+Every extension drain re-checks runtime identity before appending bounded
+`session-relay.mail` entries, with no await between the check and the appends.
+Each chunk contains at most 65,536 characters. The extension flushes the session,
+reconstructs the chunks, and verifies their length and SHA-256 before `ack`.
+Identity drift or persistence failure causes rollback.
+Only pending entries on the active branch are injected at the next prompt.
+Dropped injections remain pending and are injected again. No mail is lost.
 Use `/relay` to inspect the roster and pending count without draining mail.
 Live delivery does not run `omp -p` and does not need an external watcher.
 Read [live view](references/workspace.md#live-view) for the delivery boundary.
+
+For a two-phase CLI drain, use `session-relay inbox --hold [<seconds>] <id>`.
+It returns one JSON line with `token`, `expires_at`, `count`, and `messages`.
+Message elements keep the plain inbox shape. An empty inbox creates no hold:
+`{"token":null,"expires_at":null,"count":0,"messages":[]}`.
+Relay mints lowercase UUID-v4 tokens. The default hold lasts 30 s.
+Holds live in `holds/<token>.jsonl` and `holds/<token>.json` under the relay home.
+Run `session-relay ack <token>` to commit consumption.
+Run `session-relay rollback <token>` to restore held mail before later arrivals.
+Both exit 0 on success and are safe to repeat during recovery.
+Unknown or expired tokens exit 1 with `unknown_hold` or `expired_hold` on stderr.
+A second live hold for one session exits 1 with `hold_conflict`.
+The next drain, peek, or GC restores expired holds.
+Plain CLI `inbox` and `peek` JSON stay unchanged. Held mail is outside the live mailbox.
 
 ## Receive-path health (`session-relay doctor`)
 

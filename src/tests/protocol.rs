@@ -2119,3 +2119,144 @@ fn requeued_terminal_reply_restores_consumed_claim_for_exact_redelivery() {
             .is_empty()
     );
 }
+
+fn assert_reply_while_held(state: ClaimState) {
+    for acknowledge in [true, false] {
+        let fixture = Fixture::new(&format!("protocol-reply-held-{state:?}-{acknowledge}"));
+        let request = fixture
+            .store
+            .request(REQUESTER_ID, RESPONDER_ID, "perform the held task")
+            .unwrap();
+        let receipt = {
+            let lifecycle_store = LifecycleStore::new(fixture.home.clone());
+            let Admission::Unmanaged(mut guard) = lifecycle_store
+                .admit_operation(RESPONDER_ID, OperationKind::CliInboxDrain)
+                .unwrap()
+            else {
+                panic!("expected unmanaged admission");
+            };
+            lifecycle::hold_with_guard(&mut guard, "session_start", 60).unwrap()
+        };
+        assert_eq!(
+            receipt.messages,
+            vec![
+                String::from_utf8(request.canonical_bytes())
+                    .unwrap()
+                    .parse::<JsonValue>()
+                    .unwrap()
+            ]
+        );
+        let token = receipt.token.expect("held request token");
+        assert!(mailbox_messages(&fixture.home, RESPONDER_ID).is_empty());
+
+        if state == ClaimState::ReplyPending {
+            let faulted = ProtocolStore::new(fixture.home.clone())
+                .with_failpoint(ProtocolFailpoint::ReplyAfterPendingWrite);
+            assert!(
+                faulted
+                    .reply(
+                        &request.correlation_id,
+                        RESPONDER_ID,
+                        TerminalStatus::Completed,
+                        "completed while held",
+                    )
+                    .is_err()
+            );
+        } else {
+            fixture
+                .store
+                .reply(
+                    &request.correlation_id,
+                    RESPONDER_ID,
+                    TerminalStatus::Completed,
+                    "completed while held",
+                )
+                .unwrap();
+        }
+        let mut delivered = Vec::new();
+        if state == ClaimState::ReplyConsumed {
+            delivered.extend(fixture.store.drain_typed(REQUESTER_ID).unwrap());
+        }
+        // Inspect without pending recovery so settlement exercises the exact state.
+        let before = read_claim_file(&claim_path(&fixture.home, &request.correlation_id));
+        assert_eq!(before.state, state);
+        assert_eq!(before.request_delivery, DeliveryState::Enqueued);
+        let reply = before.reply.clone().expect("terminal reply");
+        assert_eq!(reply.kind, MessageKind::TerminalReply);
+        assert_eq!(reply.body, "completed while held");
+
+        let holds = relay::store::HoldStore::new(fixture.home.clone());
+        if acknowledge {
+            holds.ack_hold(&token).unwrap();
+        } else {
+            holds.rollback_hold(&token).unwrap();
+        }
+        let settled = read_claim_file(&claim_path(&fixture.home, &request.correlation_id));
+        assert_eq!(
+            settled.request_delivery,
+            if acknowledge {
+                DeliveryState::Consumed
+            } else {
+                DeliveryState::Enqueued
+            }
+        );
+        assert_eq!(settled.state, before.state);
+        assert_eq!(settled.reply_delivery, before.reply_delivery);
+        assert_eq!(settled.reply_sha256, before.reply_sha256);
+        assert_eq!(settled.reply, before.reply);
+        assert!(
+            !fixture
+                .home
+                .join("holds")
+                .join(format!("{token}.json"))
+                .exists()
+        );
+        assert!(
+            !fixture
+                .home
+                .join("holds")
+                .join(format!("{token}.jsonl"))
+                .exists()
+        );
+
+        fixture.store.recover_pending().unwrap();
+        fixture.store.recover_pending().unwrap();
+        assert_eq!(
+            fixture.store.drain_typed(RESPONDER_ID).unwrap(),
+            if acknowledge {
+                Vec::new()
+            } else {
+                vec![request.clone()]
+            }
+        );
+        assert!(fixture.store.drain_typed(RESPONDER_ID).unwrap().is_empty());
+        delivered.extend(fixture.store.drain_typed(REQUESTER_ID).unwrap());
+        assert_eq!(delivered, vec![reply.clone()]);
+        fixture.store.recover_pending().unwrap();
+        assert!(fixture.store.drain_typed(REQUESTER_ID).unwrap().is_empty());
+        let consumed = fixture
+            .store
+            .read_claim(&request.correlation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(consumed.request_delivery, DeliveryState::Consumed);
+        assert_eq!(consumed.state, ClaimState::ReplyConsumed);
+        assert_eq!(consumed.reply_delivery, Some(DeliveryState::Consumed));
+        assert_eq!(consumed.reply, Some(reply));
+    }
+}
+
+#[test]
+fn reply_while_held_pending_settles_request_without_losing_reply() {
+    assert_reply_while_held(ClaimState::ReplyPending);
+}
+
+#[test]
+fn reply_while_held_enqueued_settles_request_without_duplicating_reply() {
+    assert_reply_while_held(ClaimState::ReplyEnqueued);
+}
+
+#[test]
+fn reply_while_held_consumed_settles_request_without_redelivering_reply() {
+    assert_reply_while_held(ClaimState::ReplyConsumed);
+}

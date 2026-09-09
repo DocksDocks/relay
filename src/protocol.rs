@@ -1084,6 +1084,101 @@ impl ProtocolStore {
         }
     }
 
+    fn claim_directory(state: ClaimState) -> ClaimDirectory {
+        match state {
+            ClaimState::RequestPending | ClaimState::ReplyPending => ClaimDirectory::Pending,
+            ClaimState::Open => ClaimDirectory::Open,
+            ClaimState::ReplyEnqueued | ClaimState::ReplyConsumed => ClaimDirectory::Terminal,
+        }
+    }
+
+    /// Update only the exact typed envelopes named by a durable hold manifest.
+    /// The caller owns the store lock; legacy rows have no protocol claim.
+    pub(crate) fn hold_claim_update_locked(
+        &self,
+        rows: &[JsonValue],
+        consumed: bool,
+    ) -> Result<(), String> {
+        for row in rows {
+            let values = row
+                .get::<HashMap<String, JsonValue>>()
+                .ok_or("hold manifest row must be an object")?;
+            let Some(kind) = values.get("kind").and_then(JsonValue::get::<String>) else {
+                continue;
+            };
+            let kind = MessageKind::parse(kind)?;
+            let field = |key: &str| -> Result<&str, String> {
+                values
+                    .get(key)
+                    .and_then(JsonValue::get::<String>)
+                    .map(String::as_str)
+                    .ok_or_else(|| format!("hold row missing {key}"))
+            };
+            let correlation_id = field("correlation_id")?;
+            let mut claim = self
+                .read_claim_locked(correlation_id)
+                .map_err(|error| error.to_string())?
+                .ok_or("held typed row has no claim")?;
+            let message = match kind {
+                MessageKind::Request => &claim.request,
+                MessageKind::TerminalReply | MessageKind::WorkerResult => claim
+                    .reply
+                    .as_ref()
+                    .ok_or("held reply has no claim reply")?,
+            };
+            if message.kind != kind
+                || message.id != field("id")?
+                || message.correlation_id != correlation_id
+                || message.sha256() != field("sha256")?
+            {
+                return Err("held typed row claim binding mismatch".into());
+            }
+            let delivery = if consumed {
+                DeliveryState::Consumed
+            } else {
+                DeliveryState::Enqueued
+            };
+            match kind {
+                MessageKind::Request => {
+                    if claim.request_delivery == DeliveryState::NotApplicable {
+                        continue;
+                    }
+                    if !matches!(
+                        claim.request_delivery,
+                        DeliveryState::Enqueued | DeliveryState::Consumed
+                    ) {
+                        return Err("held request is not enqueued".into());
+                    }
+                    if claim.request_delivery == delivery {
+                        continue;
+                    }
+                    claim.request_delivery = delivery;
+                }
+                MessageKind::TerminalReply | MessageKind::WorkerResult => {
+                    if !matches!(
+                        claim.state,
+                        ClaimState::ReplyEnqueued | ClaimState::ReplyConsumed
+                    ) {
+                        return Err("held reply is not enqueued".into());
+                    }
+                    if claim.reply_delivery == Some(delivery) {
+                        continue;
+                    }
+                    claim.state = if consumed {
+                        ClaimState::ReplyConsumed
+                    } else {
+                        ClaimState::ReplyEnqueued
+                    };
+                    claim.reply_delivery = Some(delivery);
+                }
+            }
+            claim.updated_at = store::iso_now();
+            self.write_claim(Self::claim_directory(claim.state), &claim)
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
     pub fn with_failpoint(mut self, failpoint: ProtocolFailpoint) -> Self {
         self.failpoint = Some(failpoint);
         self
@@ -1652,7 +1747,13 @@ impl ProtocolStore {
         match message.kind {
             MessageKind::Request
                 if claim.request == *message
-                    && claim.state == ClaimState::Open
+                    && matches!(
+                        claim.state,
+                        ClaimState::Open
+                            | ClaimState::ReplyPending
+                            | ClaimState::ReplyEnqueued
+                            | ClaimState::ReplyConsumed
+                    )
                     && matches!(
                         claim.request_delivery,
                         DeliveryState::Enqueued | DeliveryState::Consumed
@@ -1662,7 +1763,7 @@ impl ProtocolStore {
                 if deliver {
                     claim.request_delivery = DeliveryState::Consumed;
                     claim.updated_at = store::iso_now();
-                    self.write_claim(ClaimDirectory::Open, &claim)?;
+                    self.write_claim(Self::claim_directory(claim.state), &claim)?;
                 }
                 Ok(deliver)
             }
@@ -1686,10 +1787,83 @@ impl ProtocolStore {
         }
     }
 
+    /// Snapshot renderable rows and their exact identities without consuming claims.
+    /// The caller holds the store lock and takes custody of the raw mailbox.
+    pub(crate) fn hold_renderable_locked(
+        &self,
+        recipient_id: &str,
+    ) -> Result<(Vec<JsonValue>, Vec<JsonValue>), String> {
+        store::recover_holds_locked(&self.root)?;
+        self.recover_pending_locked()
+            .map_err(|error| error.to_string())?;
+        let raw = match fs::read_to_string(self.mailbox_path(recipient_id)) {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(error) => return Err(error.to_string()),
+        };
+        let rows = self
+            .preflight_mailbox_locked(recipient_id, &raw)
+            .map_err(|error| error.to_string())?;
+        let mut messages = Vec::with_capacity(rows.len());
+        let mut manifest = Vec::with_capacity(rows.len());
+        for row in rows {
+            let (value, identity) = match row {
+                MailboxRow::Typed {
+                    message,
+                    line,
+                    deliver: true,
+                    ..
+                } => {
+                    let value = line
+                        .parse::<JsonValue>()
+                        .map_err(|_| "malformed typed mailbox row")?;
+                    let identity = HashMap::from([
+                        ("id".into(), JsonValue::String(message.id.clone())),
+                        ("sha256".into(), JsonValue::String(message.sha256())),
+                        (
+                            "kind".into(),
+                            JsonValue::String(message.kind.as_str().into()),
+                        ),
+                        (
+                            "correlation_id".into(),
+                            JsonValue::String(message.correlation_id),
+                        ),
+                    ]);
+                    (value, identity)
+                }
+                MailboxRow::Typed { .. } => continue,
+                MailboxRow::Legacy { line, .. } => {
+                    let Ok(value) = line.parse::<JsonValue>() else {
+                        continue;
+                    };
+                    let id = value
+                        .get::<HashMap<String, JsonValue>>()
+                        .and_then(|values| values.get("id"))
+                        .cloned()
+                        .unwrap_or(JsonValue::Null);
+                    let identity = HashMap::from([
+                        ("id".into(), id),
+                        (
+                            "sha256".into(),
+                            JsonValue::String(sha256::hex_digest(line.as_bytes())),
+                        ),
+                        ("kind".into(), JsonValue::Null),
+                        ("correlation_id".into(), JsonValue::Null),
+                    ]);
+                    (value, identity)
+                }
+            };
+            messages.push(value);
+            manifest.push(JsonValue::Object(identity));
+        }
+        Ok((messages, manifest))
+    }
+
     pub(crate) fn drain_renderable_locked(
         &self,
         recipient_id: &str,
     ) -> Result<(Vec<JsonValue>, String), ProtocolError> {
+        store::recover_holds_locked(&self.root).map_err(ProtocolError::store)?;
         self.recover_pending_locked()?;
         let raw = fs::read_to_string(self.mailbox_path(recipient_id)).unwrap_or_default();
         let rows = self.preflight_mailbox_locked(recipient_id, &raw)?;
@@ -1804,6 +1978,7 @@ impl ProtocolStore {
 
     pub fn peek_typed(&self, recipient_id: &str) -> Result<Vec<MessageV2>, ProtocolError> {
         self.locked(|| {
+            store::recover_holds_locked(&self.root).map_err(ProtocolError::store)?;
             let raw = fs::read_to_string(self.mailbox_path(recipient_id)).unwrap_or_default();
             let rows = self.preflight_mailbox_locked(recipient_id, &raw)?;
             let mut deliverable = Vec::new();
@@ -1834,9 +2009,21 @@ impl ProtocolStore {
         match message.kind {
             MessageKind::Request if claim.request == *message => {
                 match (claim.state, claim.request_delivery) {
-                    (ClaimState::RequestPending, DeliveryState::Pending)
-                    | (ClaimState::Open, DeliveryState::Enqueued) => Ok(true),
-                    (ClaimState::Open, DeliveryState::Consumed) => Ok(false),
+                    (ClaimState::RequestPending, DeliveryState::Pending) => Ok(true),
+                    (
+                        ClaimState::Open
+                        | ClaimState::ReplyPending
+                        | ClaimState::ReplyEnqueued
+                        | ClaimState::ReplyConsumed,
+                        DeliveryState::Enqueued,
+                    ) => Ok(true),
+                    (
+                        ClaimState::Open
+                        | ClaimState::ReplyPending
+                        | ClaimState::ReplyEnqueued
+                        | ClaimState::ReplyConsumed,
+                        DeliveryState::Consumed,
+                    ) => Ok(false),
                     _ => Err(ProtocolError::store("typed mailbox claim binding mismatch")),
                 }
             }
@@ -1855,6 +2042,7 @@ impl ProtocolStore {
 
     pub fn drain_typed(&self, recipient_id: &str) -> Result<Vec<MessageV2>, ProtocolError> {
         self.locked(|| {
+            store::recover_holds_locked(&self.root).map_err(ProtocolError::store)?;
             self.recover_pending_locked()?;
             let raw = fs::read_to_string(self.mailbox_path(recipient_id)).unwrap_or_default();
             let rows = self.preflight_mailbox_locked(recipient_id, &raw)?;
@@ -1932,12 +2120,17 @@ impl ProtocolStore {
             };
             match message.kind {
                 MessageKind::Request if claim.request == message => {
-                    if claim.state == ClaimState::Open
-                        && claim.request_delivery == DeliveryState::Consumed
+                    if matches!(
+                        claim.state,
+                        ClaimState::Open
+                            | ClaimState::ReplyPending
+                            | ClaimState::ReplyEnqueued
+                            | ClaimState::ReplyConsumed
+                    ) && claim.request_delivery == DeliveryState::Consumed
                     {
                         claim.request_delivery = DeliveryState::Enqueued;
                         claim.updated_at = store::iso_now();
-                        self.write_claim(ClaimDirectory::Open, &claim)?;
+                        self.write_claim(Self::claim_directory(claim.state), &claim)?;
                     }
                 }
                 MessageKind::TerminalReply | MessageKind::WorkerResult
@@ -1958,5 +2151,507 @@ impl ProtocolStore {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod hold_tests {
+    use super::*;
+
+    struct Fixture(ProtocolStore);
+
+    impl Fixture {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!("relay-hold-claims-{}", store::uuid_v4()));
+            Self(ProtocolStore::new(root))
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0.root);
+        }
+    }
+
+    pub(super) fn claim(state: ClaimState, origin: ClaimOrigin) -> ClaimStatusV1 {
+        let request = MessageV2 {
+            schema: 2,
+            id: "10000000-0000-4000-8000-000000000001".into(),
+            correlation_id: "20000000-0000-4000-8000-000000000002".into(),
+            created_at: "2026-07-25T12:34:56.789Z".into(),
+            from_session_id: "30000000-0000-4000-8000-000000000003".into(),
+            to_session_id: "40000000-0000-4000-8000-000000000004".into(),
+            kind: MessageKind::Request,
+            reply_to: None,
+            terminal_status: None,
+            body: "request".into(),
+            result_sha256: None,
+        };
+        let reply = (state != ClaimState::Open).then(|| MessageV2 {
+            id: "50000000-0000-4000-8000-000000000005".into(),
+            from_session_id: request.to_session_id.clone(),
+            to_session_id: request.from_session_id.clone(),
+            kind: if origin == ClaimOrigin::Fanout {
+                MessageKind::WorkerResult
+            } else {
+                MessageKind::TerminalReply
+            },
+            reply_to: Some(request.id.clone()),
+            terminal_status: Some(TerminalStatus::Completed),
+            result_sha256: (origin == ClaimOrigin::Fanout).then(|| "a".repeat(64)),
+            body: "reply".into(),
+            ..request.clone()
+        });
+        ClaimStatusV1 {
+            schema: 1,
+            correlation_id: request.correlation_id.clone(),
+            origin,
+            state,
+            requester_session_id: request.from_session_id.clone(),
+            responder_session_id: request.to_session_id.clone(),
+            request_sha256: request.sha256(),
+            request_delivery: if origin == ClaimOrigin::Fanout {
+                DeliveryState::NotApplicable
+            } else {
+                DeliveryState::Enqueued
+            },
+            reply_sha256: reply.as_ref().map(MessageV2::sha256),
+            reply_delivery: match state {
+                ClaimState::Open => None,
+                ClaimState::ReplyPending => Some(DeliveryState::Pending),
+                ClaimState::ReplyConsumed => Some(DeliveryState::Consumed),
+                _ => Some(DeliveryState::Enqueued),
+            },
+            reply,
+            created_at: request.created_at.clone(),
+            updated_at: request.created_at.clone(),
+            request,
+        }
+    }
+
+    pub(super) fn row(message: &MessageV2) -> JsonValue {
+        JsonValue::Object(HashMap::from([
+            ("id".into(), JsonValue::String(message.id.clone())),
+            ("sha256".into(), JsonValue::String(message.sha256())),
+            (
+                "kind".into(),
+                JsonValue::String(message.kind.as_str().into()),
+            ),
+            (
+                "correlation_id".into(),
+                JsonValue::String(message.correlation_id.clone()),
+            ),
+        ]))
+    }
+
+    #[test]
+    fn request_delivery_survives_reply_state_advancement() {
+        for state in [
+            ClaimState::Open,
+            ClaimState::ReplyPending,
+            ClaimState::ReplyEnqueued,
+            ClaimState::ReplyConsumed,
+        ] {
+            let fixture = Fixture::new();
+            let original = claim(state, ClaimOrigin::Message);
+            fixture
+                .0
+                .write_claim(ProtocolStore::claim_directory(state), &original)
+                .unwrap();
+            assert!(fixture.0.peek_message_locked(&original.request).unwrap());
+            assert!(fixture.0.consume_message_locked(&original.request).unwrap());
+            assert!(!fixture.0.peek_message_locked(&original.request).unwrap());
+            assert!(!fixture.0.consume_message_locked(&original.request).unwrap());
+            let consumed = fixture
+                .0
+                .read_claim_locked(&original.correlation_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(consumed.state, state);
+            assert_eq!(consumed.reply_delivery, original.reply_delivery);
+            assert_eq!(consumed.request_delivery, DeliveryState::Consumed);
+            let mut impostor = original.request.clone();
+            impostor.body.push_str(" changed");
+            assert!(fixture.0.peek_message_locked(&impostor).is_err());
+            assert!(fixture.0.consume_message_locked(&impostor).is_err());
+            let request_row = String::from_utf8(original.request.canonical_bytes())
+                .unwrap()
+                .parse::<JsonValue>()
+                .unwrap();
+            fixture.0.requeue_consumed_locked(&[request_row]).unwrap();
+            assert!(fixture.0.peek_message_locked(&original.request).unwrap());
+            let restored = fixture
+                .0
+                .read_claim_locked(&original.correlation_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(restored.state, state);
+            assert_eq!(restored.reply_delivery, original.reply_delivery);
+            assert_eq!(restored.request_delivery, DeliveryState::Enqueued);
+        }
+    }
+
+    #[test]
+    fn held_request_updates_do_not_consume_or_restore_a_later_reply() {
+        for state in [
+            ClaimState::ReplyPending,
+            ClaimState::ReplyEnqueued,
+            ClaimState::ReplyConsumed,
+        ] {
+            let fixture = Fixture::new();
+            let original = claim(state, ClaimOrigin::Message);
+            fixture
+                .0
+                .write_claim(ProtocolStore::claim_directory(state), &original)
+                .unwrap();
+            let rows = [row(&original.request)];
+            for consumed in [true, true, false, false] {
+                fixture.0.hold_claim_update_locked(&rows, consumed).unwrap();
+                let updated = fixture
+                    .0
+                    .read_claim_locked(&original.correlation_id)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    updated.request_delivery,
+                    if consumed {
+                        DeliveryState::Consumed
+                    } else {
+                        DeliveryState::Enqueued
+                    }
+                );
+                assert_eq!(updated.state, original.state);
+                assert_eq!(updated.reply, original.reply);
+                assert_eq!(updated.reply_delivery, original.reply_delivery);
+            }
+        }
+    }
+
+    #[test]
+    fn held_reply_updates_are_exact_and_preserve_request_delivery() {
+        for origin in [ClaimOrigin::Message, ClaimOrigin::Fanout] {
+            let fixture = Fixture::new();
+            let original = claim(ClaimState::ReplyEnqueued, origin);
+            fixture
+                .0
+                .write_claim(ClaimDirectory::Terminal, &original)
+                .unwrap();
+            let reply = original.reply.as_ref().unwrap();
+            for field in ["id", "sha256", "kind", "correlation_id"] {
+                let mut invalid = row(reply);
+                let values = invalid.get_mut::<HashMap<String, JsonValue>>().unwrap();
+                let replacement = match field {
+                    "sha256" => "b".repeat(64),
+                    "kind" => MessageKind::Request.as_str().into(),
+                    _ => "60000000-0000-4000-8000-000000000006".into(),
+                };
+                values.insert(field.into(), JsonValue::String(replacement));
+                assert!(
+                    fixture
+                        .0
+                        .hold_claim_update_locked(&[invalid], true)
+                        .is_err()
+                );
+                assert_eq!(
+                    fixture
+                        .0
+                        .read_claim_locked(&original.correlation_id)
+                        .unwrap()
+                        .unwrap(),
+                    original
+                );
+            }
+            let rows = [row(reply)];
+            for consumed in [true, true, false, false] {
+                fixture.0.hold_claim_update_locked(&rows, consumed).unwrap();
+                let updated = fixture
+                    .0
+                    .read_claim_locked(&original.correlation_id)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    updated.state,
+                    if consumed {
+                        ClaimState::ReplyConsumed
+                    } else {
+                        ClaimState::ReplyEnqueued
+                    }
+                );
+                assert_eq!(
+                    updated.reply_delivery,
+                    Some(if consumed {
+                        DeliveryState::Consumed
+                    } else {
+                        DeliveryState::Enqueued
+                    })
+                );
+                assert_eq!(updated.request_delivery, original.request_delivery);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod hold_recovery_tests {
+    use super::*;
+
+    fn interrupted_settlement(consumed: bool) {
+        let root = std::env::temp_dir().join(format!("relay-hold-recovery-{}", store::uuid_v4()));
+        let protocol = ProtocolStore::new(root.clone());
+        let mut claims = Vec::new();
+        for origin in [ClaimOrigin::Message, ClaimOrigin::Fanout] {
+            let mut claim = super::hold_tests::claim(ClaimState::ReplyEnqueued, origin);
+            claim.correlation_id = store::uuid_v4();
+            claim.request.correlation_id = claim.correlation_id.clone();
+            claim.request.id = store::uuid_v4();
+            claim.request_sha256 = claim.request.sha256();
+            let reply = claim.reply.as_mut().unwrap();
+            reply.correlation_id = claim.correlation_id.clone();
+            reply.id = store::uuid_v4();
+            reply.reply_to = Some(claim.request.id.clone());
+            claim.reply_sha256 = Some(reply.sha256());
+            protocol
+                .write_claim(ClaimDirectory::Terminal, &claim)
+                .unwrap();
+            claims.push(claim);
+        }
+        let recipient = &claims[0].requester_session_id;
+        let raw: String = claims.iter().fold(String::new(), |mut raw, claim| {
+            raw.push_str(
+                &String::from_utf8(claim.reply.as_ref().unwrap().canonical_bytes()).unwrap(),
+            );
+            raw.push('\n');
+            raw
+        });
+        fs::create_dir_all(root.join("mailbox")).unwrap();
+        fs::write(protocol.mailbox_path(recipient), &raw).unwrap();
+        let holds = store::HoldStore::new(root.clone());
+        let mut receipt = None;
+        store::with_lock_at(&root, || {
+            receipt = Some(holds.hold_locked(recipient, "session_start", 60)?);
+            Ok(())
+        })
+        .unwrap();
+        let token = receipt.unwrap().token.unwrap();
+        if !consumed {
+            // An interrupted prior claim update must be reversed by restoring.
+            for claim in &claims {
+                protocol
+                    .hold_claim_update_locked(
+                        &[super::hold_tests::row(claim.reply.as_ref().unwrap())],
+                        true,
+                    )
+                    .unwrap();
+            }
+        }
+        let failing = store::HoldStore::new(root.clone())
+            .with_failpoint(store::HoldFailpoint::AfterClaimUpdate(0));
+        assert!(
+            if consumed {
+                failing.ack_hold(&token)
+            } else {
+                failing.rollback_hold(&token)
+            }
+            .is_err()
+        );
+        let first = protocol
+            .read_claim_locked(&claims[0].correlation_id)
+            .unwrap()
+            .unwrap();
+        let second = protocol
+            .read_claim_locked(&claims[1].correlation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            first.state,
+            if consumed {
+                ClaimState::ReplyConsumed
+            } else {
+                ClaimState::ReplyEnqueued
+            }
+        );
+        assert_eq!(
+            second.state,
+            if consumed {
+                ClaimState::ReplyEnqueued
+            } else {
+                ClaimState::ReplyConsumed
+            }
+        );
+        store::with_lock_at(&root, || holds.recover_locked()).unwrap();
+        for original in &claims {
+            let recovered = protocol
+                .read_claim_locked(&original.correlation_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                recovered.state,
+                if consumed {
+                    ClaimState::ReplyConsumed
+                } else {
+                    ClaimState::ReplyEnqueued
+                }
+            );
+            assert_eq!(recovered.request_delivery, original.request_delivery);
+        }
+        if consumed {
+            assert!(!protocol.mailbox_path(recipient).exists());
+        } else {
+            assert_eq!(
+                fs::read_to_string(protocol.mailbox_path(recipient)).unwrap(),
+                raw
+            );
+            assert_eq!(
+                protocol.peek_typed(recipient).unwrap(),
+                claims
+                    .iter()
+                    .map(|claim| claim.reply.clone().unwrap())
+                    .collect::<Vec<_>>()
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn interrupted_typed_commit_finishes_remaining_rows() {
+        interrupted_settlement(true);
+    }
+
+    #[test]
+    fn interrupted_typed_restore_finishes_remaining_rows_without_duplicate_payload() {
+        interrupted_settlement(false);
+    }
+
+    #[test]
+    fn expired_typed_hold_is_restored_by_peek_without_consuming() {
+        let root = std::env::temp_dir().join(format!("relay-hold-expiry-{}", store::uuid_v4()));
+        let protocol = ProtocolStore::new(root.clone());
+        let original = super::hold_tests::claim(ClaimState::Open, ClaimOrigin::Message);
+        protocol
+            .write_claim(ClaimDirectory::Open, &original)
+            .unwrap();
+        protocol
+            .append_message(&original.responder_session_id, &original.request)
+            .unwrap();
+        let holds = store::HoldStore::new(root.clone());
+        store::with_lock_at(&root, || {
+            let receipt = holds.hold_locked(&original.responder_session_id, "session_start", 0)?;
+            assert_eq!(receipt.count, 1);
+            assert!(receipt.token.is_some());
+            Ok(())
+        })
+        .unwrap();
+        assert!(
+            !protocol
+                .mailbox_path(&original.responder_session_id)
+                .exists()
+        );
+        assert_eq!(
+            protocol.peek_typed(&original.responder_session_id).unwrap(),
+            vec![original.request.clone()]
+        );
+        assert_eq!(
+            protocol.peek_typed(&original.responder_session_id).unwrap(),
+            vec![original.request.clone()]
+        );
+        let restored = protocol
+            .read_claim(&original.correlation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.request_delivery, DeliveryState::Enqueued);
+        assert_eq!(
+            protocol
+                .drain_typed(&original.responder_session_id)
+                .unwrap(),
+            vec![original.request]
+        );
+        assert!(
+            protocol
+                .drain_typed(&original.responder_session_id)
+                .unwrap()
+                .is_empty()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reply_to_held_request_delivers_once_and_request_ack_preserves_it() {
+        let root = std::env::temp_dir().join(format!("relay-hold-reply-{}", store::uuid_v4()));
+        let protocol = ProtocolStore::new(root.clone());
+        let original = super::hold_tests::claim(ClaimState::Open, ClaimOrigin::Message);
+        protocol
+            .write_claim(ClaimDirectory::Open, &original)
+            .unwrap();
+        protocol
+            .append_message(&original.responder_session_id, &original.request)
+            .unwrap();
+        let holds = store::HoldStore::new(root.clone());
+        let mut receipt = None;
+        store::with_lock_at(&root, || {
+            receipt =
+                Some(holds.hold_locked(&original.responder_session_id, "session_start", 60)?);
+            Ok(())
+        })
+        .unwrap();
+        let token = receipt.unwrap().token.unwrap();
+        let reply = protocol
+            .reply(
+                &original.correlation_id,
+                &original.responder_session_id,
+                TerminalStatus::Completed,
+                "completed during hold",
+            )
+            .unwrap()
+            .message;
+        assert!(
+            protocol
+                .peek_typed(&original.responder_session_id)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            protocol.peek_typed(&original.requester_session_id).unwrap(),
+            vec![reply.clone()]
+        );
+        assert_eq!(
+            protocol
+                .drain_typed(&original.requester_session_id)
+                .unwrap(),
+            vec![reply.clone()]
+        );
+        assert!(
+            protocol
+                .drain_typed(&original.requester_session_id)
+                .unwrap()
+                .is_empty()
+        );
+        let before_ack = protocol
+            .read_claim(&original.correlation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(before_ack.request_delivery, DeliveryState::Enqueued);
+        assert_eq!(before_ack.state, ClaimState::ReplyConsumed);
+        holds.ack_hold(&token).unwrap();
+        let after_ack = protocol
+            .read_claim(&original.correlation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(after_ack.request_delivery, DeliveryState::Consumed);
+        assert_eq!(after_ack.state, ClaimState::ReplyConsumed);
+        assert_eq!(after_ack.reply_delivery, Some(DeliveryState::Consumed));
+        assert_eq!(after_ack.reply, Some(reply));
+        assert!(
+            protocol
+                .drain_typed(&original.requester_session_id)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            protocol
+                .drain_typed(&original.responder_session_id)
+                .unwrap()
+                .is_empty()
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 }

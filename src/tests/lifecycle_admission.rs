@@ -713,3 +713,270 @@ fn lifecycle_admission_disallowed_drain_kinds_preserve_mailbox_bytes() {
         fs::remove_dir_all(home).ok();
     }
 }
+
+fn hold_fixture(
+    label: &str,
+) -> (
+    std::path::PathBuf,
+    std::path::PathBuf,
+    lifecycle::ReentryGuard,
+) {
+    let home = fresh_home(label);
+    let cwd = home.join("project");
+    let session = "91111111-1111-4111-8111-111111111111";
+    seed_entry(&home, session, "omp", &cwd);
+    let mailbox = home.join("mailbox").join(format!("{session}.jsonl"));
+    fs::write(&mailbox, b"{\"body\":\"held\"}\n").unwrap();
+    let Admission::Unmanaged(guard) = LifecycleStore::new(home.clone())
+        .admit_operation(session, OperationKind::CliInboxDrain)
+        .unwrap()
+    else {
+        panic!("expected unmanaged admission");
+    };
+    (home, mailbox, guard)
+}
+
+#[test]
+fn hold_ack_consumes_only_held_mail_and_rejects_reused_token() {
+    let (home, mailbox, mut guard) = hold_fixture("hold-ack");
+    let receipt = lifecycle::hold_with_guard(&mut guard, "inbox", 30).unwrap();
+    assert_eq!(receipt.count, 1);
+    assert_eq!(
+        receipt.messages,
+        vec![r#"{"body":"held"}"#.parse::<JsonValue>().unwrap()]
+    );
+    assert_eq!(receipt.raw, b"{\"body\":\"held\"}\n");
+    fs::write(&mailbox, b"{\"body\":\"later\"}\n").unwrap();
+    let holds = relay::store::HoldStore::new(home.clone());
+    let token = receipt.token.as_deref().unwrap();
+    holds.ack_hold(token).unwrap();
+    assert_eq!(holds.ack_hold(token), Err(relay::store::HoldError::Unknown));
+    assert_eq!(
+        lifecycle::drain_with_guard(&mut guard)
+            .unwrap()
+            .into_messages(),
+        vec![r#"{"body":"later"}"#.parse::<JsonValue>().unwrap()]
+    );
+    assert!(
+        lifecycle::drain_with_guard(&mut guard)
+            .unwrap()
+            .into_messages()
+            .is_empty()
+    );
+    drop(guard);
+    fs::remove_dir_all(home).ok();
+}
+
+#[test]
+fn hold_rollback_restores_exact_bytes_before_later_mail_once() {
+    let (home, mailbox, mut guard) = hold_fixture("hold-rollback");
+    let original = b"{\"body\":\"held\"}\nmalformed\n\n";
+    fs::write(&mailbox, original).unwrap();
+    let receipt = lifecycle::hold_with_guard(&mut guard, "inbox", 30).unwrap();
+    fs::write(&mailbox, b"{\"body\":\"later\"}\n").unwrap();
+    let holds = relay::store::HoldStore::new(home.clone());
+    let token = receipt.token.as_deref().unwrap();
+    holds.rollback_hold(token).unwrap();
+    assert_eq!(
+        fs::read(&mailbox).unwrap(),
+        [original.as_slice(), b"{\"body\":\"later\"}\n"].concat()
+    );
+    assert_eq!(
+        holds.rollback_hold(token),
+        Err(relay::store::HoldError::Unknown)
+    );
+    assert_eq!(
+        lifecycle::drain_with_guard(&mut guard)
+            .unwrap()
+            .into_messages(),
+        vec![
+            r#"{"body":"held"}"#.parse::<JsonValue>().unwrap(),
+            r#"{"body":"later"}"#.parse::<JsonValue>().unwrap(),
+        ]
+    );
+    assert!(
+        lifecycle::drain_with_guard(&mut guard)
+            .unwrap()
+            .into_messages()
+            .is_empty()
+    );
+    drop(guard);
+    fs::remove_dir_all(home).ok();
+}
+
+#[test]
+fn hold_expiry_rejects_ack_and_restores_one_row() {
+    let (home, _, mut guard) = hold_fixture("hold-expiry");
+    let receipt = lifecycle::hold_with_guard(&mut guard, "inbox", 0).unwrap();
+    assert_eq!(
+        relay::store::HoldStore::new(home.clone()).ack_hold(receipt.token.as_deref().unwrap()),
+        Err(relay::store::HoldError::Expired)
+    );
+    assert_eq!(
+        lifecycle::drain_with_guard(&mut guard)
+            .unwrap()
+            .into_messages(),
+        vec![r#"{"body":"held"}"#.parse::<JsonValue>().unwrap()]
+    );
+    assert!(
+        lifecycle::drain_with_guard(&mut guard)
+            .unwrap()
+            .into_messages()
+            .is_empty()
+    );
+    drop(guard);
+    fs::remove_dir_all(home).ok();
+}
+
+#[test]
+fn hold_conflict_preserves_first_hold_and_later_mail() {
+    let (home, mailbox, mut guard) = hold_fixture("hold-conflict");
+    let receipt = lifecycle::hold_with_guard(&mut guard, "inbox", 30).unwrap();
+    fs::write(&mailbox, b"{\"body\":\"later\"}\n").unwrap();
+    let error = match lifecycle::hold_with_guard(&mut guard, "inbox", 30) {
+        Ok(_) => panic!("second hold unexpectedly succeeded"),
+        Err(error) => error,
+    };
+    assert_eq!(error, "hold_conflict");
+    assert_eq!(fs::read(&mailbox).unwrap(), b"{\"body\":\"later\"}\n");
+    relay::store::HoldStore::new(home.clone())
+        .rollback_hold(receipt.token.as_deref().unwrap())
+        .unwrap();
+    assert_eq!(
+        fs::read(&mailbox).unwrap(),
+        b"{\"body\":\"held\"}\n{\"body\":\"later\"}\n"
+    );
+    drop(guard);
+    fs::remove_dir_all(home).ok();
+}
+
+#[test]
+fn hold_stale_authority_preserves_mailbox() {
+    let (home, mailbox, mut guard) = hold_fixture("hold-stale");
+    let receipt = lifecycle::hold_with_guard(&mut guard, "inbox", 30).unwrap();
+    seed_entry(
+        &home,
+        "91111111-1111-4111-8111-111111111111",
+        "claude",
+        &home.join("project"),
+    );
+    assert!(lifecycle::drain_with_guard(&mut guard).is_err());
+    relay::store::HoldStore::new(home.clone())
+        .rollback_hold(receipt.token.as_deref().unwrap())
+        .unwrap();
+    assert!(
+        !home
+            .join("holds")
+            .join(format!("{}.json", receipt.token.as_deref().unwrap()))
+            .exists()
+    );
+    assert!(lifecycle::hold_with_guard(&mut guard, "inbox", 30).is_err());
+    assert_eq!(fs::read(&mailbox).unwrap(), b"{\"body\":\"held\"}\n");
+    drop(guard);
+    fs::remove_dir_all(home).ok();
+}
+
+#[test]
+fn hold_committing_recovery_never_restores_consumed_row() {
+    let (home, mailbox, mut guard) = hold_fixture("hold-committing");
+    let receipt = lifecycle::hold_with_guard(&mut guard, "inbox", 30).unwrap();
+    fs::write(&mailbox, b"{\"body\":\"later\"}\n").unwrap();
+    let broken = relay::store::HoldStore::new(home.clone())
+        .with_failpoint(relay::store::HoldFailpoint::AfterPhaseWrite);
+    assert!(broken.ack_hold(receipt.token.as_deref().unwrap()).is_err());
+    assert_eq!(
+        lifecycle::drain_with_guard(&mut guard)
+            .unwrap()
+            .into_messages(),
+        vec![r#"{"body":"later"}"#.parse::<JsonValue>().unwrap()]
+    );
+    assert!(
+        lifecycle::drain_with_guard(&mut guard)
+            .unwrap()
+            .into_messages()
+            .is_empty()
+    );
+    drop(guard);
+    fs::remove_dir_all(home).ok();
+}
+
+#[test]
+fn hold_restoring_recovery_restores_exactly_one_row() {
+    for point in [
+        relay::store::HoldFailpoint::AfterPhaseWrite,
+        relay::store::HoldFailpoint::AfterRestoreRename,
+    ] {
+        let (home, _, mut guard) = hold_fixture(&format!("hold-restoring-{point:?}"));
+        let receipt = lifecycle::hold_with_guard(&mut guard, "inbox", 30).unwrap();
+        let broken = relay::store::HoldStore::new(home.clone()).with_failpoint(point);
+        assert!(
+            broken
+                .rollback_hold(receipt.token.as_deref().unwrap())
+                .is_err()
+        );
+        assert_eq!(
+            lifecycle::drain_with_guard(&mut guard)
+                .unwrap()
+                .into_messages(),
+            vec![r#"{"body":"held"}"#.parse::<JsonValue>().unwrap()],
+            "{point:?}"
+        );
+        assert!(
+            lifecycle::drain_with_guard(&mut guard)
+                .unwrap()
+                .into_messages()
+                .is_empty()
+        );
+        drop(guard);
+        fs::remove_dir_all(home).ok();
+    }
+}
+
+#[test]
+fn hold_after_manifest_crash_state_recovers_exactly_one_row() {
+    let (home, mailbox, mut guard) = hold_fixture("hold-after-manifest");
+    let receipt = lifecycle::hold_with_guard(&mut guard, "inbox", 30).unwrap();
+    let token = receipt.token.as_deref().unwrap();
+    // Recreate the durable state before creation moves the mailbox into custody.
+    fs::rename(home.join("holds").join(format!("{token}.jsonl")), &mailbox).unwrap();
+    assert_eq!(
+        lifecycle::drain_with_guard(&mut guard)
+            .unwrap()
+            .into_messages(),
+        vec![r#"{"body":"held"}"#.parse::<JsonValue>().unwrap()]
+    );
+    assert!(
+        lifecycle::drain_with_guard(&mut guard)
+            .unwrap()
+            .into_messages()
+            .is_empty()
+    );
+    assert_eq!(
+        relay::store::HoldStore::new(home.clone()).ack_hold(token),
+        Err(relay::store::HoldError::Unknown)
+    );
+    drop(guard);
+    fs::remove_dir_all(home).ok();
+}
+
+#[test]
+fn hold_after_mailbox_rename_crash_state_expires_to_exactly_one_row() {
+    let (home, _, mut guard) = hold_fixture("hold-after-mailbox-rename");
+    // A lost receipt after the rename leaves the same durable state as a hold
+    // whose caller exits without settling it. Zero seconds makes recovery deterministic.
+    lifecycle::hold_with_guard(&mut guard, "inbox", 0).unwrap();
+    assert_eq!(
+        lifecycle::drain_with_guard(&mut guard)
+            .unwrap()
+            .into_messages(),
+        vec![r#"{"body":"held"}"#.parse::<JsonValue>().unwrap()]
+    );
+    assert!(
+        lifecycle::drain_with_guard(&mut guard)
+            .unwrap()
+            .into_messages()
+            .is_empty()
+    );
+    drop(guard);
+    fs::remove_dir_all(home).ok();
+}
