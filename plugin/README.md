@@ -62,15 +62,18 @@ Reply status defaults to `completed`.
 Use `failed` for a failed terminal answer.
 Use `/relay` for the roster and pending count without draining mail.
 
+A session ID is RFC 9562 UUID text in any version; `register`, `hook`, `wake`,
+and `watch` refuse every other shape before any write or launch.
+
 Discovery reads only the omp session root. The extension supplies
 `RELAY_OMP_SESSIONS`; set it explicitly for standalone commands using a
 different omp session root. Discovery recency is not proof of a live or idle
 process. Registry and discovery records retain `tool: "omp"`.
 
 The store defaults to `~/.agent-relay`; `AGENT_RELAY_HOME` overrides it before
-`SESSION_RELAY_HOME`. `session-relay gc` collects inactive relay-owned state,
-preserving held locks and the invoking session. Hook and bus activity sweep
-at most once every six hours. The inactivity threshold defaults to 14 days;
+`SESSION_RELAY_HOME`. Hook and bus activity collect inactive relay-owned
+state at most once every six hours, preserving held locks and the invoking
+session; there is no separate `gc` verb. The inactivity threshold defaults to 14 days;
 `AGENT_RELAY_GC_DAYS` changes it, and `0` disables GC.
 
 ## Live delivery and wake

@@ -47,6 +47,9 @@ fn parse_invocation(args: &[String]) -> Result<Invocation, String> {
     let id = a
         .unique_flag("session")?
         .ok_or("hook omp requires --session")?;
+    if !store::is_uuid(id) {
+        return Err(format!("--session must be a session UUID, got: {id}"));
+    }
     let cwd = a.unique_flag("cwd")?.ok_or("hook omp requires --cwd")?;
     let session = (id.to_string(), cwd.to_string());
     let hold_seconds = a.hold_seconds();
@@ -343,6 +346,16 @@ mod tests {
         assert!(parse_invocation(&argv(&["omp", "--cwd", "/tmp/project"])).is_err());
         assert!(parse_invocation(&argv(&["omp", "--session", "--cwd", "/tmp/project"])).is_err());
         assert!(parse_invocation(&argv(&["omp", "--session", SELF])).is_err());
+        let error = parse_invocation(&argv(&[
+            "omp",
+            "--session",
+            "../../etc/passwd",
+            "--cwd",
+            "/tmp/p",
+        ]))
+        .err()
+        .expect("non-UUID session must be rejected");
+        assert!(error.contains("session UUID"), "{error}");
     }
 
     #[test]

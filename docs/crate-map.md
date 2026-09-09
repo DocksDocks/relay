@@ -16,7 +16,7 @@ session to that store through the CLI.
 | `src/discover.rs` | Read-only discovery under the omp session root; `RELAY_OMP_SESSIONS` selects the root. Recency does not prove process liveness. |
 | `src/hook.rs` | omp registration and prompt hooks; render held or drained mail as untrusted context. |
 | `src/watch.rs` | Mailbox polling and wake fallback, without push delivery. |
-| `src/gc.rs` | Explicit and opportunistic collection of inactive relay-owned state. |
+| `src/gc.rs` | Opportunistic collection (from hook and bus activity) of inactive relay-owned state. |
 | `src/cli.rs` | Argument parsing, registry and mail commands, request/reply, holds, direct omp wake/attach, and doctor diagnostics. |
 | `src/sha256.rs` | SHA-256 primitives used for durable content integrity. |
 | `src/main.rs` | Binary dispatch for public commands and selftest helpers. |
@@ -46,7 +46,7 @@ session to that store through the CLI.
 
 ## Test topology
 
-`Cargo.toml` disables automatic test discovery and declares exactly four
+`Cargo.toml` disables automatic test discovery and declares exactly five
 integration targets:
 
 | Target | Source | Observable boundary |
@@ -55,6 +55,7 @@ integration targets:
 | `protocol` | `src/tests/protocol.rs` | Canonical request/reply validation, claims, recovery, and delivery. |
 | `lock_race` | `src/tests/lock_race.rs` | Store serialization under concurrent operations. |
 | `holds` | `src/tests/holds.rs` | Held and ordinary drains, ack, rollback, and expiry. |
+| `watch` | `src/tests/watch.rs` | Registration and watch target validation: no launcher receives a non-UUID session id. |
 
 Inline unit tests run through `--lib`. `test/rust-test-inventory.mjs` compares
 live names against `test/fixtures/rust-test-inventory.json` and executes each

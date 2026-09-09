@@ -31,6 +31,10 @@ path = "src/tests/lock_race.rs"
 name = "protocol"
 path = "src/tests/protocol.rs"
 
+[[test]]
+name = "watch"
+path = "src/tests/watch.rs"
+
 [dependencies]
 tinyjson = "2.5"
 libc = "0.2"

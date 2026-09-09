@@ -26,14 +26,25 @@ fn main() {
             let k: usize = argv[3].parse().unwrap_or_else(|_| {
                 die("k must be a number");
             });
+            // Registration requires session UUIDs; derive a stable
+            // UUID-shaped id per worker (op 0) and per iteration (op i+1).
+            let seed = who.bytes().fold(0x811c_9dc5u32, |h, b| {
+                (h ^ u32::from(b)).wrapping_mul(0x0100_0193)
+            });
+            let session_id = |op: usize| format!("{seed:08x}-0000-4000-8000-{op:012x}");
             for i in 0..k {
                 let mut msg: HashMap<String, JsonValue> = HashMap::new();
                 msg.insert("from".into(), JsonValue::from(who.clone()));
                 msg.insert("body".into(), JsonValue::from(format!("{who}-{i}")));
                 relay::store::enqueue(recipient, &msg).unwrap_or_else(|e| die(&e));
-                relay::store::register(who, Some(&format!("/tmp/{who}")), Some(who), None)
-                    .unwrap_or_else(|e| die(&e));
-                relay::store::register(&format!("{who}-op{i}"), Some("/tmp/x"), None, None)
+                relay::store::register(
+                    &session_id(0),
+                    Some(&format!("/tmp/{who}")),
+                    Some(who),
+                    None,
+                )
+                .unwrap_or_else(|e| die(&e));
+                relay::store::register(&session_id(i + 1), Some("/tmp/x"), None, None)
                     .unwrap_or_else(|e| die(&e));
             }
         }

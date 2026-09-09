@@ -246,17 +246,20 @@ export async function run({ bin, home, emit }) {
       );
     });
     check('mailbox writes stay flat inside the store (sanitize neutralizes traversal)', () => {
-      assert.equal(relay(['register', 'evil', '--id', '../../../../etc/passwd', '--dir', '/tmp']).status, 0);
-      assert.equal(relay(['send', 'evil', '--', 'nope']).status, 0);
+      // Session ids must be RFC 9562 UUID text (any version: omp mints v7,
+      // fixtures use v4). A traversal-shaped id is refused at registration,
+      // so nothing is written for it inside or outside the store; sanitize
+      // stays the last line of defense for tampered registries.
+      const refused = relay(['register', 'evil', '--id', '../../../../etc/passwd', '--dir', '/tmp']);
+      assert.notEqual(refused.status, 0, 'register must refuse a non-UUID id');
+      assert.match(refused.stderr, /session UUID/);
+      assert.notEqual(relay(['send', 'evil', '--', 'nope']).status, 0, 'unregistered name cannot receive');
       assert.ok(!fs.existsSync('/etc/passwd.jsonl'), 'no file written outside the store');
-      const files = fs.readdirSync(path.join(HOME, 'mailbox'));
+      const mailboxDir = path.join(HOME, 'mailbox');
+      const files = fs.existsSync(mailboxDir) ? fs.readdirSync(mailboxDir) : [];
       assert.ok(
-        files.every((file) => !file.includes('/') && !file.includes(path.sep)),
-        'mailbox filenames are a single flat segment',
-      );
-      assert.ok(
-        files.some((file) => /passwd/.test(file) && file.endsWith('.jsonl')),
-        'the traversal id collapsed to one in-root file',
+        files.every((file) => !file.includes('/') && !file.includes(path.sep) && !/passwd/.test(file)),
+        'mailbox filenames stay flat and the traversal id never landed',
       );
     });
 

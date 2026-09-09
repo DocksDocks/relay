@@ -23,7 +23,7 @@ The tracked top-level inventory and current working tree define this layout:
 ├── Cargo.lock                         locked Rust dependencies
 ├── rust-toolchain.toml                pinned Rust toolchain
 ├── src/                               crate sources
-│   └── tests/                         four explicit [[test]] integration targets
+│   └── tests/                         five explicit [[test]] integration targets
 ├── test/                              Node scenario and contract harness
 ├── plugin/                            shipped plugin payload
 ├── .omp-plugin/marketplace.json       omp marketplace catalog
@@ -37,7 +37,7 @@ The tracked top-level inventory and current working tree define this layout:
 └── LICENSE                            repository license
 ```
 
-`Cargo.toml` sets `autotests = false`. It declares four integration targets with explicit `[[test]]` entries under `src/tests/`: `bus_smoke`, `protocol`, `lock_race`, and `holds`.
+`Cargo.toml` sets `autotests = false`. It declares five integration targets with explicit `[[test]]` entries under `src/tests/`: `bus_smoke`, `protocol`, `lock_race`, `holds`, and `watch`.
 
 ## Payload boundary
 

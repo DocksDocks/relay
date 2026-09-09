@@ -5,7 +5,7 @@ user-invocable: true
 metadata:
   pattern: tool-wrapper
   updated: "2026-09-09"
-  content_hash: "af5074e4b96bf74fb91df5b006f04e92d94181ecf3af81eee876eab3704d45df"
+  content_hash: "67d209dda7f905a755d64f8918e26950968c7943bd6e3e8c389daf52f8335214"
 ---
 
 # Session relay
@@ -316,7 +316,7 @@ The extension is the delivery path for a running interactive session.
 ## Anti-hallucination
 
 Use only the nine documented `relay` tool actions.
-Use CLI verbs for `attach`, `watch`, `ack`, `rollback`, `gc`, and `doctor`.
+Use CLI verbs for `attach`, `watch`, `ack`, `rollback`, and `doctor`.
 Do not invent tool actions for these CLI-only operations.
 The tool `wake` exposes only a target and text, not model or effort controls.
 Use the CLI when a wake needs explicit model or effort settings.
