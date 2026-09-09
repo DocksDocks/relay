@@ -62,7 +62,11 @@ fn home_owner_pid(name: &str) -> Option<u32> {
 /// `EPERM` means the PID exists and belongs to someone else, which is still
 /// alive for our purposes. Only `ESRCH` proves nobody holds it.
 fn pid_is_alive(pid: u32) -> bool {
-    if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: Signal 0 only checks permission and process existence and writes no memory.
+    if unsafe { libc::kill(pid, 0) } == 0 {
         return true;
     }
     std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)

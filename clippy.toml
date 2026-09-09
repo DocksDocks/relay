@@ -1,0 +1,6 @@
+# Clippy configuration. The lint levels live in the `[lints]` table of Cargo.toml.
+# Tests may unwrap, expect, panic, and dbg: a failed test is the intended outcome.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-dbg-in-tests = true

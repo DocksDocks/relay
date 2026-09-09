@@ -320,7 +320,10 @@ fn digest_followed_prefix(
         if remaining == 0 {
             break Ok(Some(hasher.digest()));
         }
-        let want = remaining.min(buffer.len() as u64) as usize;
+        // A prefix above the addressable range still needs at most one buffer read.
+        let want = usize::try_from(remaining)
+            .unwrap_or(usize::MAX)
+            .min(buffer.len());
         match state.file.read(&mut buffer[..want]) {
             Ok(0) => break Ok(None),
             Ok(read) => {

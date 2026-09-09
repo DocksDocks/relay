@@ -1,3 +1,10 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    reason = "integration test crate: a panic is the intended failure signal"
+)]
+
 pub mod support;
 
 use relay::jcs::{ClosedJcs, JcsValue, LowerUuidV4, parse_jcs, serialize_jcs};
@@ -256,8 +263,8 @@ fn read_claim_file(path: &Path) -> ClaimStatusV1 {
     ClaimStatusV1::from_jcs(parse_jcs(&bytes, true).unwrap()).unwrap()
 }
 
-fn write_jcs_file(path: &Path, value: JcsValue) {
-    let mut bytes = serialize_jcs(&value).into_bytes();
+fn write_jcs_file(path: &Path, value: &JcsValue) {
+    let mut bytes = serialize_jcs(value).into_bytes();
     bytes.push(b'\n');
     fs::write(path, bytes).unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
@@ -734,7 +741,7 @@ fn recovery_quarantines_pending_claims_with_unknown_origin() {
     let pending = fixture.home.join("protocol-v1/pending");
     write_jcs_file(
         &pending.join(format!("{stale}.json")),
-        JcsValue::Object(fields),
+        &JcsValue::Object(fields),
     );
 
     let later = fixture
@@ -1190,7 +1197,7 @@ fn malformed_tampered_or_wrong_mode_claims_fail_closed_without_mailbox_mutation(
             .object()
             .unwrap();
         object.insert("unknown".into(), JcsValue::Null);
-        write_jcs_file(&path, JcsValue::Object(object));
+        write_jcs_file(&path, &JcsValue::Object(object));
         let before = fs::read(
             fixture
                 .home
@@ -1226,7 +1233,7 @@ fn malformed_tampered_or_wrong_mode_claims_fail_closed_without_mailbox_mutation(
             .object()
             .unwrap();
         object.insert("request_sha256".into(), JcsValue::String(SHA_A.into()));
-        write_jcs_file(&path, JcsValue::Object(object));
+        write_jcs_file(&path, &JcsValue::Object(object));
         let error = fixture
             .store
             .read_claim(&request.correlation_id)
@@ -1474,14 +1481,14 @@ fn conflicting_duplicate_claims_fail_closed_without_convergence_or_append() {
             .home
             .join("protocol-v1/open")
             .join(format!("{CORRELATION_ID}.json")),
-        open.to_jcs(),
+        &open.to_jcs(),
     );
     write_jcs_file(
         &fixture
             .home
             .join("protocol-v1/pending")
             .join(format!("{CORRELATION_ID}.json")),
-        pending.to_jcs(),
+        &pending.to_jcs(),
     );
 
     let read_error = fixture.store.read_claim(CORRELATION_ID).unwrap_err();
@@ -1884,10 +1891,10 @@ fn requeued_terminal_reply_restores_consumed_claim_for_exact_redelivery() {
     );
 }
 
-fn assert_reply_while_held(state: ClaimState, home: PathBuf) {
+fn assert_reply_while_held(state: ClaimState, home: &Path) {
     for acknowledge in [true, false] {
-        fs::create_dir_all(&home).unwrap();
-        let fixture = Fixture::at(home.clone());
+        fs::create_dir_all(home).unwrap();
+        let fixture = Fixture::at(home.to_path_buf());
         let request = fixture
             .store
             .request(REQUESTER_ID, RESPONDER_ID, "perform the held task")
@@ -1941,7 +1948,7 @@ fn assert_reply_while_held(state: ClaimState, home: PathBuf) {
         assert_eq!(reply.kind, MessageKind::TerminalReply);
         assert_eq!(reply.body, "completed while held");
 
-        let holds = relay::store::HoldStore::new(fixture.home.clone());
+        let holds = store::HoldStore::new(fixture.home.clone());
         if acknowledge {
             holds.ack_hold(&token).unwrap();
         } else {
@@ -2009,7 +2016,7 @@ fn reply_while_held_pending_settles_request_without_losing_reply() {
     else {
         return;
     };
-    assert_reply_while_held(ClaimState::ReplyPending, home);
+    assert_reply_while_held(ClaimState::ReplyPending, &home);
 }
 
 #[test]
@@ -2019,7 +2026,7 @@ fn reply_while_held_enqueued_settles_request_without_duplicating_reply() {
     ) else {
         return;
     };
-    assert_reply_while_held(ClaimState::ReplyEnqueued, home);
+    assert_reply_while_held(ClaimState::ReplyEnqueued, &home);
 }
 
 #[test]
@@ -2029,5 +2036,5 @@ fn reply_while_held_consumed_settles_request_without_redelivering_reply() {
     ) else {
         return;
     };
-    assert_reply_while_held(ClaimState::ReplyConsumed, home);
+    assert_reply_while_held(ClaimState::ReplyConsumed, &home);
 }

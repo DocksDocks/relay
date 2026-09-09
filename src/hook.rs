@@ -142,10 +142,13 @@ fn typed_mail_line(message: &MessageV2, recipient_id: &str) -> String {
             body,
             message.correlation_id,
             message.reply_to.as_deref().unwrap_or_default(),
-            message
-                .terminal_status
-                .expect("validated terminal reply has terminal status")
-                .as_str()
+            match message.terminal_status {
+                Some(status) => status.as_str(),
+                None => {
+                    eprintln!("validated terminal reply has terminal status");
+                    std::process::exit(1);
+                }
+            }
         ),
     }
 }

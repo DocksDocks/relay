@@ -3,6 +3,13 @@
 // `relay` child processes (env!("CARGO_BIN_EXE_relay")) with AGENT_RELAY_HOME
 // set per child — no in-process env mutation, so tests can run in parallel.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    reason = "integration test crate: a panic is the intended failure signal"
+)]
+
 pub mod support;
 
 use std::collections::{HashMap, HashSet};

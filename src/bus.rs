@@ -146,7 +146,7 @@ fn jnull() -> JsonValue {
 }
 
 // MCP tool result: {content: [{type: "text", text}], isError}.
-fn text(payload: JsonValue, is_error: bool) -> JsonValue {
+fn text(payload: &JsonValue, is_error: bool) -> JsonValue {
     let s = match payload.get::<String>() {
         Some(raw) => raw.clone(),
         None => payload.format().unwrap_or_else(|_| "{}".to_string()),
@@ -236,14 +236,15 @@ fn protocol_identity(
         })
 }
 
-fn protocol_message(message: MessageV2) -> JsonValue {
-    let payload =
-        String::from_utf8(message.canonical_bytes()).expect("canonical MessageV2 is UTF-8");
-    text(js(payload), false)
+fn protocol_message(message: &MessageV2) -> JsonValue {
+    match String::from_utf8(message.canonical_bytes()) {
+        Ok(payload) => text(&js(payload), false),
+        Err(_) => text(&js("canonical MessageV2 is UTF-8"), true),
+    }
 }
 
 fn protocol_failure(error: &ProtocolError) -> JsonValue {
-    text(js(format!(r#"{{"code":"{}"}}"#, error.code())), true)
+    text(&js(format!(r#"{{"code":"{}"}}"#, error.code())), true)
 }
 
 // Flatten an Entry under {registered: true, ...entry} like the JS spread.
@@ -267,7 +268,7 @@ fn call_tool(
         "whoami" => {
             let Some(id) = self_id() else {
                 return Ok(text(
-                    obj(vec![
+                    &obj(vec![
                         ("registered", JsonValue::from(false)),
                         ("dir", js(pdir)),
                         (
@@ -281,9 +282,9 @@ fn call_tool(
                 ));
             };
             match store::resolve(&id) {
-                Some(e) => Ok(text(registered_entry(&e), false)),
+                Some(e) => Ok(text(&registered_entry(&e), false)),
                 None => Ok(text(
-                    obj(vec![
+                    &obj(vec![
                         ("registered", JsonValue::from(true)),
                         ("id", js(id)),
                         ("dir", js(pdir)),
@@ -296,7 +297,7 @@ fn call_tool(
             let id = arg_str(args, "id").or_else(self_id);
             let Some(id) = id else {
                 return Ok(text(
-                    js(
+                    &js(
                         "Cannot register: no session id known for this project dir. Pass {id}, or ensure the SessionStart hook ran.",
                     ),
                     true,
@@ -306,20 +307,20 @@ fn call_tool(
             let name = arg_str(args, "name");
             let entry = store::register(&id, Some(&dir), name.as_deref(), Some("omp"))
                 .map_err(ToolErr::Soft)?;
-            Ok(text(registered_entry(&entry), false))
+            Ok(text(&registered_entry(&entry), false))
         }
         "roster" => {
             let agents: Vec<JsonValue> =
                 store::roster().iter().map(store::Entry::to_json).collect();
-            Ok(text(obj(vec![("agents", JsonValue::from(agents))]), false))
+            Ok(text(&obj(vec![("agents", JsonValue::from(agents))]), false))
         }
         "send" => {
             let (Some(to), Some(body)) = (arg_str(args, "to"), arg_str(args, "body")) else {
-                return Ok(text(js("send requires {to, body}."), true));
+                return Ok(text(&js("send requires {to, body}."), true));
             };
             let Some(target) = store::resolve(&to) else {
                 return Ok(text(
-                    js(format!(
+                    &js(format!(
                         "No session named or id \"{to}\" in the registry. Call roster to list recipients."
                     )),
                     true,
@@ -332,7 +333,7 @@ fn call_tool(
                 Some(f) => {
                     let Some(e) = store::resolve(&f) else {
                         return Ok(text(
-                            js(format!(
+                            &js(format!(
                                 "Unknown \"from\" identity \"{f}\" — pass your own registered session id or name (see roster)."
                             )),
                             true,
@@ -358,7 +359,7 @@ fn call_tool(
             store::enqueue(&target.id, &msg).map_err(ToolErr::Soft)?;
             let addressee = target.name.clone().unwrap_or_else(|| target.id.clone());
             Ok(text(
-                obj(vec![
+                &obj(vec![
                     ("ok", JsonValue::from(true)),
                     ("delivered_to", js(addressee.clone())),
                     (
@@ -385,7 +386,7 @@ fn call_tool(
             if let Some(who) = arg_str(args, "id") {
                 let Some(e) = store::resolve(&who) else {
                     return Ok(text(
-                        js(format!(
+                        &js(format!(
                             "Unknown inbox identity \"{who}\" — pass your own registered session id or name (see roster)."
                         )),
                         true,
@@ -393,7 +394,7 @@ fn call_tool(
                 };
                 let messages = drain_inbox(&e.id)?;
                 return Ok(text(
-                    obj(vec![
+                    &obj(vec![
                         ("count", JsonValue::from(messages.len() as f64)),
                         ("messages", JsonValue::from(messages)),
                     ]),
@@ -402,7 +403,7 @@ fn call_tool(
             }
             let Some(id) = self_id() else {
                 return Ok(text(
-                    obj(vec![
+                    &obj(vec![
                         ("count", JsonValue::from(0.0)),
                         ("messages", JsonValue::from(Vec::<JsonValue>::new())),
                         ("note", js("No session id for this project dir yet.")),
@@ -412,7 +413,7 @@ fn call_tool(
             };
             let messages = drain_inbox(&id)?;
             Ok(text(
-                obj(vec![
+                &obj(vec![
                     ("count", JsonValue::from(messages.len() as f64)),
                     ("messages", JsonValue::from(messages)),
                 ]),
@@ -437,7 +438,7 @@ fn call_tool(
             };
             let protocol = ProtocolStore::new(store::home_dir());
             match protocol.request(&requester, &responder, body) {
-                Ok(message) => Ok(protocol_message(message)),
+                Ok(message) => Ok(protocol_message(&message)),
                 Err(error) => Ok(protocol_failure(&error)),
             }
         }
@@ -457,7 +458,7 @@ fn call_tool(
             };
             let protocol = ProtocolStore::new(store::home_dir());
             match protocol.reply(correlation_id, &responder, status, body) {
-                Ok(outcome) => Ok(protocol_message(outcome.message)),
+                Ok(outcome) => Ok(protocol_message(&outcome.message)),
                 Err(error) => Ok(protocol_failure(&error)),
             }
         }
@@ -479,7 +480,7 @@ fn call_tool(
                 ..Default::default()
             });
             Ok(text(
-                obj(vec![
+                &obj(vec![
                     ("count", JsonValue::from(sessions.len() as f64)),
                     ("sessions", JsonValue::from(sessions)),
                     (
@@ -496,7 +497,7 @@ fn call_tool(
     }
 }
 
-fn send_frame(v: JsonValue) {
+fn send_frame(v: &JsonValue) {
     if let Ok(s) = v.stringify() {
         let mut out = std::io::stdout().lock();
         let _ = writeln!(out, "{s}");
@@ -504,14 +505,14 @@ fn send_frame(v: JsonValue) {
     }
 }
 fn reply(id: JsonValue, result: JsonValue) {
-    send_frame(obj(vec![
+    send_frame(&obj(vec![
         ("jsonrpc", js("2.0")),
         ("id", id),
         ("result", result),
     ]));
 }
 fn reply_error(id: JsonValue, code: f64, message: String) {
-    send_frame(obj(vec![
+    send_frame(&obj(vec![
         ("jsonrpc", js("2.0")),
         ("id", id),
         (
@@ -565,10 +566,14 @@ fn handle(msg: &JsonValue, pdir: &str) {
         }
         "notifications/initialized" => {} // notification — no response
         "ping" => reply(id.unwrap_or_else(jnull), obj(vec![])),
-        "tools/list" => {
-            let tools: JsonValue = TOOLS_JSON.parse().expect("TOOLS_JSON is valid");
-            reply(id.unwrap_or_else(jnull), obj(vec![("tools", tools)]));
-        }
+        "tools/list" => match TOOLS_JSON.parse::<JsonValue>() {
+            Ok(tools) => reply(id.unwrap_or_else(jnull), obj(vec![("tools", tools)])),
+            Err(_) => reply_error(
+                id.unwrap_or_else(jnull),
+                -32603.0,
+                "TOOLS_JSON is valid".to_string(),
+            ),
+        },
         "tools/call" => {
             let name = params
                 .and_then(|p| p.get("name"))
@@ -586,7 +591,7 @@ fn handle(msg: &JsonValue, pdir: &str) {
                 }
                 Err(ToolErr::Soft(e)) => reply(
                     id.unwrap_or_else(jnull),
-                    text(js(format!("error: {e}")), true),
+                    text(&js(format!("error: {e}")), true),
                 ),
             }
         }

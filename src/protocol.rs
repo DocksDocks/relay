@@ -84,7 +84,8 @@ fn optional_string(
 
 fn schema(values: &BTreeMap<String, JcsValue>, expected: i64) -> Result<u8, String> {
     match values.get("schema") {
-        Some(JcsValue::Integer(value)) if *value == expected => Ok(expected as u8),
+        Some(JcsValue::Integer(value)) if *value == expected => u8::try_from(expected)
+            .map_err(|_| format!("protocol schema must be integer {expected}")),
         _ => Err(format!("protocol schema must be integer {expected}")),
     }
 }
@@ -656,7 +657,12 @@ pub fn jcs_from_tinyjson(value: &JsonValue) -> Result<JcsValue, String> {
             && *value >= i64::MIN as f64
             && *value <= i64::MAX as f64
         {
-            return Ok(JcsValue::Integer(*value as i64));
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "value is clamped to the target range above"
+            )]
+            let integer = value.clamp(i64::MIN as f64, i64::MAX as f64) as i64;
+            return Ok(JcsValue::Integer(integer));
         }
         return Err("protocol JSON number is not an integer".to_string());
     }
@@ -972,7 +978,7 @@ impl ProtocolStore {
             Ok(())
         })
         .map_err(ProtocolError::store)?;
-        result.expect("protocol locked operation executed")
+        result.ok_or_else(|| ProtocolError::store("protocol locked operation did not execute"))?
     }
 
     fn ensure_layout(&self) -> Result<(), ProtocolError> {
@@ -1030,7 +1036,8 @@ impl ProtocolStore {
         let path = self.claim_path(directory, &claim.correlation_id);
         let mut bytes = claim.canonical_bytes();
         bytes.push(b'\n');
-        let text = String::from_utf8(bytes).expect("canonical protocol JSON is UTF-8");
+        let text = String::from_utf8(bytes)
+            .map_err(|_| ProtocolError::store("canonical protocol JSON is UTF-8"))?;
         store::atomic_write_private(&path, &text).map_err(ProtocolError::store)
     }
 
@@ -1139,7 +1146,8 @@ impl ProtocolStore {
         message.validate().map_err(ProtocolError::store)?;
         self.ensure_layout()?;
         let path = self.mailbox_path(recipient_id);
-        let exact = String::from_utf8(message.canonical_bytes()).expect("canonical JSON is UTF-8");
+        let exact = String::from_utf8(message.canonical_bytes())
+            .map_err(|_| ProtocolError::store("canonical JSON is UTF-8"))?;
         let raw = fs::read_to_string(&path).unwrap_or_default();
         for line in raw.lines() {
             let parsed = line.parse::<JsonValue>().ok();
@@ -1666,7 +1674,9 @@ impl ProtocolStore {
                         ));
                     }
                     MailboxRow::Legacy { .. } => {
-                        unreachable!("typed message id index must address a typed row")
+                        return Err(ProtocolError::store(
+                            "typed message id index must address a typed row",
+                        ));
                     }
                 }
             } else {
@@ -2154,7 +2164,7 @@ mod hold_recovery_tests {
         let protocol = ProtocolStore::new(root.clone());
         let mut claims = Vec::new();
         for _ in 0..2 {
-            let mut claim = super::hold_tests::claim(ClaimState::ReplyEnqueued);
+            let mut claim = hold_tests::claim(ClaimState::ReplyEnqueued);
             claim.correlation_id = store::uuid_v4();
             claim.request.correlation_id = claim.correlation_id.clone();
             claim.request.id = store::uuid_v4();
@@ -2192,7 +2202,7 @@ mod hold_recovery_tests {
             for claim in &claims {
                 protocol
                     .hold_claim_update_locked(
-                        &[super::hold_tests::row(claim.reply.as_ref().unwrap())],
+                        &[hold_tests::row(claim.reply.as_ref().unwrap())],
                         true,
                     )
                     .unwrap();
@@ -2280,7 +2290,7 @@ mod hold_recovery_tests {
     fn expired_typed_hold_is_restored_by_peek_without_consuming() {
         let root = std::env::temp_dir().join(format!("relay-hold-expiry-{}", store::uuid_v4()));
         let protocol = ProtocolStore::new(root.clone());
-        let original = super::hold_tests::claim(ClaimState::Open);
+        let original = hold_tests::claim(ClaimState::Open);
         protocol
             .write_claim(ClaimDirectory::Open, &original)
             .unwrap();
@@ -2332,7 +2342,7 @@ mod hold_recovery_tests {
     fn reply_to_held_request_delivers_once_and_request_ack_preserves_it() {
         let root = std::env::temp_dir().join(format!("relay-hold-reply-{}", store::uuid_v4()));
         let protocol = ProtocolStore::new(root.clone());
-        let original = super::hold_tests::claim(ClaimState::Open);
+        let original = hold_tests::claim(ClaimState::Open);
         protocol
             .write_claim(ClaimDirectory::Open, &original)
             .unwrap();

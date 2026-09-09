@@ -96,6 +96,7 @@ pub fn read_jcs_value(path: &Path, expected_sha256: Option<&str>) -> Result<JcsV
         .metadata()
         .map_err(|error| format!("inspect {}: {error}", path.display()))?;
     if !metadata.is_file()
+        // SAFETY: geteuid has no preconditions and cannot fail.
         || metadata.uid() != unsafe { libc::geteuid() }
         || metadata.nlink() != 1
         || metadata.mode() & 0o7777 != 0o600
@@ -158,6 +159,10 @@ fn utf16_cmp(left: &str, right: &str) -> Ordering {
     left.encode_utf16().cmp(right.encode_utf16())
 }
 
+const HEX_DIGITS: [char; 16] = [
+    '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f',
+];
+
 fn write_string(value: &str, output: &mut String) {
     output.push('"');
     for character in value.chars() {
@@ -170,8 +175,11 @@ fn write_string(value: &str, output: &mut String) {
             '\u{0c}' => output.push_str("\\f"),
             '\r' => output.push_str("\\r"),
             c if c <= '\u{1f}' => {
-                use std::fmt::Write as _;
-                write!(output, "\\u{:04x}", c as u32).expect("String write");
+                // `c` is at most 0x1f, so the escape is `\u00` plus two hex digits.
+                let code = c as u32;
+                output.push_str("\\u00");
+                output.push(HEX_DIGITS[(code >> 4) as usize]);
+                output.push(HEX_DIGITS[(code & 0x0f) as usize]);
             }
             c => output.push(c),
         }
@@ -298,7 +306,7 @@ impl Parser<'_> {
         self.offset += 4;
         let mut value = 0u16;
         for byte in bytes {
-            value = value.checked_mul(16).unwrap();
+            value <<= 4;
             value += match byte {
                 b'0'..=b'9' => (byte - b'0') as u16,
                 b'a'..=b'f' => (byte - b'a' + 10) as u16,
@@ -375,7 +383,8 @@ impl Parser<'_> {
         if matches!(self.peek(), Some(b'.' | b'e' | b'E')) {
             return Err("JCS schemas do not admit non-integer JSON numbers".to_string());
         }
-        let text = std::str::from_utf8(&self.bytes[start..self.offset]).unwrap();
+        let text = std::str::from_utf8(&self.bytes[start..self.offset])
+            .map_err(|_| "JCS JSON integer is outside the exact range".to_string())?;
         let value = text
             .parse::<i64>()
             .map_err(|_| "JCS JSON integer is outside the exact range".to_string())?;
@@ -438,6 +447,17 @@ mod tests {
         let v = parse_jcs(b"{\"a\":[true,null,1],\"z\":\"x\"}\n", true).unwrap();
         assert_eq!(serialize_jcs(&v), "{\"a\":[true,null,1],\"z\":\"x\"}");
         assert!(parse_jcs(b"{\"a\":1,\"a\":2}\n", true).is_err());
+    }
+    #[test]
+    fn control_characters_escape_to_four_hex_digits() {
+        let text = String::from("\u{0}\u{f}\u{10}\u{1f} \u{7f}");
+        let value = JcsValue::String(text);
+        assert_eq!(
+            serialize_jcs(&value),
+            "\"\\u0000\\u000f\\u0010\\u001f \u{7f}\""
+        );
+        let parsed = parse_jcs(b"\"\\u0000\\u000f\\u0010\\u001f\"\n", true).unwrap();
+        assert_eq!(serialize_jcs(&parsed), "\"\\u0000\\u000f\\u0010\\u001f\"");
     }
     #[test]
     fn primitives_are_closed() {

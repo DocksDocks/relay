@@ -174,8 +174,17 @@ impl LockMetadata {
         let o = value.get::<HashMap<String, JsonValue>>()?;
         let pid = o.get("pid")?.get::<f64>().copied()?;
         let string = |key: &str| o.get(key)?.get::<String>().cloned();
+        if !pid.is_finite() || !(0.0..=f64::from(u32::MAX)).contains(&pid) {
+            return None;
+        }
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "PID is finite and clamped to the nonnegative u32 range"
+        )]
+        let pid = pid.clamp(0.0, f64::from(u32::MAX)) as u32;
         Some(Self {
-            pid: (pid.is_finite() && pid >= 0.0 && pid <= u32::MAX as f64).then_some(pid as u32)?,
+            pid,
             started_at: string("started_at")?,
             tool: string("tool")?,
             mode: string("mode")?,
@@ -232,7 +241,7 @@ pub fn read_lock_metadata(path: &Path) -> Option<LockMetadata> {
 
 fn acquire_lock(
     path: &Path,
-    metadata: LockMetadata,
+    metadata: &LockMetadata,
     retry_for: Duration,
 ) -> Result<HeldLock, LockAcquireError> {
     let deadline = Instant::now() + retry_for;
@@ -284,7 +293,7 @@ pub fn acquire_watcher_lock(
 ) -> Result<HeldLock, LockAcquireError> {
     acquire_lock(
         &watcher_lock_path(id),
-        LockMetadata::new(tool, mode),
+        &LockMetadata::new(tool, mode),
         WATCH_LOCK_RETRY,
     )
 }
@@ -292,7 +301,7 @@ pub fn acquire_watcher_lock(
 pub fn acquire_resume_lock(id: &str, tool: &str) -> Result<HeldLock, LockAcquireError> {
     acquire_lock(
         &resume_lock_path(id),
-        LockMetadata::new(tool, "resume"),
+        &LockMetadata::new(tool, "resume"),
         Duration::ZERO,
     )
 }
@@ -343,20 +352,27 @@ pub fn watcher_progress_age_ms(id: &str) -> Option<i64> {
     Some(now_ms().saturating_sub(written).max(0))
 }
 
-fn random_hex(n_bytes: usize) -> String {
+fn random_hex(n_bytes: usize) -> Result<String, String> {
     let mut buf = vec![0u8; n_bytes];
     // /dev/urandom exists on every unix target we ship (linux-musl, apple-darwin);
     // rustix::rand::getrandom is Linux-only, so std + the device file it is.
-    let mut f = fs::File::open("/dev/urandom").expect("open /dev/urandom");
-    f.read_exact(&mut buf).expect("read /dev/urandom");
+    let mut f =
+        fs::File::open("/dev/urandom").map_err(|error| format!("open /dev/urandom: {error}"))?;
+    f.read_exact(&mut buf)
+        .map_err(|error| format!("read /dev/urandom: {error}"))?;
     use std::fmt::Write as _;
-    buf.iter()
+    Ok(buf
+        .iter()
         .fold(String::with_capacity(n_bytes * 2), |mut s, b| {
             let _ = write!(s, "{b:02x}");
             s
-        })
+        }))
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "failed entropy reads are unrecoverable; aborting UUID generation is intentional"
+)]
 pub fn uuid_v4() -> String {
     let mut b = vec![0u8; 16];
     let mut f = fs::File::open("/dev/urandom").expect("open /dev/urandom");
@@ -385,10 +401,14 @@ pub fn uuid_v4() -> String {
 }
 
 pub fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or(Duration::ZERO)
-        .as_millis() as i64
+    // Millisecond timestamps saturate at the largest representable store timestamp.
+    i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_millis(),
+    )
+    .unwrap_or(i64::MAX)
 }
 
 /// ISO-8601 UTC with millisecond precision — matches Node's Date#toISOString.
@@ -433,8 +453,9 @@ pub fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let y = yoe + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
     let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
+    // The calendar algorithm bounds day to 1..=31 and month to 1..=12.
+    let d = u32::try_from(doy - (153 * mp + 2) / 5 + 1).unwrap_or(u32::MAX);
+    let m = u32::try_from(if mp < 10 { mp + 3 } else { mp - 9 }).unwrap_or(u32::MAX);
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
@@ -443,7 +464,7 @@ fn atomic_write(file: &Path, text: &str) -> Result<(), String> {
         "{}.{}.{}.tmp",
         file.display(),
         std::process::id(),
-        random_hex(4)
+        random_hex(4)?
     ));
     fs::write(&tmp, text).map_err(|e| format!("write {}: {e}", tmp.display()))?;
     fs::rename(&tmp, file).map_err(|e| format!("rename to {}: {e}", file.display()))
@@ -463,7 +484,7 @@ pub(crate) fn atomic_write_private(file: &Path, text: &str) -> Result<(), String
         "{}.{}.{}.tmp",
         file.display(),
         std::process::id(),
-        random_hex(4)
+        random_hex(4)?
     ));
     let result = (|| {
         let mut output = fs::OpenOptions::new()
@@ -986,7 +1007,7 @@ fn stat_regular_at(root_fd: &OwnedFd, name: &str) -> Result<Option<rustix::fs::S
 }
 
 fn atomic_write_at(root_fd: &OwnedFd, name: &str, text: &str) -> Result<(), String> {
-    let tmp = format!(".{name}.{}.{}.tmp", std::process::id(), random_hex(4));
+    let tmp = format!(".{name}.{}.{}.tmp", std::process::id(), random_hex(4)?);
     let fd = openat(
         root_fd,
         &tmp,
@@ -1040,7 +1061,8 @@ fn gc_stamp_is_fresh(root_fd: &OwnedFd, now: SystemTime) -> Result<bool, String>
     };
     let modified = UNIX_EPOCH
         .checked_add(Duration::new(
-            stat.st_mtime.max(0) as u64,
+            u64::try_from(stat.st_mtime.max(0))
+                .map_err(|error| format!("GC stamp time: {error}"))?,
             stat.st_mtime_nsec.clamp(0, 999_999_999) as u32,
         ))
         .unwrap_or(UNIX_EPOCH);
@@ -1150,11 +1172,14 @@ impl LegacyGc {
                 .ok_or_else(|| "AGENT_RELAY_GC_DAYS is too large".to_string())?,
         );
         let cutoff = now.checked_sub(age).unwrap_or(UNIX_EPOCH);
-        let cutoff_ms = cutoff
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or(Duration::ZERO)
-            .as_millis()
-            .min(i64::MAX as u128) as i64;
+        // Cutoff timestamps saturate at the largest representable store timestamp.
+        let cutoff_ms = i64::try_from(
+            cutoff
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or(Duration::ZERO)
+                .as_millis(),
+        )
+        .unwrap_or(i64::MAX);
         let cutoff_iso = iso_from_unix_ms(cutoff_ms);
 
         with_gc_lock(&self.root_fd, || {
@@ -1787,7 +1812,7 @@ pub(crate) fn recover_holds_locked(root: &Path) -> Result<(), String> {
 pub fn hold_mailbox(id: &str, event: &str, seconds: u64) -> Result<HoldReceipt, String> {
     let root = home_dir();
     with_lock_at(&root, || {
-        hold_authorized_mailbox(AuthorizedMailboxTarget::new(&root, id), event, seconds)
+        hold_authorized_mailbox(&AuthorizedMailboxTarget::new(&root, id), event, seconds)
     })
 }
 
@@ -1795,12 +1820,12 @@ pub fn drain_mailbox(id: &str) -> Result<DrainReceipt, String> {
     let root = home_dir();
     with_lock_at(&root, || {
         recover_holds_locked(&root)?;
-        drain_authorized_mailbox(AuthorizedMailboxTarget::new(&root, id))
+        drain_authorized_mailbox(&AuthorizedMailboxTarget::new(&root, id))
     })
 }
 
 pub(crate) fn hold_authorized_mailbox(
-    target: AuthorizedMailboxTarget<'_>,
+    target: &AuthorizedMailboxTarget<'_>,
     event: &str,
     seconds: u64,
 ) -> Result<HoldReceipt, String> {
@@ -1875,7 +1900,7 @@ impl<'a> AuthorizedMailboxTarget<'a> {
 
 /// Read and clear one authorized inbox in a locked step.
 pub(crate) fn drain_authorized_mailbox(
-    target: AuthorizedMailboxTarget<'_>,
+    target: &AuthorizedMailboxTarget<'_>,
 ) -> Result<DrainReceipt, String> {
     let path = target
         .root
@@ -2021,7 +2046,7 @@ mod tests {
         .unwrap_err();
         assert_eq!(conflict, "hold_conflict");
         let later = with_lock_at(&root, || {
-            drain_authorized_mailbox(AuthorizedMailboxTarget::new(&root, &session))
+            drain_authorized_mailbox(&AuthorizedMailboxTarget::new(&root, &session))
         })
         .unwrap();
         assert_eq!(
@@ -2033,7 +2058,7 @@ mod tests {
             .rollback_hold(hold.token.as_deref().unwrap())
             .unwrap();
         let restored = with_lock_at(&root, || {
-            drain_authorized_mailbox(AuthorizedMailboxTarget::new(&root, &session))
+            drain_authorized_mailbox(&AuthorizedMailboxTarget::new(&root, &session))
         })
         .unwrap();
         assert_eq!(
@@ -2055,7 +2080,7 @@ mod tests {
             Err(HoldError::Expired)
         );
         let restored = with_lock_at(&root, || {
-            drain_authorized_mailbox(AuthorizedMailboxTarget::new(&root, &session))
+            drain_authorized_mailbox(&AuthorizedMailboxTarget::new(&root, &session))
         })
         .unwrap();
         assert_eq!(
@@ -2070,7 +2095,7 @@ mod tests {
         })
         .unwrap();
         let restored = with_lock_at(&root, || {
-            drain_authorized_mailbox(AuthorizedMailboxTarget::new(&root, &session))
+            drain_authorized_mailbox(&AuthorizedMailboxTarget::new(&root, &session))
         })
         .unwrap();
         assert_eq!(
