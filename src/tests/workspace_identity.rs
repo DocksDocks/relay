@@ -591,19 +591,46 @@ fn preserve_artifact_mode_round_trips_binary_and_untracked_pax() {
     }
 
     {
+        // Only creating the device inode needs CAP_MKNOD; the refusal under
+        // test runs unprivileged. Try a direct mknod, then passwordless sudo
+        // (CI), and skip this one subcase only when both lack privilege.
         let repo = TestRepository::init("artifact-device-type-refusal");
         let device = repo.root.join("unsafe.device");
-        let output = Command::new("sudo")
-            .args(["-n", "mknod", device.to_str().unwrap(), "c", "1", "3"])
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "promised native device-node test support is absent: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        if let Err(error) = artifact_preserve_refusal(&repo, "unsupported type") {
-            refusal_failures.push(format!("device type drift: {error}"));
+        let device_c =
+            std::ffi::CString::new(std::os::unix::ffi::OsStrExt::as_bytes(device.as_os_str()))
+                .unwrap();
+        let direct = unsafe {
+            libc::mknod(
+                device_c.as_ptr(),
+                libc::S_IFCHR | 0o600,
+                libc::makedev(1, 3),
+            )
+        } == 0;
+        let created = direct || {
+            let direct_error = std::io::Error::last_os_error();
+            let output = Command::new("sudo")
+                .args(["-n", "mknod", device.to_str().unwrap(), "c", "1", "3"])
+                .output()
+                .unwrap();
+            let privilege_missing = matches!(
+                direct_error.raw_os_error(),
+                Some(libc::EPERM) | Some(libc::EACCES)
+            );
+            assert!(
+                output.status.success() || privilege_missing,
+                "device fixture failed without a privilege error: mknod: {direct_error}; sudo: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            output.status.success()
+        };
+        if created {
+            if let Err(error) = artifact_preserve_refusal(&repo, "unsupported type") {
+                refusal_failures.push(format!("device type drift: {error}"));
+            }
+        } else {
+            eprintln!(
+                "SKIP device type refusal subcase: no CAP_MKNOD and no passwordless sudo on this host"
+            );
         }
     }
 
