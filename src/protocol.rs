@@ -1115,10 +1115,17 @@ impl ProtocolStore {
                     .ok_or_else(|| format!("hold row missing {key}"))
             };
             let correlation_id = field("correlation_id")?;
-            let mut claim = self
-                .read_claim_locked(correlation_id)
+            let (mut claim, stale) = self
+                .resolve_claim_locked(correlation_id)
                 .map_err(|error| error.to_string())?
                 .ok_or("held typed row has no claim")?;
+            // An interrupted claim move leaves a stale predecessor whose
+            // recovery predicate requires equal request delivery. Remove it
+            // before this update changes the authoritative claim; the reply
+            // state stays as recorded.
+            if let Some(stale) = stale {
+                fs::remove_file(&stale).map_err(|error| error.to_string())?;
+            }
             let message = match kind {
                 MessageKind::Request => &claim.request,
                 MessageKind::TerminalReply | MessageKind::WorkerResult => claim
@@ -1317,6 +1324,17 @@ impl ProtocolStore {
         &self,
         correlation_id: &str,
     ) -> Result<Option<ClaimStatusV1>, ProtocolError> {
+        Ok(self
+            .resolve_claim_locked(correlation_id)?
+            .map(|(claim, _)| claim))
+    }
+
+    /// The authoritative claim plus the path of its stale predecessor when an
+    /// interrupted move left the correlation in two directories.
+    fn resolve_claim_locked(
+        &self,
+        correlation_id: &str,
+    ) -> Result<Option<(ClaimStatusV1, Option<PathBuf>)>, ProtocolError> {
         validate_uuid(correlation_id, "correlation id").map_err(ProtocolError::store)?;
         let pending = self.read_claim_in(ClaimDirectory::Pending, correlation_id)?;
         let open = self.read_claim_in(ClaimDirectory::Open, correlation_id)?;
@@ -1329,13 +1347,15 @@ impl ProtocolStore {
         match (pending, open, terminal) {
             (None, None, None) => Ok(None),
             (Some(claim), None, None) | (None, Some(claim), None) | (None, None, Some(claim)) => {
-                Ok(Some(claim))
+                Ok(Some((claim, None)))
             }
             (Some(pending), Some(open), None) => {
                 if stale_request_pending_of_open(&pending, &open) {
-                    Ok(Some(open))
+                    let stale = self.claim_path(ClaimDirectory::Pending, correlation_id);
+                    Ok(Some((open, Some(stale))))
                 } else if stale_open_of_reply_pending(&open, &pending) {
-                    Ok(Some(pending))
+                    let stale = self.claim_path(ClaimDirectory::Open, correlation_id);
+                    Ok(Some((pending, Some(stale))))
                 } else {
                     Err(ProtocolError::store("duplicate protocol claim"))
                 }
@@ -1343,7 +1363,8 @@ impl ProtocolStore {
             (Some(pending), None, Some(terminal))
                 if stale_reply_pending_of_terminal(&pending, &terminal) =>
             {
-                Ok(Some(terminal))
+                let stale = self.claim_path(ClaimDirectory::Pending, correlation_id);
+                Ok(Some((terminal, Some(stale))))
             }
             _ => Err(ProtocolError::store("duplicate protocol claim")),
         }
@@ -2287,6 +2308,64 @@ mod hold_tests {
                 .unwrap();
             assert_eq!(restored.state, state);
             assert_eq!(restored.reply_delivery, original.reply_delivery);
+            assert_eq!(restored.request_delivery, DeliveryState::Enqueued);
+        }
+    }
+
+    #[test]
+    fn held_request_ack_removes_a_stale_reply_predecessor_first() {
+        // ReplyPendingMoveBeforeSourceUnlink leaves open/Open beside
+        // pending/ReplyPending; ReplyEnqueuedMoveBeforeSourceUnlink leaves
+        // pending/ReplyPending beside terminal/ReplyEnqueued. Both pairs share
+        // request delivery, which the ack changes on the authoritative file.
+        for (stale_state, authoritative_state) in [
+            (ClaimState::Open, ClaimState::ReplyPending),
+            (ClaimState::ReplyPending, ClaimState::ReplyEnqueued),
+        ] {
+            let fixture = Fixture::new();
+            let authoritative = claim(authoritative_state, ClaimOrigin::Message);
+            let mut stale = authoritative.clone();
+            stale.state = stale_state;
+            if stale_state == ClaimState::Open {
+                stale.reply = None;
+                stale.reply_sha256 = None;
+                stale.reply_delivery = None;
+            } else {
+                stale.reply_delivery = Some(DeliveryState::Pending);
+            }
+            let stale_directory = ProtocolStore::claim_directory(stale_state);
+            fixture.0.write_claim(stale_directory, &stale).unwrap();
+            fixture
+                .0
+                .write_claim(
+                    ProtocolStore::claim_directory(authoritative_state),
+                    &authoritative,
+                )
+                .unwrap();
+            let rows = [row(&authoritative.request)];
+            fixture.0.hold_claim_update_locked(&rows, true).unwrap();
+            let updated = fixture
+                .0
+                .read_claim_locked(&authoritative.correlation_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(updated.state, authoritative_state);
+            assert_eq!(updated.request_delivery, DeliveryState::Consumed);
+            assert_eq!(updated.reply, authoritative.reply);
+            assert_eq!(updated.reply_delivery, authoritative.reply_delivery);
+            assert!(
+                !fixture
+                    .0
+                    .claim_path(stale_directory, &authoritative.correlation_id)
+                    .exists()
+            );
+            fixture.0.recover_pending_locked().unwrap();
+            fixture.0.hold_claim_update_locked(&rows, false).unwrap();
+            let restored = fixture
+                .0
+                .read_claim_locked(&authoritative.correlation_id)
+                .unwrap()
+                .unwrap();
             assert_eq!(restored.request_delivery, DeliveryState::Enqueued);
         }
     }
