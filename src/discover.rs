@@ -248,8 +248,8 @@ fn discover_files(opts: &Options<'_>, files: impl Iterator<Item = Candidate>) ->
     for f in files {
         let (id, fcwd) = omp_meta(&f.file).unwrap_or((None, None));
         let Some(id) = id else { continue };
-        if !store::is_uuid(&id) {
-            continue; // planted/garbage id → skip (and keep it off the doorbell argv)
+        if !store::is_session_id(&id) {
+            continue; // Skip ids that are not lowercase session UUIDs; keep them off the doorbell argv.
         }
         if opts.exclude_id.is_some_and(|x| x == id) {
             continue;
@@ -502,6 +502,11 @@ mod tests {
             ("older", id, "/older"),
             ("newer", id, "/newer"),
             ("invalid", "not-a-uuid", "/invalid"),
+            (
+                "uppercase",
+                "01A081C6-19DA-737A-A863-9FB9D50AD5C2",
+                "/uppercase",
+            ),
             ("stale", "02a081c6-19da-737a-a863-9fb9d50ad5c2", "/stale"),
         ] {
             fixture.write(

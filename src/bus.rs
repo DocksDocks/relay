@@ -605,7 +605,8 @@ fn handle(msg: &JsonValue, pdir: &str) {
 
 pub fn run() -> ! {
     let pdir = project_dir();
-    let self_id = store::id_for_dir(&pdir);
+    // GC self exclusion keeps the lenient marker identity.
+    let self_id = store::raw_id_for_dir(&pdir);
     if let Err(e) = gc::run(std::time::SystemTime::now(), self_id.as_deref()) {
         log(&format!("GC skipped: {e}"));
     }

@@ -588,7 +588,13 @@ impl Entry {
         JsonValue::from(m)
     }
 
+    /// Parse a registry entry only if its id is lowercase UUID text.
     pub(crate) fn from_json(v: &JsonValue) -> Option<Entry> {
+        Self::from_json_any(v).filter(|entry| is_session_id(&entry.id))
+    }
+
+    /// Parse any registry entry for GC retention evidence only, without an id check.
+    pub(crate) fn from_json_any(v: &JsonValue) -> Option<Entry> {
         let obj: &HashMap<String, JsonValue> = v.get()?;
         let s = |k: &str| -> Option<String> { obj.get(k)?.get::<String>().cloned() };
         if obj.get("tool")?.get::<String>()? != "omp" {
@@ -1196,7 +1202,7 @@ impl LegacyGc {
             let inventory = known_gc_surfaces(&self.surface_dirs, cutoff)?;
             let mut candidates: HashMap<String, GcCandidate> = HashMap::new();
             for (registry_key, value) in &registry.agents {
-                let Some(entry) = Entry::from_json(value) else {
+                let Some(entry) = Entry::from_json_any(value) else {
                     continue; // malformed registry state is preserved, never guessed old
                 };
                 if !is_uuid(registry_key) || entry.id != *registry_key {
@@ -1378,8 +1384,19 @@ pub fn set_marker(dir: &str, id: &str) -> Result<(), String> {
     with_lock(|| atomic_write(&marker_path(dir), &format!("{id}\n")))
 }
 
+/// Read a marker only if its id is lowercase UUID text.
 pub fn id_for_dir(dir: &str) -> Option<String> {
-    let raw = fs::read_to_string(marker_path(dir)).ok()?;
+    raw_id_for_dir(dir).filter(|id| is_session_id(id))
+}
+
+/// Read any non-empty marker id for GC self exclusion, without a UUID check.
+pub(crate) fn raw_id_for_dir(dir: &str) -> Option<String> {
+    read_marker(&marker_path(dir))
+}
+
+/// Read any non-empty marker id without a UUID check.
+pub(crate) fn read_marker(path: &Path) -> Option<String> {
+    let raw = fs::read_to_string(path).ok()?;
     let t = raw.trim();
     if t.is_empty() {
         None
@@ -1941,6 +1958,42 @@ pub fn mailbox_has_content(recipient_id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn registry_readers_reject_non_lowercase_session_ids() {
+        let valid = "01a081c6-19da-737a-a863-9fb9d50ad5c2";
+        let uppercase = "01A081C6-19DA-737A-A863-9FB9D50AD5C2";
+        let garbage = "--config=evil";
+        for id in [valid, uppercase, garbage] {
+            let value = Entry {
+                id: id.to_string(),
+                dir: None,
+                name: None,
+                tool: "omp".to_string(),
+                last_seen: iso_now(),
+            }
+            .to_json();
+            assert_eq!(Entry::from_json_any(&value).unwrap().id, id);
+            if id == valid {
+                assert_eq!(Entry::from_json(&value).unwrap().id, valid);
+            } else {
+                assert!(Entry::from_json(&value).is_none(), "{id}");
+            }
+        }
+    }
+
+    #[test]
+    fn marker_reader_rejects_uppercase_but_preserves_gc_identity() {
+        let root = std::env::temp_dir().join(format!("relay-marker-{}", uuid_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("marker");
+        let uppercase = "01A081C6-19DA-737A-A863-9FB9D50AD5C2";
+        fs::write(&path, format!("{uppercase}\n")).unwrap();
+        let raw = read_marker(&path);
+        assert_eq!(raw.as_deref(), Some(uppercase));
+        assert_eq!(raw.filter(|id| is_session_id(id)), None);
+        fs::remove_dir_all(root).unwrap();
+    }
 
     fn hold_fixture() -> (PathBuf, String, PathBuf) {
         let root = std::env::temp_dir().join(format!("relay-hold-{}", uuid_v4()));
