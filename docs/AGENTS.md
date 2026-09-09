@@ -10,7 +10,7 @@ issue in `DocksDocks/session-relay`.
 
 ## Reference
 
-`docs/crate-map.md` maps the Rust crate: module responsibilities, the custody
-and deadline constant taxonomy, and the invariants each bound protects. It is
+`docs/crate-map.md` maps the Rust crate: module responsibilities, the
+integration targets, and the invariants each module protects. It is
 derived documentation, read on demand. Update it in the same change that moves a
 constant or a module boundary it names.

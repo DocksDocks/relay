@@ -406,8 +406,10 @@ pub fn iso_now() -> String {
     iso_from_unix_ms(now_ms())
 }
 
-/// Session ids must be UUID-shaped, keeping planted values and injectable
-/// options off doorbell argv. Mirrors the Node UUID_RE (case-insensitive).
+/// Session ids are RFC 9562 UUID text (8-4-4-4-12 hex, any version, any
+/// case): only the shape keeps planted values and injectable options off
+/// doorbell argv. Message-side session ids additionally require lowercase
+/// (`protocol::validate_session_id`); relay-generated record ids stay v4.
 pub fn is_uuid(s: &str) -> bool {
     let b = s.as_bytes();
     b.len() == 36

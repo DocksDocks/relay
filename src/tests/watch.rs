@@ -101,6 +101,11 @@ fn watch_never_launches_a_tampered_non_uuid_target() {
 
     let all = relay(&home, &launcher, &["watch", "--all", "--once"]);
     assert!(
+        all.status.success(),
+        "watch --all must skip the bad entry without failing: {}",
+        String::from_utf8_lossy(&all.stderr)
+    );
+    assert!(
         String::from_utf8_lossy(&all.stderr).contains("skip --config=evil"),
         "watch --all must report the skipped id: {}",
         String::from_utf8_lossy(&all.stderr)
