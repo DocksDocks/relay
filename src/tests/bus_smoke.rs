@@ -1,6 +1,5 @@
-// Black-box MCP lifecycle smoke test: spawn `relay bus` and speak real
-// newline-delimited JSON-RPC over its stdio. Catches gross wire breakage long
-// before the full Node selftest rewrite (rust-port plan step 6).
+// Black-box MCP messaging smoke tests: spawn `relay bus` and speak real
+// newline-delimited JSON-RPC over its stdio.
 
 use std::collections::HashMap;
 use std::fs;
@@ -68,7 +67,7 @@ fn register_identity(home: &Path, name: &str, id: &str, dir: &Path) {
 }
 
 #[test]
-fn bus_lifecycle_tools_and_whoami() {
+fn bus_messaging_tools_and_whoami() {
     let home = std::env::temp_dir().join(format!(
         "relay-bus-smoke-{}-{}",
         std::process::id(),
@@ -80,6 +79,7 @@ fn bus_lifecycle_tools_and_whoami() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_relay"))
         .arg("bus")
         .env("AGENT_RELAY_HOME", &home)
+        .env_remove("SESSION_RELAY_HOME")
         .env("RELAY_PROJECT_DIR", &pdir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -131,7 +131,7 @@ fn bus_lifecycle_tools_and_whoami() {
         "first frame after the notification must be the ping reply — the notification must not be answered"
     );
 
-    // tools/list carries exactly the 6 tools
+    // tools/list exposes messaging, identity, and omp discovery.
     let tl = rpc(
         &mut stdin,
         &mut lines,
@@ -144,15 +144,6 @@ fn bus_lifecycle_tools_and_whoami() {
         .iter()
         .map(|t| obj(t)["name"].get::<String>().unwrap().as_str())
         .collect();
-    let names: Vec<&str> = all_names
-        .iter()
-        .copied()
-        .filter(|name| !matches!(*name, "request" | "reply"))
-        .collect();
-    assert_eq!(
-        names,
-        ["whoami", "register", "roster", "send", "inbox", "discover"]
-    );
     assert_eq!(
         all_names,
         [
@@ -230,6 +221,78 @@ fn bus_lifecycle_tools_and_whoami() {
         .parse()
         .expect("whoami text payload is JSON");
     assert!(!obj(&payload)["registered"].get::<bool>().copied().unwrap());
+
+    let sender_id = relay::store::uuid_v4();
+    let recipient_id = relay::store::uuid_v4();
+    for (id, name) in [(&sender_id, "sender"), (&recipient_id, "recipient")] {
+        let registered = rpc(
+            &mut stdin,
+            &mut lines,
+            &tool_call_frame(
+                6,
+                "register",
+                &format!(r#"{{"id":"{id}","name":"{name}"}}"#),
+            ),
+        );
+        assert_eq!(
+            tool_result(&registered)["isError"].get::<bool>().copied(),
+            Some(false)
+        );
+    }
+    let roster = rpc(&mut stdin, &mut lines, &tool_call_frame(7, "roster", "{}"));
+    let roster: JsonValue = tool_text(&roster).parse().unwrap();
+    let agents = obj(&roster)["agents"].get::<Vec<JsonValue>>().unwrap();
+    let mut ids = agents
+        .iter()
+        .map(|agent| {
+            assert_eq!(obj(agent)["tool"].get::<String>().unwrap(), "omp");
+            obj(agent)["id"].get::<String>().unwrap().as_str()
+        })
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    let mut expected_ids = [sender_id.as_str(), recipient_id.as_str()];
+    expected_ids.sort_unstable();
+    assert_eq!(ids, expected_ids);
+
+    let sent = rpc(
+        &mut stdin,
+        &mut lines,
+        &tool_call_frame(
+            8,
+            "send",
+            r#"{"from":"sender","to":"recipient","body":"hello omp"}"#,
+        ),
+    );
+    assert_eq!(
+        tool_result(&sent)["isError"].get::<bool>().copied(),
+        Some(false)
+    );
+    let sent: JsonValue = tool_text(&sent).parse().unwrap();
+    assert_eq!(obj(&sent)["ok"].get::<bool>().copied(), Some(true));
+    let inbox = rpc(
+        &mut stdin,
+        &mut lines,
+        &tool_call_frame(9, "inbox", r#"{"id":"recipient"}"#),
+    );
+    let inbox: JsonValue = tool_text(&inbox).parse().unwrap();
+    let messages = obj(&inbox)["messages"].get::<Vec<JsonValue>>().unwrap();
+    assert_eq!(messages.len(), 1);
+    let message = obj(&messages[0]);
+    assert_eq!(message["from"].get::<String>().unwrap(), &sender_id);
+    assert_eq!(message["to"].get::<String>().unwrap(), &recipient_id);
+    assert_eq!(message["body"].get::<String>().unwrap(), "hello omp");
+    let drained = rpc(
+        &mut stdin,
+        &mut lines,
+        &tool_call_frame(10, "inbox", r#"{"id":"recipient"}"#),
+    );
+    let drained: JsonValue = tool_text(&drained).parse().unwrap();
+    assert!(
+        obj(&drained)["messages"]
+            .get::<Vec<JsonValue>>()
+            .unwrap()
+            .is_empty()
+    );
 
     // unknown tool → JSON-RPC error -32602
     let err = rpc(
@@ -322,7 +385,7 @@ fn bus_discover_omp_schema_and_session() {
         .iter()
         .map(|value| value.get::<String>().unwrap().as_str())
         .collect::<Vec<_>>();
-    assert_eq!(tools, ["claude", "codex", "omp"]);
+    assert_eq!(tools, ["omp"]);
 
     assert_eq!(
         tool_result(&replies[2])["isError"].get::<bool>().copied(),

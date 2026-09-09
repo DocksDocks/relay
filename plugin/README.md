@@ -1,6 +1,6 @@
 # Session Relay
 
-Session Relay provides cross-session and cross-project mail for omp.
+Session Relay provides durable cross-session and cross-project mail for omp only.
 The plugin ships an omp extension, a `session-relay` skill, and a POSIX launcher.
 Install the Rust CLI separately as `session-relay`.
 The plugin's `bin/relay` resolves that installed CLI.
@@ -34,9 +34,7 @@ The launcher checks `SESSION_RELAY_BIN`, then `session-relay` on `PATH`, then
 `~/.local/bin/session-relay`.
 It rejects recursive launcher resolution.
 
-Session Relay supports Linux x86-64 and arm64 only.
-Managed writing additionally requires ext4.
-Managed custody requires cgroup v2, pidfd, Landlock, and seccomp.
+Session Relay distributes Linux x86-64 and arm64 musl binaries.
 
 ## Plugin interface
 
@@ -63,6 +61,17 @@ For `reply`, `id` means correlation ID, not session ID.
 Reply status defaults to `completed`.
 Use `failed` for a failed terminal answer.
 Use `/relay` for the roster and pending count without draining mail.
+
+Discovery reads only the omp session root. The extension supplies
+`RELAY_OMP_SESSIONS`; set it explicitly for standalone commands using a
+different omp session root. Discovery recency is not proof of a live or idle
+process. Registry and discovery records retain `tool: "omp"`.
+
+The store defaults to `~/.agent-relay`; `AGENT_RELAY_HOME` overrides it before
+`SESSION_RELAY_HOME`. `session-relay gc` collects inactive relay-owned state,
+preserving held locks and the invoking session. Hook and bus activity sweep
+at most once every six hours. The inactivity threshold defaults to 14 days;
+`AGENT_RELAY_GC_DAYS` changes it, and `0` disables GC.
 
 ## Live delivery and wake
 
@@ -96,28 +105,29 @@ session-relay wake --id <id> --dir <cwd> --tool omp --model <model> --effort <le
 Relay maps `--effort` to omp `--thinking`.
 Do not use a service-tier option for omp.
 
-## Spawn, attach, and doctor
+## Attach, watch, and doctor
 
-Set `--tool omp` when spawning a worker.
+Attach to an inactive registered session:
 
 ```bash
-session-relay spawn <repo> --tool omp --name worker --model <model> --effort <level> -- <task>
 session-relay attach worker
-session-relay attach worker --exec
 session-relay doctor --id <session>
 ```
 
-Spawn also accepts `--reply-to`, `--timeout`, `--read-only`, `--full-access`,
-`--watch`, and `--dry`.
-Use `--fanout` or `--worktree` with `--from` for the bounded fan-out lifecycle.
-Do not treat ordinary spawn as managed workspace custody.
 
 Attach accepts a registered name or session ID.
-Its default mode prints the session context and interactive command.
-Use `--exec` to replace relay with the interactive CLI.
+It launches `omp --resume <id>` directly in the stored directory.
+The deprecated `--exec` flag is accepted but is not needed to launch.
 Attach rejects a stale or missing stored directory.
 It exits 3 when wake holds `locks/resume-<id>.lock`.
 Attach only when automation is idle to avoid concurrent session writers.
+Wake launches `omp -p --resume <id> --mode json [--thinking <effort>] -- <message>`.
+Both launch paths hold `locks/resume-<id>.lock` for the child lifetime.
+A live holder causes exit 3 with the resume-lock diagnostic.
+Child stdout and stderr pass through; Relay returns the child's exit status.
+
+`session-relay watch` polls pending mail and uses wake as its fallback.
+It has no push mode. Prefer the running extension for live delivery.
 
 Run doctor with an explicit session identity after a crash or delayed mail.
 Doctor reports store, registration, mailbox, and resume diagnostics.
@@ -138,8 +148,8 @@ session-relay inbox <nameOrId>
 session-relay peek <nameOrId>
 ```
 
-Existing `send`, `inbox`, `peek`, `handback`, and default `collect` syntax,
-JSON, and human-readable output remain the compatibility surface.
+Existing `send`, `inbox`, and `peek` syntax, JSON, and human-readable output
+remain the compatibility surface.
 Legacy JSONL records remain readable.
 Relay does not rewrite them as typed messages.
 The CLI accepts `--from` where shown.
@@ -206,7 +216,7 @@ The omp plugin uses its extension tool, not this bus interface.
 ### Typed protocol guarantees
 
 `MessageV2` is additive.
-A typed request, terminal reply, or worker result carries lowercase UUID-v4
+A typed request or terminal reply carries lowercase UUID-v4
 message and correlation IDs, exact registered endpoints, a 24-byte UTC timestamp,
 and a closed kind-specific field matrix.
 Relay rejects unknown fields, malformed identifiers, invalid timestamps,
@@ -224,97 +234,9 @@ The durable guarantee is one logical terminal claim.
 Relay does not promise exactly-once process execution after a consumer crash.
 
 Automatic hook and extension delivery preserves typed correlation,
-reply, terminal-status, and worker-result identity.
+reply, and terminal-status identity.
 Legacy mail keeps its original rendering.
 
-## Fan-out results
-
-Use the bounded process-only fan-out lifecycle for isolated worktrees.
-It permits one isolated root and at most two depth-1 leaves.
-Require an explicit clean handback.
-Collect from the parent.
-
-```bash
-session-relay spawn <repo> --tool omp --fanout --from <parent> --name <worker> --model <model> --effort <level> -- <task>
-session-relay handback --from <worker> --status completed [--note <summary>]
-session-relay collect <worker> --from <parent>
-```
-
-`--worktree` selects the same lifecycle as `--fanout`.
-The default successful collect output remains:
-
-```text
-collected <worker> into <parent>
-```
-
-Reservations created by 0.14.0 receive one correlation ID.
-Attachment binds an authority-only request to the exact parent, worker generation,
-and runtime session.
-Successful handback atomically stores one immutable `WorkerResultV1`.
-The result contains repository identity, base and handback commits, sorted changed
-paths, status, summary, and canonical digest.
-`failed` is informational.
-A clean committed failed handback keeps the existing collection behavior.
-
-Opt in to machine-readable collection explicitly.
-
-```bash
-session-relay collect <worker> --from <parent> --result-json
-```
-
-It emits one closed JSON object with exactly two top-level keys:
-`{"result": <complete WorkerResultV1>, "sha256": "<lowercase SHA-256>"}`.
-Collection verifies the worker, generation, runtime session, reservation and root
-reservation, repository, object format, base and head commits, changed paths,
-result digest, descendant ordering, and matching terminal delivery before any merge.
-The terminal claim must be `ReplyEnqueued` or `ReplyConsumed` with the exact result digest.
-A supervisor retains custody and capacity until that proof exists.
-
-Pre-0.14 fan-out records remain readable.
-They preserve legacy handback and collect behavior.
-They do not fabricate a typed result.
-`--result-json` therefore requires a 0.14 reservation.
-
-## Managed workspace
-
-Use managed workspace commands for authority-backed writing and integration.
-Relay owns deterministic worktrees and branches, repository gating, lifetime
-leases, capability-brokered Git, Linux worker-tree custody, claims and resources,
-integration, recovery, and cleanup.
-Treat omp as an untrusted worker.
-Arbitrary same-UID shells, IDEs, old binaries, raw Git, and independently launched
-tools remain unmanaged.
-
-| Command | Purpose |
-|---|---|
-| `preserve` | Record source WIP without changing its HEAD, index, or worktree bytes. |
-| `start` | Validate admission and preservation before allocating and launching a managed worker. |
-| `list` | Read managed sessions and lease evidence as the coordinator. |
-| `inspect` | Read one managed session's authority and lifecycle evidence. |
-| `handback` | Submit a capability-bound worker commit chain after quiescence. |
-| `integrate` | Apply an accepted worker chain in order as the coordinator. |
-| `recover` | Inspect or settle retained failure with authenticated recovery evidence. |
-| `finish` | Close retention, resources, worktree, refs, and lease after successful integration. |
-| `abort` | Fence a worker before evidence permits retention or cleanup. |
-
-```text
-session-relay workspace preserve --request-file <absolute-file> --request-sha256 <sha256>
-session-relay workspace start --request-file <absolute-file> --request-sha256 <sha256> [--coordinator-capability-file <absolute-file>]
-session-relay workspace list --repository <canonical-root> --coordinator-capability-file <absolute-file>
-session-relay workspace inspect <session-id> --repository <canonical-root> --coordinator-capability-file <absolute-file>
-session-relay workspace handback --request-file <absolute-file> --request-sha256 <sha256> --worker-capability-file <absolute-file>
-session-relay workspace integrate --request-file <absolute-file> --request-sha256 <sha256> --coordinator-capability-file <absolute-file>
-session-relay workspace recover --request-file <absolute-file> --request-sha256 <sha256> --coordinator-capability-file <absolute-file>
-session-relay workspace finish --request-file <absolute-file> --request-sha256 <sha256> --coordinator-capability-file <absolute-file>
-session-relay workspace abort --request-file <absolute-file> --request-sha256 <sha256> --coordinator-capability-file <absolute-file>
-```
-
-Use canonical, digest-bound request and receipt files.
-Only the first start can bootstrap coordinator authority without a capability file.
-Keep worker `workspace handback` separate from top-level fan-out `handback`.
-Use `workspace finish` for coordinator-owned closure, not worker commit return.
-See [the workspace reference](skills/session-relay/references/workspace.md) for
-preservation, admission, authority, and recovery contracts.
 
 ## Release discipline
 

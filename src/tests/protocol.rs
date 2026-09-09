@@ -1,12 +1,11 @@
 pub mod support;
 
-use relay::lifecycle::{self, Admission, LifecycleStore, OperationKind};
+use relay::jcs::{ClosedJcs, JcsValue, LowerUuidV4, parse_jcs, serialize_jcs};
 use relay::protocol::{
-    ClaimOrigin, ClaimState, ClaimStatusV1, DeliveryState, MessageKind, MessageV2, ObjectFormat,
-    ProtocolError, ProtocolFailpoint, ProtocolStore, ReplyDisposition, TerminalStatus,
-    WorkerResultV1,
+    ClaimOrigin, ClaimState, ClaimStatusV1, DeliveryState, MessageKind, MessageV2, ProtocolError,
+    ProtocolFailpoint, ProtocolStore, ReplyDisposition, TerminalStatus,
 };
-use relay::workspace::schema::{ClosedJcs, JcsValue, LowerUuidV4, parse_jcs, serialize_jcs};
+use relay::store;
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::fs;
@@ -23,30 +22,19 @@ const CORRELATION_ID: &str = "20000000-0000-4000-8000-000000000002";
 const REQUESTER_ID: &str = "30000000-0000-4000-8000-000000000003";
 const RESPONDER_ID: &str = "40000000-0000-4000-8000-000000000004";
 const REPLY_ID: &str = "50000000-0000-4000-8000-000000000005";
-const RESULT_ID: &str = "60000000-0000-4000-8000-000000000006";
-const RESERVATION_ID: &str = "70000000-0000-4000-8000-000000000007";
-const ROOT_RESERVATION_ID: &str = "80000000-0000-4000-8000-000000000008";
-const WORKER_ID: &str = "90000000-0000-4000-8000-000000000009";
-const GENERATION_ID: &str = "a0000000-0000-4000-8000-00000000000a";
 const THIRD_SESSION_ID: &str = "b0000000-0000-4000-8000-00000000000b";
 const UNKNOWN_SESSION_ID: &str = "c0000000-0000-4000-8000-00000000000c";
 const CREATED_AT: &str = "2026-07-25T12:34:56.789Z";
 const UPDATED_AT: &str = "2026-07-25T12:35:00.001Z";
 const SHA_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-const SHA_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const REQUEST_SHA256: &str = "5f9b7e13f3a003db70073110d0761fbfea8dccbc5ab2faca0cf875c6e3375607";
 const CLAIM_SHA256: &str = "53302c8de9b7f61950c3a05d01f18c931a1b57b90913dd3fe9dfeb7c0b787054";
-const WORKER_RESULT_SHA256: &str =
-    "55b99b0b80eabdcb794bfa8c72866e543ced5589cde75d15eb9066cca2a3a34b";
 
 const CANONICAL_REQUEST: &str = concat!(
     r#"{"body":"compile exact","correlation_id":"20000000-0000-4000-8000-000000000002","created_at":"2026-07-25T12:34:56.789Z","from_session_id":"30000000-0000-4000-8000-000000000003","id":"10000000-0000-4000-8000-000000000001","kind":"request","reply_to":null,"result_sha256":null,"schema":2,"terminal_status":null,"to_session_id":"40000000-0000-4000-8000-000000000004"}"#,
 );
 const CANONICAL_OPEN_CLAIM: &str = concat!(
     r#"{"correlation_id":"20000000-0000-4000-8000-000000000002","created_at":"2026-07-25T12:34:56.789Z","origin":"message","reply":null,"reply_delivery":null,"reply_sha256":null,"request":{"body":"compile exact","correlation_id":"20000000-0000-4000-8000-000000000002","created_at":"2026-07-25T12:34:56.789Z","from_session_id":"30000000-0000-4000-8000-000000000003","id":"10000000-0000-4000-8000-000000000001","kind":"request","reply_to":null,"result_sha256":null,"schema":2,"terminal_status":null,"to_session_id":"40000000-0000-4000-8000-000000000004"},"request_delivery":"enqueued","request_sha256":"5f9b7e13f3a003db70073110d0761fbfea8dccbc5ab2faca0cf875c6e3375607","requester_session_id":"30000000-0000-4000-8000-000000000003","responder_session_id":"40000000-0000-4000-8000-000000000004","schema":1,"state":"Open","updated_at":"2026-07-25T12:35:00.001Z"}"#,
-);
-const CANONICAL_WORKER_RESULT: &str = concat!(
-    r#"{"base_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","changed_paths":["src/protocol.rs","tests/protocol.rs"],"correlation_id":"20000000-0000-4000-8000-000000000002","created_at":"2026-07-25T12:34:56.789Z","generation":"a0000000-0000-4000-8000-00000000000a","handback_commit":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","object_format":"sha1","parent_session_id":"30000000-0000-4000-8000-000000000003","repo_common_dir":"/tmp/protocol-repository/.git","repo_dev":"2049","repo_ino":"987654","reservation_id":"70000000-0000-4000-8000-000000000007","result_id":"60000000-0000-4000-8000-000000000006","root_reservation_id":"80000000-0000-4000-8000-000000000008","runtime_session_id":"40000000-0000-4000-8000-000000000004","schema":1,"status":"completed","summary":"two files changed","worker_id":"90000000-0000-4000-8000-000000000009"}"#,
 );
 
 struct Fixture {
@@ -59,6 +47,10 @@ impl Fixture {
         // An explicit fresh authority root is stronger than mutating the process-wide
         // AGENT_RELAY_HOME: parallel integration tests cannot observe an ambient store.
         let home = fresh_home(tag);
+        Self::at(home)
+    }
+
+    fn at(home: PathBuf) -> Self {
         seed_registry(&home);
         let store = ProtocolStore::new(home.clone());
         Self { home, store }
@@ -79,10 +71,8 @@ fn registry_entry(id: &str, name: &str) -> JsonValue {
         JsonValue::from(format!("/tmp/session-relay-protocol-{name}")),
     );
     entry.insert("name".into(), JsonValue::from(name.to_string()));
-    entry.insert("tool".into(), JsonValue::from("claude".to_string()));
+    entry.insert("tool".into(), JsonValue::from("omp".to_string()));
     entry.insert("lastSeen".into(), JsonValue::from(CREATED_AT.to_string()));
-    entry.insert("server".into(), JsonValue::from(()));
-    entry.insert("spawned_via".into(), JsonValue::from(()));
     JsonValue::from(entry)
 }
 
@@ -140,22 +130,6 @@ fn terminal_reply(status: TerminalStatus, body: &str) -> MessageV2 {
     }
 }
 
-fn worker_result_message() -> MessageV2 {
-    MessageV2 {
-        schema: 2,
-        id: REPLY_ID.into(),
-        created_at: UPDATED_AT.into(),
-        from_session_id: RESPONDER_ID.into(),
-        to_session_id: REQUESTER_ID.into(),
-        correlation_id: CORRELATION_ID.into(),
-        kind: MessageKind::WorkerResult,
-        reply_to: Some(REQUEST_ID.into()),
-        terminal_status: Some(TerminalStatus::Completed),
-        body: "two files changed".into(),
-        result_sha256: Some(WORKER_RESULT_SHA256.into()),
-    }
-}
-
 fn open_claim(origin: ClaimOrigin) -> ClaimStatusV1 {
     let request = request_message();
     ClaimStatusV1 {
@@ -167,10 +141,7 @@ fn open_claim(origin: ClaimOrigin) -> ClaimStatusV1 {
         responder_session_id: RESPONDER_ID.into(),
         request_sha256: request.sha256(),
         request,
-        request_delivery: match origin {
-            ClaimOrigin::Message => DeliveryState::Enqueued,
-            ClaimOrigin::Fanout => DeliveryState::NotApplicable,
-        },
+        request_delivery: DeliveryState::Enqueued,
         reply: None,
         reply_sha256: None,
         reply_delivery: None,
@@ -181,39 +152,12 @@ fn open_claim(origin: ClaimOrigin) -> ClaimStatusV1 {
 
 fn terminal_claim(origin: ClaimOrigin) -> ClaimStatusV1 {
     let mut claim = open_claim(origin);
-    let reply = match origin {
-        ClaimOrigin::Message => terminal_reply(TerminalStatus::Completed, "done"),
-        ClaimOrigin::Fanout => worker_result_message(),
-    };
+    let reply = terminal_reply(TerminalStatus::Completed, "done");
     claim.state = ClaimState::ReplyEnqueued;
     claim.reply_sha256 = Some(reply.sha256());
     claim.reply = Some(reply);
     claim.reply_delivery = Some(DeliveryState::Enqueued);
     claim
-}
-
-fn worker_result() -> WorkerResultV1 {
-    WorkerResultV1 {
-        schema: 1,
-        result_id: RESULT_ID.into(),
-        correlation_id: CORRELATION_ID.into(),
-        reservation_id: RESERVATION_ID.into(),
-        root_reservation_id: ROOT_RESERVATION_ID.into(),
-        parent_session_id: REQUESTER_ID.into(),
-        worker_id: WORKER_ID.into(),
-        generation: GENERATION_ID.into(),
-        runtime_session_id: RESPONDER_ID.into(),
-        repo_common_dir: "/tmp/protocol-repository/.git".into(),
-        repo_dev: "2049".into(),
-        repo_ino: "987654".into(),
-        object_format: ObjectFormat::Sha1,
-        base_commit: "a".repeat(40),
-        handback_commit: "b".repeat(40),
-        status: TerminalStatus::Completed,
-        summary: "two files changed".into(),
-        changed_paths: vec!["src/protocol.rs".into(), "tests/protocol.rs".into()],
-        created_at: CREATED_AT.into(),
-    }
 }
 
 fn decode<T: ClosedJcs>(bytes: &[u8]) -> Result<T, String> {
@@ -357,32 +301,15 @@ fn claim_status_v1_has_exact_canonical_round_trip_and_digest() {
 }
 
 #[test]
-fn worker_result_v1_has_exact_canonical_round_trip_and_digest() {
-    let result = worker_result();
-    assert_eq!(result.canonical_bytes(), CANONICAL_WORKER_RESULT.as_bytes());
-    assert_eq!(result.sha256(), WORKER_RESULT_SHA256);
-    assert_eq!(
-        decode::<WorkerResultV1>(CANONICAL_WORKER_RESULT.as_bytes()).unwrap(),
-        result
-    );
-    assert_eq!(result.canonical_bytes().len(), 834);
-}
-
-#[test]
 fn every_protocol_record_is_closed_and_rejects_noncanonical_transport() {
     assert_closed_record_rejections(&request_message(), "body");
     assert_closed_record_rejections(&open_claim(ClaimOrigin::Message), "request");
-    assert_closed_record_rejections(&worker_result(), "changed_paths");
 }
 
 #[test]
 fn message_variant_matrix_is_exhaustive_and_closed() {
     let mut legal_count = 0;
-    for kind in [
-        MessageKind::Request,
-        MessageKind::TerminalReply,
-        MessageKind::WorkerResult,
-    ] {
+    for kind in [MessageKind::Request, MessageKind::TerminalReply] {
         for has_reply_to in [false, true] {
             for status in [
                 None,
@@ -404,7 +331,6 @@ fn message_variant_matrix_is_exhaustive_and_closed() {
                         MessageKind::TerminalReply => {
                             has_reply_to && status.is_some() && !has_result
                         }
-                        MessageKind::WorkerResult => has_reply_to && status.is_some() && has_result,
                     };
                     legal_count += usize::from(legal);
                     assert_eq!(
@@ -416,7 +342,7 @@ fn message_variant_matrix_is_exhaustive_and_closed() {
             }
         }
     }
-    assert_eq!(legal_count, 5);
+    assert_eq!(legal_count, 3);
 
     for (field, value) in [("kind", "response"), ("terminal_status", "succeeded")] {
         let mut object = terminal_reply(TerminalStatus::Completed, "done")
@@ -521,10 +447,6 @@ fn protocol_timestamps_require_exact_real_millisecond_utc_instants() {
         let mut claim = open_claim(ClaimOrigin::Message);
         claim.updated_at = value.into();
         assert!(validate_record(&claim).is_err(), "claim admitted {value}");
-
-        let mut result = worker_result();
-        result.created_at = value.into();
-        assert!(validate_record(&result).is_err(), "result admitted {value}");
     }
 }
 
@@ -563,23 +485,6 @@ fn message_body_uses_utf8_byte_bounds_rejects_nul_and_enforces_envelope_limit() 
     assert!(validate_record(&above_envelope_limit).is_err());
 }
 
-#[test]
-fn message_digest_fields_are_lowercase_exact_sha256() {
-    for digest in [
-        "a".repeat(63),
-        "a".repeat(65),
-        "A".repeat(64),
-        format!("{}g", "a".repeat(63)),
-    ] {
-        let mut message = worker_result_message();
-        message.result_sha256 = Some(digest);
-        assert!(validate_record(&message).is_err());
-    }
-    let mut message = worker_result_message();
-    message.result_sha256 = Some(SHA_B.into());
-    assert!(validate_record(&message).is_ok());
-}
-
 fn candidate_claim(
     origin: ClaimOrigin,
     state: ClaimState,
@@ -592,10 +497,7 @@ fn candidate_claim(
     claim.request_delivery = request_delivery;
     claim.reply_delivery = reply_delivery;
     if has_reply {
-        let reply = match origin {
-            ClaimOrigin::Message => terminal_reply(TerminalStatus::Completed, "done"),
-            ClaimOrigin::Fanout => worker_result_message(),
-        };
+        let reply = terminal_reply(TerminalStatus::Completed, "done");
         claim.reply_sha256 = Some(reply.sha256());
         claim.reply = Some(reply);
     } else {
@@ -623,11 +525,6 @@ fn legal_claim_matrix(
             ) && !has_reply
                 && reply_delivery.is_none()
         }
-        (ClaimOrigin::Fanout, ClaimState::Open) => {
-            request_delivery == DeliveryState::NotApplicable
-                && !has_reply
-                && reply_delivery.is_none()
-        }
         (origin, ClaimState::ReplyPending) => {
             legal_terminal_request_delivery(origin, request_delivery)
                 && has_reply
@@ -643,7 +540,6 @@ fn legal_claim_matrix(
                 && has_reply
                 && reply_delivery == Some(DeliveryState::Consumed)
         }
-        _ => false,
     }
 }
 
@@ -652,13 +548,12 @@ fn legal_terminal_request_delivery(origin: ClaimOrigin, delivery: DeliveryState)
         ClaimOrigin::Message => {
             matches!(delivery, DeliveryState::Enqueued | DeliveryState::Consumed)
         }
-        ClaimOrigin::Fanout => delivery == DeliveryState::NotApplicable,
     }
 }
 
 #[test]
 fn claim_origin_state_and_delivery_matrix_is_exhaustive_and_closed() {
-    let origins = [ClaimOrigin::Message, ClaimOrigin::Fanout];
+    let origins = [ClaimOrigin::Message];
     let states = [
         ClaimState::RequestPending,
         ClaimState::Open,
@@ -710,7 +605,7 @@ fn claim_origin_state_and_delivery_matrix_is_exhaustive_and_closed() {
             }
         }
     }
-    assert_eq!(legal_count, 13);
+    assert_eq!(legal_count, 9);
 }
 
 #[test]
@@ -758,9 +653,7 @@ fn claim_validates_request_identity_digest_and_endpoint_bindings() {
 #[test]
 fn claim_validates_terminal_reply_identity_digest_and_origin_binding() {
     let message_claim = terminal_claim(ClaimOrigin::Message);
-    let fanout_claim = terminal_claim(ClaimOrigin::Fanout);
     assert!(validate_record(&message_claim).is_ok());
-    assert!(validate_record(&fanout_claim).is_ok());
 
     let mut mutations = Vec::new();
     let mut claim = message_claim.clone();
@@ -781,14 +674,6 @@ fn claim_validates_terminal_reply_identity_digest_and_origin_binding() {
     mutations.push(claim);
     let mut claim = message_claim.clone();
     claim.reply_sha256 = Some(SHA_A.into());
-    mutations.push(claim);
-    let mut claim = message_claim.clone();
-    claim.reply = Some(worker_result_message());
-    claim.reply_sha256 = Some(claim.reply.as_ref().unwrap().sha256());
-    mutations.push(claim);
-    let mut claim = fanout_claim.clone();
-    claim.reply = Some(terminal_reply(TerminalStatus::Completed, "done"));
-    claim.reply_sha256 = Some(claim.reply.as_ref().unwrap().sha256());
     mutations.push(claim);
 
     for claim in mutations {
@@ -821,187 +706,6 @@ fn claim_rejects_unknown_origin_state_delivery_and_digest_syntax() {
         claim.reply_sha256 = Some(digest);
         assert!(validate_record(&claim).is_err());
     }
-}
-
-#[test]
-fn worker_result_uuid_decimal_format_and_oid_fields_are_closed() {
-    let invalid_uuid = "10000000-0000-1000-8000-000000000001";
-    for field in 0..6 {
-        let mut result = worker_result();
-        match field {
-            0 => result.result_id = invalid_uuid.into(),
-            1 => result.correlation_id = invalid_uuid.into(),
-            2 => result.reservation_id = invalid_uuid.into(),
-            3 => result.root_reservation_id = invalid_uuid.into(),
-            4 => result.worker_id = invalid_uuid.into(),
-            _ => result.generation = invalid_uuid.into(),
-        }
-        assert!(
-            validate_record(&result).is_err(),
-            "UUID field {field} was open"
-        );
-    }
-    for field in 0..2 {
-        let mut result = worker_result();
-        match field {
-            0 => result.parent_session_id = "A0000000-0000-4000-8000-00000000000A".into(),
-            _ => result.runtime_session_id = "10000000000040008000000000000001".into(),
-        }
-        assert!(
-            validate_record(&result).is_err(),
-            "session id field {field} was open"
-        );
-        let mut result = worker_result();
-        let v7 = "01a082e0-10ae-7711-9710-37e44be35d48";
-        match field {
-            0 => result.parent_session_id = v7.into(),
-            _ => result.runtime_session_id = v7.into(),
-        }
-        assert!(
-            validate_record(&result).is_ok(),
-            "session id field {field} rejected a UUIDv7"
-        );
-    }
-
-    for value in ["", "01", "+1", "-1", " 1", "1.0", "18446744073709551616"] {
-        let mut result = worker_result();
-        result.repo_dev = value.into();
-        assert!(
-            validate_record(&result).is_err(),
-            "repo_dev admitted {value}"
-        );
-        let mut result = worker_result();
-        result.repo_ino = value.into();
-        assert!(
-            validate_record(&result).is_err(),
-            "repo_ino admitted {value}"
-        );
-    }
-    for value in ["0", "1", "18446744073709551615"] {
-        let mut result = worker_result();
-        result.repo_dev = value.into();
-        result.repo_ino = value.into();
-        assert!(validate_record(&result).is_ok(), "rejected decimal {value}");
-    }
-
-    let mut sha256_result = worker_result();
-    sha256_result.object_format = ObjectFormat::Sha256;
-    sha256_result.base_commit = "c".repeat(64);
-    sha256_result.handback_commit = "d".repeat(64);
-    assert!(validate_record(&sha256_result).is_ok());
-
-    for (format, oid) in [
-        (ObjectFormat::Sha1, "a".repeat(39)),
-        (ObjectFormat::Sha1, "a".repeat(64)),
-        (ObjectFormat::Sha1, "A".repeat(40)),
-        (ObjectFormat::Sha256, "a".repeat(40)),
-        (ObjectFormat::Sha256, "a".repeat(63)),
-        (ObjectFormat::Sha256, format!("{}g", "a".repeat(63))),
-    ] {
-        let mut result = worker_result();
-        result.object_format = format;
-        result.base_commit = oid;
-        result.handback_commit = match format {
-            ObjectFormat::Sha1 => "b".repeat(40),
-            ObjectFormat::Sha256 => "b".repeat(64),
-        };
-        assert!(validate_record(&result).is_err());
-    }
-
-    for (field, value) in [("object_format", "sha512"), ("status", "succeeded")] {
-        let mut object = worker_result().to_jcs().object().unwrap();
-        object.insert(field.into(), JcsValue::String(value.into()));
-        assert!(WorkerResultV1::from_jcs(JcsValue::Object(object)).is_err());
-    }
-}
-
-#[test]
-fn worker_result_summary_uses_utf8_byte_bounds_and_rejects_nul() {
-    for summary in [String::new(), "x".repeat(4096), "é".repeat(2048)] {
-        let mut result = worker_result();
-        result.summary = summary;
-        assert!(validate_record(&result).is_ok());
-    }
-    for summary in ["x".repeat(4097), "é".repeat(2049), "left\0right".into()] {
-        let mut result = worker_result();
-        result.summary = summary;
-        assert!(validate_record(&result).is_err());
-    }
-    let mut failed = worker_result();
-    failed.status = TerminalStatus::Failed;
-    assert!(validate_record(&failed).is_ok());
-}
-
-#[test]
-fn worker_result_paths_are_sorted_unique_normalized_git_relative_paths() {
-    for valid in [
-        Vec::<String>::new(),
-        vec!["a".into()],
-        vec![".github/workflows/ci.yml".into(), "docs/é.txt".into()],
-    ] {
-        let mut result = worker_result();
-        result.changed_paths = valid;
-        assert!(validate_record(&result).is_ok());
-    }
-
-    let invalid = [
-        vec!["".into()],
-        vec!["/absolute".into()],
-        vec!["./relative".into()],
-        vec!["../escape".into()],
-        vec!["a/./b".into()],
-        vec!["a/../b".into()],
-        vec!["a//b".into()],
-        vec!["trailing/".into()],
-        vec!["left\0right".into()],
-        vec!["a".into(), "a".into()],
-        vec!["z".into(), "a".into()],
-    ];
-    for paths in invalid {
-        let mut result = worker_result();
-        result.changed_paths = paths;
-        assert!(validate_record(&result).is_err());
-    }
-
-    let mut at_limit = worker_result();
-    at_limit.changed_paths = (0..4096).map(|index| format!("p/{index:04}")).collect();
-    assert!(validate_record(&at_limit).is_ok());
-    at_limit.changed_paths.push("z/last".into());
-    assert!(validate_record(&at_limit).is_err());
-}
-
-#[test]
-fn worker_result_common_dir_is_an_absolute_lexically_canonical_path() {
-    for invalid in [
-        "",
-        "relative/.git",
-        "/tmp/repo/../repo/.git",
-        "/tmp/repo/./.git",
-        "/tmp/repo//.git",
-        "/tmp/repo/.git/",
-        "/tmp/repo/\0.git",
-    ] {
-        let mut result = worker_result();
-        result.repo_common_dir = invalid.into();
-        assert!(validate_record(&result).is_err(), "admitted {invalid:?}");
-    }
-}
-
-#[test]
-fn worker_result_enforces_the_one_mib_canonical_encoded_limit() {
-    let mut below_limit = worker_result();
-    below_limit.changed_paths = (0..4096)
-        .map(|index| format!("{index:04}/{}", "x".repeat(240)))
-        .collect();
-    assert!(serialize_jcs(&below_limit.to_jcs()).len() <= 1024 * 1024);
-    assert!(validate_record(&below_limit).is_ok());
-
-    let mut above_limit = worker_result();
-    above_limit.changed_paths = (0..4096)
-        .map(|index| format!("{index:04}/{}", "x".repeat(250)))
-        .collect();
-    assert!(serialize_jcs(&above_limit.to_jcs()).len() > 1024 * 1024);
-    assert!(validate_record(&above_limit).is_err());
 }
 
 #[test]
@@ -1578,16 +1282,6 @@ fn explicit_protocol_roots_are_fresh_store_isolated() {
     assert_eq!(claim_files(&second.home).len(), 1);
 }
 
-fn lifecycle_drain(home: &Path, session: &str) -> Result<relay::store::DrainReceipt, String> {
-    let store = LifecycleStore::new(home.to_path_buf());
-    let Admission::Unmanaged(mut guard) =
-        store.admit_operation(session, OperationKind::CliInboxDrain)?
-    else {
-        panic!("expected unmanaged admission");
-    };
-    lifecycle::drain_with_guard(&mut guard)
-}
-
 fn claim_file_in(home: &Path, directory: &str) -> PathBuf {
     claim_files(home)
         .into_iter()
@@ -1756,7 +1450,12 @@ fn conflicting_duplicate_claims_fail_closed_without_convergence_or_append() {
 
 #[test]
 fn typed_rows_without_authoritative_claims_are_never_surfaced() {
-    let fixture = Fixture::new("protocol-unclaimed-typed-row");
+    let Some(home) =
+        support::isolated_home("typed_rows_without_authoritative_claims_are_never_surfaced")
+    else {
+        return;
+    };
+    let fixture = Fixture::at(home);
     write_mailbox_message(&fixture.home, RESPONDER_ID, &request_message());
     let mailbox = fixture
         .home
@@ -1768,7 +1467,7 @@ fn typed_rows_without_authoritative_claims_are_never_surfaced() {
     assert_eq!(error_code(&peek_error), "protocol_store_error");
     let drain_error = fixture.store.drain_typed(RESPONDER_ID).unwrap_err();
     assert_eq!(error_code(&drain_error), "protocol_store_error");
-    let renderable_error = match lifecycle_drain(&fixture.home, RESPONDER_ID) {
+    let renderable_error = match store::drain_mailbox(RESPONDER_ID) {
         Err(error) => error,
         Ok(_) => panic!("renderable drain surfaced an unclaimed typed row"),
     };
@@ -1842,7 +1541,12 @@ fn typed_drain_preflights_unclaimed_suffix_before_consuming_valid_prefix() {
 
 #[test]
 fn renderable_drain_preflights_mismatched_suffix_before_consuming_valid_prefix() {
-    let fixture = Fixture::new("protocol-renderable-preflight-mismatch");
+    let Some(home) = support::isolated_home(
+        "renderable_drain_preflights_mismatched_suffix_before_consuming_valid_prefix",
+    ) else {
+        return;
+    };
+    let fixture = Fixture::at(home);
     let first = fixture
         .store
         .request(
@@ -1874,7 +1578,7 @@ fn renderable_drain_preflights_mismatched_suffix_before_consuming_valid_prefix()
     mailbox_before.push(b'\n');
     fs::write(&mailbox, &mailbox_before).unwrap();
 
-    let error = match lifecycle_drain(&fixture.home, RESPONDER_ID) {
+    let error = match store::drain_mailbox(RESPONDER_ID) {
         Err(error) => error,
         Ok(_) => panic!("renderable drain surfaced a mismatched typed suffix"),
     };
@@ -1895,7 +1599,7 @@ fn renderable_drain_preflights_mismatched_suffix_before_consuming_valid_prefix()
     assert_eq!(fs::read(&mailbox).unwrap(), mailbox_before);
 
     fs::write(&mailbox, valid_prefix).unwrap();
-    let retried = lifecycle_drain(&fixture.home, RESPONDER_ID).unwrap();
+    let retried = store::drain_mailbox(RESPONDER_ID).unwrap();
     let rows = retried.messages().to_vec();
     retried.commit();
     assert_eq!(
@@ -1907,7 +1611,7 @@ fn renderable_drain_preflights_mismatched_suffix_before_consuming_valid_prefix()
                 .unwrap()
         ]
     );
-    let empty = lifecycle_drain(&fixture.home, RESPONDER_ID).unwrap();
+    let empty = store::drain_mailbox(RESPONDER_ID).unwrap();
     assert!(empty.messages().is_empty());
     empty.commit();
     assert_eq!(
@@ -1922,7 +1626,12 @@ fn renderable_drain_preflights_mismatched_suffix_before_consuming_valid_prefix()
 
 #[test]
 fn renderable_drain_rejects_noncanonical_typed_row_before_consuming_claim() {
-    let fixture = Fixture::new("protocol-renderable-noncanonical");
+    let Some(home) = support::isolated_home(
+        "renderable_drain_rejects_noncanonical_typed_row_before_consuming_claim",
+    ) else {
+        return;
+    };
+    let fixture = Fixture::at(home);
     let request = fixture
         .store
         .request(REQUESTER_ID, RESPONDER_ID, "reject noncanonical transport")
@@ -1943,7 +1652,7 @@ fn renderable_drain_rejects_noncanonical_typed_row_before_consuming_claim() {
     fs::write(&mailbox, noncanonical.as_bytes()).unwrap();
     let mailbox_before = fs::read(&mailbox).unwrap();
 
-    let error = match lifecycle_drain(&fixture.home, RESPONDER_ID) {
+    let error = match store::drain_mailbox(RESPONDER_ID) {
         Err(error) => error,
         Ok(receipt) => {
             receipt.commit();
@@ -1964,7 +1673,12 @@ fn renderable_drain_rejects_noncanonical_typed_row_before_consuming_claim() {
 
 #[test]
 fn requeued_request_row_after_pre_inject_failure_redelivers_exactly_once() {
-    let fixture = Fixture::new("protocol-requeue-request");
+    let Some(home) = support::isolated_home(
+        "requeued_request_row_after_pre_inject_failure_redelivers_exactly_once",
+    ) else {
+        return;
+    };
+    let fixture = Fixture::at(home);
     let request = fixture
         .store
         .request(REQUESTER_ID, RESPONDER_ID, "perform the task")
@@ -1983,7 +1697,7 @@ fn requeued_request_row_after_pre_inject_failure_redelivers_exactly_once() {
         .unwrap();
     let before = fs::read_to_string(&mailbox).unwrap();
 
-    let receipt = lifecycle_drain(&fixture.home, RESPONDER_ID).unwrap();
+    let receipt = store::drain_mailbox(RESPONDER_ID).unwrap();
     assert_eq!(receipt.messages().len(), 2);
     assert!(!mailbox.exists());
     assert_eq!(
@@ -2016,7 +1730,7 @@ fn requeued_request_row_after_pre_inject_failure_redelivers_exactly_once() {
 
     // The retry delivers the typed row exactly once, in order, with the
     // legacy row preserved byte-for-byte.
-    let retried = lifecycle_drain(&fixture.home, RESPONDER_ID).unwrap();
+    let retried = store::drain_mailbox(RESPONDER_ID).unwrap();
     let rows = retried.messages().to_vec();
     retried.commit();
     assert_eq!(rows.len(), 2);
@@ -2040,7 +1754,7 @@ fn requeued_request_row_after_pre_inject_failure_redelivers_exactly_once() {
     );
     assert!(!mailbox.exists());
     assert!(
-        lifecycle_drain(&fixture.home, RESPONDER_ID)
+        store::drain_mailbox(RESPONDER_ID)
             .unwrap()
             .messages()
             .is_empty()
@@ -2049,7 +1763,12 @@ fn requeued_request_row_after_pre_inject_failure_redelivers_exactly_once() {
 
 #[test]
 fn requeued_terminal_reply_restores_consumed_claim_for_exact_redelivery() {
-    let fixture = Fixture::new("protocol-requeue-reply");
+    let Some(home) = support::isolated_home(
+        "requeued_terminal_reply_restores_consumed_claim_for_exact_redelivery",
+    ) else {
+        return;
+    };
+    let fixture = Fixture::at(home);
     let request = fixture
         .store
         .request(REQUESTER_ID, RESPONDER_ID, "perform the task")
@@ -2069,7 +1788,7 @@ fn requeued_terminal_reply_restores_consumed_claim_for_exact_redelivery() {
         .unwrap()
         .message;
 
-    let receipt = lifecycle_drain(&fixture.home, REQUESTER_ID).unwrap();
+    let receipt = store::drain_mailbox(REQUESTER_ID).unwrap();
     assert_eq!(receipt.messages().len(), 1);
     assert_eq!(
         fixture
@@ -2094,7 +1813,7 @@ fn requeued_terminal_reply_restores_consumed_claim_for_exact_redelivery() {
         vec![reply.clone()]
     );
 
-    let retried = lifecycle_drain(&fixture.home, REQUESTER_ID).unwrap();
+    let retried = store::drain_mailbox(REQUESTER_ID).unwrap();
     let rows = retried.messages().to_vec();
     retried.commit();
     assert_eq!(rows.len(), 1);
@@ -2113,30 +1832,22 @@ fn requeued_terminal_reply_restores_consumed_claim_for_exact_redelivery() {
     assert_eq!(consumed.state, ClaimState::ReplyConsumed);
     assert_eq!(consumed.reply_delivery, Some(DeliveryState::Consumed));
     assert!(
-        lifecycle_drain(&fixture.home, REQUESTER_ID)
+        store::drain_mailbox(REQUESTER_ID)
             .unwrap()
             .messages()
             .is_empty()
     );
 }
 
-fn assert_reply_while_held(state: ClaimState) {
+fn assert_reply_while_held(state: ClaimState, home: PathBuf) {
     for acknowledge in [true, false] {
-        let fixture = Fixture::new(&format!("protocol-reply-held-{state:?}-{acknowledge}"));
+        fs::create_dir_all(&home).unwrap();
+        let fixture = Fixture::at(home.clone());
         let request = fixture
             .store
             .request(REQUESTER_ID, RESPONDER_ID, "perform the held task")
             .unwrap();
-        let receipt = {
-            let lifecycle_store = LifecycleStore::new(fixture.home.clone());
-            let Admission::Unmanaged(mut guard) = lifecycle_store
-                .admit_operation(RESPONDER_ID, OperationKind::CliInboxDrain)
-                .unwrap()
-            else {
-                panic!("expected unmanaged admission");
-            };
-            lifecycle::hold_with_guard(&mut guard, "session_start", 60).unwrap()
-        };
+        let receipt = store::hold_mailbox(RESPONDER_ID, "session_start", 60).unwrap();
         assert_eq!(
             receipt.messages,
             vec![
@@ -2248,15 +1959,30 @@ fn assert_reply_while_held(state: ClaimState) {
 
 #[test]
 fn reply_while_held_pending_settles_request_without_losing_reply() {
-    assert_reply_while_held(ClaimState::ReplyPending);
+    let Some(home) =
+        support::isolated_home("reply_while_held_pending_settles_request_without_losing_reply")
+    else {
+        return;
+    };
+    assert_reply_while_held(ClaimState::ReplyPending, home);
 }
 
 #[test]
 fn reply_while_held_enqueued_settles_request_without_duplicating_reply() {
-    assert_reply_while_held(ClaimState::ReplyEnqueued);
+    let Some(home) = support::isolated_home(
+        "reply_while_held_enqueued_settles_request_without_duplicating_reply",
+    ) else {
+        return;
+    };
+    assert_reply_while_held(ClaimState::ReplyEnqueued, home);
 }
 
 #[test]
 fn reply_while_held_consumed_settles_request_without_redelivering_reply() {
-    assert_reply_while_held(ClaimState::ReplyConsumed);
+    let Some(home) = support::isolated_home(
+        "reply_while_held_consumed_settles_request_without_redelivering_reply",
+    ) else {
+        return;
+    };
+    assert_reply_while_held(ClaimState::ReplyConsumed, home);
 }

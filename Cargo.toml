@@ -1,9 +1,9 @@
 [package]
 name = "session-relay"
-version = "0.17.0"
+version = "0.18.0"
 edition = "2024"
 rust-version = "1.85"
-description = "session-relay: cross-session/cross-tool agent message bus, single static binary"
+description = "session-relay: durable messaging between omp sessions, single static binary"
 publish = false
 autotests = false
 
@@ -20,28 +20,8 @@ name = "bus_smoke"
 path = "src/tests/bus_smoke.rs"
 
 [[test]]
-name = "fanout"
-path = "src/tests/fanout.rs"
-
-[[test]]
-name = "fanout_reap"
-path = "src/tests/fanout_reap.rs"
-
-[[test]]
-name = "lifecycle_admission"
-path = "src/tests/lifecycle_admission.rs"
-
-[[test]]
-name = "lifecycle_managed"
-path = "src/tests/lifecycle_managed.rs"
-
-[[test]]
-name = "lifecycle_release"
-path = "src/tests/lifecycle_release.rs"
-
-[[test]]
-name = "lifecycle_supervisor"
-path = "src/tests/lifecycle_supervisor.rs"
+name = "holds"
+path = "src/tests/holds.rs"
 
 [[test]]
 name = "lock_race"
@@ -50,22 +30,6 @@ path = "src/tests/lock_race.rs"
 [[test]]
 name = "protocol"
 path = "src/tests/protocol.rs"
-
-[[test]]
-name = "workspace_coordination_process"
-path = "src/tests/workspace_coordination_process.rs"
-
-[[test]]
-name = "workspace_identity"
-path = "src/tests/workspace_identity.rs"
-
-[[test]]
-name = "workspace_lease_process"
-path = "src/tests/workspace_lease_process.rs"
-
-[[test]]
-name = "workspace_resources"
-path = "src/tests/workspace_resources.rs"
 
 [dependencies]
 tinyjson = "2.5"

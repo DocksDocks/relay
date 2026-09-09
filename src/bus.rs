@@ -2,7 +2,7 @@
 // Speaks newline-delimited JSON-RPC 2.0 on stdin/stdout. STDOUT PURITY IS A
 // SPEC MUST: nothing but JSON-RPC frames goes to stdout (MCP stdio transport,
 // 2025-06-18) — every diagnostic goes through log() to stderr. Implements the
-// MCP lifecycle (initialize / notifications/initialized / ping) and tools
+// MCP handshake (initialize / notifications/initialized / ping) and tools
 // (tools/list, tools/call) over the shared store.
 //
 // "Which session am I?" is resolved from the project dir (RELAY_PROJECT_DIR,
@@ -11,7 +11,6 @@
 
 use crate::discover;
 use crate::gc;
-use crate::lifecycle::{self, OperationKind};
 use crate::protocol::{MessageV2, ProtocolError, ProtocolStore, TerminalStatus};
 use crate::store;
 use std::collections::HashMap;
@@ -35,8 +34,7 @@ const TOOLS_JSON: &str = r#"[
       "properties": {
         "name": { "type": "string", "description": "Friendly name to claim, e.g. \"frontend\" or \"agent-A\"." },
         "id": { "type": "string", "description": "Override session id (defaults to this session, resolved from the project dir)." },
-        "dir": { "type": "string", "description": "Override project dir (defaults to the launch dir)." },
-        "server": { "type": "string", "description": "Codex app-server Unix socket for live delivery to this session." }
+        "dir": { "type": "string", "description": "Override project dir (defaults to the launch dir)." }
       },
       "required": ["name"],
       "additionalProperties": false
@@ -55,7 +53,7 @@ const TOOLS_JSON: &str = r#"[
       "properties": {
         "to": { "type": "string", "description": "Recipient friendly name or session id (see roster)." },
         "body": { "type": "string", "description": "Message text." },
-        "from": { "type": "string", "description": "Your own registered session id or name (see the identity line injected at session start). Pass it whenever this project dir may host more than one session — the dir-marker fallback mis-attributes the sender in shared dirs." }
+        "from": { "type": "string", "description": "Your own registered session id or name (see roster). Pass it whenever this project dir may host more than one session — the dir-marker fallback mis-attributes the sender in shared dirs." }
       },
       "required": ["to", "body"],
       "additionalProperties": false
@@ -67,19 +65,19 @@ const TOOLS_JSON: &str = r#"[
     "inputSchema": {
       "type": "object",
       "properties": {
-        "id": { "type": "string", "description": "Your own registered session id or name (see the identity line injected at session start). Pass it whenever this project dir may host more than one session — the dir-marker fallback can drain another session's mailbox." }
+        "id": { "type": "string", "description": "Your own registered session id or name (see roster). Pass it whenever this project dir may host more than one session — the dir-marker fallback can drain another session's mailbox." }
       },
       "additionalProperties": false
     }
   },
   {
     "name": "discover",
-    "description": "Find other agent sessions running RIGHT NOW (Claude or Codex) by scanning the on-disk session stores — works even for sessions that never registered on the bus. Returns candidates ranked by recency (sessions in this same project dir first), each with {tool, id, cwd, name, registered, ageSec, active}. Use this to auto-locate \"my other session\" without being handed an id; then send()+wake it, or wake an unregistered one directly with its id/dir/tool.",
+    "description": "Find other omp sessions running RIGHT NOW by scanning the on-disk session store — works even for sessions that never registered on the bus. Returns candidates ranked by recency (sessions in this same project dir first), each with {tool, id, cwd, name, registered, ageSec, active}. Use this to auto-locate \"my other session\" without being handed an id; then send()+wake it, or wake an unregistered one directly with its id/dir/tool.",
     "inputSchema": {
       "type": "object",
       "properties": {
         "activeWithinMin": { "type": "number", "description": "Only sessions whose last activity is within this many minutes (default 60)." },
-        "tool": { "type": "string", "enum": ["claude", "codex", "omp"], "description": "Restrict to one tool." }
+        "tool": { "type": "string", "enum": ["omp"], "description": "Only omp is supported." }
       },
       "additionalProperties": false
     }
@@ -119,22 +117,18 @@ fn log(msg: &str) {
     eprintln!("[session-relay/bus] {msg}");
 }
 
-// Resolve the project dir for self-id. Claude substitutes ${CLAUDE_PROJECT_DIR}
-// in the manifest env; Codex config is static, so an unsubstituted "${...}" (or
-// empty) is treated as absent and we fall back to the launch cwd.
+// Resolve the project dir from the explicit override or launch cwd.
 fn project_dir() -> String {
     let clean = |var: &str| {
         std::env::var(var)
             .ok()
             .filter(|v| !v.is_empty() && !v.contains("${"))
     };
-    clean("RELAY_PROJECT_DIR")
-        .or_else(|| clean("CLAUDE_PROJECT_DIR"))
-        .unwrap_or_else(|| {
-            std::env::current_dir()
-                .map(|d| d.to_string_lossy().into_owned())
-                .unwrap_or_else(|_| ".".to_string())
-        })
+    clean("RELAY_PROJECT_DIR").unwrap_or_else(|| {
+        std::env::current_dir()
+            .map(|d| d.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| ".".to_string())
+    })
 }
 
 fn obj(entries: Vec<(&str, JsonValue)>) -> JsonValue {
@@ -172,10 +166,7 @@ enum ToolErr {
 }
 
 fn drain_inbox(id: &str) -> Result<Vec<JsonValue>, ToolErr> {
-    let mut guard = lifecycle::admit_operation(id, OperationKind::McpInboxDrain)
-        .and_then(lifecycle::Admission::into_guard)
-        .map_err(ToolErr::Soft)?;
-    lifecycle::drain_with_guard(&mut guard)
+    store::drain_mailbox(id)
         .map(store::DrainReceipt::into_messages)
         .map_err(ToolErr::Soft)
 }
@@ -313,8 +304,7 @@ fn call_tool(
             };
             let dir = arg_str(args, "dir").unwrap_or_else(|| pdir.to_string());
             let name = arg_str(args, "name");
-            let server = arg_str(args, "server");
-            let entry = store::register(&id, Some(&dir), name.as_deref(), None, server.as_deref())
+            let entry = store::register(&id, Some(&dir), name.as_deref(), Some("omp"))
                 .map_err(ToolErr::Soft)?;
             Ok(text(registered_entry(&entry), false))
         }
@@ -343,7 +333,7 @@ fn call_tool(
                     let Some(e) = store::resolve(&f) else {
                         return Ok(text(
                             js(format!(
-                                "Unknown \"from\" identity \"{f}\" — pass your own registered session id or name (see the identity line injected at session start, or roster)."
+                                "Unknown \"from\" identity \"{f}\" — pass your own registered session id or name (see roster)."
                             )),
                             true,
                         ));
@@ -396,7 +386,7 @@ fn call_tool(
                 let Some(e) = store::resolve(&who) else {
                     return Ok(text(
                         js(format!(
-                            "Unknown inbox identity \"{who}\" — pass your own registered session id or name (see the identity line injected at session start, or roster)."
+                            "Unknown inbox identity \"{who}\" — pass your own registered session id or name (see roster)."
                         )),
                         true,
                     ));
@@ -477,7 +467,10 @@ fn call_tool(
                 .and_then(|v| v.get::<f64>().copied())
                 .unwrap_or(60.0);
             let exclude = self_id();
-            let tool_arg = arg_str(args, "tool"); // raw — the filter is equality, like the Node bus
+            let tool_arg = arg_str(args, "tool");
+            if tool_arg.as_deref().is_some_and(|tool| tool != "omp") {
+                return Err(ToolErr::Rpc(-32602.0, "Only omp is supported.".to_string()));
+            }
             let sessions = discover::discover(&discover::Options {
                 active_within_min: within,
                 tool: tool_arg.as_deref(),

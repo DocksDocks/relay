@@ -60,53 +60,5 @@ jobs:
             target
           key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml') }}-${{ hashFiles('src/**/*.rs') }}
           restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml') }}-
-      - name: "run the gate under a delegated cgroup"
-        run: |
-          CURRENT_CGROUP=
-          while IFS=: read -r HIERARCHY CONTROLLERS CGROUP_PATH; do
-            if [ "$HIERARCHY" = 0 ] && [ -z "$CONTROLLERS" ]; then
-              CURRENT_CGROUP="$CGROUP_PATH"
-              break
-            fi
-          done < /proc/self/cgroup
-          test -n "$CURRENT_CGROUP"
-          CGROUP="/sys/fs/cgroup${CURRENT_CGROUP%/}/session-relay-test-$(id -u)-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-gate"
-          sudo -n mkdir "$CGROUP"
-          cleanup() {
-            status=$?
-            trap - EXIT
-            for _ in {1..100}; do
-              grep -qx 'populated 0' "$CGROUP/cgroup.events" && break
-              sleep 0.05
-            done
-            if ! grep -qx 'populated 0' "$CGROUP/cgroup.events"; then
-              echo "Session Relay cgroup delegation leaked live processes: $CGROUP" >&2
-              status=1
-              if [ -f "$CGROUP/cgroup.kill" ]; then
-                printf '1\n' | sudo -n tee "$CGROUP/cgroup.kill" >/dev/null
-                for _ in {1..100}; do
-                  grep -qx 'populated 0' "$CGROUP/cgroup.events" && break
-                  sleep 0.05
-                done
-              fi
-            fi
-            # `populated 0` proves no live process remains, which is the leak question.
-            # It does NOT make the leaf rmdir-able: the custody tests create one nested
-            # cgroup per managed workspace, and an EMPTY child directory still returns
-            # EBUSY on the parent. Sweep the debris depth-first, then remove the leaf.
-            sudo -n find "$CGROUP" -mindepth 1 -depth -type d -exec rmdir {} + 2>/dev/null || true
-            if ! grep -qx 'populated 0' "$CGROUP/cgroup.events" || ! sudo -n rmdir "$CGROUP"; then
-              echo "Session Relay cgroup delegation did not cleanly close: $CGROUP" >&2
-              status=1
-            fi
-            exit "$status"
-          }
-          trap cleanup EXIT
-          sudo -n chown "$(id -u):$(id -g)" "$CGROUP"
-          sudo -n chown "$(id -u):$(id -g)" \
-            "$CGROUP/cgroup.procs" "$CGROUP/cgroup.threads" "$CGROUP/cgroup.subtree_control"
-          (
-            test_pid=$BASHPID
-            sudo -n tee "$CGROUP/cgroup.procs" >/dev/null <<<"$test_pid"
-            SESSION_RELAY_TEST_CGROUP_ROOT="$CGROUP" SESSION_RELAY_REQUIRE_DEVICE_FIXTURE=1 node scripts/gate.mjs
-          )
+      - name: "run the gate"
+        run: node scripts/gate.mjs

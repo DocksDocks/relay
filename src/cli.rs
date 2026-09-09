@@ -1,9 +1,9 @@
 // cli.rs — session-relay CLI (port of scripts/relay.mjs). The "doorbell" that
 // wakes an idle session, plus manual registry/inbox ops over the shared store.
 //
-//   relay discover [--within <min>] [--tool claude|codex] [--exclude <id>] [--cwd <path>] [--json]
+//   relay discover [--within <min>] [--tool omp] [--exclude <id>] [--cwd <path>] [--json]
 //   relay list
-//   relay register <name> --id <uuid> [--dir <path>] [--tool claude|codex|omp]
+//   relay register <name> --id <uuid> [--dir <path>] [--tool omp]
 //   relay send <to> [--] <message...>            (or: send --id <id> [--] <message...>)
 //   relay request <to> [--from <registered>] [--json] [--] <message...>
 //   relay reply <correlation-id> [--from <registered>] --status completed|failed [--] <message...>
@@ -11,44 +11,21 @@
 //   relay ack <token> | rollback <token>
 //   relay peek <nameOrId>                        (read-only: inbox without draining)
 //   relay attach <nameOrId> [--exec]             (interactive human takeover)
-//   relay wake <nameOrId> [--model <m>] [--effort <e>] [--service-tier default|fast] [--dry] [message...]
-//   relay wake --id <id> --dir <cwd> --tool <claude|codex|omp> [--model <m>] [--effort <e>] [--service-tier default|fast] [message...]
+//   relay wake <nameOrId> [--model <m>] [--effort <e>] [--dry] [message...]
+//   relay wake --id <id> --dir <cwd> --tool omp [--model <m>] [--effort <e>] [message...]
 //
-// `wake` is TOOL-AWARE: claude → `claude -p --resume <id> [--model m] [--effort e] --output-format json -- <nudge>`,
-// codex → `codex exec resume <id> [-m m] [-c model_reasoning_effort=e] --json -- <nudge>`,
-// omp → `omp -p --resume <id> --mode json [--model m] [--thinking e] -- <nudge>`,
-// run from the target's registered project dir. `--dry` prints the command
-// instead of spawning.
+// Wake runs omp headlessly from the target's registered project directory.
 
-use crate::appserver;
 use crate::discover;
-use crate::hook;
-use crate::lifecycle::{
-    self, AttachOptions, ChildLaunchSpec, DoorbellMessage, OperationKind, ServiceTier,
-    ValidatedEffort, ValidatedModel,
-};
 use crate::protocol::{ProtocolError, ProtocolStore, TerminalStatus};
-use crate::spawn;
 use crate::store;
 use std::collections::HashMap;
-use std::io::Write;
+use std::os::unix::process::ExitStatusExt;
+use std::process::{Command, ExitStatus};
 use tinyjson::JsonValue;
 
 pub(crate) const DEFAULT_NUDGE: &str = "You have new session-relay mail. Use the session-relay skill: call inbox to read your pending messages and act on them.";
-const DEFAULT_TURN_SETTLE_MS: u64 = 5000;
-const BOOL_FLAGS: [&str; 11] = [
-    "dry",
-    "json",
-    "result-json",
-    "auto-turn",
-    "once",
-    "all",
-    "read-only",
-    "full-access",
-    "watch",
-    "fanout",
-    "worktree",
-];
+const BOOL_FLAGS: [&str; 4] = ["dry", "json", "once", "all"];
 
 fn die(msg: &str) -> ! {
     eprintln!("{msg}");
@@ -103,20 +80,6 @@ impl Args {
         args.get(i + 1)
             .map(String::as_str)
             .filter(|v| !v.is_empty())
-    }
-    // First --name <value> before the `--` separator; message tokens are opaque.
-    pub(crate) fn flag_before_sep(&self, name: &str) -> Option<&str> {
-        let key = format!("--{name}");
-        let end = self
-            .0
-            .iter()
-            .position(|value| value == "--")
-            .unwrap_or(self.0.len());
-        let index = self.0[..end].iter().position(|value| value == &key)?;
-        self.0[..end]
-            .get(index + 1)
-            .map(String::as_str)
-            .filter(|value| !value.is_empty())
     }
     pub(crate) fn has(&self, name: &str) -> bool {
         let key = format!("--{name}");
@@ -197,8 +160,6 @@ struct Target {
     dir: Option<String>,
     tool: String,
     name: Option<String>,
-    server: Option<String>,
-    allow_bus: bool,
 }
 
 // A target built straight from flags — addresses a discovered session that was
@@ -216,22 +177,17 @@ fn explicit_target(args: &Args) -> Option<Target> {
                 .map(str::to_string)
                 .unwrap_or_else(cwd_string),
         ),
-        tool: args.flag("tool").unwrap_or("claude").to_string(),
+        tool: args.flag("tool").unwrap_or("omp").to_string(),
         name: None,
-        server: None,
-        allow_bus: false,
     })
 }
 
 fn from_entry(e: store::Entry) -> Target {
-    let allow_bus = e.spawned_via.as_deref() == Some("app-server");
     Target {
         id: e.id,
         dir: e.dir,
         tool: e.tool,
         name: e.name,
-        server: e.server,
-        allow_bus,
     }
 }
 
@@ -241,7 +197,7 @@ fn cwd_string() -> String {
         .unwrap_or_else(|_| ".".to_string())
 }
 
-const ATTACH_WARNING: &str = "WARNING: split-brain risk — neither CLI locks sessions; attaching while automation drives the session interleaves two writers. Prefer attach when the worker is idle; relay doctor --id <id> shows watcher/lock state.";
+const ATTACH_WARNING: &str = "WARNING: split-brain risk — external omp processes do not share relay's resume lock. Attach only when the session is idle; relay doctor --id <id> shows watcher/lock state.";
 
 struct ParsedAttachArgs {
     target: String,
@@ -294,8 +250,6 @@ fn discovered_target(id: &str) -> Option<Target> {
             dir: string("cwd"),
             tool: string("tool").unwrap_or_default(),
             name: string("name"),
-            server: None,
-            allow_bus: false,
         })
     })
 }
@@ -328,10 +282,10 @@ fn attach(args: &Args) -> ! {
             target.id
         ));
     }
-    if !matches!(target.tool.as_str(), "claude" | "codex" | "omp") {
+    if target.tool != "omp" {
         eprintln!("{ATTACH_WARNING}");
         die(&format!(
-            "attach target tool must be claude|codex|omp, got: {}",
+            "attach target tool must be omp, got: {}",
             target.tool
         ));
     }
@@ -363,32 +317,32 @@ fn attach(args: &Args) -> ! {
     if !dir_exists {
         die("attach refused: stored dir does not exist");
     }
+    eprintln!("{ATTACH_WARNING}");
+    let cmd = wake_cmd();
     if parsed.execute {
         eprintln!("--exec is deprecated; attach now retains a guarded parent until child exit");
     }
-    eprintln!("{ATTACH_WARNING}");
-    let mut guard = lifecycle::admit_operation(&target.id, OperationKind::AttachResume)
-        .and_then(lifecycle::Admission::into_guard)
-        .unwrap_or_else(|error| die(&error));
-    let output = match spawn::run_child_with_guard(
-        &mut guard,
-        ChildLaunchSpec::AttachResume(AttachOptions::new(None, None)),
-    ) {
-        Ok(output) => output,
-        Err(error) => {
-            drop(guard);
-            die(&error)
+    let guard = match store::acquire_resume_lock(&target.id, "omp") {
+        Ok(guard) => guard,
+        Err(store::LockAcquireError::Busy(_)) => {
+            eprintln!(
+                "attach refused: relay wake is in flight for {} (resume lock held)",
+                target.name.as_deref().unwrap_or(&target.id)
+            );
+            std::process::exit(3);
+        }
+        Err(store::LockAcquireError::Io(error)) => {
+            eprintln!("attach refused: cannot acquire resume lock: {error}");
+            std::process::exit(4);
         }
     };
-    if !output.stdout.is_empty() {
-        let _ = std::io::stdout().write_all(&output.stdout);
-    }
-    if !output.stderr.is_empty() {
-        let _ = std::io::stderr().write_all(&output.stderr);
-    }
-    let code = output.status.code().unwrap_or(1);
+    let status = Command::new(cmd)
+        .args(["--resume", &target.id])
+        .current_dir(target.dir.as_deref().unwrap())
+        .status()
+        .unwrap_or_else(|error| die(&format!("cannot launch omp: {error}")));
     drop(guard);
-    std::process::exit(code);
+    std::process::exit(child_exit_code(status));
 }
 
 fn lock_age(path: &std::path::Path) -> String {
@@ -485,31 +439,6 @@ fn doctor(args: &Args) -> ! {
         );
     }
 
-    let configured_server = entry
-        .as_ref()
-        .and_then(|entry| entry.server.clone())
-        .or_else(|| {
-            std::env::var("RELAY_APP_SERVER")
-                .ok()
-                .filter(|value| !value.is_empty())
-        });
-    match configured_server {
-        Some(server) => match appserver::probe(&server) {
-            Ok(()) => doctor_line("PASS", "app-server", &format!("reachable {server}")),
-            Err(error) => {
-                failures += 1;
-                doctor_line(
-                    "FAIL",
-                    "app-server",
-                    &format!(
-                        "unreachable {server} ({error}) — fix: start the configured server or update registration"
-                    ),
-                );
-            }
-        },
-        None => doctor_line("PASS", "app-server", "not configured (doorbell fallback)"),
-    }
-
     let mailbox = store::mailbox_path(&id);
     match std::fs::File::open(&mailbox) {
         Ok(_) => doctor_line(
@@ -538,7 +467,11 @@ fn doctor(args: &Args) -> ! {
     let relay_exe = std::env::current_exe()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| "relay".to_string());
-    let rearm = hook::watcher_command(&relay_exe, &id);
+    let rearm = format!(
+        "{} watch --follow {} --tool omp",
+        shell_quote(&relay_exe),
+        shell_quote(&id)
+    );
     let watch = store::watcher_status(&id);
     match watch {
         store::LockStatus::Live => doctor_line("PASS", "watcher", "live lock held"),
@@ -598,76 +531,44 @@ fn doctor(args: &Args) -> ! {
     std::process::exit(if failures == 0 { 0 } else { 1 });
 }
 
-fn wake_cmd(tool: &str) -> String {
-    let var = match tool {
-        "codex" => "RELAY_WAKE_CMD_CODEX",
-        "omp" => "RELAY_WAKE_CMD_OMP",
-        _ => "RELAY_WAKE_CMD_CLAUDE",
-    };
-    std::env::var(var)
-        .ok()
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| {
-            match tool {
-                "codex" => "codex",
-                "omp" => "omp",
-                _ => "claude",
-            }
-            .to_string()
-        })
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-fn doorbell_args(
-    tool: &str,
+fn wake_cmd() -> String {
+    std::env::var("RELAY_WAKE_CMD_OMP")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "omp".to_string())
+}
+
+pub(crate) fn doorbell_args(
     id: &str,
     message: &str,
     model: Option<&str>,
     effort: Option<&str>,
-    service_tier: Option<ServiceTier>,
 ) -> (String, Vec<String>) {
-    let mut cargs = if tool == "codex" {
-        vec!["exec".into(), "resume".into(), id.into()]
-    } else if tool == "omp" {
-        vec![
-            "-p".into(),
-            "--resume".into(),
-            id.into(),
-            "--mode".into(),
-            "json".into(),
-        ]
-    } else {
-        vec!["-p".into(), "--resume".into(), id.into()]
-    };
+    let mut args = vec![
+        "-p".into(),
+        "--resume".into(),
+        id.into(),
+        "--mode".into(),
+        "json".into(),
+    ];
     if let Some(model) = model {
-        cargs.push(if tool == "codex" { "-m" } else { "--model" }.into());
-        cargs.push(model.into());
+        args.extend(["--model".into(), model.into()]);
     }
     if let Some(effort) = effort {
-        if tool == "codex" {
-            cargs.push("-c".into());
-            cargs.push(format!("model_reasoning_effort={effort}"));
-        } else {
-            cargs.push(
-                if tool == "omp" {
-                    "--thinking"
-                } else {
-                    "--effort"
-                }
-                .into(),
-            );
-            cargs.push(effort.into());
-        }
+        args.extend(["--thinking".into(), effort.into()]);
     }
-    if tool == "codex" {
-        cargs.extend(service_tier.unwrap_or_default().codex_config_args());
-        cargs.push("--json".into());
-    } else if tool != "omp" {
-        cargs.push("--output-format".into());
-        cargs.push("json".into());
-    }
-    cargs.push("--".into());
-    cargs.push(message.into());
-    (wake_cmd(tool), cargs)
+    args.extend(["--".into(), message.into()]);
+    (wake_cmd(), args)
+}
+
+fn child_exit_code(status: ExitStatus) -> i32 {
+    status
+        .code()
+        .unwrap_or_else(|| 128 + status.signal().unwrap_or(1))
 }
 
 fn wake_dry_json(tool: &str, cmd: &str, args: &[String], dir: &str) -> JsonValue {
@@ -675,11 +576,7 @@ fn wake_dry_json(tool: &str, cmd: &str, args: &[String], dir: &str) -> JsonValue
     m.insert("tool".into(), JsonValue::from(tool.to_string()));
     m.insert(
         "cmd".into(),
-        JsonValue::from(if tool == "omp" {
-            format!("{cmd} {}", args.join(" "))
-        } else {
-            cmd.to_string()
-        }),
+        JsonValue::from(format!("{cmd} {}", args.join(" "))),
     );
     m.insert(
         "args".into(),
@@ -693,106 +590,23 @@ fn wake_dry_json(tool: &str, cmd: &str, args: &[String], dir: &str) -> JsonValue
     JsonValue::from(m)
 }
 
-fn custom_wake_message(body: &str) -> JsonValue {
-    let mut msg: HashMap<String, JsonValue> = HashMap::new();
-    msg.insert("fromName".into(), JsonValue::from("relay wake".to_string()));
-    msg.insert("body".into(), JsonValue::from(body.to_string()));
-    JsonValue::from(msg)
-}
-
-#[derive(Debug, PartialEq, Eq)]
-struct WakeUsage {
-    input_tokens: u64,
-    cached_input_tokens: Option<u64>,
-    output_tokens: u64,
-    cost_usd: Option<String>,
-}
-
-impl WakeUsage {
-    fn render(&self, tool: &str) -> String {
-        let mut line = format!("[relay wake] {tool}: {} in", self.input_tokens);
-        if let Some(cached) = self.cached_input_tokens.filter(|n| *n > 0) {
-            line.push_str(&format!(" ({cached} cached)"));
-        }
-        line.push_str(&format!(" / {} out", self.output_tokens));
-        if let Some(cost) = &self.cost_usd {
-            line.push_str(&format!(", ${cost}"));
-        }
-        line
-    }
-}
-
+#[cfg(test)]
 fn obj(v: &JsonValue) -> Option<&HashMap<String, JsonValue>> {
     v.get::<HashMap<String, JsonValue>>()
 }
 
+#[cfg(test)]
 fn str_field<'a>(o: &'a HashMap<String, JsonValue>, k: &str) -> Option<&'a str> {
     o.get(k)?.get::<String>().map(String::as_str)
 }
 
-fn num_field(o: &HashMap<String, JsonValue>, k: &str) -> Option<u64> {
-    let n = o.get(k)?.get::<f64>().copied()?;
-    (n.is_finite() && n >= 0.0).then_some(n as u64)
-}
-
-fn cost_field(o: &HashMap<String, JsonValue>, k: &str) -> Option<String> {
-    let n = o.get(k)?.get::<f64>().copied()?;
-    (n.is_finite() && n >= 0.0).then_some(n.to_string())
-}
-
-fn claude_usage(root: &HashMap<String, JsonValue>) -> Option<WakeUsage> {
-    if str_field(root, "type")? != "result" {
-        return None;
-    }
-    let usage = root.get("usage").and_then(obj)?;
-    let prompt = num_field(usage, "input_tokens")?;
-    let cache_read = num_field(usage, "cache_read_input_tokens");
-    let cache_create = num_field(usage, "cache_creation_input_tokens").unwrap_or(0);
-    Some(WakeUsage {
-        input_tokens: prompt + cache_read.unwrap_or(0) + cache_create,
-        cached_input_tokens: cache_read,
-        output_tokens: num_field(usage, "output_tokens")?,
-        cost_usd: cost_field(root, "total_cost_usd"),
-    })
-}
-
-fn codex_usage_line(stdout: &str) -> Option<WakeUsage> {
-    for line in stdout.lines() {
-        let root = line.parse::<JsonValue>().ok()?;
-        let root = obj(&root)?;
-        if str_field(root, "type") != Some("turn.completed") {
-            continue;
-        }
-        let usage = root.get("usage").and_then(obj)?;
-        let visible_output = num_field(usage, "output_tokens")?;
-        let reasoning_output = num_field(usage, "reasoning_output_tokens").unwrap_or(0);
-        return Some(WakeUsage {
-            input_tokens: num_field(usage, "input_tokens")?,
-            cached_input_tokens: num_field(usage, "cached_input_tokens"),
-            output_tokens: visible_output + reasoning_output,
-            cost_usd: None,
-        });
-    }
-    None
-}
-
-fn wake_usage_line(tool: &str, stdout: &[u8]) -> Option<String> {
-    if tool == "omp" {
-        return None;
-    }
-    let text = std::str::from_utf8(stdout).ok()?;
-    let usage = if tool == "codex" {
-        codex_usage_line(text)?
-    } else {
-        let root = text.parse::<JsonValue>().ok()?;
-        let root = obj(&root)?;
-        claude_usage(root)?
-    };
-    Some(usage.render(tool))
-}
-
 pub fn run(cmd: &str, raw: Vec<String>) -> ! {
     let args = Args(raw);
+    if let Some(tool) = args.flag("tool") {
+        if tool != "omp" {
+            die(&format!("--tool must be omp, got: {tool}"));
+        }
+    }
     match cmd {
         "attach" => attach(&args),
         "doctor" => doctor(&args),
@@ -869,21 +683,13 @@ pub fn run(cmd: &str, raw: Vec<String>) -> ! {
         "register" => {
             let pos = args.positionals(1);
             let (Some(name), Some(id)) = (pos.first(), args.flag("id")) else {
-                die(
-                    "usage: relay register <name> --id <uuid> [--dir <path>] [--tool claude|codex|omp] [--server <unix-socket>]",
-                );
+                die("usage: relay register <name> --id <uuid> [--dir <path>] [--tool omp]");
             };
             let dir = args
                 .flag("dir")
                 .map(str::to_string)
                 .unwrap_or_else(cwd_string);
-            match store::register(
-                id,
-                Some(&dir),
-                Some(name),
-                args.flag("tool"),
-                args.flag("server"),
-            ) {
+            match store::register(id, Some(&dir), Some(name), args.flag("tool")) {
                 Ok(e) => {
                     println!(
                         "registered {} [{}] -> {} @ {}",
@@ -1038,11 +844,8 @@ pub fn run(cmd: &str, raw: Vec<String>) -> ! {
             let Some(target) = store::resolve(who) else {
                 die(&format!("unknown session: {who}"));
             };
-            let mut guard = lifecycle::admit_operation(&target.id, OperationKind::CliInboxDrain)
-                .and_then(lifecycle::Admission::into_guard)
-                .unwrap_or_else(|error| die(&error));
             if let Some(seconds) = args.hold_seconds() {
-                let receipt = lifecycle::hold_with_guard(&mut guard, "inbox", seconds)
+                let receipt = store::hold_mailbox(&target.id, "inbox", seconds)
                     .unwrap_or_else(|error| die(&error));
                 let mut out: HashMap<String, JsonValue> = HashMap::new();
                 out.insert(
@@ -1062,16 +865,11 @@ pub fn run(cmd: &str, raw: Vec<String>) -> ! {
                 out.insert("count".into(), JsonValue::from(receipt.count as f64));
                 out.insert("messages".into(), JsonValue::from(receipt.messages));
                 println!("{}", JsonValue::from(out).stringify().unwrap());
-                drop(guard);
                 std::process::exit(0);
             }
-            let msgs = match lifecycle::drain_with_guard(&mut guard) {
-                Ok(receipt) => receipt.into_messages(),
-                Err(error) => {
-                    drop(guard);
-                    die(&error)
-                }
-            };
+            let msgs = store::drain_mailbox(&target.id)
+                .unwrap_or_else(|error| die(&error))
+                .into_messages();
             let mut out: HashMap<String, JsonValue> = HashMap::new();
             out.insert("count".into(), JsonValue::from(msgs.len() as f64));
             out.insert("messages".into(), JsonValue::from(msgs));
@@ -1081,7 +879,6 @@ pub fn run(cmd: &str, raw: Vec<String>) -> ! {
                     .format()
                     .unwrap_or_else(|_| "{}".into())
             );
-            drop(guard);
             std::process::exit(0);
         }
         "peek" => {
@@ -1127,17 +924,9 @@ pub fn run(cmd: &str, raw: Vec<String>) -> ! {
             });
             let Some(target) = target else {
                 die(
-                    "usage: relay wake <nameOrId> [--model <m>] [--effort <e>] [--service-tier default|fast] [message...]  |  wake --id <id> --dir <cwd> --tool <claude|codex|omp> [--model <m>] [--effort <e>] [--service-tier default|fast] [message...]",
+                    "usage: relay wake <nameOrId> [--model <m>] [--effort <e>] [message...] | wake --id <id> --dir <cwd> --tool omp [--model <m>] [--effort <e>] [message...]",
                 );
             };
-            let requested_service_tier = args
-                .unique_flag("service-tier")
-                .unwrap_or_else(|error| die(&error));
-            if target.tool != "codex" && requested_service_tier.is_some() {
-                die("--service-tier is Codex-only");
-            }
-            let service_tier = ServiceTier::parse(requested_service_tier.unwrap_or("default"))
-                .unwrap_or_else(|error| die(&error));
             let Some(dir) = target.dir.clone().filter(|d| !d.is_empty()) else {
                 die("target missing id/dir (for an unregistered session pass --dir)");
             };
@@ -1151,113 +940,6 @@ pub fn run(cmd: &str, raw: Vec<String>) -> ! {
                     target.id
                 ));
             }
-            let server = target.server.clone().or_else(|| {
-                std::env::var("RELAY_APP_SERVER")
-                    .ok()
-                    .filter(|value| !value.is_empty())
-            });
-            if target.tool == "codex"
-                && !args.has("dry")
-                && server
-                    .as_deref()
-                    .is_some_and(|configured| appserver::probe(configured).is_ok())
-            {
-                let server = server.as_deref().unwrap();
-                if target.server.is_none() {
-                    store::register(
-                        &target.id,
-                        target.dir.as_deref(),
-                        None,
-                        Some(&target.tool),
-                        Some(server),
-                    )
-                    .unwrap_or_else(|error| {
-                        die(&format!("cannot bind wake app-server authority: {error}"))
-                    });
-                }
-                let mut guard =
-                    lifecycle::admit_operation(&target.id, OperationKind::WakeAppServer)
-                        .and_then(lifecycle::Admission::into_guard)
-                        .unwrap_or_else(|error| die(&error));
-                if let Err(error) = ProtocolStore::new(store::home_dir()).recover_pending() {
-                    drop(guard);
-                    protocol_die(error);
-                }
-                if !store::mailbox_has_content(&target.id) && custom_message.is_none() {
-                    drop(guard);
-                    std::process::exit(0);
-                }
-                match appserver::thread_state(server, &target.id) {
-                    Ok(appserver::ThreadState::Active) => {
-                        eprintln!("wake refused: thread busy — nothing sent");
-                        drop(guard);
-                        std::process::exit(3);
-                    }
-                    Ok(appserver::ThreadState::Idle) => {}
-                    Err(e) => {
-                        drop(guard);
-                        die(&format!("cannot read app-server thread status: {e}"))
-                    }
-                }
-
-                let drained = match lifecycle::drain_with_guard(&mut guard) {
-                    Ok(receipt) => receipt,
-                    Err(error) => {
-                        drop(guard);
-                        die(&error)
-                    }
-                };
-                let mut payload = drained.messages().to_vec();
-                if let Some(custom) = custom_message.as_deref() {
-                    payload.push(custom_wake_message(custom));
-                }
-                if payload.is_empty() {
-                    drop(guard);
-                    std::process::exit(0);
-                }
-                let block = hook::mail_block(&payload, &target.id);
-                if block.is_empty() {
-                    drop(guard);
-                    std::process::exit(0);
-                }
-                let settle_ms = std::env::var("RELAY_TURN_SETTLE_MS")
-                    .ok()
-                    .and_then(|value| value.parse().ok())
-                    .unwrap_or(DEFAULT_TURN_SETTLE_MS);
-                let delivery = appserver::deliver_with_guard(
-                    &mut guard,
-                    &block,
-                    true,
-                    settle_ms,
-                    target.allow_bus,
-                    service_tier,
-                );
-                drop(guard);
-                match delivery {
-                    Ok(appserver::DeliveryOutcome::Delivered) => std::process::exit(0),
-                    Ok(appserver::DeliveryOutcome::AckDeferred) => {
-                        eprintln!(
-                            "mail delivered to thread context; visible turn deferred — thread busy"
-                        );
-                        std::process::exit(3);
-                    }
-                    Err(appserver::DeliveryError::BeforeInject(e)) => {
-                        drained.rollback().unwrap_or_else(|error| die(&error));
-                        die(&format!(
-                            "app-server inject failed ({e}); queued mailbox mail re-enqueued"
-                        ));
-                    }
-                    Err(appserver::DeliveryError::AfterInject(e)) => {
-                        die(&format!(
-                            "mail delivered to thread context; visible acknowledgement failed: {e}"
-                        ));
-                    }
-                }
-            }
-            // Per-tool headless-resume doorbell, run from the target's project
-            // dir. The untrusted message goes AFTER a `--` end-of-options
-            // marker so a dash-leading body can't be parsed as a flag on the
-            // child (all supported CLIs take the prompt as a trailing positional).
             let model = args.flag("model");
             let effort = args.flag("effort");
             if model.is_none() {
@@ -1265,14 +947,7 @@ pub fn run(cmd: &str, raw: Vec<String>) -> ! {
                     "[relay wake] no --model given — pass --model/--effort to pin a deliberate doorbell model"
                 );
             }
-            let (cmd, cargs) = doorbell_args(
-                &target.tool,
-                &target.id,
-                &message,
-                model,
-                effort,
-                (target.tool == "codex").then_some(service_tier),
-            );
+            let (cmd, cargs) = doorbell_args(&target.id, &message, model, effort);
             if args.has("dry") {
                 println!(
                     "{}",
@@ -1282,10 +957,8 @@ pub fn run(cmd: &str, raw: Vec<String>) -> ! {
                 );
                 std::process::exit(0);
             }
-            // Never resume into a cwd that no longer exists: a stale/moved
-            // registration would otherwise resume from an unexpected dir (and
-            // Codex widens its sandbox writable roots to the caller cwd).
-            if !std::path::Path::new(&dir).exists() {
+            // Refuse stale registrations rather than resuming from another directory.
+            if !std::path::Path::new(&dir).is_dir() {
                 die(&format!(
                     "target dir does not exist: {dir} — stale/moved session; re-register or pass the current --dir before waking."
                 ));
@@ -1310,54 +983,20 @@ pub fn run(cmd: &str, raw: Vec<String>) -> ! {
                 }
             };
             if store::resolve(&target.id).is_none() {
-                store::register(&target.id, Some(&dir), None, Some(&target.tool), None)
-                    .unwrap_or_else(|error| {
-                        die(&format!("cannot register explicit wake target: {error}"))
-                    });
+                store::register(&target.id, Some(&dir), None, Some(&target.tool)).unwrap_or_else(
+                    |error| die(&format!("cannot register explicit wake target: {error}")),
+                );
             }
-            let model = model
-                .map(ValidatedModel::parse)
-                .transpose()
-                .unwrap_or_else(|error| die(&error));
-            let effort = effort
-                .map(ValidatedEffort::parse)
-                .transpose()
-                .unwrap_or_else(|error| die(&error));
-            let message = DoorbellMessage::parse(&message)
-                .map(|message| {
-                    message
-                        .with_runtime_options(model, effort)
-                        .with_service_tier(service_tier)
-                })
-                .unwrap_or_else(|error| die(&error));
-            let mut guard = lifecycle::admit_operation(&target.id, OperationKind::WakeCli)
-                .and_then(lifecycle::Admission::into_guard)
-                .unwrap_or_else(|error| die(&error));
-            let out = match spawn::run_child_with_guard(
-                &mut guard,
-                ChildLaunchSpec::WakeDoorbell(message),
-            ) {
-                Ok(output) => output,
-                Err(error) => {
-                    drop(guard);
-                    die(&error)
-                }
-            };
-            if !out.stdout.is_empty() {
-                let _ = std::io::stdout().write_all(&out.stdout);
-            }
-            if !out.stderr.is_empty() {
-                eprint!("{}", String::from_utf8_lossy(&out.stderr));
-            }
-            if let Some(line) = wake_usage_line(&target.tool, &out.stdout) {
-                eprintln!("{line}");
-            }
-            let code = out.status.code().unwrap_or(0);
-            drop(guard);
-            std::process::exit(code);
+            let status = Command::new(cmd)
+                .args(cargs)
+                .current_dir(&dir)
+                .status()
+                .unwrap_or_else(|error| die(&format!("cannot launch omp: {error}")));
+            drop(_resume_guard);
+            std::process::exit(child_exit_code(status));
         }
         _ => die(
-            "usage: relay discover [--within min] [--tool t] | list | register <name> --id <uuid> [--dir <path>] [--server <sock>] | send <to> <msg> | request <to> [--from <registered>] [--json] [--] <msg> | reply <correlation-id> [--from <registered>] --status completed|failed [--] <msg> | inbox <who> | peek <who> | attach <who> [--exec] | wake <who> [--model m] [--effort e] [--service-tier default|fast] [msg] | doctor [--id <session>]",
+            "usage: relay discover [--within min] [--tool omp] | list | register <name> --id <uuid> [--dir <path>] | send <to> <msg> | request <to> [--from <registered>] [--json] [--] <msg> | reply <correlation-id> [--from <registered>] --status completed|failed [--] <msg> | inbox <who> | peek <who> | attach <who> [--exec] | wake <who> [--model m] [--effort e] [msg] | doctor [--id <session>]",
         ),
     }
 }
@@ -1409,27 +1048,10 @@ mod tests {
     #[test]
     fn wake_separator_keeps_explicit_tool() {
         let args = Args(strings(&[
-            "wake", "--id", "A", "--dir", ".", "--tool", "omp", "--", "--tool", "codex",
+            "wake", "--id", "A", "--dir", ".", "--tool", "omp", "--", "--tool", "other",
         ]));
         assert_eq!(args.flag("tool"), Some("omp"));
         assert_eq!(args.unique_flag("tool"), Ok(Some("omp")));
-    }
-
-    #[test]
-    fn wake_separator_ignores_message_service_tier() {
-        let args = Args(strings(&[
-            "wake",
-            "--id",
-            "A",
-            "--dir",
-            ".",
-            "--tool",
-            "codex",
-            "--",
-            "--service-tier",
-            "fast",
-        ]));
-        assert_eq!(args.unique_flag("service-tier"), Ok(None));
     }
 
     #[test]
@@ -1445,107 +1067,8 @@ mod tests {
     }
 
     #[test]
-    fn wake_argv_defaults_codex_to_explicit_standard_and_leaves_claude_unchanged() {
-        let (cmd, args) = doorbell_args(
-            "codex",
-            "u-1",
-            "ping",
-            None,
-            None,
-            Some(crate::lifecycle::ServiceTier::Default),
-        );
-        assert_eq!(cmd, "codex");
-        assert_eq!(
-            args,
-            strings(&[
-                "exec",
-                "resume",
-                "u-1",
-                "-c",
-                "service_tier=\"default\"",
-                "--json",
-                "--",
-                "ping"
-            ])
-        );
-
-        let (cmd, args) = doorbell_args("claude", "u-1", "ping", None, None, None);
-        assert_eq!(cmd, "claude");
-        assert_eq!(
-            args,
-            strings(&[
-                "-p",
-                "--resume",
-                "u-1",
-                "--output-format",
-                "json",
-                "--",
-                "ping"
-            ])
-        );
-    }
-
-    #[test]
-    fn wake_argv_maps_model_effort_and_fast_tier_per_tool_after_resume_id() {
-        let (cmd, args) = doorbell_args(
-            "codex",
-            "u-1",
-            "ping",
-            Some("gpt-5.5"),
-            Some("xhigh"),
-            Some(crate::lifecycle::ServiceTier::Fast),
-        );
-        assert_eq!(cmd, "codex");
-        assert_eq!(
-            args,
-            strings(&[
-                "exec",
-                "resume",
-                "u-1",
-                "-m",
-                "gpt-5.5",
-                "-c",
-                "model_reasoning_effort=xhigh",
-                "-c",
-                "features.fast_mode=true",
-                "-c",
-                "service_tier=\"fast\"",
-                "--json",
-                "--",
-                "ping"
-            ])
-        );
-
-        let (cmd, args) = doorbell_args("claude", "u-1", "ping", Some("opus"), Some("max"), None);
-        assert_eq!(cmd, "claude");
-        assert_eq!(
-            args,
-            strings(&[
-                "-p",
-                "--resume",
-                "u-1",
-                "--model",
-                "opus",
-                "--effort",
-                "max",
-                "--output-format",
-                "json",
-                "--",
-                "ping"
-            ])
-        );
-    }
-
-    #[test]
     fn omp_wake_argv_uses_json_mode_and_thinking_before_message() {
-        let (cmd, args) = doorbell_args(
-            "omp",
-            "u-1",
-            "--tool codex",
-            Some("model-name"),
-            Some("high"),
-            None,
-        );
+        let (cmd, args) = doorbell_args("u-1", "--tool other", Some("model-name"), Some("high"));
         assert_eq!(cmd, "omp");
         assert_eq!(
             args,
@@ -1560,14 +1083,14 @@ mod tests {
                 "--thinking",
                 "high",
                 "--",
-                "--tool codex",
+                "--tool other",
             ])
         );
     }
 
     #[test]
     fn omp_wake_dry_json_includes_full_command_and_preserves_argv() {
-        let (cmd, args) = doorbell_args("omp", "u-1", "ping", None, None, None);
+        let (cmd, args) = doorbell_args("u-1", "ping", None, None);
         let output = wake_dry_json("omp", &cmd, &args, ".");
         let output = output.stringify().unwrap().parse::<JsonValue>().unwrap();
         let output = obj(&output).unwrap();
@@ -1586,66 +1109,6 @@ mod tests {
             ))
         );
         assert_eq!(str_field(output, "cwd"), Some("."));
-    }
-
-    #[test]
-    fn omp_wake_does_not_report_claude_usage() {
-        assert_eq!(
-            wake_usage_line(
-                "omp",
-                include_str!("../test/fixtures/wake-usage-claude.json").as_bytes(),
-            ),
-            None
-        );
-    }
-
-    #[test]
-    fn parses_claude_fixture_usage_line() {
-        let line = wake_usage_line(
-            "claude",
-            include_str!("../test/fixtures/wake-usage-claude.json").as_bytes(),
-        );
-        assert_eq!(
-            line,
-            Some("[relay wake] claude: 45682 in (45603 cached) / 4 out, $0.0142089".to_string())
-        );
-    }
-
-    #[test]
-    fn parses_codex_fixture_usage_line() {
-        let line = wake_usage_line(
-            "codex",
-            include_str!("../test/fixtures/wake-usage-codex.jsonl").as_bytes(),
-        );
-        assert_eq!(
-            line,
-            Some("[relay wake] codex: 47400 in (12032 cached) / 10 out".to_string())
-        );
-    }
-
-    #[test]
-    fn parser_accepts_no_trailing_newline_payload() {
-        let line = wake_usage_line(
-            "claude",
-            br#"{"type":"result","total_cost_usd":1.25,"usage":{"input_tokens":7,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":3}}"#,
-        );
-        assert_eq!(
-            line,
-            Some("[relay wake] claude: 7 in / 3 out, $1.25".to_string())
-        );
-    }
-
-    #[test]
-    fn parser_ignores_invalid_utf8_stdout() {
-        assert_eq!(
-            wake_usage_line("claude", b"{\"type\":\"result\"}\xff"),
-            None
-        );
-    }
-
-    #[test]
-    fn parser_ignores_garbage_stdout() {
-        assert_eq!(wake_usage_line("codex", b"not json"), None);
     }
 
     #[test]

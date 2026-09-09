@@ -1,6 +1,6 @@
 {
   "name": "session-relay",
-  "version": "0.17.0",
+  "version": "0.18.0",
   "description": "Cross-session mail and custody for omp sessions",
   "license": "MIT",
   "omp": {

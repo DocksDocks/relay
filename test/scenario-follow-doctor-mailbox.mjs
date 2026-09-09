@@ -36,15 +36,15 @@ const messageV2 = ({
 
 const sha256 = (value) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 
-const claimStatusV1 = ({ origin, reply = null, request, requesterId, responderId }) => ({
+const claimStatusV1 = ({ reply = null, request, requesterId, responderId }) => ({
   correlation_id: request.correlation_id,
   created_at: request.created_at,
-  origin,
+  origin: 'message',
   reply,
   reply_delivery: reply === null ? null : 'enqueued',
   reply_sha256: reply === null ? null : sha256(reply),
   request,
-  request_delivery: origin === 'fanout' ? 'not_applicable' : 'enqueued',
+  request_delivery: 'enqueued',
   request_sha256: sha256(request),
   requester_session_id: requesterId,
   responder_session_id: responderId,
@@ -55,10 +55,6 @@ const claimStatusV1 = ({ origin, reply = null, request, requesterId, responderId
 
 const followedDeliveryRows = ({ recipientId, seed, senderId }) => {
   const id = (offset) => testUuid(seed + offset);
-  const reservationId = id(9);
-  const workerId = id(10);
-  const generation = id(11);
-  const collectCommand = `relay collect ${senderId} --from ${recipientId}`;
   const request = messageV2({
     body: 'followed typed request',
     correlationId: id(2),
@@ -85,27 +81,6 @@ const followedDeliveryRows = ({ recipientId, seed, senderId }) => {
     terminalStatus: 'failed',
     toSessionId: recipientId,
   });
-  const workerRequest = messageV2({
-    body: 'worker result authority request',
-    correlationId: id(8),
-    fromSessionId: recipientId,
-    id: id(7),
-    kind: 'request',
-    toSessionId: senderId,
-  });
-  const workerResult = messageV2({
-    body:
-      `worker_result reservation_id=${reservationId} worker_id=${workerId} generation=${generation} ` +
-      `runtime_session_id=${senderId} parent_session_id=${recipientId}; collect: ${collectCommand}`,
-    correlationId: id(8),
-    fromSessionId: senderId,
-    id: id(6),
-    kind: 'worker_result',
-    replyTo: id(7),
-    resultSha256: 'cd'.repeat(32),
-    terminalStatus: 'completed',
-    toSessionId: recipientId,
-  });
   const legacy = {
     body: 'legacy follow row',
     from: senderId,
@@ -116,27 +91,18 @@ const followedDeliveryRows = ({ recipientId, seed, senderId }) => {
   };
   const claims = [
     claimStatusV1({
-      origin: 'message',
       request,
       requesterId: senderId,
       responderId: recipientId,
     }),
     claimStatusV1({
-      origin: 'message',
       reply: terminalReply,
       request: terminalRequest,
       requesterId: recipientId,
       responderId: senderId,
     }),
-    claimStatusV1({
-      origin: 'fanout',
-      reply: workerResult,
-      request: workerRequest,
-      requesterId: recipientId,
-      responderId: senderId,
-    }),
   ];
-  return { claims, rows: [request, terminalReply, workerResult, legacy] };
+  return { claims, rows: [request, terminalReply, legacy] };
 };
 
 const seedClaimFixtures = (home, claims) => {
@@ -170,7 +136,7 @@ export async function run({ bin, home, emit }) {
     const dirA = path.join(HOME, 'proj-a');
     const idA = '11111111-1111-1111-1111-111111111111';
     fs.mkdirSync(dirA, { recursive: true });
-    assert.equal(runHook({ session_id: idA, cwd: dirA, hook_event_name: 'SessionStart', source: 'startup' }).status, 0);
+    assert.equal(runHook({ session_id: idA, cwd: dirA }).status, 0);
     assert.equal(relay(['register', 'agent-A', '--id', idA, '--dir', dirA]).status, 0);
 
     const sleep = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
@@ -240,7 +206,7 @@ export async function run({ bin, home, emit }) {
       assert.equal(relay(['register', 'follow-target', '--id', id, '--dir', dir]).status, 0);
       assert.equal(relay(['send', 'follow-target', '--', 'preexisting-skip']).status, 0);
 
-      const followed = spawnToFiles(['watch', '--follow', id], {}, 'follow-watch');
+      const followed = spawnToFiles(['watch', '--follow', id, '--tool', 'omp'], {}, 'follow-watch');
       const lock = path.join(HOME, 'watchers', `${id}.lock`);
       waitFor(() => {
         try {
@@ -354,7 +320,7 @@ export async function run({ bin, home, emit }) {
           .split('\n')
           .map((line) => JSON.parse(line)),
         rows,
-        'every correlation, reply, status, digest, collection, and legacy field survives follow',
+        'every request, terminal reply, and legacy field survives follow',
       );
       typedFollowed.child.kill('SIGKILL');
       sleep(100);
@@ -461,7 +427,7 @@ export async function run({ bin, home, emit }) {
         timeout: 1000,
       });
       assert.equal(r.status, 1, `invalid tool should exit 1, got status=${r.status} signal=${r.signal}`);
-      assert.match(r.stderr, /--tool must be claude\|codex/);
+      assert.match(r.stderr, /--tool must be omp/);
       assert.equal(fs.existsSync(path.join(HOME, 'watchers', `${id}.lock`)), false);
     });
 
@@ -496,17 +462,17 @@ export async function run({ bin, home, emit }) {
         'healthy explicit-id doctor is all PASS',
       );
 
-      const hookRun = runHook({ session_id: doctorA, cwd: shared, source: 'resume' });
-      const context = JSON.parse(hookRun.stdout).hookSpecificOutput.additionalContext;
-      const rearm = /run `([^`]+)` as a persistent watch/.exec(context)?.[1];
-      assert.ok(rearm, 'hook nudge exposes the re-arm command');
       watched.child.kill('SIGKILL');
       sleep(100);
 
       const dead = relay(['doctor', '--id', 'doctor-a']);
       assert.equal(dead.status, 1);
       assert.match(dead.stdout, /FAIL watcher: dead/);
-      assert.ok(dead.stdout.includes(`fix: ${rearm}`), 'doctor and hook share the exact re-arm command');
+      assert.match(
+        dead.stdout,
+        new RegExp(`fix: .+ watch --follow '?${doctorA}'? --tool omp(?:\\n|$)`),
+        'doctor exposes an omp re-arm command for the explicit session',
+      );
 
       const eachA = relay(['doctor', '--id', doctorA]);
       const eachB = relay(['doctor', '--id', 'doctor-b']);

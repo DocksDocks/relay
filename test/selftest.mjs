@@ -5,13 +5,11 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { EXPECTED_LABELS as APP_SERVER_LABELS } from './scenario-appserver.mjs';
 import { EXPECTED_LABELS as CORE_LABELS } from './scenario-core.mjs';
 import { EXPECTED_LABELS as DISCOVERY_HARDENING_LABELS } from './scenario-discovery-hardening.mjs';
 import { EXPECTED_LABELS as FOLLOW_DOCTOR_MAILBOX_LABELS } from './scenario-follow-doctor-mailbox.mjs';
 import { EXPECTED_LABELS as GC_LABELS } from './scenario-gc.mjs';
 import { EXPECTED_LABELS as HOOKS_IDENTITY_LABELS } from './scenario-hooks-identity.mjs';
-import { EXPECTED_LABELS as SPAWN_WAKE_SUPERVISOR_LABELS } from './scenario-spawn-wake-supervisor.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '..');
@@ -29,9 +27,9 @@ const TREE_POLL_INTERVAL_MS = 20;
 const RESULT_CLOCK_TOLERANCE_MS = 1000;
 const RESULT_KEYS = ['count', 'labels', 'scenario', 'schema', 'status'];
 const SUN_PATH_LIMIT_BYTES = 108;
-const LONGEST_SOCKET_BASENAME = 'custody-command-v1.sock';
+const LONGEST_SOCKET_BASENAME = 'bus.sock';
 
-export const PRE_SPLIT_STDOUT_SHA256 = '8eaa9ecfdc3e5a9ceb72d65cbf2062c0495746a4a31ae7a0ce14c73b9cb5c44f';
+export const PRODUCTION_STDOUT_SHA256 = 'f547d79a23988ec5fd1f6e739f68bdc9ea5d6ccbe9aeb995411f734bfc404026';
 
 function scenario(name, expectedLabels) {
   return Object.freeze({
@@ -45,9 +43,7 @@ export const SCENARIOS = Object.freeze([
   scenario('core', CORE_LABELS),
   scenario('discovery-hardening', DISCOVERY_HARDENING_LABELS),
   scenario('hooks-identity', HOOKS_IDENTITY_LABELS),
-  scenario('appserver', APP_SERVER_LABELS),
   scenario('gc', GC_LABELS),
-  scenario('spawn-wake-supervisor', SPAWN_WAKE_SUPERVISOR_LABELS),
   scenario('follow-doctor-mailbox', FOLLOW_DOCTOR_MAILBOX_LABELS),
 ]);
 
@@ -67,11 +63,8 @@ export const PRODUCTION_OUTPUT_LABELS = Object.freeze([
   ...CORE_LABELS,
   ...DISCOVERY_HARDENING_LABELS,
   ...HOOKS_IDENTITY_LABELS,
-  ...APP_SERVER_LABELS,
   ...GC_LABELS,
-  ...SPAWN_WAKE_SUPERVISOR_LABELS.slice(0, -1),
   ...FOLLOW_DOCTOR_MAILBOX_LABELS,
-  SPAWN_WAKE_SUPERVISOR_LABELS.at(-1),
 ]);
 
 function parallelismCap(availableParallelism) {
@@ -824,36 +817,25 @@ export async function runScenarioScheduler({
 }
 
 function validateProductionCatalog() {
-  const expectedOrder = [
-    'core',
-    'discovery-hardening',
-    'hooks-identity',
-    'appserver',
-    'gc',
-    'spawn-wake-supervisor',
-    'follow-doctor-mailbox',
-  ];
+  const expectedOrder = ['core', 'discovery-hardening', 'hooks-identity', 'gc', 'follow-doctor-mailbox'];
   if (SCENARIOS.length !== expectedOrder.length) throw new Error('session-relay scenario catalog is incomplete');
   for (const [index, expected] of expectedOrder.entries()) {
     if (SCENARIOS[index].name !== expected) throw new Error('session-relay scenario catalog order changed');
   }
-  if (SPAWN_WAKE_SUPERVISOR_LABELS.length !== 24 || FOLLOW_DOCTOR_MAILBOX_LABELS.length !== 6) {
-    throw new Error('session-relay split scenario catalog must contain exactly 24 and 6 labels');
-  }
   const labels = SCENARIOS.flatMap(({ expectedLabels }) => expectedLabels);
-  if (labels.length !== 133 || new Set(labels).size !== 133) {
-    throw new Error('session-relay scenario catalog must contain exactly 133 unique labels');
+  if (labels.length !== 77 || new Set(labels).size !== 77) {
+    throw new Error('session-relay scenario catalog must contain exactly 77 unique labels');
   }
   if (
-    PRODUCTION_OUTPUT_LABELS.length !== 133 ||
-    new Set(PRODUCTION_OUTPUT_LABELS).size !== 133 ||
+    PRODUCTION_OUTPUT_LABELS.length !== 77 ||
+    new Set(PRODUCTION_OUTPUT_LABELS).size !== 77 ||
     PRODUCTION_OUTPUT_LABELS.some((label) => !labels.includes(label))
   ) {
-    throw new Error('session-relay production output must contain the exact 133-label scenario union');
+    throw new Error('session-relay production output must contain the exact 77-label scenario union');
   }
   const rendered = PRODUCTION_OUTPUT_LABELS.map((label) => `  ok: ${label}\n`).join('');
-  if (createHash('sha256').update(rendered).digest('hex') !== PRE_SPLIT_STDOUT_SHA256) {
-    throw new Error('session-relay production output changed from the immutable pre-split baseline');
+  if (createHash('sha256').update(rendered).digest('hex') !== PRODUCTION_STDOUT_SHA256) {
+    throw new Error('session-relay production output changed from the reviewed catalog');
   }
 }
 
@@ -884,12 +866,12 @@ export async function main({ env = process.env, stdout = process.stdout, stderr 
       bin: env.SESSION_RELAY_TEST_BIN,
       outputLabels: PRODUCTION_OUTPUT_LABELS,
     });
-    if (result.count !== 133 || result.labels.length !== 133) {
-      throw new Error('session-relay scenario aggregation did not produce exactly 133 checks');
+    if (result.count !== 77 || result.labels.length !== 77) {
+      throw new Error('session-relay scenario aggregation did not produce exactly 77 checks');
     }
     stdout.write(result.stdout);
     const bin = fs.realpathSync(env.SESSION_RELAY_TEST_BIN);
-    stdout.write(`\nPASS: session-relay self-test — 133 checks (binary: ${path.relative(ROOT, bin)})\n`);
+    stdout.write(`\nPASS: session-relay self-test — 77 checks (binary: ${path.relative(ROOT, bin)})\n`);
     return 0;
   } catch (error) {
     writeFailure(error, stderr);

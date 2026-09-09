@@ -1,16 +1,4 @@
-// relay — session-relay's single binary. One executable, multi-call:
-//   relay bus                      MCP stdio server (manifest entry)
-//   relay channel                  EXPERIMENTAL one-way Claude channel MCP server
-//   relay hook [codex] [--event prompt]   SessionStart/UserPromptSubmit hook (register + drain inbox)
-//   relay discover|list|register|send|inbox|peek|attach|wake|doctor   CLI / attach / doorbell / health
-//   relay watch …                  poll mailboxes, push into live Codex threads via app-server
-//   relay workspace …              managed workspace authority (nine closed verbs)
-//   relay __spawn-log-writer <id>  hidden bounded stderr pump for detached spawn
-//   relay __appserver-spawn-pump    hidden bounded app-server first-turn pump
-//   relay __lifecycle-watchdog …    hidden detached supervisor owner
-//   relay __lifecycle-supervisor …  hidden exact child custodian
-//   relay __fanout-supervisor        hidden exact fan-out child custodian
-//   relay __stress …               hidden test helper (cross-process lock race)
+// relay — durable messaging between omp sessions.
 
 use std::collections::HashMap;
 use tinyjson::JsonValue;
@@ -20,31 +8,12 @@ fn main() {
     match argv.first().map(String::as_str) {
         Some("--version") => println!("session-relay {}", env!("CARGO_PKG_VERSION")),
         Some("bus") => relay::bus::run(),
-        Some("channel") => relay::channel::run(),
         Some("hook") => relay::hook::run(&argv[1..]),
         Some(
             cmd @ ("discover" | "list" | "register" | "send" | "request" | "reply" | "inbox"
             | "ack" | "rollback" | "peek" | "attach" | "wake" | "doctor"),
         ) => relay::cli::run(cmd, argv.clone()),
         Some("watch") => relay::watch::run(argv.clone()),
-        Some("spawn") => relay::spawn::run(argv.clone()),
-        Some("handback") => relay::fanout::run_handback(argv.clone()),
-        Some("collect") => relay::fanout::run_collect(argv.clone()),
-        Some("workspace") => relay::workspace::run(argv[1..].to_vec()),
-        Some("__spawn-log-writer") => {
-            let Some(id) = argv.get(1) else {
-                die("usage: relay __spawn-log-writer <uuid>");
-            };
-            relay::spawn::run_log_writer(id);
-        }
-        Some("__appserver-spawn-pump") => relay::spawn::run_appserver_pump(),
-        Some("__fanout-supervisor") => relay::spawn::run_fanout_supervisor(),
-        Some("__lifecycle-watchdog") => {
-            relay::supervisor::run_watchdog(&argv[1..]).unwrap_or_else(|error| die(&error))
-        }
-        Some("__lifecycle-supervisor") => {
-            relay::supervisor::run_supervisor(&argv[1..]).unwrap_or_else(|error| die(&error))
-        }
         // __stress <recipient-id> <who> <k> — mirrors test/selftest.mjs's
         // stress worker: race k enqueues against k register upserts, plus one
         // unique-id register per iteration so a lost read-modify-write shows
@@ -62,17 +31,16 @@ fn main() {
                 msg.insert("from".into(), JsonValue::from(who.clone()));
                 msg.insert("body".into(), JsonValue::from(format!("{who}-{i}")));
                 relay::store::enqueue(recipient, &msg).unwrap_or_else(|e| die(&e));
-                relay::store::register(who, Some(&format!("/tmp/{who}")), Some(who), None, None)
+                relay::store::register(who, Some(&format!("/tmp/{who}")), Some(who), None)
                     .unwrap_or_else(|e| die(&e));
-                relay::store::register(&format!("{who}-op{i}"), Some("/tmp/x"), None, None, None)
+                relay::store::register(&format!("{who}-op{i}"), Some("/tmp/x"), None, None)
                     .unwrap_or_else(|e| die(&e));
             }
         }
-        _ => die(
-            "usage: relay bus | channel | hook [codex] [--event prompt] | hook omp --session <id> --cwd <dir> [--event prompt] [--hold [<seconds>]] | discover [--within min] [--tool t] | list | register <name> --id <uuid> [--dir <path>] [--server <sock>] | send <to> [--] <msg> | request <to> [--from <registered>] [--json] [--] <msg> | reply <correlation-id> [--from <registered>] --status completed|failed [--] <msg> | inbox [--hold [<seconds>]] <who> | ack <token> | rollback <token> | peek <who> | attach <who> [--exec] | wake <who> [--model m] [--effort e] [--service-tier default|fast] [msg] | doctor [--id <session>] | watch <who>...|--all [--server <sock>] [--auto-turn] [--once] | spawn <dir> [--fanout|--worktree --from <session>] [--service-tier default|fast] [options] -- <task> | handback --from <session> --status completed|failed [--note <text>] | collect <session> --from <parent> [--result-json] | workspace preserve|start|list|inspect|handback|integrate|recover|finish|abort ...",
-        ),
+        _ => die(USAGE),
     }
 }
+const USAGE: &str = "usage: relay bus | hook omp --session <id> --cwd <dir> [--event prompt] [--hold [<seconds>]] | discover [--within min] [--tool omp] | list | register <name> --id <uuid> [--dir <path>] | send <to> [--] <msg> | request <to> [--from <registered>] [--json] [--] <msg> | reply <correlation-id> [--from <registered>] --status completed|failed [--] <msg> | inbox [--hold [<seconds>]] <who> | ack <token> | rollback <token> | peek <who> | attach <who> [--exec] | wake <who> [--effort e] [msg] | doctor [--id <session>] | watch <who>...|--all [--once]";
 
 fn die(msg: &str) -> ! {
     eprintln!("{msg}");

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // gate.mjs — the whole gate for this repository. Run it before pushing and before tagging.
-// Nine phases run in a fixed order: manifests, skill, extension, shell, rust, delegation,
+// Eight phases run in a fixed order: manifests, skill, extension, shell, rust,
 // checks, selftest, javascript. The first failure names its phase and exits 1, so a red run always
 // reports the earliest cause rather than a cascade.
 // Usage: node scripts/gate.mjs
@@ -11,32 +11,11 @@ import path from 'node:path';
 const REPO = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..');
 process.chdir(REPO);
 
-const CASES = [
-  'bus_smoke',
-  'fanout',
-  'fanout_reap',
-  'lifecycle_admission',
-  'lifecycle_managed',
-  'lifecycle_release',
-  'lifecycle_supervisor',
-  'lock_race',
-  'protocol',
-  'workspace_coordination_process',
-  'workspace_identity',
-  'workspace_lease_process',
-  'workspace_resources',
-  'unit',
-];
-
 const SKILL_PATH = 'plugin/skills/session-relay/SKILL.md';
 const SKILL_DESCRIPTION_LIMIT = 1024;
 const SKILL_BODY_LINE_LIMIT = 500;
 
 let activePhase = null;
-// The delegation phase may hand back a closure that releases the cgroup leaf it created.
-// It is consumed exactly once, by whichever of `fail()` or the normal end of the run gets
-// there first, so a failing gate still gives the runner its cgroup subtree back.
-let releaseDelegationLeaf = null;
 
 const ok = (message) => console.log(`\x1b[1;32m  ✔\x1b[0m ${message}`);
 const warn = (message) => console.log(`\x1b[1;33m  ⚠\x1b[0m ${message}`);
@@ -45,17 +24,9 @@ const section = (name) => {
   console.log(`\n\x1b[1m▸ ${name}\x1b[0m`);
 };
 
-function takeDelegationRelease() {
-  const release = releaseDelegationLeaf;
-  releaseDelegationLeaf = null;
-  return release === null ? null : release();
-}
-
 function fail(message) {
   console.log(`\x1b[1;31m  ✘\x1b[0m ${message}`);
   console.log(`\x1b[1;31mgate failed in phase: ${activePhase}\x1b[0m`);
-  const releaseDetail = takeDelegationRelease();
-  if (releaseDetail !== null) console.log(`\x1b[1;31m  ✘\x1b[0m ${releaseDetail}`);
   process.exit(1);
 }
 
@@ -259,135 +230,74 @@ const RUST_BINARY = (() => {
   return privateBinary;
 })();
 
-// ── 6. delegation ───────────────────────────────────────────────────────────────────
-section('delegation');
+// ── 6. checks ─────────────────────────────────────────────────────────────────────
+section('checks');
 {
-  const configured = process.env.SESSION_RELAY_TEST_CGROUP_ROOT;
-  if (configured) {
-    let canonical;
-    try {
-      canonical = fs.realpathSync(configured);
-      const stat = fs.statSync(canonical);
-      if (!stat.isDirectory() || stat.uid !== process.getuid()) throw new Error('not an owned directory');
-    } catch (error) {
-      fail(`cgroup delegation is invalid: ${error.message}`);
-    }
-    if (canonical !== path.resolve(configured)) fail('cgroup delegation must be a canonical path');
-    process.env.SESSION_RELAY_TEST_CGROUP_ROOT = canonical;
-    ok(`cgroup delegation honoured from the environment: ${canonical}`);
-  } else if (process.env.GITHUB_ACTIONS !== 'true') {
-    // Off CI the variable stays unset, so test/rust-test-inventory.mjs finds its own
-    // `systemd-run --user` scope instead.
-    ok('no cgroup delegation prepared off CI; the inventory finds its own systemd-run scope');
-  } else {
-    const uid = process.getuid();
-    const gid = process.getgid();
-    const leaf =
-      `/sys/fs/cgroup/session-relay-test-${uid}-` +
-      `${process.env.GITHUB_RUN_ID ?? 'run'}-${process.env.GITHUB_RUN_ATTEMPT ?? 'attempt'}-${process.pid}`;
-    const sudo = (args) => run(['sudo', '-n', ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
-
-    const created = sudo(['mkdir', '-p', leaf]);
-    if (failed(created)) fail(`cgroup delegation could not be created: ${detailOf(created)}`);
-    const owned = sudo(['chown', `${uid}:${gid}`, leaf]);
-    if (failed(owned)) {
-      sudo(['rmdir', leaf]);
-      fail(`cgroup delegation could not be delegated: ${detailOf(owned)}`);
-    }
-    process.env.SESSION_RELAY_TEST_CGROUP_ROOT = leaf;
-    releaseDelegationLeaf = () => {
-      delete process.env.SESSION_RELAY_TEST_CGROUP_ROOT;
-      // The custody tests create one nested cgroup per managed workspace and leave the empty
-      // directory behind. An empty child still returns EBUSY on the parent, so `rmdir` alone
-      // fails on a run whose every check passed. Sweep depth-first first; that removes debris
-      // without hiding a leak, because a cgroup holding a live process will not rmdir either.
-      sudo(['find', leaf, '-mindepth', '1', '-depth', '-type', 'd', '-exec', 'rmdir', '{}', '+']);
-      const removed = sudo(['rmdir', leaf]);
-      // A leaf that will not close is a leaked cgroup on a shared runner: the gate fails.
-      return failed(removed) ? `cgroup delegation did not cleanly close: ${detailOf(removed)}` : null;
-    };
-    ok(`cgroup delegation prepared for CI: ${leaf}`);
+  const cases = [...Object.keys(readJSON('test/fixtures/rust-test-inventory.json').cases), 'unit'];
+  const childEnv = { ...process.env, SESSION_RELAY_TEST_BIN: RUST_BINARY };
+  const invocations = [
+    ...cases.map((name) => ['test/rust-test-inventory.mjs', '--case', name]),
+    ['test/distribution-contract.mjs'],
+  ];
+  for (const argv of invocations) {
+    const label = argv.join(' ');
+    const outcome = run(['node', ...argv], { env: childEnv, stdio: 'inherit' });
+    if (failed(outcome)) fail(`check failed (run: node ${label})`);
+    ok(`check passed (${label})`);
   }
 }
 
-try {
-  // ── 7. checks ─────────────────────────────────────────────────────────────────────
-  section('checks');
-  {
-    const childEnv = { ...process.env, SESSION_RELAY_TEST_BIN: RUST_BINARY };
-    const invocations = [
-      ...CASES.map((name) => ['test/rust-test-inventory.mjs', '--case', name]),
-      ['test/reentry-inventory.mjs'],
-      ['test/workspace-smoke.mjs', '--case', 'single-session-compat', '--bin', RUST_BINARY],
-      ['test/workspace-smoke.mjs', '--case', 'docs-contract', '--bin', RUST_BINARY],
-      ['test/distribution-contract.mjs'],
-    ];
-    for (const argv of invocations) {
-      const label = argv.join(' ');
-      const outcome = run(['node', ...argv], { env: childEnv, stdio: 'inherit' });
-      if (failed(outcome)) fail(`check failed (run: node ${label})`);
-      ok(`check passed (${label})`);
+// ── 7. selftest ───────────────────────────────────────────────────────────────────
+section('selftest');
+{
+  const baseEnv = { ...process.env, SESSION_RELAY_TEST_BIN: RUST_BINARY };
+  const selftest = (jobs) =>
+    run(['node', 'test/selftest.mjs'], {
+      encoding: 'utf8',
+      env: { ...baseEnv, SESSION_RELAY_TEST_JOBS: jobs },
+    });
+  const jobsOne = selftest('1');
+  const jobsFour = selftest('4');
+  const crashed = [
+    ['jobs-1', jobsOne],
+    ['jobs-4', jobsFour],
+  ].filter(([, outcome]) => failed(outcome));
+  if (crashed.length > 0) {
+    for (const [label, outcome] of crashed) {
+      const detail = `${outcome.stdout ?? ''}${outcome.stderr ?? ''}`.trim();
+      console.error(`${label} exited ${outcome.status ?? 'null'}${detail ? `:\n${detail}` : ' with no output'}`);
     }
-  }
-
-  // ── 8. selftest ───────────────────────────────────────────────────────────────────
-  section('selftest');
-  {
-    const baseEnv = { ...process.env, SESSION_RELAY_TEST_BIN: RUST_BINARY };
-    const selftest = (jobs) =>
-      run(['node', 'test/selftest.mjs'], {
-        encoding: 'utf8',
-        env: { ...baseEnv, SESSION_RELAY_TEST_JOBS: jobs },
-      });
-    const jobsOne = selftest('1');
-    const jobsFour = selftest('4');
-    const crashed = [
-      ['jobs-1', jobsOne],
-      ['jobs-4', jobsFour],
-    ].filter(([, outcome]) => failed(outcome));
-    if (crashed.length > 0) {
-      for (const [label, outcome] of crashed) {
-        const detail = `${outcome.stdout ?? ''}${outcome.stderr ?? ''}`.trim();
-        console.error(`${label} exited ${outcome.status ?? 'null'}${detail ? `:\n${detail}` : ' with no output'}`);
-      }
-      fail(
-        `self-test failed (${crashed.map(([label]) => label).join(', ')}) ` +
-          `(run twice with SESSION_RELAY_TEST_BIN=${RUST_BINARY} and SESSION_RELAY_TEST_JOBS=1|4)`,
-      );
-    }
-    if (jobsOne.stdout !== jobsFour.stdout) {
-      const left = (jobsOne.stdout ?? '').split('\n');
-      const right = (jobsFour.stdout ?? '').split('\n');
-      const firstDiff = left.findIndex((line, index) => line !== right[index]);
-      const at = firstDiff === -1 ? Math.min(left.length, right.length) : firstDiff;
-      console.error(
-        `jobs-1 (${left.length} lines) vs jobs-4 (${right.length} lines) diverged at line ${at + 1}:\n` +
-          `- ${left[at] ?? '<eof>'}\n+ ${right[at] ?? '<eof>'}`,
-      );
-      fail('self-test jobs-1/jobs-4 output drifted; the scenario set is not scheduling-independent');
-    }
-    ok('self-test passed with byte-identical jobs-1/jobs-4 output');
-  }
-
-  // ── 9. javascript ─────────────────────────────────────────────────────────────────
-  section('javascript');
-  {
-    const biome = run(
-      ['pnpm', 'exec', 'biome', 'ci', 'scripts', 'test', 'plugin/extension', 'package.json', 'biome.json'],
-      {
-        stdio: 'inherit',
-      },
+    fail(
+      `self-test failed (${crashed.map(([label]) => label).join(', ')}) ` +
+        `(run twice with SESSION_RELAY_TEST_BIN=${RUST_BINARY} and SESSION_RELAY_TEST_JOBS=1|4)`,
     );
-    if (failed(biome))
-      fail('biome ci failed (run: pnpm exec biome ci scripts test plugin/extension package.json biome.json)');
-    ok('biome ci clean');
   }
-} finally {
-  const releaseDetail = takeDelegationRelease();
-  if (releaseDetail !== null) {
-    activePhase = 'delegation';
-    fail(releaseDetail);
+  if (jobsOne.stdout !== jobsFour.stdout) {
+    const left = (jobsOne.stdout ?? '').split('\n');
+    const right = (jobsFour.stdout ?? '').split('\n');
+    const firstDiff = left.findIndex((line, index) => line !== right[index]);
+    const at = firstDiff === -1 ? Math.min(left.length, right.length) : firstDiff;
+    console.error(
+      `jobs-1 (${left.length} lines) vs jobs-4 (${right.length} lines) diverged at line ${at + 1}:\n` +
+        `- ${left[at] ?? '<eof>'}\n+ ${right[at] ?? '<eof>'}`,
+    );
+    fail('self-test jobs-1/jobs-4 output drifted; the scenario set is not scheduling-independent');
   }
+  ok('self-test passed with byte-identical jobs-1/jobs-4 output');
+}
+
+// ── 8. javascript ─────────────────────────────────────────────────────────────────
+section('javascript');
+{
+  const biome = run(
+    ['pnpm', 'exec', 'biome', 'ci', 'scripts', 'test', 'plugin/extension', 'package.json', 'biome.json'],
+    {
+      stdio: 'inherit',
+    },
+  );
+  if (failed(biome))
+    fail('biome ci failed (run: pnpm exec biome ci scripts test plugin/extension package.json biome.json)');
+  ok('biome ci clean');
 }
 
 console.log('\n\x1b[1;32mgate passed\x1b[0m');

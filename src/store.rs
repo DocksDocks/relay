@@ -1,10 +1,8 @@
 // store.rs — shared on-disk state for the session-relay bus (port of lib/store.mjs).
-// Holds three things, all under one fixed home so every component agrees:
+// Holds shared session state under one fixed home so every component agrees:
 //   registry.json      id -> { id, dir, name, tool, lastSeen } + a name -> id index
-//   lifecycle-v1.json durable lifecycle authority, isolated from legacy writers
 //   mailbox/<id>.jsonl one append-only inbox per recipient session id
 //   markers/<cwd>      the session id last registered for a project dir
-//   hook-state/        bounded per-session hook emission state
 //
 // Home is a FIXED, TOOL-NEUTRAL path (~/.agent-relay, never under the plugin
 // root — the install dir is replaced on every plugin update). Override with
@@ -32,10 +30,8 @@ use tinyjson::JsonValue;
 
 const WATCH_LOCK_RETRY: Duration = Duration::from_secs(2);
 const DEFAULT_GC_DAYS: u64 = 14;
-const DEFAULT_FANOUT_WORKTREE_GC_DAYS: u64 = 1;
 const GC_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
-const SESSION_START_IDENTITY_DEBOUNCE_MS: i64 = 1_000;
 pub const WATCH_PROGRESS_STALE_MS: i64 = 300_000;
 
 fn home_override() -> Option<PathBuf> {
@@ -61,8 +57,6 @@ fn registry_path() -> PathBuf {
     home_dir().join("registry.json")
 }
 
-const LIFECYCLE_AUTHORITY_FILE: &str = "lifecycle-v1.json";
-const LIFECYCLE_AUTHORITY_SCHEMA: &str = "1";
 pub(crate) fn mailbox_path(id: &str) -> PathBuf {
     home_dir()
         .join("mailbox")
@@ -70,11 +64,6 @@ pub(crate) fn mailbox_path(id: &str) -> PathBuf {
 }
 fn marker_path(dir: &str) -> PathBuf {
     home_dir().join("markers").join(encode_dir(dir))
-}
-fn session_start_identity_path(id: &str) -> PathBuf {
-    home_dir()
-        .join("hook-state")
-        .join(format!("session-start-{}.stamp", sanitize(id)))
 }
 pub fn watcher_lock_path(id: &str) -> PathBuf {
     home_dir()
@@ -94,8 +83,7 @@ pub fn resume_lock_path(id: &str) -> PathBuf {
         .join(format!("resume-{}.lock", sanitize(id)))
 }
 
-/// Filesystem-safe key for a project dir — mirrors Claude Code's own scheme
-/// (every non-alphanumeric char becomes '-').
+/// Filesystem-safe key for a project dir: every non-alphanumeric becomes '-'.
 pub fn encode_dir(dir: &str) -> String {
     let abs = std::path::absolute(dir).unwrap_or_else(|_| PathBuf::from(dir));
     abs.to_string_lossy()
@@ -118,17 +106,10 @@ pub fn sanitize(s: &str) -> String {
 }
 
 fn ensure_dirs_at(root: &Path) -> Result<(), String> {
-    for d in [
-        "mailbox",
-        "markers",
-        "watchers",
-        "locks",
-        "hook-state",
-        "worktrees",
-    ] {
+    for d in ["mailbox", "markers", "watchers", "locks"] {
         let path = root.join(d);
         fs::create_dir_all(&path).map_err(|e| format!("mkdir {d}: {e}"))?;
-        if matches!(d, "watchers" | "locks" | "hook-state") {
+        if matches!(d, "watchers" | "locks") {
             fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
                 .map_err(|e| format!("chmod {}: {e}", path.display()))?;
         }
@@ -425,9 +406,8 @@ pub fn iso_now() -> String {
     iso_from_unix_ms(now_ms())
 }
 
-/// Session ids must be UUID-shaped — both tools mint UUIDs, so a non-UUID id
-/// is a planted/garbage value (and this keeps ids off doorbell argv as
-/// injectable options). Mirrors the Node UUID_RE (case-insensitive).
+/// Session ids must be UUID-shaped, keeping planted values and injectable
+/// options off doorbell argv. Mirrors the Node UUID_RE (case-insensitive).
 pub fn is_uuid(s: &str) -> bool {
     let b = s.as_bytes();
     b.len() == 36
@@ -555,8 +535,6 @@ pub struct Entry {
     pub name: Option<String>,
     pub tool: String,
     pub last_seen: String,
-    pub server: Option<String>,
-    pub spawned_via: Option<String>,
 }
 
 impl Entry {
@@ -577,36 +555,23 @@ impl Entry {
                 .map(JsonValue::from)
                 .unwrap_or(JsonValue::from(())),
         );
-        m.insert("tool".into(), JsonValue::from(self.tool.clone()));
+        m.insert("tool".into(), JsonValue::from("omp".to_string()));
         m.insert("lastSeen".into(), JsonValue::from(self.last_seen.clone()));
-        m.insert(
-            "server".into(),
-            self.server
-                .clone()
-                .map(JsonValue::from)
-                .unwrap_or(JsonValue::from(())),
-        );
-        m.insert(
-            "spawned_via".into(),
-            self.spawned_via
-                .clone()
-                .map(JsonValue::from)
-                .unwrap_or(JsonValue::from(())),
-        );
         JsonValue::from(m)
     }
 
     pub(crate) fn from_json(v: &JsonValue) -> Option<Entry> {
         let obj: &HashMap<String, JsonValue> = v.get()?;
         let s = |k: &str| -> Option<String> { obj.get(k)?.get::<String>().cloned() };
+        if obj.get("tool")?.get::<String>()? != "omp" {
+            return None;
+        }
         Some(Entry {
             id: s("id")?,
             dir: s("dir"),
             name: s("name"),
-            tool: s("tool").unwrap_or_else(|| "claude".to_string()),
+            tool: "omp".to_string(),
             last_seen: s("lastSeen").unwrap_or_default(),
-            server: s("server"),
-            spawned_via: s("spawned_via"),
         })
     }
 }
@@ -662,63 +627,6 @@ fn write_registry(registry: Registry) -> Result<(), String> {
     atomic_write(&registry_path(), &text)
 }
 
-pub(crate) fn write_registry_at(root: &Path, registry: Registry) -> Result<(), String> {
-    let text = format_registry(registry)?;
-    atomic_write(&root.join("registry.json"), &text)
-}
-
-pub(crate) fn read_lifecycle_authority_at(
-    root: &Path,
-) -> Result<Option<HashMap<String, JsonValue>>, String> {
-    let path = root.join(LIFECYCLE_AUTHORITY_FILE);
-    let raw = match fs::read_to_string(&path) {
-        Ok(raw) => raw,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(format!(
-                "read lifecycle authority {}: {error}",
-                path.display()
-            ));
-        }
-    };
-    let value = raw
-        .parse::<JsonValue>()
-        .map_err(|error| format!("malformed lifecycle authority: {error}"))?;
-    let object = value
-        .get::<HashMap<String, JsonValue>>()
-        .ok_or_else(|| "malformed lifecycle authority: root is not an object".to_string())?;
-    if object.len() != 2
-        || object
-            .get("schema_version")
-            .and_then(JsonValue::get::<String>)
-            .map(String::as_str)
-            != Some(LIFECYCLE_AUTHORITY_SCHEMA)
-    {
-        return Err("malformed lifecycle authority: unsupported or inexact schema".to_string());
-    }
-    let state = object
-        .get("state")
-        .and_then(JsonValue::get::<HashMap<String, JsonValue>>)
-        .ok_or_else(|| "malformed lifecycle authority: state is not an object".to_string())?;
-    Ok(Some(state.clone()))
-}
-
-pub(crate) fn write_lifecycle_authority_at(
-    root: &Path,
-    state: HashMap<String, JsonValue>,
-) -> Result<(), String> {
-    let mut object = HashMap::new();
-    object.insert(
-        "schema_version".to_string(),
-        JsonValue::from(LIFECYCLE_AUTHORITY_SCHEMA.to_string()),
-    );
-    object.insert("state".to_string(), JsonValue::from(state));
-    let text = JsonValue::from(object)
-        .format()
-        .map_err(|error| format!("lifecycle authority serialize: {error}"))?;
-    atomic_write_private(&root.join(LIFECYCLE_AUTHORITY_FILE), &text)
-}
-
 fn format_registry(mut registry: Registry) -> Result<String, String> {
     let mut root = std::mem::take(&mut registry.extra);
     root.insert("agents".into(), JsonValue::from(registry.agents));
@@ -764,13 +672,6 @@ pub(crate) struct LegacyGc {
     root_fd: OwnedFd,
     surface_dirs: Vec<GcSurfaceDir>,
     days: u64,
-    root_source: GcRootSource,
-}
-
-enum GcRootSource {
-    Configured,
-    #[cfg(test)]
-    ExplicitTest,
 }
 
 fn gc_days() -> Result<u64, String> {
@@ -846,15 +747,7 @@ fn add_gc_surface(
 
 fn open_gc_surface_dirs(root_fd: &OwnedFd) -> Result<Vec<GcSurfaceDir>, String> {
     let mut dirs = Vec::new();
-    for name in [
-        "mailbox",
-        "markers",
-        "watchers",
-        "locks",
-        "hook-state",
-        "spawn-logs",
-        "worktrees",
-    ] {
+    for name in ["mailbox", "markers", "watchers", "locks"] {
         match openat(
             root_fd,
             name,
@@ -877,49 +770,6 @@ fn gc_surface_dir<'a>(dirs: &'a [GcSurfaceDir], name: &str) -> Option<&'a GcSurf
     dirs.iter().find(|dir| dir.name == name)
 }
 
-fn collect_fanout_gc(
-    surface_dirs: &[GcSurfaceDir],
-    root: &Path,
-    cutoff: SystemTime,
-) -> Result<crate::fanout::FanoutGcReport, String> {
-    match gc_surface_dir(surface_dirs, "worktrees") {
-        Some(worktrees) => crate::fanout::reap_abandoned_worktrees(
-            &crate::fanout::FanoutStore::new(root.to_path_buf()),
-            worktrees,
-            cutoff,
-        ),
-        None => Ok(crate::fanout::FanoutGcReport::worktrees_surface_unavailable()),
-    }
-}
-
-fn write_fanout_diagnostics<W: Write>(
-    writer: &mut W,
-    report: &crate::fanout::FanoutGcReport,
-) -> std::io::Result<()> {
-    for branch in &report.retained_branches {
-        writeln!(writer, "[session-relay/gc] retained fanout branch {branch}")?;
-    }
-    for entry in &report.entries {
-        if let Some(branch) = &entry.branch {
-            let branch = JsonValue::from(branch.clone())
-                .stringify()
-                .expect("fanout branch string is valid JSON");
-            writeln!(
-                writer,
-                r#"[session-relay/gc] {{"event":"fanout_gc","branch":{branch},"reason":"{}"}}"#,
-                entry.reason.label()
-            )?;
-        } else {
-            writeln!(
-                writer,
-                r#"[session-relay/gc] {{"event":"fanout_gc","reason":"{}"}}"#,
-                entry.reason.label()
-            )?;
-        }
-    }
-    Ok(())
-}
-
 fn gc_surface_id(directory: &str, name: &str) -> Option<String> {
     let id = match directory {
         "mailbox" => name.strip_suffix(".jsonl")?,
@@ -927,10 +777,6 @@ fn gc_surface_id(directory: &str, name: &str) -> Option<String> {
             .strip_suffix(".lock")
             .or_else(|| name.strip_suffix(".progress"))?,
         "locks" => name.strip_prefix("resume-")?.strip_suffix(".lock")?,
-        "hook-state" => name
-            .strip_prefix("session-start-")?
-            .strip_suffix(".stamp")?,
-        "spawn-logs" => name.strip_suffix(".stderr")?,
         _ => return None,
     };
     is_uuid(id).then(|| id.to_string())
@@ -1094,24 +940,6 @@ fn lock_status_at(dir: Option<&GcSurfaceDir>, name: &str) -> LockStatus {
     }
 }
 
-fn acquire_gc_spawn_log_guard(dir: Option<&GcSurfaceDir>, name: &str) -> Option<OwnedFd> {
-    let dir = dir?;
-    let fd = openat(
-        &dir.fd,
-        name,
-        OFlags::RDWR | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .ok()?;
-    let stat = fstat(&fd).ok()?;
-    if !FileType::from_raw_mode(stat.st_mode).is_file() {
-        return None;
-    }
-    flock(&fd, FlockOperation::NonBlockingLockExclusive)
-        .ok()
-        .map(|()| fd)
-}
-
 fn read_text_at(root_fd: &OwnedFd, name: &str) -> Result<Option<String>, String> {
     let fd = match openat(
         root_fd,
@@ -1250,15 +1078,10 @@ impl LegacyGc {
         let Some((root, resolved_root)) = safe_existing_root()? else {
             return Ok(None);
         };
-        Self::open(root, resolved_root, days, GcRootSource::Configured).map(Some)
+        Self::open(root, resolved_root, days).map(Some)
     }
 
-    fn open(
-        root: PathBuf,
-        resolved_root: PathBuf,
-        days: u64,
-        root_source: GcRootSource,
-    ) -> Result<Self, String> {
+    fn open(root: PathBuf, resolved_root: PathBuf, days: u64) -> Result<Self, String> {
         let root_fd = open(
             &resolved_root,
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
@@ -1275,17 +1098,7 @@ impl LegacyGc {
             root_fd,
             surface_dirs,
             days,
-            root_source,
         })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn for_test(root: &Path, days: u64) -> Result<Self, String> {
-        let root = std::path::absolute(root)
-            .map_err(|error| format!("resolve relay store root: {error}"))?;
-        let resolved_root = fs::canonicalize(&root)
-            .map_err(|error| format!("canonicalize relay store root: {error}"))?;
-        Self::open(root, resolved_root, days, GcRootSource::ExplicitTest)
     }
 
     pub(crate) fn preflight_throttled(&self, now: SystemTime) -> Result<bool, String> {
@@ -1298,11 +1111,7 @@ impl LegacyGc {
     }
 
     fn reopen_validated_root(&self) -> Result<Option<OwnedFd>, String> {
-        let current = match self.root_source {
-            GcRootSource::Configured => safe_existing_root()?,
-            #[cfg(test)]
-            GcRootSource::ExplicitTest => resolve_existing_root(&self.root)?,
-        };
+        let current = safe_existing_root()?;
         let Some((current_root, current_resolved_root)) = current else {
             return Ok(None);
         };
@@ -1326,31 +1135,14 @@ impl LegacyGc {
         Ok(Some(current_root_fd))
     }
 
-    /// Remove legacy sessions whose every known surface is old. The protection
-    /// loader runs exactly once while the legacy lock is held, after the second
-    /// throttle observation and before inventory or deletion.
-    pub(crate) fn collect<L, P>(
-        &self,
-        now: SystemTime,
-        self_id: Option<&str>,
-        load_protection: L,
-    ) -> Result<usize, String>
-    where
-        L: FnOnce(&Path) -> Result<P, String>,
-        P: FnMut(&str) -> Result<bool, String>,
-    {
+    /// Remove legacy sessions whose every known surface is old.
+    pub(crate) fn collect(&self, now: SystemTime, self_id: Option<&str>) -> Result<usize, String> {
         let age = Duration::from_secs(
             self.days
                 .checked_mul(SECONDS_PER_DAY)
                 .ok_or_else(|| "AGENT_RELAY_GC_DAYS is too large".to_string())?,
         );
         let cutoff = now.checked_sub(age).unwrap_or(UNIX_EPOCH);
-        let fanout_worktree_age = Duration::from_secs(
-            DEFAULT_FANOUT_WORKTREE_GC_DAYS
-                .checked_mul(SECONDS_PER_DAY)
-                .ok_or_else(|| "DEFAULT_FANOUT_WORKTREE_GC_DAYS is too large".to_string())?,
-        );
-        let fanout_worktree_cutoff = now.checked_sub(fanout_worktree_age).unwrap_or(UNIX_EPOCH);
         let cutoff_ms = cutoff
             .duration_since(UNIX_EPOCH)
             .unwrap_or(Duration::ZERO)
@@ -1358,17 +1150,7 @@ impl LegacyGc {
             .min(i64::MAX as u128) as i64;
         let cutoff_iso = iso_from_unix_ms(cutoff_ms);
 
-        let fanout_report =
-            collect_fanout_gc(&self.surface_dirs, &self.root, fanout_worktree_cutoff)?;
-        {
-            let stderr = std::io::stderr();
-            let mut stderr = stderr.lock();
-            write_fanout_diagnostics(&mut stderr, &fanout_report)
-                .map_err(|error| format!("write fanout GC diagnostic: {error}"))?;
-        }
-        let removed_worktrees = fanout_report.removed_worktrees;
-
-        let removed_legacy = with_gc_lock(&self.root_fd, || {
+        with_gc_lock(&self.root_fd, || {
             let Some(_current_root_fd) = self.reopen_validated_root()? else {
                 return Ok(0);
             };
@@ -1377,7 +1159,6 @@ impl LegacyGc {
                 return Ok(0);
             }
 
-            let mut protects_session = load_protection(&self.resolved_root)?;
             let registry_raw = read_text_at(&self.root_fd, "registry.json")?;
             let mut registry = parse_registry(registry_raw.as_deref());
             let inventory = known_gc_surfaces(&self.surface_dirs, cutoff)?;
@@ -1429,9 +1210,6 @@ impl LegacyGc {
                     continue;
                 }
                 if let Some(id) = candidate.id.as_deref() {
-                    if protects_session(id)? {
-                        continue;
-                    }
                     let watcher = format!("{id}.lock");
                     let resume = format!("resume-{id}.lock");
                     if matches!(
@@ -1449,22 +1227,8 @@ impl LegacyGc {
 
             let mut removed_files = 0;
             let mut removed_registry_ids = HashSet::new();
-            'candidate: for key in &eligible {
+            for key in &eligible {
                 let candidate = &candidates[key];
-                let mut spawn_log_guards = Vec::new();
-                for surface in candidate
-                    .surfaces
-                    .iter()
-                    .filter(|surface| surface.directory == "spawn-logs")
-                {
-                    let Some(guard) = acquire_gc_spawn_log_guard(
-                        gc_surface_dir(&self.surface_dirs, "spawn-logs"),
-                        &surface.name,
-                    ) else {
-                        continue 'candidate;
-                    };
-                    spawn_log_guards.push(guard);
-                }
                 // All-or-nothing preflight: a surface that became fresh or was
                 // replaced since enumeration preserves the whole candidate.
                 if !candidate_surfaces_still_eligible(&self.surface_dirs, candidate, cutoff)? {
@@ -1478,7 +1242,6 @@ impl LegacyGc {
                 if let Some(registry_key) = &candidate.registry_key {
                     removed_registry_ids.insert(registry_key.clone());
                 }
-                drop(spawn_log_guards);
             }
 
             // Registry is last: an interrupted sweep leaves visible entries
@@ -1497,8 +1260,7 @@ impl LegacyGc {
             }
             atomic_write_at(&self.root_fd, "gc-stamp", &format!("{}\n", iso_now()))?;
             Ok(removed_files + removed_registry_ids.len())
-        })?;
-        Ok(removed_worktrees + removed_legacy)
+        })
     }
 }
 
@@ -1509,21 +1271,12 @@ pub fn register(
     dir: Option<&str>,
     name: Option<&str>,
     tool: Option<&str>,
-    server: Option<&str>,
-) -> Result<Entry, String> {
-    register_with_origin(id, dir, name, tool, server, None)
-}
-
-pub fn register_with_origin(
-    id: &str,
-    dir: Option<&str>,
-    name: Option<&str>,
-    tool: Option<&str>,
-    server: Option<&str>,
-    spawned_via: Option<&str>,
 ) -> Result<Entry, String> {
     if id.is_empty() {
         return Err("register requires an id".to_string());
+    }
+    if tool.is_some_and(|tool| tool != "omp") {
+        return Err("register supports only tool omp".to_string());
     }
     with_lock(|| {
         let mut registry = read_registry();
@@ -1541,17 +1294,8 @@ pub fn register_with_origin(
             name: name
                 .map(str::to_string)
                 .or_else(|| prev.as_ref().and_then(|p| p.name.clone())),
-            tool: tool
-                .map(str::to_string)
-                .or_else(|| prev.as_ref().map(|p| p.tool.clone()))
-                .unwrap_or_else(|| "claude".to_string()),
+            tool: "omp".to_string(),
             last_seen: iso_now(),
-            server: server
-                .map(str::to_string)
-                .or_else(|| prev.as_ref().and_then(|p| p.server.clone())),
-            spawned_via: spawned_via
-                .map(str::to_string)
-                .or_else(|| prev.as_ref().and_then(|p| p.spawned_via.clone())),
         };
         registry.agents.insert(id.to_string(), entry.to_json());
         if let Some(n) = &entry.name {
@@ -1598,35 +1342,6 @@ pub fn resolve(name_or_id: &str) -> Option<Entry> {
 
 pub fn set_marker(dir: &str, id: &str) -> Result<(), String> {
     with_lock(|| atomic_write(&marker_path(dir), &format!("{id}\n")))
-}
-
-/// Record one Codex SessionStart identity emission and return whether its
-/// context should be surfaced. Codex has been observed dispatching the same
-/// start source several times within one turn; the global store lock makes the
-/// cross-process decision atomic. Unknown sources fail open, and callers must
-/// never use this result to suppress real mailbox content.
-pub fn should_emit_session_start_identity(id: &str, source: Option<&str>) -> Result<bool, String> {
-    if !is_uuid(id) {
-        return Ok(true);
-    }
-    let Some(source @ ("startup" | "resume" | "clear" | "compact")) = source else {
-        return Ok(true);
-    };
-    with_lock(|| {
-        let path = session_start_identity_path(id);
-        let now = now_ms();
-        let duplicate = fs::read_to_string(&path).ok().is_some_and(|raw| {
-            let mut rows = raw.lines();
-            let recorded_at = rows.next().and_then(|row| row.parse::<i64>().ok());
-            let recorded_source = rows.next();
-            rows.next().is_none()
-                && recorded_source == Some(source)
-                && recorded_at
-                    .is_some_and(|at| now >= at && now - at <= SESSION_START_IDENTITY_DEBOUNCE_MS)
-        });
-        atomic_write_private(&path, &format!("{now}\n{source}\n"))?;
-        Ok(!duplicate)
-    })
 }
 
 pub fn id_for_dir(dir: &str) -> Option<String> {
@@ -2060,6 +1775,21 @@ pub(crate) fn recover_holds_locked(root: &Path) -> Result<(), String> {
     HoldStore::new(root.to_path_buf()).recover_locked()
 }
 
+pub fn hold_mailbox(id: &str, event: &str, seconds: u64) -> Result<HoldReceipt, String> {
+    let root = home_dir();
+    with_lock_at(&root, || {
+        hold_authorized_mailbox(AuthorizedMailboxTarget::new(&root, id), event, seconds)
+    })
+}
+
+pub fn drain_mailbox(id: &str) -> Result<DrainReceipt, String> {
+    let root = home_dir();
+    with_lock_at(&root, || {
+        recover_holds_locked(&root)?;
+        drain_authorized_mailbox(AuthorizedMailboxTarget::new(&root, id))
+    })
+}
+
 pub(crate) fn hold_authorized_mailbox(
     target: AuthorizedMailboxTarget<'_>,
     event: &str,
@@ -2134,7 +1864,7 @@ impl<'a> AuthorizedMailboxTarget<'a> {
     }
 }
 
-/// Read and clear one lifecycle-authorized inbox in a locked step.
+/// Read and clear one authorized inbox in a locked step.
 pub(crate) fn drain_authorized_mailbox(
     target: AuthorizedMailboxTarget<'_>,
 ) -> Result<DrainReceipt, String> {
@@ -2424,37 +2154,12 @@ mod tests {
     }
 
     #[test]
-    fn entry_roundtrips_server_and_origin_while_legacy_entries_default_to_none() {
-        let entry = Entry {
-            id: "11111111-1111-4111-8111-111111111111".into(),
-            dir: Some("/tmp/project".into()),
-            name: Some("worker".into()),
-            tool: "codex".into(),
-            last_seen: "2026-07-10T00:00:00.000Z".into(),
-            server: Some("/tmp/app.sock".into()),
-            spawned_via: Some("app-server".into()),
-        };
-        assert_eq!(Entry::from_json(&entry.to_json()), Some(entry.clone()));
-
-        let mut legacy = entry
-            .to_json()
-            .get::<HashMap<String, JsonValue>>()
-            .cloned()
-            .expect("entry object");
-        legacy.remove("server");
-        legacy.remove("spawned_via");
-        let legacy_entry = Entry::from_json(&JsonValue::from(legacy)).unwrap();
-        assert_eq!(legacy_entry.server, None);
-        assert_eq!(legacy_entry.spawned_via, None);
-    }
-
-    #[test]
     fn changed_surface_invalidates_the_whole_candidate_before_deletion() {
         let root = std::env::temp_dir().join(format!("relay-gc-freshness-{}", uuid_v4()));
-        let spawn_logs = root.join("spawn-logs");
-        fs::create_dir_all(&spawn_logs).expect("create GC freshness fixture");
+        let mailbox = root.join("mailbox");
+        fs::create_dir_all(&mailbox).expect("create GC freshness fixture");
         let id = "50505050-5050-4050-8050-505050505050";
-        let path = spawn_logs.join(format!("{id}.stderr"));
+        let path = mailbox.join(format!("{id}.jsonl"));
         fs::write(&path, b"old").expect("write old surface");
 
         let root_fd = open(
@@ -2470,7 +2175,7 @@ mod tests {
             .surfaces
             .into_iter()
             .find(|(surface_id, _, _)| surface_id.as_deref() == Some(id))
-            .expect("find spawn surface");
+            .expect("find mailbox surface");
         let candidate = GcCandidate {
             id: Some(id.to_string()),
             surfaces: vec![surface],
@@ -2489,74 +2194,5 @@ mod tests {
         drop(dirs);
         drop(root_fd);
         fs::remove_dir_all(root).expect("remove GC freshness fixture");
-    }
-
-    #[test]
-    fn fanout_diagnostics_render_report_reasons() {
-        use crate::fanout::{FanoutGcReason, FanoutGcReport, FanoutGcReportEntry};
-
-        let reasons = [
-            FanoutGcReason::LegacyShape,
-            FanoutGcReason::RepositoryIdentityChanged,
-            FanoutGcReason::WorktreeChanged,
-            FanoutGcReason::UncollectedCommits,
-            FanoutGcReason::CommitInspectionFailed,
-            FanoutGcReason::WorktreeNotClean,
-            FanoutGcReason::RemovalFailed,
-            FanoutGcReason::WorktreesSurfaceUnavailable,
-        ];
-        let report = FanoutGcReport {
-            entries: reasons
-                .into_iter()
-                .enumerate()
-                .map(|(index, reason)| FanoutGcReportEntry {
-                    branch: (reason != FanoutGcReason::WorktreesSurfaceUnavailable)
-                        .then(|| format!("branch-{index}")),
-                    reason,
-                })
-                .collect(),
-            ..FanoutGcReport::default()
-        };
-        let mut rendered = Vec::new();
-        write_fanout_diagnostics(&mut rendered, &report).expect("render fanout diagnostics");
-
-        assert_eq!(
-            rendered,
-            concat!(
-                "[session-relay/gc] {\"event\":\"fanout_gc\",\"branch\":\"branch-0\",\"reason\":\"legacy_shape\"}\n",
-                "[session-relay/gc] {\"event\":\"fanout_gc\",\"branch\":\"branch-1\",\"reason\":\"repository_identity_changed\"}\n",
-                "[session-relay/gc] {\"event\":\"fanout_gc\",\"branch\":\"branch-2\",\"reason\":\"worktree_changed\"}\n",
-                "[session-relay/gc] {\"event\":\"fanout_gc\",\"branch\":\"branch-3\",\"reason\":\"uncollected_commits\"}\n",
-                "[session-relay/gc] {\"event\":\"fanout_gc\",\"branch\":\"branch-4\",\"reason\":\"commit_inspection_failed\"}\n",
-                "[session-relay/gc] {\"event\":\"fanout_gc\",\"branch\":\"branch-5\",\"reason\":\"worktree_not_clean\"}\n",
-                "[session-relay/gc] {\"event\":\"fanout_gc\",\"branch\":\"branch-6\",\"reason\":\"removal_failed\"}\n",
-                "[session-relay/gc] {\"event\":\"fanout_gc\",\"reason\":\"worktrees_surface_unavailable\"}\n",
-            )
-            .as_bytes()
-        );
-    }
-
-    #[test]
-    fn missing_worktrees_surface_reports_unavailable() {
-        use crate::fanout::{FanoutGcReason, FanoutGcReportEntry};
-
-        let report = collect_fanout_gc(&[], Path::new("/not-opened"), UNIX_EPOCH)
-            .expect("missing worktrees surface is reported");
-        assert_eq!(report.removed_worktrees, 0);
-        assert!(report.retained_branches.is_empty());
-        assert_eq!(
-            report.entries,
-            vec![FanoutGcReportEntry {
-                branch: None,
-                reason: FanoutGcReason::WorktreesSurfaceUnavailable,
-            }]
-        );
-
-        let mut rendered = Vec::new();
-        write_fanout_diagnostics(&mut rendered, &report).expect("render unavailable diagnostic");
-        assert_eq!(
-            rendered,
-            b"[session-relay/gc] {\"event\":\"fanout_gc\",\"reason\":\"worktrees_surface_unavailable\"}\n"
-        );
     }
 }

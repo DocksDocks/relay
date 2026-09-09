@@ -1,10 +1,10 @@
 # Session Relay
 
-Session Relay is a cross-session, cross-project message bus for omp sessions. It provides an omp extension with a `relay` tool and `/relay` command, a CLI, and an agent skill.
+Session Relay provides durable mail between omp sessions across projects: hold/ack/rollback, correlated request/reply, hook delivery, wake, and watch. It provides an omp extension with a `relay` tool and `/relay` command, a CLI, and an agent skill.
 
 ## Supported platforms
 
-Session Relay supports Linux only, on x86-64 and arm64. It does not support macOS or Windows.
+Session Relay distributes Linux x86-64 and arm64 musl binaries.
 
 ## Install from GitHub Releases
 
