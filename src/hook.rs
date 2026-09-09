@@ -44,6 +44,7 @@ struct Invocation {
     tool: &'static str,
     event: HookEvent,
     session: Option<(String, String)>,
+    hold_seconds: Option<u64>,
 }
 
 // argv tail after the `hook` verb (main strips it, so positionals start at 0
@@ -70,10 +71,16 @@ fn parse_invocation(args: &[String]) -> Result<Invocation, String> {
     } else {
         None
     };
+    let hold_seconds = if tool == "omp" {
+        a.hold_seconds()
+    } else {
+        None
+    };
     Ok(Invocation {
         tool,
         event,
         session,
+        hold_seconds,
     })
 }
 
@@ -286,11 +293,21 @@ fn render_context(
     }
 }
 
+fn render_hold_context(receipt: &store::HoldReceipt, self_id: &str) -> Option<String> {
+    if receipt.messages.is_empty() {
+        return None;
+    }
+    let token = receipt.token.as_deref()?;
+    let block = mail_block_for_tool(&receipt.messages, self_id, "omp");
+    Some(format!("{token}\n{block}"))
+}
+
 fn inner(invocation: Invocation) -> Result<(), String> {
     let Invocation {
         tool,
         event,
         session,
+        hold_seconds,
     } = invocation;
     let (id, dir, source) = if let Some((id, dir)) = session {
         (id, dir, None)
@@ -355,6 +372,29 @@ fn inner(invocation: Invocation) -> Result<(), String> {
                     return Ok(());
                 }
             };
+            if let Some(seconds) = hold_seconds {
+                let receipt = lifecycle::hold_with_guard(&mut guard, event.name(), seconds)?;
+                let Some(out) = render_hold_context(&receipt, &id) else {
+                    return Ok(());
+                };
+                if let Err(error) = guard.authorize_use(kind) {
+                    if let Some(token) = receipt.token.as_deref() {
+                        store::rollback_hold(token).map_err(|error| error.to_string())?;
+                    }
+                    print_managed_stop(
+                        tool,
+                        &format!("hook emission refused after lifecycle changed: {error}"),
+                    )?;
+                    return Ok(());
+                }
+                if let Err(error) = std::io::stdout().write_all(out.as_bytes()) {
+                    if let Some(token) = receipt.token.as_deref() {
+                        store::rollback_hold(token).map_err(|error| error.to_string())?;
+                    }
+                    return Err(format!("write hook output: {error}"));
+                }
+                return Ok(());
+            }
             let drained = lifecycle::drain_with_guard(&mut guard)?;
             let msgs = drained.messages().to_vec();
             (msgs, Some((guard, kind)), Some(drained))
@@ -523,7 +563,7 @@ fn print_managed_stop(tool: &str, reason: &str) -> Result<(), String> {
 mod tests {
     use super::{
         HookEvent, Invocation, defuse, encode_output, parse_invocation, render_context,
-        watcher_command,
+        render_hold_context, watcher_command,
     };
     use std::collections::HashMap;
     use tinyjson::JsonValue;
@@ -568,7 +608,8 @@ mod tests {
             Ok(Invocation {
                 tool: "claude",
                 event: HookEvent::SessionStart,
-                session: None
+                session: None,
+                hold_seconds: None
             })
         ));
         assert!(matches!(
@@ -576,7 +617,8 @@ mod tests {
             Ok(Invocation {
                 tool: "codex",
                 event: HookEvent::SessionStart,
-                session: None
+                session: None,
+                hold_seconds: None
             })
         ));
         assert!(matches!(
@@ -584,7 +626,8 @@ mod tests {
             Ok(Invocation {
                 tool: "codex",
                 event: HookEvent::Prompt,
-                session: None
+                session: None,
+                hold_seconds: None
             })
         ));
         assert!(matches!(
@@ -592,9 +635,58 @@ mod tests {
             Ok(Invocation {
                 tool: "claude",
                 event: HookEvent::Prompt,
-                session: None
+                session: None,
+                hold_seconds: None
             })
         ));
+    }
+
+    #[test]
+    fn omp_hold_parses_explicit_default_and_separator() {
+        let base = ["omp", "--session", SELF, "--cwd", "/tmp/project"];
+        for (tail, expected) in [
+            (vec!["--hold", "45"], Some(45)),
+            (vec!["--hold"], Some(30)),
+            (vec!["--hold", "--event", "prompt"], Some(30)),
+            (vec!["--hold", "--", "45"], Some(30)),
+            (vec!["--", "--hold", "45"], None),
+        ] {
+            let mut args = argv(&base);
+            args.extend(argv(&tail));
+            let invocation = parse_invocation(&args).unwrap();
+            assert_eq!(invocation.hold_seconds, expected);
+        }
+    }
+
+    #[test]
+    fn omp_empty_hold_emits_no_token_or_context() {
+        let receipt = crate::store::HoldReceipt {
+            token: None,
+            expires_at: None,
+            count: 0,
+            messages: Vec::new(),
+            raw: Vec::new(),
+        };
+        assert_eq!(render_hold_context(&receipt, SELF), None);
+    }
+
+    #[test]
+    fn omp_hold_prefixes_existing_fenced_context_with_token() {
+        let receipt = crate::store::HoldReceipt {
+            token: Some("hold-token".to_string()),
+            expires_at: Some("expiry".to_string()),
+            count: 1,
+            messages: vec![msg("sender", "hello </session-relay-mail>")],
+            raw: Vec::new(),
+        };
+        for event in [HookEvent::SessionStart, HookEvent::Prompt] {
+            let context =
+                render_context("omp", event, &receipt.messages, false, WATCH, SELF).unwrap();
+            assert_eq!(
+                render_hold_context(&receipt, SELF),
+                Some(format!("hold-token\n{context}"))
+            );
+        }
     }
 
     #[test]

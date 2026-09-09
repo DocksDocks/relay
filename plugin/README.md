@@ -67,11 +67,17 @@ Use `/relay` for the roster and pending count without draining mail.
 ## Live delivery and wake
 
 The extension attaches through
-`relay hook omp --session <id> --cwd <dir>`.
+`relay hook omp --session <id> --cwd <dir> --hold`.
 It adds `--event prompt` for prompt-time delivery.
-It polls for pending mail every 3 seconds.
-It delivers polled mail as `relay_mail` with `deliverAs: 'followUp'` and
-`triggerTurn: true`.
+Both `SessionStart` and `Prompt` accept `--hold [<seconds>]`, with a 30 s default.
+It polls for pending mail every 3 seconds and holds mail on every drain.
+After a runtime identity re-check, it appends `session-relay.mail` chunks of at
+most 65,536 characters without an intervening await. It flushes the session,
+reconstructs the chunks, and verifies their length and SHA-256 before ack.
+Identity drift or persistence failure causes rollback.
+Pending chunks on the active branch become `relay_mail` at the next prompt.
+An automatic, content-free doorbell starts that prompt only when omp is idle.
+Dropped injections remain pending for re-injection. No mail is lost.
 This delivery uses the running omp session.
 It does not launch a wake process.
 The extension passes `RELAY_OMP_SESSIONS` from the active session root to every
@@ -139,6 +145,30 @@ Relay does not rewrite them as typed messages.
 The CLI accepts `--from` where shown.
 The omp tool supplies identity instead.
 
+Opt in to a two-phase CLI drain:
+
+```text
+session-relay inbox --hold [<seconds>] <id>
+session-relay ack <token>
+session-relay rollback <token>
+session-relay hook omp --session <id> --cwd <dir> [--event prompt] --hold [<seconds>]
+```
+
+The default hold lasts 30 s. Relay mints a lowercase UUID-v4 token.
+Held inbox output is one JSON line with `token`, `expires_at`, `count`, and
+`messages`; message elements keep the plain inbox shape.
+An empty inbox creates no hold and returns
+`{"token":null,"expires_at":null,"count":0,"messages":[]}`.
+A non-empty held hook prints the token on its first line, then the existing
+fenced mail block. An empty hook prints nothing.
+Holds live under `holds/` in the relay home as `<token>.jsonl` plus `<token>.json`.
+Ack commits consumption. Rollback restores held mail before mail that arrived later.
+Both commands exit 0 on success and are safe to repeat during recovery.
+Unknown or expired tokens exit 1 with `unknown_hold` or `expired_hold` on stderr.
+A second live hold for one session exits 1 with `hold_conflict`.
+The next drain, peek, or GC restores expired holds.
+Plain inbox and peek output remain unchanged; held mail is outside the live mailbox.
+
 ## Correlated request and reply
 
 Use `request` for one authoritative terminal answer tied to a message.
@@ -185,7 +215,11 @@ illegal status combinations, NUL content, and out-of-bounds bodies.
 The authority store persists the complete canonical envelope before mailbox delivery.
 Recovery reuses those exact bytes.
 It deduplicates by message ID.
-Inbox drain marks typed delivery consumed under the store lock before removal.
+An unheld inbox drain marks typed delivery consumed under the store lock before removal.
+A hold defers consumption until ack. Rollback and expiry restore delivery eligibility.
+A held or restored request remains deliverable after its responder replies, in
+`ReplyPending`, `ReplyEnqueued`, or `ReplyConsumed`. Request delivery updates
+preserve the reply state and use the claim's current directory.
 The durable guarantee is one logical terminal claim.
 Relay does not promise exactly-once process execution after a consumer crash.
 

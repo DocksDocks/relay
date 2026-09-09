@@ -32,10 +32,10 @@ The source tree is 53,478 lines in 30 files. Inline `#[cfg(test)]` regions accou
 | `src/gc.rs` | 311 | Orders lifecycle GC before legacy-store GC behind one preparation step (`src/gc.rs:5-10`, `src/gc.rs:11-106`). |
 | `src/hook.rs` | 626 | Registers SessionStart/UserPromptSubmit identity and renders inbox mail as untrusted context (`src/hook.rs:15-25`, `src/hook.rs:195-455`). |
 | `src/lifecycle.rs` † | 6,182 | Owns durable managed-worker state, admission, fencing, supervisor/watchdog state and lifecycle GC (`src/lifecycle.rs:1-7`, `src/lifecycle.rs:28-38`, `src/lifecycle.rs:1171-3889`). |
-| `src/protocol.rs` | 1,945 | Owns typed request/reply/result records and the crash-safe pending/open/terminal claim store (`src/protocol.rs:1-7`, `src/protocol.rs:240-862`, `src/protocol.rs:1061-1945`). |
+| `src/protocol.rs` | 1,945 | Owns typed request/reply/result records, the crash-safe pending/open/terminal claim store, and exact-row hold ack/rollback updates that preserve reply state (`src/protocol.rs:1-7`, `src/protocol.rs:240-862`, `src/protocol.rs:1061-1945`). |
 | `src/sha256.rs` | 241 | Provides dependency-free SHA-256, HMAC and constant-time equality (`src/sha256.rs:1-241`). |
 | `src/spawn.rs` | 2,169 | Creates detached Claude/Codex/omp workers, log pumps, app-server births and fan-out supervisors (`src/spawn.rs:21-32`, `src/spawn.rs:341-1869`). |
-| `src/store.rs` | 1,986 | Owns the fixed relay home, registry, mailboxes, markers, watcher locks and legacy GC (`src/store.rs:1-18`, `src/store.rs:506-668`, `src/store.rs:1244-1761`). |
+| `src/store.rs` | 1,986 | Owns the fixed relay home, registry, mailboxes, durable holds under `holds/`, ack/rollback and expiry recovery, markers, watcher locks and legacy GC (`src/store.rs:1-18`, `src/store.rs:506-668`, `src/store.rs:1244-1761`). |
 | `src/supervisor.rs` | 2,997 | Owns detached watchdog/supervisor processes, child stdio/reap, and the workspace custody bridge (`src/supervisor.rs:1-6`, `src/supervisor.rs:94-983`, `src/supervisor.rs:1244-2438`). |
 | `src/watch.rs` | 796 | Watches mailboxes and chooses app-server push or wake fallback (`src/watch.rs:31-39`, `src/watch.rs:124-744`). |
 | `src/workspace.rs` † | 9,223 | Orchestrates the nine workspace verbs, manifests, Git broker, custody processes, cleanup and recovery (`src/workspace.rs:35-43`, `src/workspace.rs:152-279`, `src/workspace.rs:704-8692`). |
@@ -49,6 +49,11 @@ The source tree is 53,478 lines in 30 files. Inline `#[cfg(test)]` regions accou
 | `src/workspace/repository_gate.rs` | 835 | Serializes legacy/workspace admission and proves exact ext4 repository identity (`src/workspace/repository_gate.rs:14-16`, `src/workspace/repository_gate.rs:18-685`). |
 | `src/workspace/resources.rs` | 3,657 | Allocates, receipts, reloads and releases session resources through verified providers (`src/workspace/resources.rs:25-30`, `src/workspace/resources.rs:32-3190`). |
 | `src/workspace/schema.rs` † | 3,870 | Defines canonical JCS plus every closed workspace request, receipt, capability and state type (`src/workspace/schema.rs:9-128`, `src/workspace/schema.rs:395-3550`). |
+
+`plugin/extension/index.ts` holds mail, re-checks runtime identity, persists bounded
+`session-relay.mail` chunks, flushes and verifies them, then acks. Drift or failure
+rolls back. An idle doorbell and next-prompt injection deliver pending active-branch
+mail automatically; dropped injections remain pending.
 
 The four giants are large for different reasons:
 

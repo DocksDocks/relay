@@ -7,7 +7,8 @@
 //   relay send <to> [--] <message...>            (or: send --id <id> [--] <message...>)
 //   relay request <to> [--from <registered>] [--json] [--] <message...>
 //   relay reply <correlation-id> [--from <registered>] --status completed|failed [--] <message...>
-//   relay inbox <nameOrId>
+//   relay inbox [--hold [<seconds>]] <nameOrId>
+//   relay ack <token> | rollback <token>
 //   relay peek <nameOrId>                        (read-only: inbox without draining)
 //   relay attach <nameOrId> [--exec]             (interactive human takeover)
 //   relay wake <nameOrId> [--model <m>] [--effort <e>] [--service-tier default|fast] [--dry] [message...]
@@ -150,6 +151,14 @@ impl Args {
             .map(Some)
             .ok_or_else(|| format!("--{name} requires a value"))
     }
+    pub(crate) fn hold_seconds(&self) -> Option<u64> {
+        self.has("hold").then(|| {
+            self.flag("hold")
+                .and_then(|value| value.parse::<u64>().ok())
+                .filter(|seconds| *seconds > 0)
+                .unwrap_or(30)
+        })
+    }
     // positional args excluding flags + their values; a bare `--` ends option parsing.
     pub(crate) fn positionals(&self, from: usize) -> Vec<&str> {
         let mut out = Vec::new();
@@ -158,7 +167,15 @@ impl Args {
         while i < end {
             let a = &self.0[i];
             if let Some(name) = a.strip_prefix("--") {
-                if !BOOL_FLAGS.contains(&name) && i + 1 < end {
+                let takes_value = if name == "hold" {
+                    self.0[..end]
+                        .get(i + 1)
+                        .and_then(|value| value.parse::<u64>().ok())
+                        .is_some_and(|seconds| seconds > 0)
+                } else {
+                    !BOOL_FLAGS.contains(&name)
+                };
+                if takes_value && i + 1 < end {
                     i += 1; // value flags also skip their value
                 }
             } else {
@@ -1000,10 +1017,23 @@ pub fn run(cmd: &str, raw: Vec<String>) -> ! {
             );
             std::process::exit(0);
         }
+        "ack" | "rollback" => {
+            let pos = args.positionals(1);
+            if pos.len() != 1 {
+                die(&format!("usage: relay {cmd} <token>"));
+            }
+            let result = if cmd == "ack" {
+                store::ack_hold(pos[0])
+            } else {
+                store::rollback_hold(pos[0])
+            };
+            result.unwrap_or_else(|error| die(&error.to_string()));
+            std::process::exit(0);
+        }
         "inbox" => {
             let pos = args.positionals(1);
             let Some(who) = pos.first() else {
-                die("usage: relay inbox <nameOrId>");
+                die("usage: relay inbox [--hold [<seconds>]] <nameOrId>");
             };
             let Some(target) = store::resolve(who) else {
                 die(&format!("unknown session: {who}"));
@@ -1011,6 +1041,30 @@ pub fn run(cmd: &str, raw: Vec<String>) -> ! {
             let mut guard = lifecycle::admit_operation(&target.id, OperationKind::CliInboxDrain)
                 .and_then(lifecycle::Admission::into_guard)
                 .unwrap_or_else(|error| die(&error));
+            if let Some(seconds) = args.hold_seconds() {
+                let receipt = lifecycle::hold_with_guard(&mut guard, "inbox", seconds)
+                    .unwrap_or_else(|error| die(&error));
+                let mut out: HashMap<String, JsonValue> = HashMap::new();
+                out.insert(
+                    "token".into(),
+                    receipt
+                        .token
+                        .map(JsonValue::from)
+                        .unwrap_or(JsonValue::Null),
+                );
+                out.insert(
+                    "expires_at".into(),
+                    receipt
+                        .expires_at
+                        .map(JsonValue::from)
+                        .unwrap_or(JsonValue::Null),
+                );
+                out.insert("count".into(), JsonValue::from(receipt.count as f64));
+                out.insert("messages".into(), JsonValue::from(receipt.messages));
+                println!("{}", JsonValue::from(out).stringify().unwrap());
+                drop(guard);
+                std::process::exit(0);
+            }
             let msgs = match lifecycle::drain_with_guard(&mut guard) {
                 Ok(receipt) => receipt.into_messages(),
                 Err(error) => {
@@ -1314,6 +1368,32 @@ mod tests {
 
     fn strings(xs: &[&str]) -> Vec<String> {
         xs.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn hold_optional_seconds_preserve_target_and_separator() {
+        for (argv, seconds, targets) in [
+            (vec!["inbox", "--hold", "target"], Some(30), vec!["target"]),
+            (
+                vec!["inbox", "--hold", "7", "target"],
+                Some(7),
+                vec!["target"],
+            ),
+            (
+                vec!["inbox", "target", "--", "--hold", "7"],
+                None,
+                vec!["target"],
+            ),
+            (
+                vec!["inbox", "target", "--hold", "--", "7"],
+                Some(30),
+                vec!["target"],
+            ),
+        ] {
+            let args = Args(strings(&argv));
+            assert_eq!(args.hold_seconds(), seconds);
+            assert_eq!(args.positionals(1), targets);
+        }
     }
 
     #[test]

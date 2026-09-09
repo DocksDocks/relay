@@ -1289,7 +1289,12 @@ impl LegacyGc {
     }
 
     pub(crate) fn preflight_throttled(&self, now: SystemTime) -> Result<bool, String> {
-        with_gc_lock(&self.root_fd, || gc_stamp_is_fresh(&self.root_fd, now))
+        with_gc_lock(&self.root_fd, || {
+            if self.reopen_validated_root()?.is_some() {
+                recover_holds_locked(&self.resolved_root)?;
+            }
+            gc_stamp_is_fresh(&self.root_fd, now)
+        })
     }
 
     fn reopen_validated_root(&self) -> Result<Option<OwnedFd>, String> {
@@ -1367,6 +1372,7 @@ impl LegacyGc {
             let Some(_current_root_fd) = self.reopen_validated_root()? else {
                 return Ok(0);
             };
+            recover_holds_locked(&self.resolved_root)?;
             if gc_stamp_is_fresh(&self.root_fd, now)? {
                 return Ok(0);
             }
@@ -1666,6 +1672,410 @@ fn parse_lines(raw: &str) -> Vec<JsonValue> {
         .collect()
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HoldError {
+    Unknown,
+    Expired,
+    Conflict,
+    Other(String),
+}
+
+impl std::fmt::Display for HoldError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unknown => f.write_str("unknown_hold"),
+            Self::Expired => f.write_str("expired_hold"),
+            Self::Conflict => f.write_str("hold_conflict"),
+            Self::Other(error) => f.write_str(error),
+        }
+    }
+}
+
+pub struct HoldReceipt {
+    pub token: Option<String>,
+    pub expires_at: Option<String>,
+    pub count: usize,
+    pub messages: Vec<JsonValue>,
+    pub raw: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HoldFailpoint {
+    BeforeManifest,
+    AfterManifest,
+    AfterMailboxRename,
+    AfterPhaseWrite,
+    BeforeClaimUpdates,
+    AfterClaimUpdate(usize),
+    AfterClaimUpdates,
+    AfterRestoreRename,
+    BeforePayloadRemoval,
+    BeforeManifestRemoval,
+}
+
+pub struct HoldStore {
+    root: PathBuf,
+    failpoint: Option<HoldFailpoint>,
+}
+
+impl HoldStore {
+    pub fn new(root: PathBuf) -> Self {
+        Self {
+            root,
+            failpoint: None,
+        }
+    }
+
+    pub fn with_failpoint(mut self, failpoint: HoldFailpoint) -> Self {
+        self.failpoint = Some(failpoint);
+        self
+    }
+
+    fn fault(&self, point: HoldFailpoint) -> Result<(), String> {
+        if self.failpoint == Some(point) {
+            Err(format!("hold failpoint {point:?}"))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn directory(&self) -> PathBuf {
+        self.root.join("holds")
+    }
+
+    fn manifest_path(&self, token: &str) -> PathBuf {
+        self.directory().join(format!("{token}.json"))
+    }
+
+    fn payload_path(&self, token: &str) -> PathBuf {
+        self.directory().join(format!("{token}.jsonl"))
+    }
+
+    fn manifests(&self) -> Result<Vec<HashMap<String, JsonValue>>, String> {
+        let entries = match fs::read_dir(self.directory()) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.to_string()),
+        };
+        let mut manifests = Vec::new();
+        for entry in entries {
+            let path = entry.map_err(|error| error.to_string())?.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let raw = fs::read_to_string(&path).map_err(|error| error.to_string())?;
+            let JsonValue::Object(manifest) = raw
+                .parse::<JsonValue>()
+                .map_err(|error| error.to_string())?
+            else {
+                return Err(format!("invalid hold manifest {}", path.display()));
+            };
+            let token = hold_string(&manifest, "token")?;
+            if !is_uuid(token) || self.manifest_path(token) != path {
+                return Err("invalid hold token".to_string());
+            }
+            manifests.push(manifest);
+        }
+        Ok(manifests)
+    }
+
+    fn save(&self, manifest: &HashMap<String, JsonValue>) -> Result<(), String> {
+        atomic_write_private(
+            &self.manifest_path(hold_string(manifest, "token")?),
+            &JsonValue::Object(manifest.clone())
+                .stringify()
+                .map_err(|error| error.to_string())?,
+        )
+    }
+
+    pub(crate) fn hold_locked(
+        &self,
+        session: &str,
+        event: &str,
+        seconds: u64,
+    ) -> Result<HoldReceipt, String> {
+        self.recover_locked()?;
+        for manifest in self.manifests()? {
+            if hold_string(&manifest, "session_id")? == session
+                && hold_string(&manifest, "phase")? == "held"
+            {
+                return Err(HoldError::Conflict.to_string());
+            }
+        }
+        let (messages, rows) = crate::protocol::ProtocolStore::new(self.root.clone())
+            .hold_renderable_locked(session)?;
+        let path = self
+            .root
+            .join("mailbox")
+            .join(format!("{}.jsonl", sanitize(session)));
+        let raw = match fs::read(&path) {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => return Err(error.to_string()),
+        };
+        if messages.is_empty() {
+            return Ok(HoldReceipt {
+                token: None,
+                expires_at: None,
+                count: 0,
+                messages,
+                raw: Vec::new(),
+            });
+        }
+        fs::create_dir_all(self.directory()).map_err(|error| error.to_string())?;
+        sync_directory(&self.root)?;
+        let token = uuid_v4();
+        let created = now_ms();
+        let expires = iso_from_unix_ms(
+            created.saturating_add(seconds.saturating_mul(1000).min(i64::MAX as u64) as i64),
+        );
+        let manifest = HashMap::from([
+            ("token".to_string(), JsonValue::String(token.clone())),
+            (
+                "session_id".to_string(),
+                JsonValue::String(session.to_string()),
+            ),
+            ("event".to_string(), JsonValue::String(event.to_string())),
+            (
+                "created_at".to_string(),
+                JsonValue::String(iso_from_unix_ms(created)),
+            ),
+            ("expires_at".to_string(), JsonValue::String(expires.clone())),
+            ("phase".to_string(), JsonValue::String("held".to_string())),
+            (
+                "payload_len".to_string(),
+                JsonValue::Number(raw.len() as f64),
+            ),
+            (
+                "payload_sha256".to_string(),
+                JsonValue::String(crate::sha256::hex_digest(&raw)),
+            ),
+            ("rows".to_string(), JsonValue::Array(rows)),
+        ]);
+        self.fault(HoldFailpoint::BeforeManifest)?;
+        self.save(&manifest)?;
+        self.fault(HoldFailpoint::AfterManifest)?;
+        fs::rename(&path, self.payload_path(&token)).map_err(|error| error.to_string())?;
+        sync_directory(&self.directory())?;
+        sync_directory(&self.root.join("mailbox"))?;
+        self.fault(HoldFailpoint::AfterMailboxRename)?;
+        Ok(HoldReceipt {
+            token: Some(token),
+            expires_at: Some(expires),
+            count: messages.len(),
+            messages,
+            raw,
+        })
+    }
+
+    fn update_claims(
+        &self,
+        manifest: &HashMap<String, JsonValue>,
+        consumed: bool,
+    ) -> Result<(), String> {
+        let Some(JsonValue::Array(rows)) = manifest.get("rows") else {
+            return Err("invalid hold rows".to_string());
+        };
+        self.fault(HoldFailpoint::BeforeClaimUpdates)?;
+        let protocol = crate::protocol::ProtocolStore::new(self.root.clone());
+        for (index, row) in rows.iter().enumerate() {
+            protocol.hold_claim_update_locked(std::slice::from_ref(row), consumed)?;
+            self.fault(HoldFailpoint::AfterClaimUpdate(index))?;
+        }
+        self.fault(HoldFailpoint::AfterClaimUpdates)
+    }
+
+    fn remove_payload(&self, token: &str) -> Result<(), String> {
+        self.fault(HoldFailpoint::BeforePayloadRemoval)?;
+        remove_hold_file(&self.payload_path(token))
+    }
+
+    fn remove_manifest(&self, token: &str) -> Result<(), String> {
+        self.fault(HoldFailpoint::BeforeManifestRemoval)?;
+        remove_hold_file(&self.manifest_path(token))
+    }
+
+    fn finish_locked(
+        &self,
+        mut manifest: HashMap<String, JsonValue>,
+        consumed: bool,
+    ) -> Result<(), String> {
+        let token = hold_string(&manifest, "token")?.to_string();
+        manifest.insert(
+            "phase".to_string(),
+            JsonValue::String(if consumed { "committing" } else { "restoring" }.to_string()),
+        );
+        self.save(&manifest)?;
+        self.fault(HoldFailpoint::AfterPhaseWrite)?;
+        if consumed {
+            self.update_claims(&manifest, true)?;
+            self.remove_payload(&token)?;
+        } else {
+            match fs::read(self.payload_path(&token)) {
+                Ok(payload) => {
+                    let Some(JsonValue::Number(length)) = manifest.get("payload_len") else {
+                        return Err("invalid hold payload length".to_string());
+                    };
+                    let hash = hold_string(&manifest, "payload_sha256")?;
+                    if payload.len() as f64 != *length
+                        || crate::sha256::hex_digest(&payload) != hash
+                    {
+                        return Err("hold payload integrity mismatch".to_string());
+                    }
+                    let path = self.root.join("mailbox").join(format!(
+                        "{}.jsonl",
+                        sanitize(hold_string(&manifest, "session_id")?)
+                    ));
+                    let current = match fs::read(&path) {
+                        Ok(bytes) => bytes,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+                        Err(error) => return Err(error.to_string()),
+                    };
+                    if current.len() < payload.len()
+                        || crate::sha256::hex_digest(&current[..payload.len()]) != hash
+                    {
+                        let mut restored = payload;
+                        restored.extend_from_slice(&current);
+                        atomic_write_bytes(&path, &restored)?;
+                    }
+                    self.fault(HoldFailpoint::AfterRestoreRename)?;
+                    self.remove_payload(&token)?;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.to_string()),
+            }
+            self.update_claims(&manifest, false)?;
+        }
+        self.remove_manifest(&token)
+    }
+
+    pub(crate) fn recover_locked(&self) -> Result<(), String> {
+        for manifest in self.manifests()? {
+            let token = hold_string(&manifest, "token")?;
+            match hold_string(&manifest, "phase")? {
+                "committing" => self.finish_locked(manifest, true)?,
+                "restoring" => self.finish_locked(manifest, false)?,
+                "held" if !self.payload_path(token).exists() => self.remove_manifest(token)?,
+                "held" if hold_string(&manifest, "expires_at")? <= iso_now().as_str() => {
+                    self.finish_locked(manifest, false)?
+                }
+                "held" => {}
+                _ => return Err("invalid hold phase".to_string()),
+            }
+        }
+        Ok(())
+    }
+
+    fn settle(&self, token: &str, consumed: bool) -> Result<(), HoldError> {
+        if !is_uuid(token) {
+            return Err(HoldError::Unknown);
+        }
+        let mut outcome = Ok(());
+        with_lock_at(&self.root, || {
+            let target = self
+                .manifests()?
+                .into_iter()
+                .find(|manifest| hold_string(manifest, "token").ok() == Some(token));
+            let Some(manifest) = target else {
+                outcome = Err(HoldError::Unknown);
+                return Ok(());
+            };
+            let expired = hold_string(&manifest, "phase")? == "held"
+                && hold_string(&manifest, "expires_at")? <= iso_now().as_str();
+            if expired {
+                self.finish_locked(manifest, false)?;
+                outcome = Err(HoldError::Expired);
+            } else {
+                let phase = hold_string(&manifest, "phase")?;
+                let commit = match phase {
+                    "committing" => true,
+                    "restoring" => false,
+                    _ => consumed,
+                };
+                if phase == "held" && !self.payload_path(token).exists() {
+                    self.remove_manifest(token)?;
+                    outcome = Err(HoldError::Unknown);
+                } else {
+                    self.finish_locked(manifest, commit)?;
+                }
+            }
+            Ok(())
+        })
+        .map_err(HoldError::Other)?;
+        outcome
+    }
+
+    pub fn ack_hold(&self, token: &str) -> Result<(), HoldError> {
+        self.settle(token, true)
+    }
+
+    pub fn rollback_hold(&self, token: &str) -> Result<(), HoldError> {
+        self.settle(token, false)
+    }
+}
+
+fn hold_string<'a>(manifest: &'a HashMap<String, JsonValue>, key: &str) -> Result<&'a str, String> {
+    match manifest.get(key) {
+        Some(JsonValue::String(value)) => Ok(value),
+        _ => Err(format!("invalid hold {key}")),
+    }
+}
+
+fn sync_directory(path: &Path) -> Result<(), String> {
+    fs::File::open(path)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| error.to_string())
+}
+
+fn remove_hold_file(path: &Path) -> Result<(), String> {
+    match fs::remove_file(path) {
+        Ok(()) => sync_directory(path.parent().ok_or("hold file has no parent")?),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let temporary = path.with_extension(format!("{}.tmp", uuid_v4()));
+    let result = (|| {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)
+            .map_err(|error| error.to_string())?;
+        file.write_all(bytes)
+            .and_then(|()| file.sync_all())
+            .map_err(|error| error.to_string())?;
+        fs::rename(&temporary, path).map_err(|error| error.to_string())?;
+        sync_directory(path.parent().ok_or("mailbox has no parent")?)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(temporary);
+    }
+    result
+}
+
+pub(crate) fn recover_holds_locked(root: &Path) -> Result<(), String> {
+    HoldStore::new(root.to_path_buf()).recover_locked()
+}
+
+pub(crate) fn hold_authorized_mailbox(
+    target: AuthorizedMailboxTarget<'_>,
+    event: &str,
+    seconds: u64,
+) -> Result<HoldReceipt, String> {
+    HoldStore::new(target.root.to_path_buf()).hold_locked(target.runtime_session_id, event, seconds)
+}
+
+pub fn ack_hold(token: &str) -> Result<(), HoldError> {
+    HoldStore::new(home_dir()).ack_hold(token)
+}
+
+pub fn rollback_hold(token: &str) -> Result<(), HoldError> {
+    HoldStore::new(home_dir()).rollback_hold(token)
+}
+
 pub struct DrainReceipt {
     messages: Vec<JsonValue>,
     raw: String,
@@ -1746,9 +2156,13 @@ pub(crate) fn drain_authorized_mailbox(
 }
 
 pub fn peek(recipient_id: &str) -> Vec<JsonValue> {
-    fs::read_to_string(mailbox_path(recipient_id))
-        .map(|raw| parse_lines(&raw))
-        .unwrap_or_default()
+    with_lock(|| {
+        recover_holds_locked(&home_dir())?;
+        Ok(fs::read_to_string(mailbox_path(recipient_id))
+            .map(|raw| parse_lines(&raw))
+            .unwrap_or_default())
+    })
+    .unwrap_or_default()
 }
 
 /// The watch poll loop only needs presence, not parsed messages. Avoid reading
@@ -1763,6 +2177,169 @@ pub fn mailbox_has_content(recipient_id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn hold_fixture() -> (PathBuf, String, PathBuf) {
+        let root = std::env::temp_dir().join(format!("relay-hold-{}", uuid_v4()));
+        ensure_dirs_at(&root).unwrap();
+        let session = uuid_v4();
+        let path = root.join("mailbox").join(format!("{session}.jsonl"));
+        fs::write(&path, b"{\"text\":\"first\"}\nmalformed preserved\n").unwrap();
+        (root, session, path)
+    }
+
+    #[test]
+    fn hold_creation_crashes_recover_without_losing_mail() {
+        for point in [
+            HoldFailpoint::BeforeManifest,
+            HoldFailpoint::AfterManifest,
+            HoldFailpoint::AfterMailboxRename,
+        ] {
+            let (root, session, path) = hold_fixture();
+            let original = fs::read(&path).unwrap();
+            let broken = HoldStore::new(root.clone()).with_failpoint(point);
+            with_lock_at(&root, || {
+                broken.hold_locked(&session, "prompt", 0).map(|_| ())
+            })
+            .unwrap_err();
+            with_lock_at(&root, || recover_holds_locked(&root)).unwrap();
+            assert_eq!(fs::read(&path).unwrap(), original, "{point:?}");
+            assert!(HoldStore::new(root.clone()).manifests().unwrap().is_empty());
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn hold_restore_crashes_preserve_exact_legacy_and_malformed_bytes_once() {
+        for point in [
+            HoldFailpoint::AfterPhaseWrite,
+            HoldFailpoint::AfterRestoreRename,
+            HoldFailpoint::BeforePayloadRemoval,
+            HoldFailpoint::BeforeClaimUpdates,
+            HoldFailpoint::AfterClaimUpdate(0),
+            HoldFailpoint::AfterClaimUpdates,
+            HoldFailpoint::BeforeManifestRemoval,
+        ] {
+            let (root, session, path) = hold_fixture();
+            let original = fs::read(&path).unwrap();
+            let hold = with_lock_at(&root, || {
+                HoldStore::new(root.clone()).hold_locked(&session, "prompt", 30)
+            })
+            .unwrap();
+            let later = b"{\"text\":\"later\"}\n";
+            fs::write(&path, later).unwrap();
+            let broken = HoldStore::new(root.clone()).with_failpoint(point);
+            broken
+                .rollback_hold(hold.token.as_deref().unwrap())
+                .unwrap_err();
+            with_lock_at(&root, || recover_holds_locked(&root)).unwrap();
+            let mut expected = original;
+            expected.extend_from_slice(later);
+            assert_eq!(fs::read(&path).unwrap(), expected, "{point:?}");
+            with_lock_at(&root, || recover_holds_locked(&root)).unwrap();
+            assert_eq!(fs::read(&path).unwrap(), expected);
+            assert!(HoldStore::new(root.clone()).manifests().unwrap().is_empty());
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn hold_ack_crashes_complete_without_restoring_consumed_mail() {
+        for point in [
+            HoldFailpoint::AfterPhaseWrite,
+            HoldFailpoint::BeforeClaimUpdates,
+            HoldFailpoint::AfterClaimUpdate(0),
+            HoldFailpoint::AfterClaimUpdates,
+            HoldFailpoint::BeforePayloadRemoval,
+            HoldFailpoint::BeforeManifestRemoval,
+        ] {
+            let (root, session, path) = hold_fixture();
+            let hold = with_lock_at(&root, || {
+                HoldStore::new(root.clone()).hold_locked(&session, "prompt", 30)
+            })
+            .unwrap();
+            let broken = HoldStore::new(root.clone()).with_failpoint(point);
+            broken.ack_hold(hold.token.as_deref().unwrap()).unwrap_err();
+            with_lock_at(&root, || recover_holds_locked(&root)).unwrap();
+            assert!(!path.exists(), "{point:?}");
+            assert!(HoldStore::new(root.clone()).manifests().unwrap().is_empty());
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn hold_isolates_later_drain_and_refuses_second_hold() {
+        let (root, session, path) = hold_fixture();
+        let hold = with_lock_at(&root, || {
+            HoldStore::new(root.clone()).hold_locked(&session, "prompt", 30)
+        })
+        .unwrap();
+        fs::write(&path, b"{\"text\":\"later\"}\n").unwrap();
+        let conflict = with_lock_at(&root, || {
+            HoldStore::new(root.clone())
+                .hold_locked(&session, "prompt", 30)
+                .map(|_| ())
+        })
+        .unwrap_err();
+        assert_eq!(conflict, "hold_conflict");
+        let later = with_lock_at(&root, || {
+            drain_authorized_mailbox(AuthorizedMailboxTarget::new(&root, &session))
+        })
+        .unwrap();
+        assert_eq!(
+            later.messages(),
+            &[r#"{"text":"later"}"#.parse::<JsonValue>().unwrap()]
+        );
+        later.commit();
+        HoldStore::new(root.clone())
+            .rollback_hold(hold.token.as_deref().unwrap())
+            .unwrap();
+        let restored = with_lock_at(&root, || {
+            drain_authorized_mailbox(AuthorizedMailboxTarget::new(&root, &session))
+        })
+        .unwrap();
+        assert_eq!(
+            restored.messages(),
+            &[r#"{"text":"first"}"#.parse::<JsonValue>().unwrap()]
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn hold_expiry_is_restored_by_drain_and_rejects_ack() {
+        let (root, session, _) = hold_fixture();
+        let hold = with_lock_at(&root, || {
+            HoldStore::new(root.clone()).hold_locked(&session, "prompt", 0)
+        })
+        .unwrap();
+        assert_eq!(
+            HoldStore::new(root.clone()).ack_hold(hold.token.as_deref().unwrap()),
+            Err(HoldError::Expired)
+        );
+        let restored = with_lock_at(&root, || {
+            drain_authorized_mailbox(AuthorizedMailboxTarget::new(&root, &session))
+        })
+        .unwrap();
+        assert_eq!(
+            restored.messages(),
+            &[r#"{"text":"first"}"#.parse::<JsonValue>().unwrap()]
+        );
+        restored.commit();
+        let path = root.join("mailbox").join(format!("{session}.jsonl"));
+        fs::write(path, b"{\"text\":\"again\"}\n").unwrap();
+        with_lock_at(&root, || {
+            HoldStore::new(root.clone()).hold_locked(&session, "prompt", 0)
+        })
+        .unwrap();
+        let restored = with_lock_at(&root, || {
+            drain_authorized_mailbox(AuthorizedMailboxTarget::new(&root, &session))
+        })
+        .unwrap();
+        assert_eq!(
+            restored.messages(),
+            &[r#"{"text":"again"}"#.parse::<JsonValue>().unwrap()]
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn private_atomic_write_replaces_with_0600_and_cleans_failed_temp() {

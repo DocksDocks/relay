@@ -4147,6 +4147,34 @@ pub fn drain_with_guard(guard: &mut ReentryGuard) -> Result<store::DrainReceipt,
     })
 }
 
+pub fn hold_with_guard(
+    guard: &mut ReentryGuard,
+    event: &str,
+    seconds: u64,
+) -> Result<store::HoldReceipt, String> {
+    let kind = guard.allowed();
+    if !matches!(
+        kind,
+        OperationKind::SessionStartDrain
+            | OperationKind::UserPromptDrain
+            | OperationKind::CliInboxDrain
+            | OperationKind::McpInboxDrain
+            | OperationKind::ChannelDeliver
+            | OperationKind::WatchInject
+            | OperationKind::WatchAutoTurn
+            | OperationKind::WakeAppServer
+    ) {
+        return Err(format!("{} cannot hold a mailbox", kind.as_str()));
+    }
+    guard.with_authorized(kind, |target| {
+        store::hold_authorized_mailbox(
+            store::AuthorizedMailboxTarget::new(&target.root, &target.runtime_session_id),
+            event,
+            seconds,
+        )
+    })
+}
+
 pub fn admit_operation(session_or_worker: &str, kind: OperationKind) -> Result<Admission, String> {
     LifecycleStore::default().admit_operation(session_or_worker, kind)
 }

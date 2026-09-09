@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import * as path from 'node:path';
 import type { ExtensionAPI, ExtensionContext } from '@oh-my-pi/pi-coding-agent';
 
@@ -58,7 +59,7 @@ export default function (pi: ExtensionAPI): void {
       case 'discover':
         return ['discover'];
       case 'inbox':
-        return ['inbox', sessionId];
+        return ['inbox', '--hold', sessionId];
       case 'send':
       case 'request':
         if (!to || text === undefined) throw new Error(`${action} requires to and text`);
@@ -76,17 +77,207 @@ export default function (pi: ExtensionAPI): void {
     }
   }
 
-  // True while `current` is still the attached session and the runtime still reports its id.
-  // Every await in a delivery path re-checks this: a branch or fork changes the id without
-  // any event, and mail drained for the old id must never reach the new one.
+  let doorbell: { generation: number; sentAt: number } | null = null;
+  const chunkSize = 65_536;
+  const tokenPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+  const sha256 = (text: string) => createHash('sha256').update(text).digest('hex');
+
+  interface MailChunk {
+    token: string;
+    chunk: number;
+    chunks: number;
+    rendered_len: number;
+    rendered_sha256: string;
+    rows: string[];
+    content: string;
+  }
+
+  function isChunk(value: unknown): value is MailChunk {
+    return (
+      typeof value === 'object' &&
+      value !== null &&
+      'token' in value &&
+      typeof value.token === 'string' &&
+      tokenPattern.test(value.token) &&
+      'chunk' in value &&
+      typeof value.chunk === 'number' &&
+      Number.isInteger(value.chunk) &&
+      value.chunk >= 0 &&
+      'chunks' in value &&
+      typeof value.chunks === 'number' &&
+      Number.isInteger(value.chunks) &&
+      value.chunks > value.chunk &&
+      'rendered_len' in value &&
+      typeof value.rendered_len === 'number' &&
+      'rendered_sha256' in value &&
+      typeof value.rendered_sha256 === 'string' &&
+      'rows' in value &&
+      Array.isArray(value.rows) &&
+      value.rows.every((row) => typeof row === 'string') &&
+      'content' in value &&
+      typeof value.content === 'string' &&
+      value.content.length <= chunkSize
+    );
+  }
+
+  function pendingMail(ctx: ExtensionContext) {
+    const groups = new Map<string, MailChunk[]>();
+    for (const entry of ctx.sessionManager.getBranch()) {
+      if (entry.type === 'custom' && entry.customType === 'session-relay.mail' && isChunk(entry.data)) {
+        const group = groups.get(entry.data.token) ?? [];
+        group.push(entry.data);
+        groups.set(entry.data.token, group);
+      }
+      const details: unknown =
+        entry.type === 'custom_message' && entry.customType === 'relay_mail'
+          ? entry.details
+          : entry.type === 'message' && entry.message.role === 'toolResult' && entry.message.toolName === 'relay'
+            ? entry.message.details
+            : undefined;
+      if (typeof details === 'object' && details !== null && 'tokens' in details && Array.isArray(details.tokens)) {
+        for (const token of details.tokens) if (typeof token === 'string') groups.delete(token);
+      }
+    }
+    const complete = new Map<string, MailChunk[]>();
+    for (const [token, group] of groups) {
+      group.sort((a, b) => a.chunk - b.chunk);
+      const first = group[0];
+      if (
+        !first ||
+        group.length !== first.chunks ||
+        group.some(
+          (row, index) =>
+            row.chunk !== index ||
+            row.chunks !== first.chunks ||
+            row.rendered_len !== first.rendered_len ||
+            row.rendered_sha256 !== first.rendered_sha256,
+        )
+      )
+        continue;
+      const rendered = group.map((row) => row.content).join('');
+      if (rendered.length === first.rendered_len && sha256(rendered) === first.rendered_sha256)
+        complete.set(token, group);
+    }
+    return complete;
+  }
+
+  function pendingPayload(ctx: ExtensionContext) {
+    const pending = pendingMail(ctx);
+    return {
+      content: [...pending.values()].flatMap((chunks) =>
+        chunks.map((chunk) => ({ type: 'text' as const, text: chunk.content })),
+      ),
+      details: { tokens: [...pending.keys()] },
+    };
+  }
+
   function stillCurrent(current: Live): boolean {
     return live?.generation === current.generation && current.ctx.sessionManager.getSessionId() === current.sessionId;
+  }
+
+  async function finishHold(action: 'ack' | 'rollback', token: string, current: Live): Promise<void> {
+    try {
+      const result = await run([action, token], current);
+      if (result.code !== 0) throw new Error(result.stderr || result.stdout || `exit ${result.code}`);
+    } catch (error) {
+      if (current.ctx.hasUI) {
+        const reason = error instanceof Error ? error.message : String(error);
+        current.ctx.ui.notify(`${action} failed: ${reason}`, 'warning');
+      }
+    }
+  }
+
+  async function commit(current: Live, token: string, content: string, rows: string[]): Promise<void> {
+    if (!tokenPattern.test(token)) throw new Error('relay returned an invalid hold token');
+    const chunks = Math.max(1, Math.ceil(content.length / chunkSize));
+    const rendered_sha256 = sha256(content);
+    try {
+      if (!stillCurrent(current)) throw new Error('session identity changed during hold');
+      // These synchronous appends bind the complete payload to this loaded session.
+      for (let chunk = 0; chunk < chunks; chunk++) {
+        pi.appendEntry('session-relay.mail', {
+          token,
+          chunk,
+          chunks,
+          rendered_len: content.length,
+          rendered_sha256,
+          rows,
+          content: content.slice(chunk * chunkSize, (chunk + 1) * chunkSize),
+        });
+      }
+      // The runtime manager exposes flush, although ReadonlySessionManager omits it.
+      const manager: unknown = current.ctx.sessionManager;
+      if (!manager || typeof manager !== 'object' || !('flush' in manager) || typeof manager.flush !== 'function') {
+        throw new Error('session manager does not expose durable flush');
+      }
+      await manager.flush();
+      const persisted = pendingMail(current.ctx).get(token)?.[0];
+      if (
+        !stillCurrent(current) ||
+        persisted?.rendered_len !== content.length ||
+        persisted.rendered_sha256 !== rendered_sha256
+      ) {
+        throw new Error('persisted relay mail failed verification');
+      }
+    } catch {
+      try {
+        await finishHold('rollback', token, current);
+      } finally {
+        if (!reattaching) await reconcile(current.ctx);
+      }
+      return;
+    }
+    // Ack failure is safe: the durable entry remains the delivery source of truth.
+    await finishHold('ack', token, current);
+  }
+
+  async function drain(current: Live, inbox = false, initial = false): Promise<void> {
+    const argv = inbox
+      ? ['inbox', '--hold', current.sessionId]
+      : [
+          'hook',
+          'omp',
+          '--session',
+          current.sessionId,
+          '--cwd',
+          current.cwd,
+          ...(initial ? [] : ['--event', 'prompt']),
+          '--hold',
+        ];
+    const result = await run(argv, current);
+    if (result.code !== 0) throw new Error(result.stderr || result.stdout);
+    if (!result.stdout) return;
+    if (inbox) {
+      const held: unknown = JSON.parse(result.stdout);
+      if (!held || typeof held !== 'object' || !('token' in held))
+        throw new Error('relay inbox returned no hold token');
+      if (held.token === null) return;
+      if (typeof held.token !== 'string' || !('messages' in held) || !Array.isArray(held.messages))
+        throw new Error('relay inbox returned an invalid hold');
+      const rows: string[] = [];
+      for (const row of held.messages)
+        if (row && typeof row === 'object' && 'id' in row && typeof row.id === 'string') rows.push(row.id);
+      await commit(current, held.token, result.stdout, rows);
+    } else {
+      const newline = result.stdout.indexOf('\n');
+      if (newline < 0) throw new Error('relay hook returned no held mail');
+      await commit(current, result.stdout.slice(0, newline), result.stdout.slice(newline + 1), []);
+    }
+  }
+
+  async function reconcileMail(ctx: ExtensionContext): Promise<void> {
+    const current = await reconcile(ctx);
+    if (!stillCurrent(current) || !ctx.isIdle() || doorbell) return;
+    const pending = pendingMail(ctx);
+    if (!pending.size) return;
+    doorbell = { generation: current.generation, sentAt: Date.now() };
+    pi.sendUserMessage(`[session-relay] ${pending.size} new message(s)`);
   }
 
   async function poll(current: Live): Promise<void> {
     if (live?.generation !== current.generation || current.draining) return;
     if (!stillCurrent(current)) {
-      await reconcile(current.ctx);
+      await reconcileMail(current.ctx);
       return;
     }
     current.draining = true;
@@ -94,44 +285,26 @@ export default function (pi: ExtensionAPI): void {
       const peek = await run(['peek', current.sessionId], current);
       if (peek.code !== 0) throw new Error(peek.stderr || peek.stdout);
       const pending: unknown = JSON.parse(peek.stdout);
-      if (
-        typeof pending !== 'object' ||
-        pending === null ||
-        !('count' in pending) ||
-        typeof pending.count !== 'number'
-      ) {
+      if (!pending || typeof pending !== 'object' || !('count' in pending) || typeof pending.count !== 'number')
         throw new Error('relay peek returned no numeric count');
-      }
-      if (pending.count <= 0 || !stillCurrent(current)) return;
-      const result = await run(
-        ['hook', 'omp', '--session', current.sessionId, '--cwd', current.cwd, '--event', 'prompt'],
-        current,
-      );
-      if (result.code !== 0) throw new Error(result.stderr || result.stdout);
-      if (result.stdout && stillCurrent(current)) {
-        pi.sendMessage(
-          { customType: 'relay_mail', content: result.stdout, display: true },
-          { deliverAs: 'followUp', triggerTurn: true },
-        );
-      }
+      if (pending.count > 0 && stillCurrent(current)) await drain(current);
     } finally {
       current.draining = false;
-      if (!stillCurrent(current) && live?.generation === current.generation) await reconcile(current.ctx);
+      if (doorbell?.generation === current.generation && current.ctx.isIdle() && Date.now() - doorbell.sentAt > 6000)
+        doorbell = null;
+      if (live?.generation === current.generation) await reconcileMail(current.ctx);
     }
   }
 
   async function attach(ctx: ExtensionContext): Promise<Live> {
-    // A new omp session stays memory-only until its first assistant message. Relay birth
-    // detection needs the session header on disk before the hook registers the id.
     const manager: unknown = ctx.sessionManager;
     if (
       manager &&
       typeof manager === 'object' &&
       'ensureOnDisk' in manager &&
       typeof manager.ensureOnDisk === 'function'
-    ) {
+    )
       await manager.ensureOnDisk();
-    }
     const file = ctx.sessionManager.getSessionFile();
     const current: Live = {
       ctx,
@@ -144,18 +317,9 @@ export default function (pi: ExtensionAPI): void {
     };
     live = current;
     try {
-      const result = await run(['hook', 'omp', '--session', current.sessionId, '--cwd', current.cwd], current);
-      if (result.code !== 0) throw new Error(result.stderr || result.stdout);
-      if (result.stdout && stillCurrent(current)) {
-        pi.sendMessage(
-          { customType: 'relay_mail', content: result.stdout, display: true },
-          { deliverAs: 'followUp', triggerTurn: true },
-        );
-      }
+      await drain(current, false, true);
     } finally {
       current.draining = false;
-      // `ctx.setInterval` contains a rejected `poll`; identity drift during this hook is
-      // reconciled by the first tick (awaiting `reconcile` here would wait on this attach).
       if (live?.generation === current.generation) current.timer = ctx.setInterval(() => poll(current), 3000);
     }
     return current;
@@ -163,13 +327,11 @@ export default function (pi: ExtensionAPI): void {
 
   function detach(ctx: ExtensionContext): void {
     if (live?.timer !== null && live?.timer !== undefined) ctx.clearTimer(live.timer);
+    doorbell = null;
     generation++;
     live = null;
   }
 
-  // Branching or forking changes the session id without a switch event; every delivery and
-  // tool path re-checks the runtime identity and reattaches when it moved. One reattach runs
-  // at a time: concurrent callers share it instead of racing a second attach hook.
   let reattaching: Promise<Live> | null = null;
   function reconcile(ctx: ExtensionContext): Promise<Live> {
     if (live && live.sessionId === ctx.sessionManager.getSessionId()) return Promise.resolve(live);
@@ -183,28 +345,39 @@ export default function (pi: ExtensionAPI): void {
 
   pi.on('session_start', async (_event, ctx) => {
     await attach(ctx);
+    await reconcileMail(ctx);
   });
   pi.on('before_agent_start', async (_event, ctx) => {
+    doorbell = null;
     const current = await reconcile(ctx);
-    if (current.draining || !stillCurrent(current)) return;
-    current.draining = true;
-    try {
-      const result = await run(
-        ['hook', 'omp', '--session', current.sessionId, '--cwd', current.cwd, '--event', 'prompt'],
-        current,
-      );
-      if (result.code !== 0) throw new Error(result.stderr || result.stdout);
-      if (result.stdout && stillCurrent(current)) {
-        return { message: { customType: 'relay_mail', content: result.stdout, display: true } };
+    if (!stillCurrent(current)) return;
+    if (!current.draining) {
+      current.draining = true;
+      try {
+        await drain(current);
+      } finally {
+        current.draining = false;
       }
-    } finally {
-      current.draining = false;
-      if (!stillCurrent(current) && live?.generation === current.generation) await reconcile(ctx);
     }
+    const payload = pendingPayload(ctx);
+    if (payload.details.tokens.length) return { message: { customType: 'relay_mail', ...payload, display: true } };
+  });
+  pi.on('agent_end', async (event, ctx) => {
+    if (!event.willContinue) doorbell = null;
+    await reconcileMail(ctx);
+  });
+  pi.on('session_branch', async (_event, ctx) => {
+    doorbell = null;
+    await reconcileMail(ctx);
+  });
+  pi.on('session_tree', async (_event, ctx) => {
+    doorbell = null;
+    await reconcileMail(ctx);
   });
   pi.on('session_switch', async (_event, ctx) => {
     detach(ctx);
     await attach(ctx);
+    await reconcileMail(ctx);
   });
   pi.on('session_shutdown', (_event, ctx) => {
     detach(ctx);
@@ -234,6 +407,16 @@ export default function (pi: ExtensionAPI): void {
         // between reconcile and run would otherwise send or claim as the previous session.
         const current = await reconcile(ctx);
         if (!stillCurrent(current)) throw new Error('session identity changed during reconcile; retry');
+        if (params.action === 'inbox') {
+          if (current.draining) throw new Error('relay inbox drain already in progress');
+          current.draining = true;
+          try {
+            await drain(current, true);
+          } finally {
+            current.draining = false;
+          }
+          return pendingPayload(ctx);
+        }
         const result = await run(argvFor(params.action, params, current.sessionId), current);
         return {
           content: [{ type: 'text', text: result.stdout || result.stderr }],
@@ -278,7 +461,7 @@ export default function (pi: ExtensionAPI): void {
         : message.content
             .filter((block) => block.type === 'text')
             .map((block) => block.text)
-            .join('\n');
+            .join('');
     return new pi.pi.Text(content, 0, 0);
   });
 }
