@@ -10,30 +10,13 @@ const ROOT = path.resolve(HERE, '..');
 const SCRUBBED_ENV = [
   'AGENT_RELAY_HOME',
   'AGENT_RELAY_GC_DAYS',
-  'RELAY_CLAUDE_PROJECTS',
-  'RELAY_CODEX_SESSIONS',
   'RELAY_OMP_SESSIONS',
   'OMP_PROFILE',
   'PI_PROFILE',
   'PI_CONFIG_DIR',
   'PI_CODING_AGENT_DIR',
-  'CLAUDE_CONFIG_DIR',
-  'CLAUDE_PROJECT_DIR',
-  'CLAUDE_CODE_SESSION_ID',
-  'CODEX_HOME',
   'RELAY_NO_WATCH',
-  'RELAY_APP_SERVER',
-  'RELAY_CHANNEL_POLL_MS',
-  'RELAY_CHANNEL_REGISTER_TIMEOUT_MS',
-  'RELAY_TURN_SETTLE_MS',
-  'RELAY_TURN_WAIT_MS',
-  'RELAY_SPAWN_CMD_CLAUDE',
-  'RELAY_SPAWN_CMD_CODEX',
-  'RELAY_WAKE_CMD_CLAUDE',
-  'RELAY_WAKE_CMD_CODEX',
-  'RELAY_SPAWN_CMD_OMP',
   'RELAY_WAKE_CMD_OMP',
-  'RELAY_SPAWN_TOOL',
   'STUB_RELAY_BIN',
   'STUB_TOOL',
   'STUB_RECORD',
@@ -252,8 +235,11 @@ export function createFixture({ bin: configuredBin, home }) {
     if (result.status !== 0) throw new Error(`relay ${args[0]} exited ${result.status}: ${result.stderr}`);
     return JSON.parse(result.stdout);
   };
-  const runHook = (event) => relay(['hook'], { input: JSON.stringify(event) });
-  const hookArgs = (args, event, env) => relay(['hook', ...args], { input: JSON.stringify(event), env });
+  const hookArgs = (args, event, env) =>
+    relay(['hook', 'omp', '--session', event.session_id, '--cwd', event.cwd, ...args.filter((arg) => arg !== 'omp')], {
+      env,
+    });
+  const runHook = (event) => hookArgs([], event);
   const peek = (who) => relayJSON(['peek', who]);
 
   function runBus(projectDir, requests, extraEnv = {}) {
@@ -273,14 +259,6 @@ export function createFixture({ bin: configuredBin, home }) {
   }
 
   const toolJSON = (response) => JSON.parse(response.result.content[0].text);
-
-  function configValues(args) {
-    const values = [];
-    for (let index = 1; index < args.length; index += 1) {
-      if (args[index - 1] === '-c') values.push(args[index]);
-    }
-    return values;
-  }
 
   function check(label, fn) {
     fn();
@@ -359,7 +337,6 @@ export function createFixture({ bin: configuredBin, home }) {
     hookArgs,
     runBus,
     toolJSON,
-    configValues,
     peek,
     check,
     get passed() {

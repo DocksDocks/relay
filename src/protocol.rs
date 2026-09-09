@@ -1,16 +1,15 @@
+use crate::jcs::{
+    ClosedJcs, JcsValue, LowerUuidV4, Sha256Digest, parse_jcs, read_jcs_file, read_jcs_value,
+    serialize_jcs,
+};
 use crate::sha256;
 use crate::store;
-pub use crate::workspace::schema::ObjectFormat;
-use crate::workspace::schema::{
-    AbsPath, ClosedJcs, Decimal, JcsValue, LowerUuidV4, RelPath, Sha256Digest, parse_jcs,
-    read_jcs_file, serialize_jcs,
-};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tinyjson::JsonValue;
 
 const MESSAGE_KEYS: [&str; 11] = [
@@ -157,8 +156,8 @@ fn validate_uuid(value: &str, label: &str) -> Result<(), String> {
         .map_err(|_| format!("{label} is not a lowercase UUID v4"))
 }
 
-/// Runtime session ids come from the tool, not from relay: Claude and Codex mint UUIDv4, omp
-/// mints UUIDv7. Accept any lowercase UUID shape; relay-generated ids stay strict v4.
+/// Omp runtime session ids may be UUIDv7. Accept any lowercase UUID shape;
+/// relay-generated ids stay strict v4.
 fn validate_session_id(value: &str, label: &str) -> Result<(), String> {
     if store::is_uuid(value) && !value.bytes().any(|b| b.is_ascii_uppercase()) {
         Ok(())
@@ -187,7 +186,6 @@ fn validate_sha(value: &str, label: &str) -> Result<(), String> {
 pub enum MessageKind {
     Request,
     TerminalReply,
-    WorkerResult,
 }
 
 impl MessageKind {
@@ -195,7 +193,6 @@ impl MessageKind {
         match self {
             Self::Request => "request",
             Self::TerminalReply => "terminal_reply",
-            Self::WorkerResult => "worker_result",
         }
     }
 
@@ -203,7 +200,6 @@ impl MessageKind {
         match value {
             "request" => Ok(Self::Request),
             "terminal_reply" => Ok(Self::TerminalReply),
-            "worker_result" => Ok(Self::WorkerResult),
             _ => Err("unknown MessageV2 kind".to_string()),
         }
     }
@@ -297,11 +293,6 @@ impl MessageV2 {
                     && self.terminal_status.is_some()
                     && self.result_sha256.is_none()
             }
-            MessageKind::WorkerResult => {
-                self.reply_to.is_some()
-                    && self.terminal_status.is_some()
-                    && self.result_sha256.is_some()
-            }
         };
         if !legal {
             return Err("MessageV2 variant matrix violation".to_string());
@@ -382,21 +373,18 @@ impl ClosedJcs for MessageV2 {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ClaimOrigin {
     Message,
-    Fanout,
 }
 
 impl ClaimOrigin {
     fn as_str(self) -> &'static str {
         match self {
             Self::Message => "message",
-            Self::Fanout => "fanout",
         }
     }
 
     fn parse(value: &str) -> Result<Self, String> {
         match value {
             "message" => Ok(Self::Message),
-            "fanout" => Ok(Self::Fanout),
             _ => Err("unknown claim origin".to_string()),
         }
     }
@@ -517,51 +505,43 @@ impl ClaimStatusV1 {
             return Err("claim request authority binding mismatch".to_string());
         }
         let has_reply = self.reply.is_some();
-        let legal_request_delivery = match self.origin {
-            ClaimOrigin::Message => matches!(
-                self.request_delivery,
-                DeliveryState::Enqueued | DeliveryState::Consumed
-            ),
-            ClaimOrigin::Fanout => self.request_delivery == DeliveryState::NotApplicable,
-        };
-        let legal = match (self.origin, self.state) {
-            (ClaimOrigin::Message, ClaimState::RequestPending) => {
+        let legal_request_delivery = matches!(
+            self.request_delivery,
+            DeliveryState::Enqueued | DeliveryState::Consumed
+        );
+        let legal = match self.state {
+            ClaimState::RequestPending => {
                 self.request_delivery == DeliveryState::Pending
                     && !has_reply
                     && self.reply_delivery.is_none()
             }
-            (_, ClaimState::Open) => {
+            ClaimState::Open => {
                 legal_request_delivery && !has_reply && self.reply_delivery.is_none()
             }
-            (_, ClaimState::ReplyPending) => {
+            ClaimState::ReplyPending => {
                 legal_request_delivery
                     && has_reply
                     && self.reply_delivery == Some(DeliveryState::Pending)
             }
-            (_, ClaimState::ReplyEnqueued) => {
+            ClaimState::ReplyEnqueued => {
                 legal_request_delivery
                     && has_reply
                     && self.reply_delivery == Some(DeliveryState::Enqueued)
             }
-            (_, ClaimState::ReplyConsumed) => {
+            ClaimState::ReplyConsumed => {
                 legal_request_delivery
                     && has_reply
                     && self.reply_delivery == Some(DeliveryState::Consumed)
             }
-            _ => false,
         };
         if !legal {
             return Err("claim origin/state/delivery matrix violation".to_string());
         }
-        match (&self.reply, &self.reply_sha256, self.origin) {
-            (None, None, _) => {}
-            (Some(reply), Some(reply_sha256), origin) => {
+        match (&self.reply, &self.reply_sha256) {
+            (None, None) => {}
+            (Some(reply), Some(reply_sha256)) => {
                 reply.validate()?;
-                let expected_kind = match origin {
-                    ClaimOrigin::Message => MessageKind::TerminalReply,
-                    ClaimOrigin::Fanout => MessageKind::WorkerResult,
-                };
-                if reply.kind != expected_kind
+                if reply.kind != MessageKind::TerminalReply
                     || reply.correlation_id != self.correlation_id
                     || reply.from_session_id != self.responder_session_id
                     || reply.to_session_id != self.requester_session_id
@@ -656,225 +636,6 @@ impl ClosedJcs for ClaimStatusV1 {
             ("schema", JcsValue::Integer(i64::from(self.schema))),
             ("state", JcsValue::String(self.state.as_str().into())),
             ("updated_at", JcsValue::String(self.updated_at.clone())),
-        ])
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct WorkerResultV1 {
-    pub schema: u8,
-    pub result_id: String,
-    pub correlation_id: String,
-    pub reservation_id: String,
-    pub root_reservation_id: String,
-    pub parent_session_id: String,
-    pub worker_id: String,
-    pub generation: String,
-    pub runtime_session_id: String,
-    pub repo_common_dir: String,
-    pub repo_dev: String,
-    pub repo_ino: String,
-    pub object_format: ObjectFormat,
-    pub base_commit: String,
-    pub handback_commit: String,
-    pub status: TerminalStatus,
-    pub summary: String,
-    pub changed_paths: Vec<String>,
-    pub created_at: String,
-}
-
-impl WorkerResultV1 {
-    pub fn canonical_bytes(&self) -> Vec<u8> {
-        canonical_bytes(self)
-    }
-
-    pub fn sha256(&self) -> String {
-        digest(self)
-    }
-
-    fn validate(&self) -> Result<(), String> {
-        if self.schema != 1 {
-            return Err("WorkerResultV1 schema mismatch".to_string());
-        }
-        for (label, value) in [
-            ("result id", self.result_id.as_str()),
-            ("result correlation", self.correlation_id.as_str()),
-            ("reservation id", self.reservation_id.as_str()),
-            ("root reservation id", self.root_reservation_id.as_str()),
-            ("worker id", self.worker_id.as_str()),
-            ("generation", self.generation.as_str()),
-        ] {
-            validate_uuid(value, label)?;
-        }
-        for (label, value) in [
-            ("parent session id", self.parent_session_id.as_str()),
-            ("runtime session id", self.runtime_session_id.as_str()),
-        ] {
-            validate_session_id(value, label)?;
-        }
-        validate_timestamp(&self.created_at, "worker result created_at")?;
-        for (label, value) in [("repo_dev", &self.repo_dev), ("repo_ino", &self.repo_ino)] {
-            Decimal::parse(value)
-                .and_then(|_| {
-                    value
-                        .parse::<u64>()
-                        .map(|_| ())
-                        .map_err(|_| "overflow".into())
-                })
-                .map_err(|_| format!("{label} is not an in-range canonical u64"))?;
-        }
-        if self.repo_common_dir.contains("//")
-            || self.repo_common_dir.contains("/./")
-            || self.repo_common_dir.contains("/../")
-            || self.repo_common_dir.ends_with("/.")
-            || self.repo_common_dir.ends_with("/..")
-            || self.repo_common_dir.ends_with('/')
-            || AbsPath::parse(&self.repo_common_dir).is_err()
-        {
-            return Err("repo_common_dir is not a lexical canonical absolute path".to_string());
-        }
-        for oid in [&self.base_commit, &self.handback_commit] {
-            if oid.len() != self.object_format.oid_len()
-                || !oid
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
-            {
-                return Err("worker result Git OID is invalid".to_string());
-            }
-        }
-        if self.summary.len() > 4096 || self.summary.contains('\0') {
-            return Err("worker result summary is outside UTF-8 byte bounds".to_string());
-        }
-        if self.changed_paths.len() > 4096 {
-            return Err("worker result has too many changed paths".to_string());
-        }
-        for path in &self.changed_paths {
-            RelPath::parse(path)?;
-        }
-        if self.changed_paths.windows(2).any(|pair| pair[0] >= pair[1]) {
-            return Err("worker result changed paths are not sorted and unique".to_string());
-        }
-        if serialize_jcs(&self.to_jcs()).len() > 1024 * 1024 {
-            return Err("WorkerResultV1 exceeds one MiB".to_string());
-        }
-        Ok(())
-    }
-}
-
-impl ClosedJcs for WorkerResultV1 {
-    fn from_jcs(value: JcsValue) -> Result<Self, String> {
-        let values = value.object()?;
-        let expected = [
-            "schema",
-            "result_id",
-            "correlation_id",
-            "reservation_id",
-            "root_reservation_id",
-            "parent_session_id",
-            "worker_id",
-            "generation",
-            "runtime_session_id",
-            "repo_common_dir",
-            "repo_dev",
-            "repo_ino",
-            "object_format",
-            "base_commit",
-            "handback_commit",
-            "status",
-            "summary",
-            "changed_paths",
-            "created_at",
-        ];
-        require_keys(&values, &expected)?;
-        let changed_paths = match values
-            .get("changed_paths")
-            .ok_or_else(|| "missing changed_paths".to_string())?
-        {
-            JcsValue::Array(paths) => paths
-                .iter()
-                .map(|path| path.as_str().map(str::to_string))
-                .collect::<Result<Vec<_>, _>>()?,
-            _ => return Err("changed_paths must be an array".to_string()),
-        };
-        let result = Self {
-            schema: schema(&values, 1)?,
-            result_id: string(&values, "result_id")?,
-            correlation_id: string(&values, "correlation_id")?,
-            reservation_id: string(&values, "reservation_id")?,
-            root_reservation_id: string(&values, "root_reservation_id")?,
-            parent_session_id: string(&values, "parent_session_id")?,
-            worker_id: string(&values, "worker_id")?,
-            generation: string(&values, "generation")?,
-            runtime_session_id: string(&values, "runtime_session_id")?,
-            repo_common_dir: string(&values, "repo_common_dir")?,
-            repo_dev: string(&values, "repo_dev")?,
-            repo_ino: string(&values, "repo_ino")?,
-            object_format: ObjectFormat::parse(&string(&values, "object_format")?)?,
-            base_commit: string(&values, "base_commit")?,
-            handback_commit: string(&values, "handback_commit")?,
-            status: TerminalStatus::parse(&string(&values, "status")?)?,
-            summary: string(&values, "summary")?,
-            changed_paths,
-            created_at: string(&values, "created_at")?,
-        };
-        result.validate()?;
-        Ok(result)
-    }
-
-    fn to_jcs(&self) -> JcsValue {
-        object([
-            ("base_commit", JcsValue::String(self.base_commit.clone())),
-            (
-                "changed_paths",
-                JcsValue::Array(
-                    self.changed_paths
-                        .iter()
-                        .cloned()
-                        .map(JcsValue::String)
-                        .collect(),
-                ),
-            ),
-            (
-                "correlation_id",
-                JcsValue::String(self.correlation_id.clone()),
-            ),
-            ("created_at", JcsValue::String(self.created_at.clone())),
-            ("generation", JcsValue::String(self.generation.clone())),
-            (
-                "handback_commit",
-                JcsValue::String(self.handback_commit.clone()),
-            ),
-            (
-                "object_format",
-                JcsValue::String(self.object_format.as_str().into()),
-            ),
-            (
-                "parent_session_id",
-                JcsValue::String(self.parent_session_id.clone()),
-            ),
-            (
-                "repo_common_dir",
-                JcsValue::String(self.repo_common_dir.clone()),
-            ),
-            ("repo_dev", JcsValue::String(self.repo_dev.clone())),
-            ("repo_ino", JcsValue::String(self.repo_ino.clone())),
-            (
-                "reservation_id",
-                JcsValue::String(self.reservation_id.clone()),
-            ),
-            ("result_id", JcsValue::String(self.result_id.clone())),
-            (
-                "root_reservation_id",
-                JcsValue::String(self.root_reservation_id.clone()),
-            ),
-            (
-                "runtime_session_id",
-                JcsValue::String(self.runtime_session_id.clone()),
-            ),
-            ("schema", JcsValue::Integer(i64::from(self.schema))),
-            ("status", JcsValue::String(self.status.as_str().into())),
-            ("summary", JcsValue::String(self.summary.clone())),
-            ("worker_id", JcsValue::String(self.worker_id.clone())),
         ])
     }
 }
@@ -1128,7 +889,7 @@ impl ProtocolStore {
             }
             let message = match kind {
                 MessageKind::Request => &claim.request,
-                MessageKind::TerminalReply | MessageKind::WorkerResult => claim
+                MessageKind::TerminalReply => claim
                     .reply
                     .as_ref()
                     .ok_or("held reply has no claim reply")?,
@@ -1161,7 +922,7 @@ impl ProtocolStore {
                     }
                     claim.request_delivery = delivery;
                 }
-                MessageKind::TerminalReply | MessageKind::WorkerResult => {
+                MessageKind::TerminalReply => {
                     if !matches!(
                         claim.state,
                         ClaimState::ReplyEnqueued | ClaimState::ReplyConsumed
@@ -1474,77 +1235,12 @@ impl ProtocolStore {
         })
     }
 
-    pub fn open_fanout_claim(
-        &self,
-        correlation_id: &str,
-        requester_session_id: &str,
-        responder_session_id: &str,
-        body: &str,
-    ) -> Result<MessageV2, ProtocolError> {
-        self.locked(|| {
-            self.ensure_layout()?;
-            self.recover_pending_locked()?;
-            validate_uuid(correlation_id, "fanout correlation").map_err(ProtocolError::store)?;
-            if !self.registered(requester_session_id)? || !self.registered(responder_session_id)? {
-                return Err(ProtocolError::store(
-                    "fanout claim endpoints must be registered",
-                ));
-            }
-            if let Some(existing) = self.read_claim_locked(correlation_id)? {
-                if existing.origin == ClaimOrigin::Fanout
-                    && existing.state == ClaimState::Open
-                    && existing.requester_session_id == requester_session_id
-                    && existing.responder_session_id == responder_session_id
-                    && existing.request.body == body
-                {
-                    return Ok(existing.request);
-                }
-                return Err(ProtocolError::CorrelationConflict);
-            }
-            let now = store::iso_now();
-            let message = MessageV2 {
-                schema: 2,
-                id: store::uuid_v4(),
-                created_at: now.clone(),
-                from_session_id: requester_session_id.to_string(),
-                to_session_id: responder_session_id.to_string(),
-                correlation_id: correlation_id.to_string(),
-                kind: MessageKind::Request,
-                reply_to: None,
-                terminal_status: None,
-                body: body.to_string(),
-                result_sha256: None,
-            };
-            message.validate().map_err(ProtocolError::store)?;
-            let claim = ClaimStatusV1 {
-                schema: 1,
-                correlation_id: correlation_id.to_string(),
-                origin: ClaimOrigin::Fanout,
-                state: ClaimState::Open,
-                requester_session_id: requester_session_id.to_string(),
-                responder_session_id: responder_session_id.to_string(),
-                request_sha256: message.sha256(),
-                request: message.clone(),
-                request_delivery: DeliveryState::NotApplicable,
-                reply: None,
-                reply_sha256: None,
-                reply_delivery: None,
-                created_at: now.clone(),
-                updated_at: now,
-            };
-            self.write_claim(ClaimDirectory::Open, &claim)?;
-            Ok(message)
-        })
-    }
-
     fn reply_locked(
         &self,
         correlation_id: &str,
         responder_session_id: &str,
         status: TerminalStatus,
         body: &str,
-        kind: MessageKind,
-        result_sha256: Option<String>,
     ) -> Result<ReplyOutcome, ProtocolError> {
         self.recover_pending_locked()?;
         let mut claim = self
@@ -1554,11 +1250,7 @@ impl ProtocolStore {
             return Err(ProtocolError::UnauthorizedResponder);
         }
         if let Some(existing) = &claim.reply {
-            if existing.kind == kind
-                && existing.terminal_status == Some(status)
-                && existing.body == body
-                && existing.result_sha256 == result_sha256
-            {
+            if existing.terminal_status == Some(status) && existing.body == body {
                 return Ok(ReplyOutcome {
                     disposition: ReplyDisposition::Idempotent,
                     message: existing.clone(),
@@ -1576,11 +1268,11 @@ impl ProtocolStore {
             from_session_id: responder_session_id.to_string(),
             to_session_id: claim.requester_session_id.clone(),
             correlation_id: correlation_id.to_string(),
-            kind,
+            kind: MessageKind::TerminalReply,
             reply_to: Some(claim.request.id.clone()),
             terminal_status: Some(status),
             body: body.to_string(),
-            result_sha256,
+            result_sha256: None,
         };
         message.validate().map_err(ProtocolError::store)?;
         claim.state = ClaimState::ReplyPending;
@@ -1623,43 +1315,37 @@ impl ProtocolStore {
         status: TerminalStatus,
         body: &str,
     ) -> Result<ReplyOutcome, ProtocolError> {
-        self.locked(|| {
-            self.reply_locked(
-                correlation_id,
-                responder_session_id,
-                status,
-                body,
-                MessageKind::TerminalReply,
-                None,
-            )
-        })
+        self.locked(|| self.reply_locked(correlation_id, responder_session_id, status, body))
     }
 
-    pub fn publish_worker_result(
-        &self,
-        result: &WorkerResultV1,
-        body: &str,
-    ) -> Result<ReplyOutcome, ProtocolError> {
-        result.validate().map_err(ProtocolError::store)?;
-        self.locked(|| {
-            let claim = self
-                .read_claim_locked(&result.correlation_id)?
-                .ok_or(ProtocolError::UnknownCorrelation)?;
-            if claim.origin != ClaimOrigin::Fanout
-                || claim.responder_session_id != result.runtime_session_id
-                || claim.requester_session_id != result.parent_session_id
-            {
-                return Err(ProtocolError::CorrelationConflict);
-            }
-            self.reply_locked(
-                &result.correlation_id,
-                &result.runtime_session_id,
-                result.status,
-                body,
-                MessageKind::WorkerResult,
-                Some(result.sha256()),
-            )
-        })
+    /// Pending claims whose origin the current protocol does not know (fan-out,
+    /// removed in 0.18.0, or a missing origin) cannot be recovered and must not
+    /// block current messaging: move them aside once, then continue.
+    fn quarantine_obsolete_pending(&self, path: &Path) -> Result<bool, ProtocolError> {
+        let value = read_jcs_value(path, None).map_err(ProtocolError::store)?;
+        let known_origin = match &value {
+            JcsValue::Object(fields) => fields
+                .get("origin")
+                .and_then(|v| v.as_str().ok())
+                .is_some_and(|origin| ClaimOrigin::parse(origin).is_ok()),
+            _ => false,
+        };
+        if known_origin {
+            return Ok(false);
+        }
+        let obsolete = self.root.join("protocol-v1/obsolete");
+        fs::create_dir_all(&obsolete).map_err(ProtocolError::store)?;
+        fs::set_permissions(&obsolete, fs::Permissions::from_mode(0o700))
+            .map_err(ProtocolError::store)?;
+        let name = path
+            .file_name()
+            .ok_or_else(|| ProtocolError::store("pending claim has no file name"))?;
+        fs::rename(path, obsolete.join(name)).map_err(ProtocolError::store)?;
+        eprintln!(
+            "[relay protocol] quarantined obsolete pending claim {} to protocol-v1/obsolete",
+            name.to_string_lossy()
+        );
+        Ok(true)
     }
 
     fn recover_pending_locked(&self) -> Result<(), ProtocolError> {
@@ -1675,6 +1361,9 @@ impl ProtocolStore {
             .collect::<Result<Vec<_>, _>>()?;
         paths.sort();
         for path in paths {
+            if self.quarantine_obsolete_pending(&path)? {
+                continue;
+            }
             let claim =
                 read_jcs_file::<ClaimStatusV1>(&path, None).map_err(ProtocolError::store)?;
             if path.file_stem().and_then(|stem| stem.to_str()) != Some(&claim.correlation_id) {
@@ -1788,7 +1477,7 @@ impl ProtocolStore {
                 }
                 Ok(deliver)
             }
-            MessageKind::TerminalReply | MessageKind::WorkerResult
+            MessageKind::TerminalReply
                 if claim.reply.as_ref() == Some(message)
                     && matches!(
                         claim.state,
@@ -2048,9 +1737,7 @@ impl ProtocolStore {
                     _ => Err(ProtocolError::store("typed mailbox claim binding mismatch")),
                 }
             }
-            MessageKind::TerminalReply | MessageKind::WorkerResult
-                if claim.reply.as_ref() == Some(message) =>
-            {
+            MessageKind::TerminalReply if claim.reply.as_ref() == Some(message) => {
                 match claim.state {
                     ClaimState::ReplyPending | ClaimState::ReplyEnqueued => Ok(true),
                     ClaimState::ReplyConsumed => Ok(false),
@@ -2154,9 +1841,7 @@ impl ProtocolStore {
                         self.write_claim(Self::claim_directory(claim.state), &claim)?;
                     }
                 }
-                MessageKind::TerminalReply | MessageKind::WorkerResult
-                    if claim.reply.as_ref() == Some(&message) =>
-                {
+                MessageKind::TerminalReply if claim.reply.as_ref() == Some(&message) => {
                     if claim.state == ClaimState::ReplyConsumed {
                         claim.state = ClaimState::ReplyEnqueued;
                         claim.reply_delivery = Some(DeliveryState::Enqueued);
@@ -2194,7 +1879,7 @@ mod hold_tests {
         }
     }
 
-    pub(super) fn claim(state: ClaimState, origin: ClaimOrigin) -> ClaimStatusV1 {
+    pub(super) fn claim(state: ClaimState) -> ClaimStatusV1 {
         let request = MessageV2 {
             schema: 2,
             id: "10000000-0000-4000-8000-000000000001".into(),
@@ -2212,30 +1897,22 @@ mod hold_tests {
             id: "50000000-0000-4000-8000-000000000005".into(),
             from_session_id: request.to_session_id.clone(),
             to_session_id: request.from_session_id.clone(),
-            kind: if origin == ClaimOrigin::Fanout {
-                MessageKind::WorkerResult
-            } else {
-                MessageKind::TerminalReply
-            },
+            kind: MessageKind::TerminalReply,
             reply_to: Some(request.id.clone()),
             terminal_status: Some(TerminalStatus::Completed),
-            result_sha256: (origin == ClaimOrigin::Fanout).then(|| "a".repeat(64)),
+            result_sha256: None,
             body: "reply".into(),
             ..request.clone()
         });
         ClaimStatusV1 {
             schema: 1,
             correlation_id: request.correlation_id.clone(),
-            origin,
+            origin: ClaimOrigin::Message,
             state,
             requester_session_id: request.from_session_id.clone(),
             responder_session_id: request.to_session_id.clone(),
             request_sha256: request.sha256(),
-            request_delivery: if origin == ClaimOrigin::Fanout {
-                DeliveryState::NotApplicable
-            } else {
-                DeliveryState::Enqueued
-            },
+            request_delivery: DeliveryState::Enqueued,
             reply_sha256: reply.as_ref().map(MessageV2::sha256),
             reply_delivery: match state {
                 ClaimState::Open => None,
@@ -2274,7 +1951,7 @@ mod hold_tests {
             ClaimState::ReplyConsumed,
         ] {
             let fixture = Fixture::new();
-            let original = claim(state, ClaimOrigin::Message);
+            let original = claim(state);
             fixture
                 .0
                 .write_claim(ProtocolStore::claim_directory(state), &original)
@@ -2323,7 +2000,7 @@ mod hold_tests {
             (ClaimState::ReplyPending, ClaimState::ReplyEnqueued),
         ] {
             let fixture = Fixture::new();
-            let authoritative = claim(authoritative_state, ClaimOrigin::Message);
+            let authoritative = claim(authoritative_state);
             let mut stale = authoritative.clone();
             stale.state = stale_state;
             if stale_state == ClaimState::Open {
@@ -2378,7 +2055,7 @@ mod hold_tests {
             ClaimState::ReplyConsumed,
         ] {
             let fixture = Fixture::new();
-            let original = claim(state, ClaimOrigin::Message);
+            let original = claim(state);
             fixture
                 .0
                 .write_claim(ProtocolStore::claim_directory(state), &original)
@@ -2408,64 +2085,62 @@ mod hold_tests {
 
     #[test]
     fn held_reply_updates_are_exact_and_preserve_request_delivery() {
-        for origin in [ClaimOrigin::Message, ClaimOrigin::Fanout] {
-            let fixture = Fixture::new();
-            let original = claim(ClaimState::ReplyEnqueued, origin);
-            fixture
-                .0
-                .write_claim(ClaimDirectory::Terminal, &original)
-                .unwrap();
-            let reply = original.reply.as_ref().unwrap();
-            for field in ["id", "sha256", "kind", "correlation_id"] {
-                let mut invalid = row(reply);
-                let values = invalid.get_mut::<HashMap<String, JsonValue>>().unwrap();
-                let replacement = match field {
-                    "sha256" => "b".repeat(64),
-                    "kind" => MessageKind::Request.as_str().into(),
-                    _ => "60000000-0000-4000-8000-000000000006".into(),
-                };
-                values.insert(field.into(), JsonValue::String(replacement));
-                assert!(
-                    fixture
-                        .0
-                        .hold_claim_update_locked(&[invalid], true)
-                        .is_err()
-                );
-                assert_eq!(
-                    fixture
-                        .0
-                        .read_claim_locked(&original.correlation_id)
-                        .unwrap()
-                        .unwrap(),
-                    original
-                );
-            }
-            let rows = [row(reply)];
-            for consumed in [true, true, false, false] {
-                fixture.0.hold_claim_update_locked(&rows, consumed).unwrap();
-                let updated = fixture
+        let fixture = Fixture::new();
+        let original = claim(ClaimState::ReplyEnqueued);
+        fixture
+            .0
+            .write_claim(ClaimDirectory::Terminal, &original)
+            .unwrap();
+        let reply = original.reply.as_ref().unwrap();
+        for field in ["id", "sha256", "kind", "correlation_id"] {
+            let mut invalid = row(reply);
+            let values = invalid.get_mut::<HashMap<String, JsonValue>>().unwrap();
+            let replacement = match field {
+                "sha256" => "b".repeat(64),
+                "kind" => MessageKind::Request.as_str().into(),
+                _ => "60000000-0000-4000-8000-000000000006".into(),
+            };
+            values.insert(field.into(), JsonValue::String(replacement));
+            assert!(
+                fixture
+                    .0
+                    .hold_claim_update_locked(&[invalid], true)
+                    .is_err()
+            );
+            assert_eq!(
+                fixture
                     .0
                     .read_claim_locked(&original.correlation_id)
                     .unwrap()
-                    .unwrap();
-                assert_eq!(
-                    updated.state,
-                    if consumed {
-                        ClaimState::ReplyConsumed
-                    } else {
-                        ClaimState::ReplyEnqueued
-                    }
-                );
-                assert_eq!(
-                    updated.reply_delivery,
-                    Some(if consumed {
-                        DeliveryState::Consumed
-                    } else {
-                        DeliveryState::Enqueued
-                    })
-                );
-                assert_eq!(updated.request_delivery, original.request_delivery);
-            }
+                    .unwrap(),
+                original
+            );
+        }
+        let rows = [row(reply)];
+        for consumed in [true, true, false, false] {
+            fixture.0.hold_claim_update_locked(&rows, consumed).unwrap();
+            let updated = fixture
+                .0
+                .read_claim_locked(&original.correlation_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                updated.state,
+                if consumed {
+                    ClaimState::ReplyConsumed
+                } else {
+                    ClaimState::ReplyEnqueued
+                }
+            );
+            assert_eq!(
+                updated.reply_delivery,
+                Some(if consumed {
+                    DeliveryState::Consumed
+                } else {
+                    DeliveryState::Enqueued
+                })
+            );
+            assert_eq!(updated.request_delivery, original.request_delivery);
         }
     }
 }
@@ -2478,8 +2153,8 @@ mod hold_recovery_tests {
         let root = std::env::temp_dir().join(format!("relay-hold-recovery-{}", store::uuid_v4()));
         let protocol = ProtocolStore::new(root.clone());
         let mut claims = Vec::new();
-        for origin in [ClaimOrigin::Message, ClaimOrigin::Fanout] {
-            let mut claim = super::hold_tests::claim(ClaimState::ReplyEnqueued, origin);
+        for _ in 0..2 {
+            let mut claim = super::hold_tests::claim(ClaimState::ReplyEnqueued);
             claim.correlation_id = store::uuid_v4();
             claim.request.correlation_id = claim.correlation_id.clone();
             claim.request.id = store::uuid_v4();
@@ -2605,7 +2280,7 @@ mod hold_recovery_tests {
     fn expired_typed_hold_is_restored_by_peek_without_consuming() {
         let root = std::env::temp_dir().join(format!("relay-hold-expiry-{}", store::uuid_v4()));
         let protocol = ProtocolStore::new(root.clone());
-        let original = super::hold_tests::claim(ClaimState::Open, ClaimOrigin::Message);
+        let original = super::hold_tests::claim(ClaimState::Open);
         protocol
             .write_claim(ClaimDirectory::Open, &original)
             .unwrap();
@@ -2657,7 +2332,7 @@ mod hold_recovery_tests {
     fn reply_to_held_request_delivers_once_and_request_ack_preserves_it() {
         let root = std::env::temp_dir().join(format!("relay-hold-reply-{}", store::uuid_v4()));
         let protocol = ProtocolStore::new(root.clone());
-        let original = super::hold_tests::claim(ClaimState::Open, ClaimOrigin::Message);
+        let original = super::hold_tests::claim(ClaimState::Open);
         protocol
             .write_claim(ClaimDirectory::Open, &original)
             .unwrap();

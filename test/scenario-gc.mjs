@@ -14,8 +14,6 @@ export const EXPECTED_LABELS = [
   'GC cannot follow a mailbox-directory symlink to delete a victim file',
   'GC removes exactly aged registered/orphan surfaces and preserves young state',
   'GC preserves an aged session while its watcher lock is held',
-  'a live per-log pump protects only its candidate while GC collects an unrelated aged log',
-  'spawn-log pump lock follows a provisional log rename to the born session name',
   'GC never removes the invoking session even when all its surfaces are aged',
   'AGENT_RELAY_GC_DAYS=0 disables GC without writing a stamp',
   'fresh gc-stamp throttles an immediate second sweep',
@@ -61,20 +59,16 @@ export async function run({ bin, home, emit }) {
       path.join(home, 'watchers', `${id}.lock`),
       path.join(home, 'watchers', `${id}.progress`),
       path.join(home, 'locks', `resume-${id}.lock`),
-      path.join(home, 'spawn-logs', `${id}.stderr`),
     ];
     const seedGcSession = (home, name, id) => {
       const dir = path.join(home, `project-${name}`);
       fs.mkdirSync(dir, { recursive: true });
-      const event = JSON.stringify({ session_id: id, cwd: dir, hook_event_name: 'SessionStart', source: 'startup' });
-      assert.equal(gcRun(home, ['hook'], { input: event }).status, 0);
+      assert.equal(gcRun(home, ['hook', 'omp', '--session', id, '--cwd', dir]).status, 0);
       assert.equal(gcRun(home, ['register', name, '--id', id, '--dir', dir]).status, 0);
-      fs.mkdirSync(path.join(home, 'spawn-logs'), { recursive: true });
       fs.writeFileSync(path.join(home, 'mailbox', `${id}.jsonl`), '{}\n');
       fs.writeFileSync(path.join(home, 'watchers', `${id}.lock`), '{}');
       fs.writeFileSync(path.join(home, 'watchers', `${id}.progress`), '0\n');
       fs.writeFileSync(path.join(home, 'locks', `resume-${id}.lock`), '{}');
-      fs.writeFileSync(path.join(home, 'spawn-logs', `${id}.stderr`), 'log\n');
       return { id, dir, paths: gcSurfaces(home, id, dir) };
     };
     const ageGcSession = (home, session) => {
@@ -90,7 +84,7 @@ export async function run({ bin, home, emit }) {
       return r;
     };
     const makeGcSurfaceDirs = (home, omit = []) => {
-      for (const directory of ['mailbox', 'markers', 'watchers', 'locks', 'spawn-logs']) {
+      for (const directory of ['mailbox', 'markers', 'watchers', 'locks']) {
         if (!omit.includes(directory)) fs.mkdirSync(path.join(home, directory), { recursive: true });
       }
     };
@@ -123,7 +117,6 @@ export async function run({ bin, home, emit }) {
         path.join(home, 'watchers', 'notes.lock'),
         path.join(home, 'watchers', 'notes.progress'),
         path.join(home, 'locks', 'resume-notes.lock'),
-        path.join(home, 'spawn-logs', 'notes.stderr'),
       ];
       for (const file of foreign) {
         fs.writeFileSync(file, 'not-a-uuid\n');
@@ -189,10 +182,7 @@ export async function run({ bin, home, emit }) {
       const invoker = seedGcSession(home, 'invoker', '32323232-3232-4232-8232-323232323232');
       ageGcSession(home, aged);
       const orphanId = '33333333-3434-4333-8333-333333333333';
-      const orphan = [
-        path.join(home, 'mailbox', `${orphanId}.jsonl`),
-        path.join(home, 'spawn-logs', `${orphanId}.stderr`),
-      ];
+      const orphan = [path.join(home, 'mailbox', `${orphanId}.jsonl`)];
       for (const file of orphan) {
         fs.writeFileSync(file, 'orphan\n');
         fs.utimesSync(file, gcOld, gcOld);
@@ -250,75 +240,6 @@ export async function run({ bin, home, emit }) {
         );
       } finally {
         watcher.kill('SIGKILL');
-      }
-    });
-
-    check('a live per-log pump protects only its candidate while GC collects an unrelated aged log', () => {
-      const home = fs.mkdtempSync(path.join(HOME, 'gc-spawn-pump-'));
-      const held = seedGcSession(home, 'held', '44444444-4444-4444-8444-444444444444');
-      const collected = seedGcSession(home, 'collected', '46464646-4646-4646-8646-464646464646');
-      const invoker = seedGcSession(home, 'invoker', '45454545-4545-4545-8545-454545454545');
-      ageGcSession(home, held);
-      ageGcSession(home, collected);
-      const heldLog = path.join(home, 'spawn-logs', `${held.id}.stderr`);
-      fs.rmSync(heldLog);
-      fs.rmSync(path.join(home, 'gc-stamp'), { force: true });
-      const pump = trackChild(
-        spawn(BIN, ['__spawn-log-writer', held.id], {
-          env: gcEnv(home),
-          detached: true,
-          stdio: ['pipe', 'ignore', 'ignore'],
-        }),
-        { processGroup: true },
-      );
-      try {
-        waitFor(() => pump.exitCode === null && fs.existsSync(heldLog), 'per-log pump liveness lock');
-        fs.utimesSync(heldLog, gcOld, gcOld);
-        runGcBus(home, invoker.dir);
-        assert.ok(
-          held.paths.every((file) => fs.existsSync(file)),
-          'pump-held candidate survives intact',
-        );
-        assert.ok(
-          collected.paths.every((file) => !fs.existsSync(file)),
-          'unrelated aged candidate is collected',
-        );
-      } finally {
-        pump.stdin.end();
-        pump.kill('SIGKILL');
-      }
-    });
-
-    check('spawn-log pump lock follows a provisional log rename to the born session name', () => {
-      const home = fs.mkdtempSync(path.join(HOME, 'gc-spawn-rename-'));
-      const born = seedGcSession(home, 'born', '49494949-4949-4949-8949-494949494949');
-      const invoker = seedGcSession(home, 'invoker', '51515151-5151-4151-8151-515151515151');
-      const provisionalId = '52525252-5252-4252-8252-525252525252';
-      const bornLog = path.join(home, 'spawn-logs', `${born.id}.stderr`);
-      const provisionalLog = path.join(home, 'spawn-logs', `${provisionalId}.stderr`);
-      ageGcSession(home, born);
-      fs.rmSync(bornLog);
-      fs.rmSync(path.join(home, 'gc-stamp'), { force: true });
-      const pump = trackChild(
-        spawn(BIN, ['__spawn-log-writer', provisionalId], {
-          env: gcEnv(home),
-          detached: true,
-          stdio: ['pipe', 'ignore', 'ignore'],
-        }),
-        { processGroup: true },
-      );
-      try {
-        waitFor(() => pump.exitCode === null && fs.existsSync(provisionalLog), 'provisional per-log pump lock');
-        fs.renameSync(provisionalLog, bornLog);
-        fs.utimesSync(bornLog, gcOld, gcOld);
-        runGcBus(home, invoker.dir);
-        assert.ok(
-          born.paths.every((file) => fs.existsSync(file)),
-          'renamed pump-held candidate survives intact',
-        );
-      } finally {
-        pump.stdin.end();
-        pump.kill('SIGKILL');
       }
     });
 

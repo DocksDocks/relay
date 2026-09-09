@@ -3,10 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { scaledTimeout } from './lib/time-factor.mjs';
 import { createFixture, createScenarioCheck, runScenarioCli } from './selftest-fixture.mjs';
-
-const HERE = path.dirname(fileURLToPath(import.meta.url));
 
 const UUID_V4_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const MESSAGE_V2_KEYS = [
@@ -33,7 +30,6 @@ const LEGACY_MCP_INPUT_SCHEMAS = {
         description: 'Override session id (defaults to this session, resolved from the project dir).',
       },
       dir: { type: 'string', description: 'Override project dir (defaults to the launch dir).' },
-      server: { type: 'string', description: 'Codex app-server Unix socket for live delivery to this session.' },
     },
     required: ['name'],
     additionalProperties: false,
@@ -71,7 +67,7 @@ const LEGACY_MCP_INPUT_SCHEMAS = {
         type: 'number',
         description: 'Only sessions whose last activity is within this many minutes (default 60).',
       },
-      tool: { type: 'string', enum: ['claude', 'codex', 'omp'], description: 'Restrict to one tool.' },
+      tool: { type: 'string', enum: ['omp'], description: 'Restrict to one tool.' },
     },
     additionalProperties: false,
   },
@@ -169,7 +165,11 @@ function assertMcpToolCatalog(tools) {
     'whoami',
   ]);
   for (const [name, schema] of Object.entries(LEGACY_MCP_INPUT_SCHEMAS)) {
-    assert.deepEqual(byName[name].inputSchema, schema, `${name} MCP input schema changed`);
+    assert.deepEqual(
+      mcpSchemaShape(byName[name].inputSchema),
+      mcpSchemaShape(schema),
+      `${name} MCP input schema changed`,
+    );
   }
   assert.deepEqual(mcpSchemaShape(byName.request.inputSchema), {
     type: 'object',
@@ -611,42 +611,36 @@ export const EXPECTED_LABELS = [
   'hook seeds marker + registration for both sessions (exit 0)',
   'register CLI names both sessions',
   'initialize negotiates protocol + serverInfo',
-  'tools/list returns the 6 bus tools',
+  'bus catalog and request/reply preserve correlated delivery contracts',
   'whoami resolves this session from the cwd marker',
   'roster lists both registered sessions',
   'send to agent-B reports ok + correct recipient dir',
   "message landed in agent-B's mailbox tagged with the sender (peek is read-only)",
   'hook exits 0',
-  'hook injects pending mail as SessionStart additionalContext',
+  'hook injects pending mail as omp context',
   'hook drained the inbox (no redelivery)',
   'send CLI queues to an explicit --id target',
   'inbox() returns then clears pending messages',
+  'held mail rolls back for redelivery and ack commits delivery',
   'non-attach verbs still treat --exec as a value flag',
   'send to an unknown recipient returns isError',
-  'registry carries a tool field (codex tagged; default claude)',
+  'registry pins explicit and default tools to omp',
   'AGENT_RELAY_HOME takes precedence over SESSION_RELAY_HOME',
-  'wake dispatches the codex doorbell for a codex target',
-  'wake dispatches the claude doorbell for a claude target',
-  'wake --dry maps --model/--effort for codex and claude targets',
-  'wake --service-tier is Codex-only and emits exact Fast overrides',
-  'attach always runs as a guarded spawn+wait and prints no copyable command',
-  'legacy attach --exec is accepted but still uses guarded spawn+wait',
-  'guarded attach inherits stdin/stdout/stderr while the relay parent waits',
+  'wake --dry resumes omp with model and thinking before the prompt fence',
+  'attach directly resumes omp under the resume lock without printing a command',
+  'attach --exec inherits stdin/stdout/stderr and holds the resume lock',
   'attach strictly rejects extra operands, unknown flags, and exec after --',
-  'attach refuses a missing stored dir before guarded spawn',
+  'attach refuses a missing stored dir before launch',
   'attach rejects an unresolved non-UUID id',
   'attach fails closed when the resume lock cannot be probed',
-  'wake prints claude usage to stderr and keeps fixture stdout byte-identical',
-  'wake prints codex usage to stderr and keeps fixture stdout byte-identical',
-  'wake preserves no-trailing-newline stdout while still reporting usage',
-  'wake omits usage on garbage stdout and preserves the child exit code',
+  'wake preserves child stdout and stderr bytes',
+  'wake preserves no-trailing-newline stdout and child exit code',
 ];
 
 export async function run({ bin, home, emit }) {
   const fixture = createFixture({ bin, home });
   const labels = [];
   let check;
-  let waitForLifecycleCustody;
   let scenarioResult;
   let hasPrimaryError = false;
   let primaryError;
@@ -659,25 +653,11 @@ export async function run({ bin, home, emit }) {
     runHook,
     runBus,
     toolJSON,
-    configValues,
     peek,
   } = fixture;
 
   try {
     check = createScenarioCheck({ emit, labels });
-    const lifecycleState = () => JSON.parse(fs.readFileSync(path.join(HOME, 'lifecycle-v1.json'), 'utf8')).state;
-    const lifecycleWait = new Int32Array(new SharedArrayBuffer(4));
-    waitForLifecycleCustody = () => {
-      const deadline = Date.now() + scaledTimeout(5_000);
-      while (true) {
-        const state = lifecycleState();
-        const supervisors = Object.keys(state.lifecycle_supervisors ?? {});
-        const watchdogs = Object.keys(state.lifecycle_watchdogs ?? {});
-        if (supervisors.length === 0 && watchdogs.length === 0) return;
-        assert.ok(Date.now() < deadline, 'detached lifecycle custody exits before scenario cleanup');
-        Atomics.wait(lifecycleWait, 0, 0, 10);
-      }
-    };
     const dirA = path.join(HOME, 'proj-a');
     const dirB = path.join(HOME, 'proj-b');
     fs.mkdirSync(dirA, { recursive: true });
@@ -732,7 +712,7 @@ export async function run({ bin, home, emit }) {
       assert.equal(res.get(1).result.serverInfo.name, 'session-relay-bus');
       assert.ok(res.get(1).result.capabilities.tools);
     });
-    check('tools/list returns the 6 bus tools', () => {
+    check('bus catalog and request/reply preserve correlated delivery contracts', () => {
       const names = res
         .get(2)
         .result.tools.filter(({ name }) => name !== 'request' && name !== 'reply')
@@ -774,10 +754,8 @@ export async function run({ bin, home, emit }) {
 
     const hookRun = runHook({ session_id: idB, cwd: dirB, hook_event_name: 'SessionStart', source: 'resume' });
     check('hook exits 0', () => assert.equal(hookRun.status, 0));
-    check('hook injects pending mail as SessionStart additionalContext', () => {
-      const out = JSON.parse(hookRun.stdout);
-      assert.equal(out.hookSpecificOutput.hookEventName, 'SessionStart');
-      assert.ok(out.hookSpecificOutput.additionalContext.includes('hello from A'));
+    check('hook injects pending mail as omp context', () => {
+      assert.ok(hookRun.stdout.includes('hello from A'));
     });
     check('hook drained the inbox (no redelivery)', () => assert.equal(peek('agent-B').count, 0));
 
@@ -793,6 +771,20 @@ export async function run({ bin, home, emit }) {
       assert.equal(box.count, 1);
       assert.equal(box.messages[0].body, 'second message');
       assert.equal(peek('agent-B').count, 0);
+    });
+    check('held mail rolls back for redelivery and ack commits delivery', () => {
+      assert.equal(relay(['send', 'agent-B', '--', 'held message']).status, 0);
+      const held = relayJSON(['inbox', '--hold', '60', 'agent-B']);
+      assert.deepEqual(
+        held.messages.map(({ body }) => body),
+        ['held message'],
+      );
+      assert.equal(relayJSON(['inbox', 'agent-B']).count, 0);
+      assert.equal(relay(['rollback', held.token]).status, 0);
+      const retried = relayJSON(['inbox', '--hold', '60', 'agent-B']);
+      assert.deepEqual(retried.messages, held.messages);
+      assert.equal(relay(['ack', retried.token]).status, 0);
+      assert.equal(relayJSON(['inbox', 'agent-B']).count, 0);
     });
     check('non-attach verbs still treat --exec as a value flag', () => {
       const result = relay(['send', 'agent-B', '--exec', 'must-not-send']);
@@ -812,8 +804,8 @@ export async function run({ bin, home, emit }) {
     const dirC = path.join(HOME, 'proj-c');
     const idC = '33333333-3333-3333-3333-333333333333';
     fs.mkdirSync(dirC, { recursive: true });
-    relay(['register', 'codex-C', '--id', idC, '--dir', dirC, '--tool', 'codex']);
-    check('registry carries a tool field (codex tagged; default claude)', () => {
+    assert.equal(relay(['register', 'omp-C', '--id', idC, '--dir', dirC, '--tool', 'omp']).status, 0);
+    check('registry pins explicit and default tools to omp', () => {
       const { agents } = toolJSON(
         runBus(dirA, [
           { jsonrpc: '2.0', id: 1, method: 'initialize', params: {} },
@@ -821,8 +813,8 @@ export async function run({ bin, home, emit }) {
         ]).get(2),
       );
       const byName = Object.fromEntries(agents.map((agent) => [agent.name, agent.tool]));
-      assert.equal(byName['codex-C'], 'codex');
-      assert.equal(byName['agent-A'], 'claude');
+      assert.equal(byName['omp-C'], 'omp');
+      assert.equal(byName['agent-A'], 'omp');
     });
     check('AGENT_RELAY_HOME takes precedence over SESSION_RELAY_HOME', () => {
       const alternateHome = path.join(HOME, 'alt-home');
@@ -838,193 +830,113 @@ export async function run({ bin, home, emit }) {
       const registry = JSON.parse(fs.readFileSync(path.join(HOME, 'registry.json'), 'utf8'));
       assert.ok(!registry.agents[precedenceId], 'legacy-alias store untouched');
     });
-    const relayDry = (who) => relayJSON(['wake', who, '--dry']);
-    check('wake dispatches the codex doorbell for a codex target', () => {
-      const dryRun = relayDry('codex-C');
-      assert.equal(dryRun.tool, 'codex');
-      assert.equal(dryRun.cmd, 'codex');
-      assert.deepEqual(dryRun.args.slice(0, 3), ['exec', 'resume', idC]);
-      assert.deepEqual(configValues(dryRun.args), ['service_tier="default"']);
-      assert.equal(dryRun.cwd, dirC);
-    });
-    check('wake dispatches the claude doorbell for a claude target', () => {
-      const dryRun = relayDry('agent-A');
-      assert.equal(dryRun.tool, 'claude');
-      assert.equal(dryRun.cmd, 'claude');
-      assert.ok(dryRun.args.includes('--resume') && dryRun.args.includes(idA));
-    });
-    check('wake --dry maps --model/--effort for codex and claude targets', () => {
-      const codex = relayJSON(['wake', 'codex-C', '--model', 'gpt-5.6-sol', '--effort', 'xhigh', '--dry']);
-      assert.deepEqual(codex.args.slice(0, 7), [
-        'exec',
-        'resume',
-        idC,
-        '-m',
-        'gpt-5.6-sol',
-        '-c',
-        'model_reasoning_effort=xhigh',
-      ]);
-      assert.deepEqual(configValues(codex.args), ['model_reasoning_effort=xhigh', 'service_tier="default"']);
-      assert.ok(codex.args.indexOf('--') > 6, 'codex model flags stay before the prompt fence');
-
-      const claude = relayJSON(['wake', 'agent-A', '--model', 'opus', '--effort', 'max', '--dry']);
-      const resume = claude.args.indexOf('--resume');
-      assert.deepEqual(claude.args.slice(resume, resume + 7), [
-        '--resume',
-        idA,
+    check('wake --dry resumes omp with model and thinking before the prompt fence', () => {
+      const dryRun = relayJSON([
+        'wake',
+        'omp-C',
         '--model',
-        'opus',
+        'test-model',
         '--effort',
-        'max',
-        '--output-format',
+        'high',
+        '--dry',
+        '--',
+        '-prompt',
       ]);
-      assert.ok(claude.args.indexOf('--') > resume + 6, 'claude model flags stay before the prompt fence');
-    });
-    check('wake --service-tier is Codex-only and emits exact Fast overrides', () => {
-      const codex = relayJSON(['wake', 'codex-C', '--service-tier', 'fast', '--dry']);
-      assert.deepEqual(configValues(codex.args), ['features.fast_mode=true', 'service_tier="fast"']);
-      const duplicate = relay(['wake', 'codex-C', '--service-tier', 'fast', '--service-tier', 'default', '--dry']);
-      assert.notEqual(duplicate.status, 0);
-      assert.match(duplicate.stderr, /duplicate.*service-tier|service-tier.*duplicate/i);
-      const invalid = relay(['wake', 'codex-C', '--service-tier', 'turbo', '--dry']);
-      assert.notEqual(invalid.status, 0);
-      assert.match(invalid.stderr, /service-tier.*default\|fast/i);
-      const claude = relay(['wake', 'agent-A', '--service-tier', 'fast', '--dry']);
-      assert.notEqual(claude.status, 0);
-      assert.match(claude.stderr, /service-tier.*Codex-only/i);
-    });
-
-    const attachStubDir = path.join(HOME, 'attach-stubs');
-    fs.mkdirSync(attachStubDir);
-    const attachStub = `#!/usr/bin/env node
-const fs = require('node:fs');
-const interactive = process.env.ATTACH_STUB_INTERACTIVE === '1';
-const stdin = interactive ? fs.readFileSync(0, 'utf8') : '';
-if (interactive) {
-  process.stdout.write('attach-stdout');
-  process.stderr.write('attach-stderr');
-}
-fs.writeFileSync(process.env.ATTACH_STUB_OUTPUT, JSON.stringify({ argv: process.argv.slice(2), cwd: process.cwd(), ...(interactive ? { stdin } : {}) }));
-`;
-    for (const tool of ['codex', 'claude']) {
-      fs.writeFileSync(path.join(attachStubDir, tool), attachStub, { mode: 0o755 });
-    }
-    const attachPath = `${attachStubDir}${path.delimiter}${process.env.PATH}`;
-
-    check('attach always runs as a guarded spawn+wait and prints no copyable command', () => {
-      const codexRecord = path.join(HOME, 'attach-codex.json');
-      const codex = relay(['attach', 'codex-C'], {
-        env: { PATH: attachPath, ATTACH_STUB_OUTPUT: codexRecord },
-      });
-      assert.equal(codex.status, 0, codex.stderr);
-      assert.deepEqual(JSON.parse(fs.readFileSync(codexRecord, 'utf8')), {
-        argv: ['resume', idC, '-C', dirC, '-c', 'service_tier="default"'],
-        cwd: process.cwd(),
-      });
-      assert.match(codex.stderr, /WARNING: split-brain risk/);
-      assert.doesNotMatch(codex.stdout, /command:/);
-
-      const byIdRecord = path.join(HOME, 'attach-codex-id.json');
-      const byId = relay(['attach', idC], {
-        env: { PATH: attachPath, ATTACH_STUB_OUTPUT: byIdRecord },
-      });
-      assert.equal(byId.status, 0, byId.stderr);
-      assert.deepEqual(JSON.parse(fs.readFileSync(byIdRecord, 'utf8')).argv, [
-        'resume',
+      assert.equal(dryRun.tool, 'omp');
+      assert.deepEqual(dryRun.args, [
+        '-p',
+        '--resume',
         idC,
-        '-C',
-        dirC,
-        '-c',
-        'service_tier="default"',
+        '--mode',
+        'json',
+        '--model',
+        'test-model',
+        '--thinking',
+        'high',
+        '--',
+        '-prompt',
       ]);
-
-      const claudeRecord = path.join(HOME, 'attach-claude.json');
-      const claude = relay(['attach', 'agent-A'], {
-        env: { PATH: attachPath, ATTACH_STUB_OUTPUT: claudeRecord },
-      });
-      assert.equal(claude.status, 0, claude.stderr);
-      assert.deepEqual(JSON.parse(fs.readFileSync(claudeRecord, 'utf8')), {
-        argv: ['--resume', idA],
-        cwd: dirA,
-      });
-      assert.match(claude.stderr, /WARNING: split-brain risk/);
+      assert.equal(dryRun.cwd, dirC);
+      assert.match(dryRun.cmd, /^omp /);
     });
 
-    check('legacy attach --exec is accepted but still uses guarded spawn+wait', () => {
-      for (const args of [
-        ['attach', 'codex-C', '--exec'],
-        ['attach', '--exec', 'codex-C'],
-      ]) {
-        const record = path.join(HOME, `attach-legacy-${args[1] === '--exec' ? 'before' : 'after'}.json`);
-        const result = relay(args, {
-          env: { PATH: attachPath, ATTACH_STUB_OUTPUT: record },
-        });
-        assert.equal(result.status, 0, result.stderr);
-        assert.deepEqual(JSON.parse(fs.readFileSync(record, 'utf8')).argv, [
-          'resume',
-          idC,
-          '-C',
-          dirC,
-          '-c',
-          'service_tier="default"',
-        ]);
-        assert.match(result.stderr, /--exec is deprecated/);
-        assert.doesNotMatch(result.stdout, /command:/);
-      }
+    const stubDir = path.join(HOME, 'omp-stub');
+    fs.mkdirSync(stubDir);
+    const stub = path.join(stubDir, 'omp');
+    fs.writeFileSync(
+      stub,
+      `#!/usr/bin/env node
+const fs = require('node:fs');
+const { spawnSync } = require('node:child_process');
+if (process.env.ATTACH_RECORD) {
+  const competing = spawnSync(process.env.RELAY_BIN, ['attach', 'agent-A', '--exec'], {
+    encoding: 'utf8', env: { ...process.env, ATTACH_RECORD: '' },
+  });
+  fs.writeFileSync(process.env.ATTACH_RECORD, JSON.stringify({
+    argv: process.argv.slice(2), cwd: process.cwd(), stdin: fs.readFileSync(0, 'utf8'),
+    competing: { status: competing.status, stderr: competing.stderr },
+  }));
+}
+process.stdout.write(process.env.CHILD_STDOUT || '');
+process.stderr.write(process.env.CHILD_STDERR || '');
+process.exit(Number(process.env.CHILD_STATUS || 0));
+`,
+      { mode: 0o755 },
+    );
+    const childEnv = { PATH: `${stubDir}${path.delimiter}${process.env.PATH}`, RELAY_BIN: path.resolve(bin) };
+
+    check('attach directly resumes omp under the resume lock without printing a command', () => {
+      const record = path.join(HOME, 'attach-default.json');
+      const result = relay(['attach', 'agent-A'], { env: { ...childEnv, ATTACH_RECORD: record } });
+      assert.equal(result.status, 0, result.stderr);
+      const observed = JSON.parse(fs.readFileSync(record, 'utf8'));
+      assert.deepEqual(observed.argv, ['--resume', idA]);
+      assert.equal(observed.cwd, dirA);
+      assert.equal(observed.competing.status, 3);
+      assert.match(observed.competing.stderr, /resume lock held/);
+      assert.equal(result.stdout, '');
     });
 
-    check('guarded attach inherits stdin/stdout/stderr while the relay parent waits', () => {
-      const record = path.join(HOME, 'attach-interactive.json');
-      const result = relay(['attach', 'agent-A'], {
+    check('attach --exec inherits stdin/stdout/stderr and holds the resume lock', () => {
+      const record = path.join(HOME, 'attach-exec.json');
+      const result = relay(['attach', 'agent-A', '--exec'], {
         input: 'interactive-input',
-        env: {
-          PATH: attachPath,
-          ATTACH_STUB_OUTPUT: record,
-          ATTACH_STUB_INTERACTIVE: '1',
-        },
+        env: { ...childEnv, ATTACH_RECORD: record, CHILD_STDOUT: 'attach-out', CHILD_STDERR: 'attach-err' },
       });
       assert.equal(result.status, 0, result.stderr);
-      assert.equal(JSON.parse(fs.readFileSync(record, 'utf8')).stdin, 'interactive-input');
-      assert.match(result.stdout, /attach-stdout/);
-      assert.match(result.stderr, /attach-stderr/);
-      assert.deepEqual(
-        lifecycleState().active_operations ?? {},
-        {},
-        'attach releases its durable operation id before exit',
-      );
+      const observed = JSON.parse(fs.readFileSync(record, 'utf8'));
+      assert.deepEqual(observed.argv, ['--resume', idA]);
+      assert.equal(observed.cwd, dirA);
+      assert.equal(observed.stdin, 'interactive-input');
+      assert.equal(observed.competing.status, 3);
+      assert.match(observed.competing.stderr, /resume lock held/);
+      assert.equal(result.stdout, 'attach-out');
+      assert.match(result.stderr, /attach-err/);
+      const again = relay(['attach', 'agent-A', '--exec'], { env: childEnv });
+      assert.equal(again.status, 0, again.stderr);
     });
 
     check('attach strictly rejects extra operands, unknown flags, and exec after --', () => {
-      const record = path.join(HOME, 'attach-strict.json');
       for (const args of [
-        ['attach', 'codex-C', 'extra'],
-        ['attach', 'codex-C', '--bogus'],
-        ['attach', 'codex-C', '--', '--exec'],
+        ['attach', 'omp-C', 'extra'],
+        ['attach', 'omp-C', '--bogus'],
+        ['attach', 'omp-C', '--', '--exec'],
       ]) {
-        const result = relay(args, { env: { PATH: attachPath, ATTACH_STUB_OUTPUT: record } });
-        assert.equal(result.status, 2, `${args.join(' ')} exited ${result.status}: ${result.stderr}`);
-        assert.match(result.stderr, /usage: relay attach <nameOrId> \[--exec\]/);
+        const result = relay(args, { env: childEnv });
+        assert.equal(result.status, 2);
+        assert.match(result.stderr, /usage: relay attach/);
       }
-      assert.equal(fs.existsSync(record), false, '--exec after -- never replaced the process');
     });
 
-    check('attach refuses a missing stored dir before guarded spawn', () => {
+    check('attach refuses a missing stored dir before launch', () => {
       const missingId = '53535353-5353-4353-8353-535353535353';
-      const missingDir = path.join(HOME, 'missing-attach-dir');
       assert.equal(
-        relay(['register', 'missing-attach', '--id', missingId, '--dir', missingDir, '--tool', 'codex']).status,
+        relay(['register', 'missing-attach', '--id', missingId, '--dir', path.join(HOME, 'missing-dir')]).status,
         0,
       );
-      for (const args of [
-        ['attach', 'missing-attach'],
-        ['attach', 'missing-attach', '--exec'],
-      ]) {
-        const record = path.join(HOME, `attach-missing-${args.length}.json`);
-        const result = relay(args, { env: { PATH: attachPath, ATTACH_STUB_OUTPUT: record } });
-        assert.equal(result.status, 1);
-        assert.match(result.stderr, /stored dir does not exist/);
-        assert.equal(fs.existsSync(record), false);
-      }
+      const result = relay(['attach', 'missing-attach', '--exec'], { env: childEnv });
+      assert.equal(result.status, 1);
+      assert.match(result.stderr, /stored dir does not exist/);
     });
 
     check('attach rejects an unresolved non-UUID id', () => {
@@ -1037,81 +949,31 @@ fs.writeFileSync(process.env.ATTACH_STUB_OUTPUT, JSON.stringify({ argv: process.
       const unknownId = '54545454-5454-4454-8454-545454545454';
       assert.equal(relay(['register', 'unknown-attach-lock', '--id', unknownId, '--dir', dirA]).status, 0);
       const lock = path.join(HOME, 'locks', `resume-${unknownId}.lock`);
-      fs.writeFileSync(lock, '{}', { mode: 0o000 });
+      fs.mkdirSync(lock);
       try {
-        const result = relay(['attach', 'unknown-attach-lock']);
+        const result = relay(['attach', 'unknown-attach-lock', '--exec'], { env: childEnv });
         assert.equal(result.status, 4);
-        assert.match(result.stderr, /attach refused: cannot verify resume lock state/);
-        assert.match(result.stderr, /relay doctor --id/);
-        assert.match(result.stderr, /WARNING: split-brain risk/);
+        assert.match(result.stderr, /cannot verify resume lock state/);
       } finally {
-        fs.chmodSync(lock, 0o600);
+        fs.rmdirSync(lock);
       }
     });
 
-    const wakeStub = path.join(HOME, 'fake-wake');
-    fs.writeFileSync(
-      wakeStub,
-      `#!/usr/bin/env node
-const fs = require('node:fs');
-if (process.env.WAKE_STUB_RECORD) fs.writeFileSync(process.env.WAKE_STUB_RECORD, JSON.stringify(process.argv.slice(2)));
-const file = process.env.WAKE_STUB_FILE;
-if (file) process.stdout.write(fs.readFileSync(file));
-else process.stdout.write(process.env.WAKE_STUB_STDOUT || '');
-if (process.env.WAKE_STUB_STDERR) process.stderr.write(process.env.WAKE_STUB_STDERR);
-const delay = Number(process.env.WAKE_STUB_DELAY_MS || 0);
-if (delay > 0) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, delay);
-process.exit(Number(process.env.WAKE_STUB_STATUS || 0));
-`,
-      { mode: 0o755 },
-    );
-    const fixtureDir = path.join(HERE, 'fixtures');
-    const claudeUsageFixture = path.join(fixtureDir, 'wake-usage-claude.json');
-    const codexUsageFixture = path.join(fixtureDir, 'wake-usage-codex.jsonl');
-    const noNewlineFixture = path.join(HOME, 'wake-no-newline.json');
-    fs.writeFileSync(
-      noNewlineFixture,
-      '{"type":"result","total_cost_usd":1.25,"usage":{"input_tokens":7,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":3}}',
-    );
-
-    check('wake prints claude usage to stderr and keeps fixture stdout byte-identical', () => {
-      const expected = fs.readFileSync(claudeUsageFixture);
-      const result = relayBytes(['wake', 'agent-A', '--model', 'opus', '--effort', 'max'], {
-        env: { RELAY_WAKE_CMD_CLAUDE: wakeStub, WAKE_STUB_FILE: claudeUsageFixture },
+    check('wake preserves child stdout and stderr bytes', () => {
+      const result = relayBytes(['wake', 'agent-A', '--model', 'test-model', '--', 'ping'], {
+        env: { RELAY_WAKE_CMD_OMP: stub, CHILD_STDOUT: '{"message":"hello"}\n', CHILD_STDERR: 'child diagnostic\n' },
       });
-      assert.equal(result.status, 0, `wake exited ${result.status}: ${result.stderr}`);
-      assert.deepEqual(result.stdout, expected);
-      assert.match(
-        result.stderr.toString('utf8'),
-        /\[relay wake\] claude: 45682 in \(45603 cached\) \/ 4 out, \$0\.0142089/,
-      );
+      assert.equal(result.status, 0);
+      assert.deepEqual(result.stdout, Buffer.from('{"message":"hello"}\n'));
+      assert.deepEqual(result.stderr, Buffer.from('child diagnostic\n'));
     });
-    check('wake prints codex usage to stderr and keeps fixture stdout byte-identical', () => {
-      const expected = fs.readFileSync(codexUsageFixture);
-      const result = relayBytes(['wake', 'codex-C', '--model', 'gpt-5.6-sol', '--effort', 'xhigh'], {
-        env: { RELAY_WAKE_CMD_CODEX: wakeStub, WAKE_STUB_FILE: codexUsageFixture },
-      });
-      assert.equal(result.status, 0, `wake exited ${result.status}: ${result.stderr}`);
-      assert.deepEqual(result.stdout, expected);
-      assert.match(result.stderr.toString('utf8'), /\[relay wake\] codex: 47400 in \(12032 cached\) \/ 10 out/);
-    });
-    check('wake preserves no-trailing-newline stdout while still reporting usage', () => {
-      const expected = fs.readFileSync(noNewlineFixture);
-      assert.notEqual(expected.at(-1), 0x0a, 'fixture intentionally has no trailing newline');
-      const result = relayBytes(['wake', 'agent-A', '--model', 'opus', '--effort', 'max'], {
-        env: { RELAY_WAKE_CMD_CLAUDE: wakeStub, WAKE_STUB_FILE: noNewlineFixture },
-      });
-      assert.equal(result.status, 0, `wake exited ${result.status}: ${result.stderr}`);
-      assert.deepEqual(result.stdout, expected);
-      assert.match(result.stderr.toString('utf8'), /\[relay wake\] claude: 7 in \/ 3 out, \$1\.25/);
-    });
-    check('wake omits usage on garbage stdout and preserves the child exit code', () => {
-      const result = relayBytes(['wake', 'agent-A', '--model', 'opus', '--effort', 'max'], {
-        env: { RELAY_WAKE_CMD_CLAUDE: wakeStub, WAKE_STUB_STDOUT: 'not json', WAKE_STUB_STATUS: '7' },
+    check('wake preserves no-trailing-newline stdout and child exit code', () => {
+      const result = relayBytes(['wake', 'agent-A', '--model', 'test-model', '--', 'ping'], {
+        env: { RELAY_WAKE_CMD_OMP: stub, CHILD_STDOUT: 'not json', CHILD_STATUS: '7' },
       });
       assert.equal(result.status, 7);
       assert.deepEqual(result.stdout, Buffer.from('not json'));
-      assert.doesNotMatch(result.stderr.toString('utf8'), /\[relay wake\]/);
+      assert.deepEqual(result.stderr, Buffer.alloc(0));
     });
 
     assert.deepEqual(labels, EXPECTED_LABELS);
@@ -1119,15 +981,6 @@ process.exit(Number(process.env.WAKE_STUB_STATUS || 0));
   } catch (error) {
     hasPrimaryError = true;
     primaryError = error;
-  }
-
-  let hasDrainError = false;
-  let drainError;
-  try {
-    waitForLifecycleCustody?.();
-  } catch (error) {
-    hasDrainError = true;
-    drainError = error;
   }
 
   let hasCleanupError = false;
@@ -1141,7 +994,6 @@ process.exit(Number(process.env.WAKE_STUB_STATUS || 0));
 
   const failures = [];
   if (hasPrimaryError) failures.push(primaryError);
-  if (hasDrainError) failures.push(drainError);
   if (hasCleanupError) failures.push(cleanupError);
   if (failures.length === 1) throw failures[0];
   if (failures.length > 1) {

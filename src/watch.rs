@@ -1,51 +1,17 @@
-// watch.rs — `relay watch`: zero-keystroke push of relay mail into LIVE Codex
-// threads hosted under `codex app-server` (the maintainer-endorsed automation
-// seam — the plain TUI cannot be injected into, openai/codex#11415).
-// Spike-verified 2026-07-02 on codex-cli 0.142.5:
-//   - every app-server socket listener (unix:// included) speaks WebSocket —
-//     HTTP Upgrade + RFC6455 frames; raw JSONL exists only on stdio. Hence the
-//     hand-rolled WS CLIENT below (zero-crate budget: /dev/urandom supplies the
-//     key + masks; the Sec-WebSocket-Accept SHA1 check is intentionally
-//     skipped — local socket, the 101 status line is the gate).
-//   - `thread/resume` accepts a raw rollout/session uuid (thread id == the
-//     relay registry id); `thread/inject_items` persists durably and is
-//     model-visible; `turn/start` with approvalPolicy "never" completes
-//     unattended. The `jsonrpc` field is omitted on the wire.
-//   - a `turn/start` issued immediately after inject_items wedges the turn:
-//     wait RELAY_TURN_SETTLE_MS (default 5000) between the two.
-//   - `approvalPolicy: "never"` auto-rejects shell approvals, but an MCP tool
-//     call raises an `mcpServer/elicitation/request` server->client REQUEST
-//     that MUST be answered (`{action: "accept"|"decline"}`) or the turn wedges
-//     on `waitingOnApproval` forever (live-reproduced 2026-07-02). So after
-//     `turn/start`, watch stays attached until `turn/completed`, accepting
-//     elicitations for the relay's own `bus` server (store-local tools only)
-//     and declining every other server — a declined call fails cleanly and the
-//     turn continues.
-// Delivery: default = inject_items with the UNTRUSTED-DATA fence (mail waits
-// for the thread's next turn); --auto-turn additionally starts a turn carrying
-// a neutral acknowledgement (never mail content). Status is checked before
-// inject and again before turn/start. This shrinks, but cannot close, the
-// cross-client race with a simultaneous human turn/start. Targets that are not
-// app-server reachable fall back to the wake doorbell. A successful inject is
-// final: only a failure before inject succeeds may re-enqueue mail.
-
-use crate::appserver;
+// Poll omp mailboxes and wake idle sessions; follow mode streams mailbox records.
 use crate::cli::{Args, DEFAULT_NUDGE};
-use crate::hook;
-use crate::lifecycle::{self, ChildLaunchSpec, DoorbellMessage, OperationKind};
 use crate::protocol::ProtocolStore;
 use crate::sha256::Sha256;
-use crate::spawn;
 use crate::store;
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{Duration, Instant};
 use tinyjson::JsonValue;
 
 const POLL_MS: u64 = 2000;
-const DEFAULT_SETTLE_MS: u64 = 5000;
 const WAKE_RETRY_MAX_MS: u64 = 30_000;
 const FOLLOW_READ_BUFFER_BYTES: usize = 64 * 1024;
 const MAX_FOLLOW_PENDING_BYTES: usize = 8 * 1024 * 1024;
@@ -59,14 +25,6 @@ struct Target {
     id: String,
     tool: String,
     dir: Option<String>,
-    server: Option<String>,
-    allow_bus: bool,
-}
-
-#[derive(PartialEq, Debug, Clone, Copy)]
-enum Mode {
-    Push,
-    Wake,
 }
 
 struct FollowFile {
@@ -111,60 +69,38 @@ enum WakeOutcome {
     Failed,
 }
 
-enum PushOutcome {
-    Delivered,
-    Busy,
-    AckDeferred(Option<String>),
-}
-
-// Reachability: only a codex session hosted under an app-server can take a
-// push; everything else gets the doorbell. `--server` implies tool=codex on
-// the --id path (an unregistered id would otherwise default to claude and
-// silently route to the wrong leg).
-fn decide(tool: &str, server: Option<&str>) -> Mode {
-    if tool == "codex" && server.is_some() {
-        Mode::Push
-    } else {
-        Mode::Wake
-    }
-}
-
 fn validate_tool(tool: &str) {
-    if !matches!(tool, "claude" | "codex" | "omp") {
-        die(&format!("--tool must be claude|codex|omp, got: {tool}"));
+    if tool != "omp" {
+        die(&format!("--tool must be omp, got: {tool}"));
     }
 }
 
-fn resolve_targets(args: &Args, server: Option<&str>) -> Vec<Target> {
+fn resolve_targets(args: &Args) -> Vec<Target> {
     if let Some(id) = args.flag("id") {
         if !store::is_uuid(id) {
             die(&format!("--id must be a session UUID, got: {id}"));
         }
-        let tool = args
-            .flag("tool")
-            .map(str::to_string)
-            .unwrap_or_else(|| if server.is_some() { "codex" } else { "claude" }.to_string());
+        let tool = args.flag("tool").unwrap_or("omp").to_string();
         return vec![Target {
             id: id.to_string(),
             tool,
             dir: args.flag("dir").map(str::to_string),
-            server: server.map(str::to_string),
-            allow_bus: false,
         }];
     }
     if args.has("all") {
         return store::roster()
             .into_iter()
-            .filter(|e| server.is_none() || e.tool == "codex")
-            .map(|e| {
-                let allow_bus = e.spawned_via.as_deref() == Some("app-server");
-                Target {
-                    id: e.id,
-                    tool: e.tool,
-                    dir: e.dir,
-                    server: e.server.or_else(|| server.map(str::to_string)),
-                    allow_bus,
+            .filter(|e| {
+                let valid = store::is_uuid(&e.id);
+                if !valid {
+                    eprintln!("[relay watch] skip {}: not a session UUID", e.id);
                 }
+                valid
+            })
+            .map(|e| Target {
+                id: e.id,
+                tool: e.tool,
+                dir: e.dir,
             })
             .collect();
     }
@@ -174,87 +110,43 @@ fn resolve_targets(args: &Args, server: Option<&str>) -> Vec<Target> {
             let Some(e) = store::resolve(who) else {
                 die(&format!("unknown session: {who}"));
             };
-            let allow_bus = e.spawned_via.as_deref() == Some("app-server");
+            if !store::is_uuid(&e.id) {
+                die(&format!("{who} is not a session UUID: {}", e.id));
+            }
             Target {
                 id: e.id,
                 tool: args.flag("tool").map(str::to_string).unwrap_or(e.tool),
                 dir: e.dir,
-                server: e.server.or_else(|| server.map(str::to_string)),
-                allow_bus,
             }
         })
         .collect()
 }
 
-fn materialize_appserver_authority(target: &Target) -> Result<(), String> {
-    let Some(server) = target.server.as_deref() else {
-        return Ok(());
-    };
-    if let Some(entry) = store::resolve(&target.id) {
-        if entry.server.as_deref() == Some(server) {
-            return Ok(());
-        }
-        store::register(
-            &target.id,
-            entry.dir.as_deref(),
-            None,
-            Some(&entry.tool),
-            Some(server),
-        )?;
-        return Ok(());
-    }
-    if crate::lifecycle::LifecycleStore::default()
-        .read_binding(&target.id)?
-        .is_some()
-    {
-        return Err("app-server target has lifecycle state but no registry entry".to_string());
-    }
-    let dir = target
-        .dir
-        .as_deref()
-        .ok_or_else(|| "unregistered app-server target requires --dir".to_string())?;
-    store::register(
-        &target.id,
-        Some(dir),
-        None,
-        Some(&target.tool),
-        Some(server),
-    )?;
-    Ok(())
-}
-
 pub fn run(raw: Vec<String>) -> ! {
     let args = Args(raw);
+    if let Some(tool) = args.flag("tool") {
+        validate_tool(tool);
+    }
     if let Some(id) = args.flag("follow") {
         if !store::is_uuid(id) {
             die(&format!("--follow must be a session UUID, got: {id}"));
         }
-        if args.has("all") || args.has("once") || args.flag("server").is_some() {
-            die("--follow cannot be combined with --all, --once, or --server");
+        if args.has("all") || args.has("once") {
+            die("--follow cannot be combined with --all or --once");
         }
-        let tool = args.flag("tool").unwrap_or("claude");
+        let tool = args.flag("tool").unwrap_or("omp");
         validate_tool(tool);
         let _guard = store::acquire_watcher_lock(id, tool, "follow")
             .unwrap_or_else(|e| die(&format!("cannot follow {id}: {e}")));
         follow_mailbox(id);
     }
-    let fallback_server = args.flag("server").map(str::to_string).or_else(|| {
-        std::env::var("RELAY_APP_SERVER")
-            .ok()
-            .filter(|v| !v.is_empty())
-    });
-    let auto_turn = args.has("auto-turn");
     let once = args.has("once");
     let dry = args.has("dry");
-    let settle_ms: u64 = std::env::var("RELAY_TURN_SETTLE_MS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(DEFAULT_SETTLE_MS);
 
-    let targets = resolve_targets(&args, fallback_server.as_deref());
+    let targets = resolve_targets(&args);
     if targets.is_empty() {
         die(
-            "usage: relay watch <nameOrId>... | --all | --id <uuid> [--server <unix-socket>] [--tool codex] [--auto-turn] [--once] [--dry]",
+            "usage: relay watch <nameOrId>... | --all | --id <uuid> [--dir <path>] [--tool omp] [--once] [--dry]",
         );
     }
 
@@ -266,8 +158,6 @@ pub fn run(raw: Vec<String>) -> ! {
             active_targets.push(target);
             continue;
         }
-        materialize_appserver_authority(&target)
-            .unwrap_or_else(|error| die(&format!("cannot bind app-server authority: {error}")));
         let mode = if once { "once" } else { "doorbell" };
         match store::acquire_watcher_lock(&target.id, &target.tool, mode) {
             Ok(guard) => {
@@ -288,7 +178,6 @@ pub fn run(raw: Vec<String>) -> ! {
     // re-ring the doorbell every poll tick while that is in flight.
     let mut woken: HashSet<String> = HashSet::new();
     let mut wake_retries: HashMap<String, WakeRetry> = HashMap::new();
-    let mut pending_ack: HashSet<String> = HashSet::new();
     let mut had_error = false;
     loop {
         if let Err(error) = ProtocolStore::new(store::home_dir()).recover_pending() {
@@ -304,125 +193,49 @@ pub fn run(raw: Vec<String>) -> ! {
             if let Err(e) = store::update_watcher_progress(&t.id) {
                 eprintln!("[relay watch] progress update for {} failed: {e}", t.id);
             }
-            if pending_ack.contains(&t.id) {
-                let Some(server) = t.server.as_deref() else {
-                    eprintln!(
-                        "[relay watch] pending acknowledgement for {} has no app-server",
-                        t.id
-                    );
-                    continue;
-                };
-                if appserver::probe(server).is_err() {
-                    continue;
-                }
-                let mut guard = match lifecycle::admit_operation(&t.id, OperationKind::WatchAck)
-                    .and_then(lifecycle::Admission::into_guard)
-                {
-                    Ok(guard) => guard,
-                    Err(error) => {
-                        eprintln!(
-                            "[relay watch] acknowledgement for {} refused: {error}",
-                            t.id
-                        );
-                        continue;
-                    }
-                };
-                match appserver::acknowledge_with_guard(
-                    &mut guard,
-                    t.allow_bus,
-                    crate::lifecycle::ServiceTier::Default,
-                ) {
-                    Ok(appserver::DeliveryOutcome::Delivered) => {
-                        pending_ack.remove(&t.id);
-                    }
-                    Ok(appserver::DeliveryOutcome::AckDeferred) => continue,
-                    Err(e) => {
-                        eprintln!("[relay watch] acknowledgement for {} deferred: {e}", t.id);
-                        continue;
-                    }
-                }
-            }
             if !store::mailbox_has_content(&t.id) {
                 woken.remove(&t.id);
                 wake_retries.remove(&t.id);
                 continue;
             }
-            let configured_mode = decide(&t.tool, t.server.as_deref());
-            let mode = if configured_mode == Mode::Push
-                && !dry
-                && appserver::probe(t.server.as_deref().unwrap()).is_err()
+            if woken.contains(&t.id) {
+                continue;
+            }
+            if wake_retries
+                .get(&t.id)
+                .is_some_and(|retry| Instant::now() < retry.next_at)
             {
-                Mode::Wake
-            } else {
-                configured_mode
-            };
-            match mode {
-                Mode::Push => {
-                    match push_target(t.server.as_deref().unwrap(), t, auto_turn, dry, settle_ms) {
-                        Ok(PushOutcome::Delivered) => {}
-                        Ok(PushOutcome::AckDeferred(reason)) => {
-                            if let Some(reason) = reason {
-                                eprintln!(
-                                    "[relay watch] mail delivered to {}; visible acknowledgement deferred: {reason}",
-                                    t.id
-                                );
-                            }
-                            if !once {
-                                pending_ack.insert(t.id.clone());
-                            }
-                        }
-                        Ok(PushOutcome::Busy) => {
-                            if once {
-                                had_error = true;
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("[relay watch] {e}");
-                            had_error = true;
-                        }
-                    }
+                continue;
+            }
+            match wake_fallback(t, dry) {
+                WakeOutcome::Delivered => {
+                    wake_retries.remove(&t.id);
+                    woken.insert(t.id.clone());
                 }
-                Mode::Wake => {
-                    if woken.contains(&t.id) {
+                WakeOutcome::Refused => {
+                    if once {
+                        had_error = true;
                         continue;
                     }
-                    if wake_retries
-                        .get(&t.id)
-                        .is_some_and(|retry| Instant::now() < retry.next_at)
-                    {
-                        continue;
-                    }
-                    match wake_fallback(t, dry) {
-                        WakeOutcome::Delivered => {
-                            wake_retries.remove(&t.id);
-                            woken.insert(t.id.clone());
-                        }
-                        WakeOutcome::Refused => {
-                            if once {
-                                had_error = true;
-                                continue;
-                            }
-                            let retry = wake_retries.entry(t.id.clone()).or_insert(WakeRetry {
-                                refusals: 0,
-                                next_at: Instant::now(),
-                            });
-                            retry.refusals = retry.refusals.saturating_add(1);
-                            let shift = retry.refusals.saturating_sub(1).min(4);
-                            let delay_ms = POLL_MS
-                                .saturating_mul(1_u64 << shift)
-                                .min(WAKE_RETRY_MAX_MS);
-                            retry.next_at = Instant::now() + Duration::from_millis(delay_ms);
-                            eprintln!(
-                                "[relay watch] wake refused for {} (fallback); retrying in {}ms",
-                                t.id, delay_ms
-                            );
-                        }
-                        WakeOutcome::Failed => {
-                            wake_retries.remove(&t.id);
-                            woken.insert(t.id.clone());
-                            had_error = true;
-                        }
-                    }
+                    let retry = wake_retries.entry(t.id.clone()).or_insert(WakeRetry {
+                        refusals: 0,
+                        next_at: Instant::now(),
+                    });
+                    retry.refusals = retry.refusals.saturating_add(1);
+                    let shift = retry.refusals.saturating_sub(1).min(4);
+                    let delay_ms = POLL_MS
+                        .saturating_mul(1_u64 << shift)
+                        .min(WAKE_RETRY_MAX_MS);
+                    retry.next_at = Instant::now() + Duration::from_millis(delay_ms);
+                    eprintln!(
+                        "[relay watch] wake refused for {} (fallback); retrying in {}ms",
+                        t.id, delay_ms
+                    );
+                }
+                WakeOutcome::Failed => {
+                    wake_retries.remove(&t.id);
+                    woken.insert(t.id.clone());
+                    had_error = true;
                 }
             }
         }
@@ -619,73 +432,6 @@ fn follow_mailbox(id: &str) -> ! {
     }
 }
 
-fn push_target(
-    server: &str,
-    t: &Target,
-    auto_turn: bool,
-    dry: bool,
-    settle_ms: u64,
-) -> Result<PushOutcome, String> {
-    if dry {
-        println!(
-            "{}",
-            str_obj(&[
-                ("action", if auto_turn { "auto-turn" } else { "inject" }),
-                ("id", &t.id),
-                ("server", server),
-            ])
-        );
-        return Ok(PushOutcome::Delivered);
-    }
-    match appserver::thread_state(server, &t.id) {
-        Ok(appserver::ThreadState::Active) => return Ok(PushOutcome::Busy),
-        Ok(appserver::ThreadState::Idle) => {}
-        Err(e) => return Err(format!("cannot read thread status for {}: {e}", t.id)),
-    }
-    let kind = if auto_turn {
-        OperationKind::WatchAutoTurn
-    } else {
-        OperationKind::WatchInject
-    };
-    let mut guard = lifecycle::admit_operation(&t.id, kind)?.into_guard()?;
-    let drained = lifecycle::drain_with_guard(&mut guard)?;
-    if drained.messages().is_empty() {
-        return Ok(PushOutcome::Delivered);
-    }
-    let block = hook::mail_block(drained.messages(), &t.id);
-    if block.is_empty() {
-        return Ok(PushOutcome::Delivered);
-    }
-    match appserver::deliver_with_guard(
-        &mut guard,
-        &block,
-        auto_turn,
-        settle_ms,
-        t.allow_bus,
-        crate::lifecycle::ServiceTier::Default,
-    ) {
-        Ok(outcome) => {
-            println!(
-                "{}",
-                str_obj(&[
-                    ("delivered", &drained.messages().len().to_string()),
-                    ("to", &t.id),
-                    ("mode", if auto_turn { "auto-turn" } else { "inject" }),
-                ])
-            );
-            match outcome {
-                appserver::DeliveryOutcome::Delivered => Ok(PushOutcome::Delivered),
-                appserver::DeliveryOutcome::AckDeferred => Ok(PushOutcome::AckDeferred(None)),
-            }
-        }
-        Err(appserver::DeliveryError::BeforeInject(e)) => {
-            drained.rollback()?;
-            Err(format!("push to {} failed ({e}); mail re-enqueued", t.id))
-        }
-        Err(appserver::DeliveryError::AfterInject(e)) => Ok(PushOutcome::AckDeferred(Some(e))),
-    }
-}
-
 fn wake_fallback(t: &Target, dry: bool) -> WakeOutcome {
     if dry {
         println!(
@@ -698,21 +444,12 @@ fn wake_fallback(t: &Target, dry: bool) -> WakeOutcome {
         );
         return WakeOutcome::Delivered;
     }
-    let message = match DoorbellMessage::parse(DEFAULT_NUDGE) {
-        Ok(message) => message,
-        Err(error) => {
-            eprintln!("[relay watch] invalid wake fallback message: {error}");
-            return WakeOutcome::Failed;
-        }
-    };
-    let mut guard = match lifecycle::admit_operation(&t.id, OperationKind::WatchWakeFallback)
-        .and_then(lifecycle::Admission::into_guard)
-    {
-        Ok(guard) => guard,
-        Err(error) => {
-            eprintln!("[relay watch] wake fallback for {} refused: {error}", t.id);
-            return WakeOutcome::Refused;
-        }
+    let Some(dir) = t.dir.as_deref().filter(|dir| Path::new(dir).is_dir()) else {
+        eprintln!(
+            "[relay watch] wake fallback for {} requires an existing directory",
+            t.id
+        );
+        return WakeOutcome::Failed;
     };
     let _resume_guard = match store::acquire_resume_lock(&t.id, &t.tool) {
         Ok(lock) => lock,
@@ -725,14 +462,12 @@ fn wake_fallback(t: &Target, dry: bool) -> WakeOutcome {
             return WakeOutcome::Failed;
         }
     };
-    match spawn::run_child_with_guard(&mut guard, ChildLaunchSpec::WatchWakeFallback(message)) {
-        Ok(output) if output.status.success() => WakeOutcome::Delivered,
-        Ok(output) if output.status.code() == Some(3) => WakeOutcome::Refused,
-        Ok(output) => {
-            eprintln!(
-                "[relay watch] wake fallback for {} exited {}",
-                t.id, output.status
-            );
+    let (cmd, args) = crate::cli::doorbell_args(&t.id, DEFAULT_NUDGE, None, None);
+    match Command::new(cmd).args(args).current_dir(dir).status() {
+        Ok(status) if status.success() => WakeOutcome::Delivered,
+        Ok(status) if status.code() == Some(3) => WakeOutcome::Refused,
+        Ok(status) => {
+            eprintln!("[relay watch] wake fallback for {} exited {}", t.id, status);
             WakeOutcome::Failed
         }
         Err(error) => {
@@ -755,20 +490,6 @@ fn str_obj(pairs: &[(&str, &str)]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn decide_routes_only_codex_with_server_to_push() {
-        assert_eq!(decide("codex", Some("/s.sock")), Mode::Push);
-        assert_eq!(decide("codex", None), Mode::Wake);
-        assert_eq!(decide("claude", Some("/s.sock")), Mode::Wake);
-        assert_eq!(decide("claude", None), Mode::Wake);
-    }
-
-    #[test]
-    fn decide_routes_omp_to_wake_with_or_without_server() {
-        assert_eq!(decide("omp", Some("/s.sock")), Mode::Wake);
-        assert_eq!(decide("omp", None), Mode::Wake);
-    }
 
     #[test]
     fn follow_drops_an_overlong_incomplete_record_then_resumes() {

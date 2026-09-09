@@ -187,62 +187,12 @@ jobs:
           cp "target/$TARGET/release/relay" "$out/$ASSET_NAME"
           chmod 0755 "$out/$ASSET_NAME"
           test "$("$out/$ASSET_NAME" --version)" = "session-relay $EXPECTED_VERSION"
-      - name: prove Linux managed-workspace custody
+      - name: selftest built x86-64 release binary
+        if: matrix.target == 'x86_64-unknown-linux-musl'
         env:
           ASSET_NAME: ${{ matrix.asset }}
           TARGET: ${{ matrix.target }}
-        run: |
-          set -euo pipefail
-          test "$(uname -s)" = Linux
-          case "$(uname -m):$TARGET" in
-            x86_64:x86_64-unknown-linux-musl|aarch64:aarch64-unknown-linux-musl) ;;
-            *) echo "target is not native to this Linux runner" >&2; exit 1 ;;
-          esac
-          test -x "$RUNNER_TEMP/session-relay/$TARGET/$ASSET_NAME"
-          CURRENT_CGROUP=
-          while IFS=: read -r HIERARCHY CONTROLLERS CGROUP_PATH; do
-            if [ "$HIERARCHY" = 0 ] && [ -z "$CONTROLLERS" ]; then
-              CURRENT_CGROUP="$CGROUP_PATH"
-              break
-            fi
-          done < /proc/self/cgroup
-          test -n "$CURRENT_CGROUP"
-          CGROUP="/sys/fs/cgroup${CURRENT_CGROUP%/}/session-relay-producer-$(id -u)-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${RUNNER_ARCH}"
-          # The custody test creates one nested cgroup per managed workspace and leaves the
-          # empty directory behind, and an empty child still returns EBUSY on the parent.
-          # Sweep depth-first before removing the leaf, on both the trap and the happy path.
-          sweep() { sudo -n find "$CGROUP" -mindepth 1 -depth -type d -exec rmdir {} + 2>/dev/null || true; }
-          cleanup() {
-            sweep
-            sudo -n rmdir "$CGROUP" 2>/dev/null || true
-          }
-          trap cleanup EXIT
-          sudo -n mkdir "$CGROUP"
-          sudo -n chown "$(id -u):$(id -g)" "$CGROUP"
-          sudo -n chown "$(id -u):$(id -g)" \
-            "$CGROUP/cgroup.procs" "$CGROUP/cgroup.threads" "$CGROUP/cgroup.subtree_control"
-          (
-            test_pid=$BASHPID &&
-              sudo -n tee "$CGROUP/cgroup.procs" >/dev/null <<<"$test_pid" &&
-              SESSION_RELAY_TEST_BIN="$RUNNER_TEMP/session-relay/$TARGET/$ASSET_NAME" \
-                SESSION_RELAY_TEST_CGROUP_ROOT="$CGROUP" cargo test \
-                --locked --test workspace_lease_process \
-                linux_cgroup_pidfd_guardian_kills_hostile_descendants \
-                -- --exact --nocapture
-          )
-          sweep
-          sudo -n rmdir "$CGROUP"
-          trap - EXIT
-      - name: smoke explicit fresh Linux workspace binary
-        env:
-          ASSET_NAME: ${{ matrix.asset }}
-          TARGET: ${{ matrix.target }}
-        run: |
-          set -euo pipefail
-          bin="$RUNNER_TEMP/session-relay/$TARGET/$ASSET_NAME"
-          test -x "$bin"
-          node test/workspace-smoke.mjs --case single-session-compat --bin "$bin"
-          node test/workspace-smoke.mjs --case docs-contract --bin "$bin"
+        run: SESSION_RELAY_TEST_BIN="$RUNNER_TEMP/session-relay/$TARGET/$ASSET_NAME" SESSION_RELAY_TEST_JOBS=4 node test/selftest.mjs
       - name: attest native release binary
         env:
           ASSET_NAME: ${{ matrix.asset }}

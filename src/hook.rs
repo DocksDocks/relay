@@ -1,28 +1,13 @@
-// hook.rs — the SessionStart / UserPromptSubmit hook for Claude Code, Codex,
-// and omp. Claude/Codex read stdin {session_id, cwd, source, ...} and emit a
-// hookSpecificOutput.additionalContext injection. omp takes --session/--cwd
-// flags, never reads stdin, and emits plain context without an identity trailer.
-// The positional tool tag defaults to "claude"; `--event prompt` selects
-// UserPromptSubmit (default SessionStart). Two jobs on every start/resume/prompt:
-//   1. Register this session: write the cwd->id marker and upsert
-//      {id, dir, tool} into the registry (each prompt also refreshes
-//      last_seen, keeping `discover` liveness fresh).
-//   2. Drain this session's inbox and inject pending messages as
-//      additionalContext, fenced as UNTRUSTED DATA. On claude+SessionStart a
-//      trailing nudge asks the model to arm a persistent Monitor watch on
-//      this session's mailbox (push delivery); RELAY_NO_WATCH=1 opts out.
+// hook.rs — register an omp session and deliver pending mail on start or prompt.
+// Takes --session/--cwd flags, never reads stdin, and emits plain context.
 // Never blocks the session: any error is logged to stderr and we exit 0.
 
 use crate::cli::Args;
 use crate::gc;
-use crate::lifecycle::{
-    self, Admission, BindingState, ClaimManagedAttach, ClaimOutcome, LifecycleStore, ManagedState,
-    OperationKind, WorkerTreeBridge,
-};
 use crate::protocol::{MessageKind, MessageV2};
 use crate::store;
 use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::io::Write;
 use tinyjson::JsonValue;
 
 #[derive(Clone, Copy, PartialEq)]
@@ -41,9 +26,8 @@ impl HookEvent {
 }
 
 struct Invocation {
-    tool: &'static str,
     event: HookEvent,
-    session: Option<(String, String)>,
+    session: (String, String),
     hold_seconds: Option<u64>,
 }
 
@@ -52,32 +36,21 @@ struct Invocation {
 // the parse must be testable on its own.
 fn parse_invocation(args: &[String]) -> Result<Invocation, String> {
     let a = Args(args.to_vec());
-    let tool = match a.positionals(0).first() {
-        Some(&"omp") => "omp",
-        Some(&"codex") => "codex",
-        _ => "claude",
-    };
+    if a.positionals(0).first().is_some_and(|tool| *tool != "omp") {
+        return Err("hook supports only omp".to_string());
+    }
     let event = if a.flag("event") == Some("prompt") {
         HookEvent::Prompt
     } else {
         HookEvent::SessionStart
     };
-    let session = if tool == "omp" {
-        let id = a
-            .unique_flag("session")?
-            .ok_or("hook omp requires --session")?;
-        let cwd = a.unique_flag("cwd")?.ok_or("hook omp requires --cwd")?;
-        Some((id.to_string(), cwd.to_string()))
-    } else {
-        None
-    };
-    let hold_seconds = if tool == "omp" {
-        a.hold_seconds()
-    } else {
-        None
-    };
+    let id = a
+        .unique_flag("session")?
+        .ok_or("hook omp requires --session")?;
+    let cwd = a.unique_flag("cwd")?.ok_or("hook omp requires --cwd")?;
+    let session = (id.to_string(), cwd.to_string());
+    let hold_seconds = a.hold_seconds();
     Ok(Invocation {
-        tool,
         event,
         session,
         hold_seconds,
@@ -118,26 +91,6 @@ fn str_of(m: &HashMap<String, JsonValue>, key: &str) -> Option<String> {
         .cloned()
 }
 
-fn shell_word(value: &str) -> String {
-    if !value.is_empty()
-        && value
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'_' | b'-'))
-    {
-        value.to_string()
-    } else {
-        format!("'{}'", value.replace('\'', "'\"'\"'"))
-    }
-}
-
-pub(crate) fn watcher_command(relay_exe: &str, id: &str) -> String {
-    format!(
-        "{} watch --follow {}",
-        shell_word(relay_exe),
-        shell_word(id)
-    )
-}
-
 pub fn run(args: &[String]) -> ! {
     if let Err(e) = parse_invocation(args).and_then(inner) {
         eprintln!("[session-relay/hook] {e}");
@@ -145,12 +98,8 @@ pub fn run(args: &[String]) -> ! {
     std::process::exit(0);
 }
 
-// Structurally fence the mail: bodies come from other (untrusted) writers,
-// so label the block as data, not instructions. Shared with `relay watch`,
-// which injects the same fenced form into live Codex threads. `recipient_id`
-// names the reader's OWN bus id in the reply guidance — in a shared dir the
-// marker may belong to another session, so the reply must carry an explicit
-// `from` (the (b) identity handshake).
+// Fence untrusted message bodies and names. Typed reply guidance carries the
+// recipient's explicit identity so shared-directory markers cannot misattribute it.
 fn legacy_mail_line(message: &JsonValue) -> String {
     let object = message
         .get::<HashMap<String, JsonValue>>()
@@ -193,19 +142,6 @@ fn typed_mail_line(message: &MessageV2, recipient_id: &str) -> String {
                 .expect("validated terminal reply has terminal status")
                 .as_str()
         ),
-        MessageKind::WorkerResult => format!(
-            "- worker_result from_session_id={} ({}): {}\n  correlation_id={} reply_to={} terminal_status={} result_sha256={}",
-            message.from_session_id,
-            message.created_at,
-            body,
-            message.correlation_id,
-            message.reply_to.as_deref().unwrap_or_default(),
-            message
-                .terminal_status
-                .expect("validated worker result has terminal status")
-                .as_str(),
-            message.result_sha256.as_deref().unwrap_or_default()
-        ),
     }
 }
 
@@ -216,10 +152,6 @@ fn typed_schema(message: &JsonValue) -> bool {
 }
 
 pub(crate) fn mail_block(msgs: &[JsonValue], recipient_id: &str) -> String {
-    mail_block_for_tool(msgs, recipient_id, "codex")
-}
-
-fn mail_block_for_tool(msgs: &[JsonValue], recipient_id: &str, tool: &str) -> String {
     let lines: Vec<String> = msgs
         .iter()
         .filter_map(|message| match MessageV2::from_tinyjson(message) {
@@ -243,54 +175,15 @@ fn mail_block_for_tool(msgs: &[JsonValue], recipient_id: &str, tool: &str) -> St
         "<session-relay-mail>".to_string(),
         lines.join("\n"),
         "</session-relay-mail>".to_string(),
-        if tool == "omp" {
-            "Reply with the relay tool: action \"reply\" or \"send\"; the extension supplies your identity.".to_string()
-        } else {
-            format!(
-                "To reply, use the session-relay skill and send to the sender, passing from:\"{recipient_id}\" (this session's own bus id) so attribution survives shared-directory markers."
-            )
-        },
+        "Reply with the relay tool: action \"reply\" or \"send\"; the extension supplies your identity.".to_string(),
     ]
     .join("\n")
 }
 
-// The emit decision for every (tool, event, inbox, RELAY_NO_WATCH) cell, kept
-// pure so the matrix is unit-testable. None ⇒ the hook writes nothing: a
-// no-mail prompt turn must add zero context (watch.rs relies on this), and
-// only claude+SessionStart carries the Monitor-arm nudge (Codex has no
-// Monitor; re-nudging on every prompt would be waste). Claude/Codex SessionStart
-// carries an identity line so agents need not trust a shared-directory marker.
-// omp supplies identity through its extension and emits only pending mail.
-fn render_context(
-    tool: &str,
-    event: HookEvent,
-    msgs: &[JsonValue],
-    no_watch: bool,
-    watch_command: &str,
-    self_id: &str,
-) -> Option<String> {
-    let mut parts: Vec<String> = Vec::new();
-    if !msgs.is_empty() {
-        let block = mail_block_for_tool(msgs, self_id, tool);
-        if !block.is_empty() {
-            parts.push(block);
-        }
-    }
-    if tool != "omp" && event == HookEvent::SessionStart {
-        parts.push(format!(
-            "Session-relay identity: this session's bus id is {self_id}. In a directory hosting more than one session, pass from:\"{self_id}\" to the bus send tool (or --from {self_id} to the relay CLI) and id:\"{self_id}\" to inbox — otherwise the shared directory marker may attribute you as another session."
-        ));
-    }
-    if tool == "claude" && event == HookEvent::SessionStart && !no_watch {
-        parts.push(format!(
-            "If a background file-watch/Monitor tool is available and you have not already armed one this session, run `{watch_command}` as a persistent watch so new session-relay mail surfaces mid-session without waiting for the next user turn; if no such tool exists, ignore this line."
-        ));
-    }
-    if parts.is_empty() {
-        None
-    } else {
-        Some(parts.join("\n"))
-    }
+// Empty inboxes add no context; omp supplies identity through its extension.
+fn render_context(msgs: &[JsonValue], self_id: &str) -> Option<String> {
+    let block = mail_block(msgs, self_id);
+    if block.is_empty() { None } else { Some(block) }
 }
 
 fn render_hold_context(receipt: &store::HoldReceipt, self_id: &str) -> Option<String> {
@@ -298,273 +191,51 @@ fn render_hold_context(receipt: &store::HoldReceipt, self_id: &str) -> Option<St
         return None;
     }
     let token = receipt.token.as_deref()?;
-    let block = mail_block_for_tool(&receipt.messages, self_id, "omp");
+    let block = mail_block(&receipt.messages, self_id);
     Some(format!("{token}\n{block}"))
 }
 
 fn inner(invocation: Invocation) -> Result<(), String> {
     let Invocation {
-        tool,
         event,
         session,
         hold_seconds,
     } = invocation;
-    let (id, dir, source) = if let Some((id, dir)) = session {
-        (id, dir, None)
-    } else {
-        let mut input = String::new();
-        let _ = std::io::stdin().read_to_string(&mut input);
-        let ev: JsonValue = if input.trim().is_empty() {
-            JsonValue::from(HashMap::new())
-        } else {
-            input.parse().map_err(|e| format!("{e}"))?
-        };
-        let obj = ev
-            .get::<HashMap<String, JsonValue>>()
-            .cloned()
-            .unwrap_or_default();
-        let Some(id) = str_of(&obj, "session_id") else {
-            return Ok(());
-        };
-        let dir = str_of(&obj, "cwd")
-            .or_else(|| {
-                std::env::var("CLAUDE_PROJECT_DIR")
-                    .ok()
-                    .filter(|v| !v.is_empty())
-            })
-            .unwrap_or_else(|| {
-                std::env::current_dir()
-                    .map(|d| d.to_string_lossy().into_owned())
-                    .unwrap_or_else(|_| ".".to_string())
-            });
-        (id, dir, str_of(&obj, "source"))
-    };
-    if event == HookEvent::SessionStart {
-        if let Some(reason) = managed_session_start(tool, &id, &dir)? {
-            print_managed_stop(tool, &reason)?;
-            return Ok(());
-        }
-    }
+    let (id, dir) = session;
     if let Err(e) = gc::run(std::time::SystemTime::now(), Some(&id)) {
         eprintln!("[session-relay/hook] GC skipped: {e}");
     }
     store::set_marker(&dir, &id)?;
-    store::register(&id, Some(&dir), None, Some(tool), None)?;
-    // An opted-in EXPERIMENTAL channel owns new prompt-time delivery while its
-    // kernel flock is held. On crash/SIGKILL the OS releases that lock and the
-    // next prompt automatically resumes the normal hook drain. SessionStart
-    // still wins startup mail before a channel finishes initializing.
-    let (msgs, guarded_emission, drained_receipt) =
-        if event == HookEvent::Prompt && store::live_watcher_mode(&id, "channel") {
-            (Vec::new(), None, None)
-        } else {
-            let kind = match event {
-                HookEvent::SessionStart => OperationKind::SessionStartDrain,
-                HookEvent::Prompt => OperationKind::UserPromptDrain,
-            };
-            let mut guard = match LifecycleStore::default().admit_operation(&id, kind)? {
-                Admission::Unmanaged(guard) | Admission::Managed(guard) => guard,
-                Admission::Refused { state, reason, .. } => {
-                    print_managed_stop(
-                        tool,
-                        &format!("managed worker {}: {reason}", managed_state_name(state)),
-                    )?;
-                    return Ok(());
-                }
-            };
-            if let Some(seconds) = hold_seconds {
-                let receipt = lifecycle::hold_with_guard(&mut guard, event.name(), seconds)?;
-                let Some(out) = render_hold_context(&receipt, &id) else {
-                    return Ok(());
-                };
-                if let Err(error) = guard.authorize_use(kind) {
-                    if let Some(token) = receipt.token.as_deref() {
-                        store::rollback_hold(token).map_err(|error| error.to_string())?;
-                    }
-                    print_managed_stop(
-                        tool,
-                        &format!("hook emission refused after lifecycle changed: {error}"),
-                    )?;
-                    return Ok(());
-                }
-                if let Err(error) = std::io::stdout().write_all(out.as_bytes()) {
-                    if let Some(token) = receipt.token.as_deref() {
-                        store::rollback_hold(token).map_err(|error| error.to_string())?;
-                    }
-                    return Err(format!("write hook output: {error}"));
-                }
-                return Ok(());
-            }
-            let drained = lifecycle::drain_with_guard(&mut guard)?;
-            let msgs = drained.messages().to_vec();
-            (msgs, Some((guard, kind)), Some(drained))
-        };
-    let no_watch = std::env::var("RELAY_NO_WATCH").as_deref() == Ok("1");
-    let relay_exe = std::env::current_exe()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| "relay".to_string());
-    let watch = watcher_command(&relay_exe, &id);
-    if tool == "codex" && event == HookEvent::SessionStart {
-        let should_emit = store::should_emit_session_start_identity(&id, source.as_deref())
-            .unwrap_or_else(|error| {
-                eprintln!("[session-relay/hook] SessionStart debounce skipped: {error}");
-                true
-            });
-        if msgs.is_empty() && !should_emit {
+    store::register(&id, Some(&dir), None, Some("omp"))?;
+    if let Some(seconds) = hold_seconds {
+        let receipt = store::hold_mailbox(&id, event.name(), seconds)?;
+        let Some(out) = render_hold_context(&receipt, &id) else {
             return Ok(());
+        };
+        if let Err(error) = std::io::stdout().write_all(out.as_bytes()) {
+            if let Some(token) = receipt.token.as_deref() {
+                store::rollback_hold(token).map_err(|error| error.to_string())?;
+            }
+            return Err(format!("write hook output: {error}"));
         }
+        return Ok(());
     }
-    let Some(additional_context) = render_context(tool, event, &msgs, no_watch, &watch, &id) else {
+    let receipt = store::drain_mailbox(&id)?;
+    let Some(out) = render_context(receipt.messages(), &id) else {
+        receipt.commit();
         return Ok(());
     };
-
-    let out = encode_output(tool, event, additional_context)?;
-    if let Some((mut guard, kind)) = guarded_emission {
-        if let Err(error) = guard.authorize_use(kind) {
-            if let Some(receipt) = drained_receipt {
-                receipt.rollback()?;
-            }
-            print_managed_stop(
-                tool,
-                &format!("hook emission refused after lifecycle changed: {error}"),
-            )?;
-            return Ok(());
-        }
-    }
     if let Err(error) = std::io::stdout().write_all(out.as_bytes()) {
-        if let Some(receipt) = drained_receipt {
-            receipt.rollback()?;
-        }
+        receipt.rollback()?;
         return Err(format!("write hook output: {error}"));
     }
-    if let Some(receipt) = drained_receipt {
-        receipt.commit();
-    }
-    Ok(())
-}
-
-fn encode_output(tool: &str, event: HookEvent, context: String) -> Result<String, String> {
-    if tool == "omp" {
-        return Ok(context);
-    }
-    let mut hso: HashMap<String, JsonValue> = HashMap::new();
-    hso.insert(
-        "hookEventName".into(),
-        JsonValue::from(event.name().to_string()),
-    );
-    hso.insert("additionalContext".into(), JsonValue::from(context));
-    let mut root: HashMap<String, JsonValue> = HashMap::new();
-    root.insert("hookSpecificOutput".into(), JsonValue::from(hso));
-    JsonValue::from(root)
-        .stringify()
-        .map_err(|e| format!("serialize hook output: {e}"))
-}
-
-/// Workspace adapters call this before making a mutation-capable hook surface
-/// visible. Ordinary V1 hooks never enter this bridge and retain their current
-/// output and failure behavior.
-pub fn validate_worker_tree_hook_bridge(
-    expected_session_id: &str,
-    bridge: Option<&WorkerTreeBridge>,
-) -> Result<(), String> {
-    let bridge = bridge
-        .ok_or_else(|| "mutation-capable workspace hook has no WorkerTree custody".to_string())?;
-    bridge.validate_active()?;
-    if bridge.session_id != expected_session_id {
-        return Err("workspace hook WorkerTree session identity changed".to_string());
-    }
-    Ok(())
-}
-
-fn managed_session_start(tool: &str, id: &str, dir: &str) -> Result<Option<String>, String> {
-    let worker_id = std::env::var("RELAY_MANAGED_WORKER_ID").ok();
-    let generation = std::env::var("RELAY_MANAGED_GENERATION").ok();
-    let raw_token = std::env::var("RELAY_MANAGED_ATTACH_TOKEN").ok();
-    let supplied = [
-        worker_id.is_some(),
-        generation.is_some(),
-        raw_token.is_some(),
-    ];
-    let store = LifecycleStore::default();
-    if supplied.iter().any(|present| *present) {
-        if !supplied.iter().all(|present| *present) {
-            return Ok(Some(
-                "managed attach metadata is incomplete; refusing SessionStart".to_string(),
-            ));
-        }
-        let request = ClaimManagedAttach {
-            raw_token: raw_token.expect("checked above"),
-            worker_id: worker_id.expect("checked above"),
-            generation: generation.expect("checked above"),
-            runtime_session_id: id.to_string(),
-            tool: tool.to_string(),
-            cwd: dir.to_string(),
-        };
-        return match store.claim_managed_attach(request) {
-            Ok(ClaimOutcome::Active { .. }) => Ok(None),
-            Ok(ClaimOutcome::Refused { reason, .. }) => Ok(Some(reason)),
-            Err(error) => Ok(Some(format!("managed attach refused: {error}"))),
-        };
-    }
-
-    let Some(binding) = store.read_binding(id)? else {
-        return Ok(None);
-    };
-    match binding.state {
-        BindingState::Unmanaged => Ok(None),
-        BindingState::UnmanagedCanceling { .. } => Ok(Some(
-            "session has an exact unmanaged cancellation in progress".to_string(),
-        )),
-        BindingState::Managed { .. } => match store.resume_managed_attach(id, tool, dir) {
-            Ok(ClaimOutcome::Active { .. }) => Ok(None),
-            Ok(ClaimOutcome::Refused { state, reason, .. }) => Ok(Some(format!(
-                "managed worker {}: {reason}",
-                managed_state_name(state)
-            ))),
-            Err(error) => Ok(Some(format!("managed resume refused: {error}"))),
-        },
-        BindingState::Claiming { .. } => Ok(Some(
-            "managed attach is still Claiming; refusing duplicate prompt start".to_string(),
-        )),
-        BindingState::GcDeleting { .. } => Ok(Some(
-            "session binding is being garbage-collected; refusing SessionStart".to_string(),
-        )),
-    }
-}
-
-fn managed_state_name(state: ManagedState) -> &'static str {
-    match state {
-        ManagedState::Attaching => "Attaching",
-        ManagedState::Active => "Active",
-        ManagedState::Fencing => "Fencing",
-        ManagedState::FencingUnconfirmed => "FencingUnconfirmed",
-        ManagedState::Fenced => "Fenced",
-        ManagedState::TerminalRetained => "TerminalRetained",
-        ManagedState::TerminalReleasable => "TerminalReleasable",
-    }
-}
-
-fn print_managed_stop(tool: &str, reason: &str) -> Result<(), String> {
-    if tool == "omp" {
-        eprintln!("[session-relay/hook] {reason}");
-        return Ok(());
-    }
-    let mut root = HashMap::new();
-    root.insert("continue".into(), JsonValue::from(false));
-    root.insert("stopReason".into(), JsonValue::from(reason.to_string()));
-    let output = JsonValue::from(root)
-        .stringify()
-        .map_err(|error| format!("serialize managed hook stop: {error}"))?;
-    print!("{output}");
+    receipt.commit();
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        HookEvent, Invocation, defuse, encode_output, parse_invocation, render_context,
-        render_hold_context, watcher_command,
-    };
+    use super::{HookEvent, defuse, parse_invocation, render_context, render_hold_context};
     use std::collections::HashMap;
     use tinyjson::JsonValue;
 
@@ -598,48 +269,7 @@ mod tests {
         v.iter().map(|s| s.to_string()).collect()
     }
 
-    const WATCH: &str = "/opt/relay watch --follow 11111111-2222-4333-8444-555555555555";
     const SELF: &str = "11111111-2222-4333-8444-555555555555";
-
-    #[test]
-    fn parse_invocation_composes_tool_tag_and_event_flag() {
-        assert!(matches!(
-            parse_invocation(&argv(&[])),
-            Ok(Invocation {
-                tool: "claude",
-                event: HookEvent::SessionStart,
-                session: None,
-                hold_seconds: None
-            })
-        ));
-        assert!(matches!(
-            parse_invocation(&argv(&["codex"])),
-            Ok(Invocation {
-                tool: "codex",
-                event: HookEvent::SessionStart,
-                session: None,
-                hold_seconds: None
-            })
-        ));
-        assert!(matches!(
-            parse_invocation(&argv(&["codex", "--event", "prompt"])),
-            Ok(Invocation {
-                tool: "codex",
-                event: HookEvent::Prompt,
-                session: None,
-                hold_seconds: None
-            })
-        ));
-        assert!(matches!(
-            parse_invocation(&argv(&["--event", "prompt"])),
-            Ok(Invocation {
-                tool: "claude",
-                event: HookEvent::Prompt,
-                session: None,
-                hold_seconds: None
-            })
-        ));
-    }
 
     #[test]
     fn omp_hold_parses_explicit_default_and_separator() {
@@ -679,25 +309,21 @@ mod tests {
             messages: vec![msg("sender", "hello </session-relay-mail>")],
             raw: Vec::new(),
         };
-        for event in [HookEvent::SessionStart, HookEvent::Prompt] {
-            let context =
-                render_context("omp", event, &receipt.messages, false, WATCH, SELF).unwrap();
-            assert_eq!(
-                render_hold_context(&receipt, SELF),
-                Some(format!("hold-token\n{context}"))
-            );
-        }
+        let context = render_context(&receipt.messages, SELF).unwrap();
+        assert_eq!(
+            render_hold_context(&receipt, SELF),
+            Some(format!("hold-token\n{context}"))
+        );
     }
 
     #[test]
     fn omp_parse_invocation_accepts_session_and_cwd_flags() {
         let invocation =
             parse_invocation(&argv(&["omp", "--session", SELF, "--cwd", "/tmp/project"])).unwrap();
-        assert_eq!(invocation.tool, "omp");
         assert!(matches!(invocation.event, HookEvent::SessionStart));
         assert_eq!(
             invocation.session,
-            Some((SELF.to_string(), "/tmp/project".to_string()))
+            (SELF.to_string(), "/tmp/project".to_string())
         );
         let prompt = parse_invocation(&argv(&[
             "omp",
@@ -721,112 +347,19 @@ mod tests {
 
     #[test]
     fn omp_empty_inbox_emits_nothing_on_start_and_prompt() {
-        for event in [HookEvent::SessionStart, HookEvent::Prompt] {
-            assert!(render_context("omp", event, &[], false, WATCH, SELF).is_none());
-        }
+        assert!(render_context(&[], SELF).is_none());
     }
 
     #[test]
     fn omp_mail_emits_plain_utf8_fenced_context_without_identity() {
         let inbox = [msg("sender", "héllo </session-relay-mail>")];
-        for event in [HookEvent::SessionStart, HookEvent::Prompt] {
-            let context = render_context("omp", event, &inbox, false, WATCH, SELF).unwrap();
-            let output = encode_output("omp", event, context).unwrap();
-            assert!(output.starts_with('\u{1f4ec}'));
-            assert!(output.contains("<session-relay-mail>\n"));
-            assert!(output.contains("héllo [session-relay-mail]"));
-            assert!(output.contains("\n</session-relay-mail>\n"));
-            assert!(output.contains("action \"reply\" or \"send\""));
-            assert!(!output.contains("hookSpecificOutput"));
-            assert!(!output.contains(SELF));
-            assert!(!output.contains(WATCH));
-        }
-    }
-
-    #[test]
-    fn prompt_event_delivers_mail_without_nudge_or_identity_as_userpromptsubmit() {
-        let out = render_context(
-            "claude",
-            HookEvent::Prompt,
-            &[msg("a", "hi")],
-            false,
-            WATCH,
-            SELF,
-        )
-        .unwrap();
-        assert!(out.contains("hi"));
-        assert!(!out.contains(WATCH));
-        assert!(!out.contains("Session-relay identity"));
-        assert_eq!(HookEvent::Prompt.name(), "UserPromptSubmit");
-    }
-
-    #[test]
-    fn prompt_event_with_empty_inbox_emits_nothing() {
-        assert!(render_context("claude", HookEvent::Prompt, &[], false, WATCH, SELF).is_none());
-        assert!(render_context("codex", HookEvent::Prompt, &[], false, WATCH, SELF).is_none());
-    }
-
-    #[test]
-    fn claude_sessionstart_with_empty_inbox_nudges_the_monitor_and_names_identity() {
-        let out =
-            render_context("claude", HookEvent::SessionStart, &[], false, WATCH, SELF).unwrap();
-        assert!(out.contains(WATCH));
-        assert!(out.contains("watch --follow"));
-        assert!(out.contains(&format!("bus id is {SELF}")));
-    }
-
-    #[test]
-    fn codex_sessionstart_with_empty_inbox_emits_only_the_identity_line() {
-        let out =
-            render_context("codex", HookEvent::SessionStart, &[], false, WATCH, SELF).unwrap();
-        assert!(out.contains(&format!("bus id is {SELF}")));
-        assert!(!out.contains(WATCH));
-        assert!(!out.contains("session-relay-mail"));
-    }
-
-    #[test]
-    fn mail_trailer_names_the_recipients_own_id_for_the_reply() {
-        let out = render_context(
-            "codex",
-            HookEvent::Prompt,
-            &[msg("a", "hi")],
-            false,
-            WATCH,
-            SELF,
-        )
-        .unwrap();
-        assert!(out.contains(&format!("from:\"{SELF}\"")));
-    }
-
-    #[test]
-    fn no_watch_drops_the_nudge_but_keeps_mail_and_identity() {
-        let out = render_context(
-            "claude",
-            HookEvent::SessionStart,
-            &[msg("a", "hi")],
-            true,
-            WATCH,
-            SELF,
-        )
-        .unwrap();
-        assert!(out.contains("hi"));
-        assert!(!out.contains(WATCH));
-        assert!(out.contains(&format!("bus id is {SELF}")));
-        let empty = render_context("claude", HookEvent::SessionStart, &[], true, WATCH, SELF)
-            .expect("identity line survives RELAY_NO_WATCH");
-        assert!(!empty.contains(WATCH));
-        assert!(empty.contains(&format!("bus id is {SELF}")));
-    }
-
-    #[test]
-    fn watcher_command_quotes_shell_words_without_exposing_the_id_as_an_option() {
-        assert_eq!(
-            watcher_command("/opt/relay bin/relay", SELF),
-            format!("'/opt/relay bin/relay' watch --follow {SELF}")
-        );
-        assert_eq!(
-            watcher_command("relay", "--bad id"),
-            "relay watch --follow '--bad id'"
-        );
+        let output = render_context(&inbox, SELF).unwrap();
+        assert!(output.starts_with('\u{1f4ec}'));
+        assert!(output.contains("<session-relay-mail>\n"));
+        assert!(output.contains("héllo [session-relay-mail]"));
+        assert!(output.contains("\n</session-relay-mail>\n"));
+        assert!(output.contains("action \"reply\" or \"send\""));
+        assert!(!output.contains("hookSpecificOutput"));
+        assert!(!output.contains(SELF));
     }
 }

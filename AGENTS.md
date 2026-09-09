@@ -1,6 +1,6 @@
 # Session Relay repository
 
-This repository holds the Session Relay Rust crate, its Node harness, and its release infrastructure. The separate `plugin/` directory contains only the shipped payload.
+This repository holds the Session Relay Rust crate for durable mail between omp sessions, its Node harness, and its release infrastructure. The separate `plugin/` directory contains only the shipped payload.
 
 ## Commands
 
@@ -23,7 +23,7 @@ The tracked top-level inventory and current working tree define this layout:
 ├── Cargo.lock                         locked Rust dependencies
 ├── rust-toolchain.toml                pinned Rust toolchain
 ├── src/                               crate sources
-│   └── tests/                         13 explicit [[test]] integration targets
+│   └── tests/                         four explicit [[test]] integration targets
 ├── test/                              Node scenario and contract harness
 ├── plugin/                            shipped plugin payload
 ├── .omp-plugin/marketplace.json       omp marketplace catalog
@@ -34,11 +34,10 @@ The tracked top-level inventory and current working tree define this layout:
 ├── biome.json                         JavaScript formatting and lint rules
 ├── README.md                          installation guide
 ├── AGENTS.md                          repository rules
-├── CLAUDE.md                          Claude Code context-tree import
 └── LICENSE                            repository license
 ```
 
-`Cargo.toml` sets `autotests = false`. It declares all 13 integration targets with explicit `[[test]]` entries under `src/tests/`.
+`Cargo.toml` sets `autotests = false`. It declares four integration targets with explicit `[[test]]` entries under `src/tests/`: `bus_smoke`, `protocol`, `lock_race`, and `holds`.
 
 ## Payload boundary
 
@@ -79,7 +78,7 @@ The release has no prerelease step. It has no promotion step.
 
 ## Platform support
 
-Session Relay supports Linux only, on x86-64 and arm64. Managed workspace custody requires cgroup v2, pidfd, Landlock, and seccomp.
+Session Relay distributes Linux x86-64 and arm64 musl binaries.
 
 ## Provenance
 
