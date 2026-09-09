@@ -247,7 +247,33 @@ fn readers_ignore_an_uppercase_registry_entry() {
         "doctor must report the unknown session: {report}"
     );
 
+    // An uppercase cwd marker is invisible to `id_for_dir`: doctor sees no marker.
     let dir = home.to_string_lossy().into_owned();
+    let markers = home.join("markers");
+    fs::create_dir_all(&markers).unwrap();
+    fs::write(
+        markers.join(relay::store::encode_dir(&dir)),
+        format!("{UPPER}\n"),
+    )
+    .unwrap();
+    let marked = Command::new(env!("CARGO_BIN_EXE_relay"))
+        .arg("doctor")
+        .current_dir(&home)
+        .env("AGENT_RELAY_HOME", &home)
+        .env("RELAY_WAKE_CMD_OMP", &launcher)
+        .output()
+        .unwrap();
+    assert_eq!(
+        marked.status.code(),
+        Some(1),
+        "doctor with an uppercase marker must exit 1"
+    );
+    let marked_report = String::from_utf8_lossy(&marked.stdout);
+    assert!(
+        marked_report.contains("FAIL identity: no cwd marker"),
+        "doctor must ignore the uppercase marker: {marked_report}"
+    );
+
     let wake = relay(
         &home,
         &launcher,

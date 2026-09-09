@@ -1386,7 +1386,12 @@ pub fn set_marker(dir: &str, id: &str) -> Result<(), String> {
 
 /// Read a marker only if its id is lowercase UUID text.
 pub fn id_for_dir(dir: &str) -> Option<String> {
-    raw_id_for_dir(dir).filter(|id| is_session_id(id))
+    session_marker(&marker_path(dir))
+}
+
+/// Strict marker read: `read_marker` filtered by `is_session_id`.
+fn session_marker(path: &Path) -> Option<String> {
+    read_marker(path).filter(|id| is_session_id(id))
 }
 
 /// Read any non-empty marker id for GC self exclusion, without a UUID check.
@@ -1989,9 +1994,11 @@ mod tests {
         let path = root.join("marker");
         let uppercase = "01A081C6-19DA-737A-A863-9FB9D50AD5C2";
         fs::write(&path, format!("{uppercase}\n")).unwrap();
-        let raw = read_marker(&path);
-        assert_eq!(raw.as_deref(), Some(uppercase));
-        assert_eq!(raw.filter(|id| is_session_id(id)), None);
+        assert_eq!(read_marker(&path).as_deref(), Some(uppercase));
+        assert_eq!(session_marker(&path), None);
+        let lowercase = uppercase.to_ascii_lowercase();
+        fs::write(&path, format!("{lowercase}\n")).unwrap();
+        assert_eq!(session_marker(&path), Some(lowercase));
         fs::remove_dir_all(root).unwrap();
     }
 
