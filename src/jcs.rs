@@ -81,6 +81,12 @@ pub fn read_jcs_file<T: ClosedJcs>(
     path: &Path,
     expected_sha256: Option<&str>,
 ) -> Result<T, String> {
+    T::from_jcs(read_jcs_value(path, expected_sha256)?)
+}
+
+/// Securely read and canonically parse a JCS file without binding it to a
+/// record type, so a caller can inspect a discriminator before decoding.
+pub fn read_jcs_value(path: &Path, expected_sha256: Option<&str>) -> Result<JcsValue, String> {
     let mut file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
@@ -108,7 +114,7 @@ pub fn read_jcs_file<T: ClosedJcs>(
             return Err(format!("SHA-256 mismatch for {}", path.display()));
         }
     }
-    T::from_jcs(parse_jcs(&bytes, true)?)
+    parse_jcs(&bytes, true)
 }
 
 pub fn jcs_sha256<T: ClosedJcs>(value: &T) -> String {

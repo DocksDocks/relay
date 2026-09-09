@@ -709,6 +709,51 @@ fn claim_rejects_unknown_origin_state_delivery_and_digest_syntax() {
 }
 
 #[test]
+fn recovery_quarantines_pending_claims_with_unknown_origin() {
+    let fixture = Fixture::new("protocol-recovery-obsolete-origin");
+    let request = fixture
+        .store
+        .request(REQUESTER_ID, RESPONDER_ID, "before upgrade")
+        .unwrap();
+    // A pre-0.18.0 fan-out reply interrupted after its Pending move: the
+    // current record cannot decode `origin: fanout`.
+    let mut fields = ClaimStatusV1::from_jcs(
+        parse_jcs(
+            &fs::read(claim_path(&fixture.home, &request.correlation_id)).unwrap(),
+            true,
+        )
+        .unwrap(),
+    )
+    .unwrap()
+    .to_jcs()
+    .object()
+    .unwrap();
+    fields.insert("origin".into(), JcsValue::String("fanout".into()));
+    let stale = "d0000000-0000-4000-8000-00000000000d";
+    fields.insert("correlation_id".into(), JcsValue::String(stale.into()));
+    let pending = fixture.home.join("protocol-v1/pending");
+    write_jcs_file(
+        &pending.join(format!("{stale}.json")),
+        JcsValue::Object(fields),
+    );
+
+    let later = fixture
+        .store
+        .request(REQUESTER_ID, RESPONDER_ID, "after upgrade")
+        .unwrap();
+    assert_eq!(mailbox_messages(&fixture.home, RESPONDER_ID).len(), 2);
+    assert!(!pending.join(format!("{stale}.json")).exists());
+    assert!(
+        fixture
+            .home
+            .join("protocol-v1/obsolete")
+            .join(format!("{stale}.json"))
+            .exists()
+    );
+    assert!(claim_path(&fixture.home, &later.correlation_id).exists());
+}
+
+#[test]
 fn request_requires_exact_registered_endpoints_and_persists_one_open_claim() {
     let fixture = Fixture::new("protocol-request-registration");
     let request = fixture

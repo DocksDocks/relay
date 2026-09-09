@@ -90,6 +90,13 @@ fn resolve_targets(args: &Args) -> Vec<Target> {
     if args.has("all") {
         return store::roster()
             .into_iter()
+            .filter(|e| {
+                let valid = store::is_uuid(&e.id);
+                if !valid {
+                    eprintln!("[relay watch] skip {}: not a session UUID", e.id);
+                }
+                valid
+            })
             .map(|e| Target {
                 id: e.id,
                 tool: e.tool,
@@ -103,6 +110,9 @@ fn resolve_targets(args: &Args) -> Vec<Target> {
             let Some(e) = store::resolve(who) else {
                 die(&format!("unknown session: {who}"));
             };
+            if !store::is_uuid(&e.id) {
+                die(&format!("{who} is not a session UUID: {}", e.id));
+            }
             Target {
                 id: e.id,
                 tool: args.flag("tool").map(str::to_string).unwrap_or(e.tool),

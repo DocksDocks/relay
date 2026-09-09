@@ -1,5 +1,6 @@
 use crate::jcs::{
-    ClosedJcs, JcsValue, LowerUuidV4, Sha256Digest, parse_jcs, read_jcs_file, serialize_jcs,
+    ClosedJcs, JcsValue, LowerUuidV4, Sha256Digest, parse_jcs, read_jcs_file, read_jcs_value,
+    serialize_jcs,
 };
 use crate::sha256;
 use crate::store;
@@ -8,7 +9,7 @@ use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tinyjson::JsonValue;
 
 const MESSAGE_KEYS: [&str; 11] = [
@@ -1317,6 +1318,36 @@ impl ProtocolStore {
         self.locked(|| self.reply_locked(correlation_id, responder_session_id, status, body))
     }
 
+    /// Pending claims whose origin the current protocol does not know (fan-out,
+    /// removed in 0.18.0, or a missing origin) cannot be recovered and must not
+    /// block current messaging: move them aside once, then continue.
+    fn quarantine_obsolete_pending(&self, path: &Path) -> Result<bool, ProtocolError> {
+        let value = read_jcs_value(path, None).map_err(ProtocolError::store)?;
+        let known_origin = match &value {
+            JcsValue::Object(fields) => fields
+                .get("origin")
+                .and_then(|v| v.as_str().ok())
+                .is_some_and(|origin| ClaimOrigin::parse(origin).is_ok()),
+            _ => false,
+        };
+        if known_origin {
+            return Ok(false);
+        }
+        let obsolete = self.root.join("protocol-v1/obsolete");
+        fs::create_dir_all(&obsolete).map_err(ProtocolError::store)?;
+        fs::set_permissions(&obsolete, fs::Permissions::from_mode(0o700))
+            .map_err(ProtocolError::store)?;
+        let name = path
+            .file_name()
+            .ok_or_else(|| ProtocolError::store("pending claim has no file name"))?;
+        fs::rename(path, obsolete.join(name)).map_err(ProtocolError::store)?;
+        eprintln!(
+            "[relay protocol] quarantined obsolete pending claim {} to protocol-v1/obsolete",
+            name.to_string_lossy()
+        );
+        Ok(true)
+    }
+
     fn recover_pending_locked(&self) -> Result<(), ProtocolError> {
         self.ensure_layout()?;
         let directory = self.root.join("protocol-v1/pending");
@@ -1330,6 +1361,9 @@ impl ProtocolStore {
             .collect::<Result<Vec<_>, _>>()?;
         paths.sort();
         for path in paths {
+            if self.quarantine_obsolete_pending(&path)? {
+                continue;
+            }
             let claim =
                 read_jcs_file::<ClaimStatusV1>(&path, None).map_err(ProtocolError::store)?;
             if path.file_stem().and_then(|stem| stem.to_str()) != Some(&claim.correlation_id) {

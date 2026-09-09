@@ -49,6 +49,7 @@
         "message_variant_matrix_is_exhaustive_and_closed",
         "pending_recovery_replays_embedded_exact_bytes_and_deduplicates_existing_append",
         "protocol_timestamps_require_exact_real_millisecond_utc_instants",
+        "recovery_quarantines_pending_claims_with_unknown_origin",
         "recovery_rejects_same_message_id_with_different_bytes",
         "renderable_drain_preflights_mismatched_suffix_before_consuming_valid_prefix",
         "renderable_drain_rejects_noncanonical_typed_row_before_consuming_claim",
