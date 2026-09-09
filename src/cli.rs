@@ -163,12 +163,14 @@ struct Target {
 }
 
 // A target built straight from flags — addresses a discovered session that was
-// never registered on the bus. The id MUST be a session UUID: it keeps an
+// never registered on the bus. The id MUST be a lowercase session UUID: it keeps an
 // attacker-planted, flag-shaped id (e.g. "--config=…") off the doorbell argv.
 fn explicit_target(args: &Args) -> Option<Target> {
     let id = args.flag("id")?;
-    if !store::is_uuid(id) {
-        die(&format!("--id must be a session UUID, got: {id}"));
+    if !store::is_session_id(id) {
+        die(&format!(
+            "--id must be a session UUID (lowercase), got: {id}"
+        ));
     }
     Some(Target {
         id: id.to_string(),
@@ -266,19 +268,21 @@ fn attach(args: &Args) -> ! {
     let who = parsed.target.as_str();
     let target = match store::resolve(who) {
         Some(entry) => from_entry(entry),
-        None if store::is_uuid(who) => discovered_target(who).unwrap_or_else(|| {
+        None if store::is_session_id(who) => discovered_target(who).unwrap_or_else(|| {
             eprintln!("{ATTACH_WARNING}");
             die(&format!("unknown session UUID: {who}"));
         }),
         None => {
             eprintln!("{ATTACH_WARNING}");
-            die(&format!("unknown session name or non-session UUID: {who}"));
+            die(&format!(
+                "unknown session name or non-session UUID (lowercase): {who}"
+            ));
         }
     };
-    if !store::is_uuid(&target.id) {
+    if !store::is_session_id(&target.id) {
         eprintln!("{ATTACH_WARNING}");
         die(&format!(
-            "refusing to attach: target id is not a session UUID: {}",
+            "refusing to attach: target id is not a session UUID (lowercase): {}",
             target.id
         ));
     }
@@ -380,7 +384,7 @@ fn doctor(args: &Args) -> ! {
     let (id, fallback) = match args.flag("id") {
         Some(who) => match store::resolve(who) {
             Some(entry) => (entry.id, false),
-            None if store::is_uuid(who) => (who.to_string(), false),
+            None if store::is_session_id(who) => (who.to_string(), false),
             None => {
                 doctor_line(
                     "FAIL",
@@ -946,9 +950,9 @@ pub fn run(cmd: &str, raw: Vec<String>) -> ! {
             // explicit_target() already UUID-gates an --id; gate the
             // resolved-name path too, so a planted, flag-shaped id in the
             // registry can't become an option.
-            if !store::is_uuid(&target.id) {
+            if !store::is_session_id(&target.id) {
                 die(&format!(
-                    "refusing to wake: target id is not a session UUID: {}",
+                    "refusing to wake: target id is not a session UUID (lowercase): {}",
                     target.id
                 ));
             }

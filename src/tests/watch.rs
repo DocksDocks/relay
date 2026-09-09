@@ -102,8 +102,9 @@ fn watch_never_launches_a_tampered_non_uuid_target() {
     let named = relay(&home, &launcher, &["watch", "bad", "--once"]);
     assert!(!named.status.success(), "watch bad must refuse");
     assert!(
-        String::from_utf8_lossy(&named.stderr).contains("not a session UUID"),
-        "watch bad must name the refusal"
+        String::from_utf8_lossy(&named.stderr).contains("unknown session"),
+        "watch bad must name the refusal: {}",
+        String::from_utf8_lossy(&named.stderr)
     );
     assert!(!log.exists(), "named watch launched the invalid id");
 
@@ -114,8 +115,8 @@ fn watch_never_launches_a_tampered_non_uuid_target() {
         String::from_utf8_lossy(&all.stderr)
     );
     assert!(
-        String::from_utf8_lossy(&all.stderr).contains("skip --config=evil"),
-        "watch --all must report the skipped id: {}",
+        !String::from_utf8_lossy(&all.stderr).contains(INVALID),
+        "watch --all must not see the bad entry: {}",
         String::from_utf8_lossy(&all.stderr)
     );
     let launched = fs::read_to_string(&log).unwrap_or_default();
@@ -162,7 +163,7 @@ fn watch_refuses_and_skips_an_uppercase_session_id() {
     let named = relay(&home, &launcher, &["watch", UPPER, "--once"]);
     assert!(!named.status.success(), "watch {UPPER} must refuse");
     assert!(
-        String::from_utf8_lossy(&named.stderr).contains("session UUID (lowercase)"),
+        String::from_utf8_lossy(&named.stderr).contains("unknown session"),
         "watch must name the refusal: {}",
         String::from_utf8_lossy(&named.stderr)
     );
@@ -195,9 +196,8 @@ fn watch_refuses_and_skips_an_uppercase_session_id() {
         String::from_utf8_lossy(&all.stderr)
     );
     assert!(
-        String::from_utf8_lossy(&all.stderr)
-            .contains(&format!("skip {UPPER}: not a session UUID (lowercase)")),
-        "watch --all must report the skipped id: {}",
+        !String::from_utf8_lossy(&all.stderr).contains(UPPER),
+        "watch --all must not see the uppercase entry: {}",
         String::from_utf8_lossy(&all.stderr)
     );
     let launched = fs::read_to_string(&log).unwrap_or_default();
@@ -209,5 +209,82 @@ fn watch_refuses_and_skips_an_uppercase_session_id() {
         !launched.contains(UPPER),
         "watch --all launched the uppercase id: {launched:?}"
     );
+    fs::remove_dir_all(home).ok();
+}
+
+#[test]
+fn readers_ignore_an_uppercase_registry_entry() {
+    let home = fresh_home("readers-uppercase");
+    let (launcher, log) = recording_launcher(&home);
+    seed_tampered_registry(&home, UPPER);
+
+    let list = relay(&home, &launcher, &["list"]);
+    assert!(list.status.success(), "list must not fail on a bad entry");
+    let listed = String::from_utf8_lossy(&list.stdout);
+    assert!(
+        listed.contains(VALID),
+        "list must keep the valid entry: {listed}"
+    );
+    assert!(
+        !listed.contains(UPPER),
+        "list must drop the uppercase entry: {listed}"
+    );
+
+    let attach = relay(&home, &launcher, &["attach", UPPER]);
+    assert!(!attach.status.success(), "attach {UPPER} must refuse");
+    assert!(
+        String::from_utf8_lossy(&attach.stderr).contains("non-session UUID (lowercase)"),
+        "attach must name the refusal: {}",
+        String::from_utf8_lossy(&attach.stderr)
+    );
+    assert!(!log.exists(), "attach launched the uppercase id");
+
+    let doctor = relay(&home, &launcher, &["doctor", "--id", UPPER]);
+    assert_eq!(doctor.status.code(), Some(1), "doctor {UPPER} must exit 1");
+    let report = String::from_utf8_lossy(&doctor.stdout);
+    assert!(
+        report.contains("FAIL identity: unknown session"),
+        "doctor must report the unknown session: {report}"
+    );
+
+    // An uppercase cwd marker is invisible to `id_for_dir`: doctor sees no marker.
+    let dir = home.to_string_lossy().into_owned();
+    let markers = home.join("markers");
+    fs::create_dir_all(&markers).unwrap();
+    fs::write(
+        markers.join(relay::store::encode_dir(&dir)),
+        format!("{UPPER}\n"),
+    )
+    .unwrap();
+    let marked = Command::new(env!("CARGO_BIN_EXE_relay"))
+        .arg("doctor")
+        .current_dir(&home)
+        .env("AGENT_RELAY_HOME", &home)
+        .env("RELAY_WAKE_CMD_OMP", &launcher)
+        .output()
+        .unwrap();
+    assert_eq!(
+        marked.status.code(),
+        Some(1),
+        "doctor with an uppercase marker must exit 1"
+    );
+    let marked_report = String::from_utf8_lossy(&marked.stdout);
+    assert!(
+        marked_report.contains("FAIL identity: no cwd marker"),
+        "doctor must ignore the uppercase marker: {marked_report}"
+    );
+
+    let wake = relay(
+        &home,
+        &launcher,
+        &["wake", "--id", UPPER, "--dir", &dir, "--dry"],
+    );
+    assert!(!wake.status.success(), "wake --id {UPPER} must refuse");
+    assert!(
+        String::from_utf8_lossy(&wake.stderr).contains("--id must be a session UUID (lowercase)"),
+        "wake must name the refusal: {}",
+        String::from_utf8_lossy(&wake.stderr)
+    );
+    assert!(!log.exists(), "wake launched the uppercase id");
     fs::remove_dir_all(home).ok();
 }

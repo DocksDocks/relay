@@ -68,6 +68,7 @@
     },
     "watch": {
       "tests": [
+        "readers_ignore_an_uppercase_registry_entry",
         "register_refuses_a_non_uuid_session_id",
         "register_refuses_an_uppercase_session_id",
         "watch_never_launches_a_tampered_non_uuid_target",

@@ -97,6 +97,8 @@ Holds live in `holds/<token>.jsonl` with a `holds/<token>.json` manifest.
 An empty inbox creates no hold and returns null token and expiry, zero count, and no messages.
 A non-empty held omp hook prints the token before the existing fenced mail block.
 An empty hook prints nothing. Relay-generated record ids stay lowercase UUID-v4.
+Session ids are lowercase RFC 9562 UUID text at writers and readers; any other
+shape in the registry or marker is ignored.
 `ack <token>` commits held mail; `rollback <token>` restores it before later mail.
 Both exit 0 on success. Unknown or expired tokens exit 1 with `unknown_hold` or
 `expired_hold`. Recovery can safely repeat either operation.

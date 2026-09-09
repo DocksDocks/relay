@@ -7,7 +7,7 @@
     {
       "name": "session-relay",
       "source": "./plugin",
-      "version": "0.18.0",
+      "version": "0.18.1",
       "description": "Cross-session mail for omp sessions"
     }
   ]

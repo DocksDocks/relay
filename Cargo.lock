@@ -45,7 +45,7 @@ dependencies = [
 
 [[package]]
 name = "session-relay"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "libc",
  "rustix",
