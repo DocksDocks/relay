@@ -11,7 +11,7 @@ session to that store through the CLI.
 |---|---|
 | `src/store.rs` | Relay home, omp registry and names, mailboxes, markers, store and resume locks, durable holds, ack/rollback, expiry recovery, and inactive-state collection. |
 | `src/protocol.rs` | Closed request and terminal-reply envelopes, correlated claims, validation, canonical digests, crash recovery, and typed delivery state. |
-| `src/jcs.rs` | Public canonical JSON values, parsing, serialization, secure file reads, lowercase UUID-v4 and SHA-256 digest primitives. |
+| `src/jcs.rs` | Public canonical JSON values, parsing, serialization, secure file reads, lowercase UUID-v4 record-id and SHA-256 digest primitives. |
 | `src/bus.rs` | MCP stdio transport and messaging tool dispatch. The omp extension uses its own tool interface instead. |
 | `src/discover.rs` | Read-only discovery under the omp session root; `RELAY_OMP_SESSIONS` selects the root. Recency does not prove process liveness. |
 | `src/hook.rs` | omp registration and prompt hooks; render held or drained mail as untrusted context. |

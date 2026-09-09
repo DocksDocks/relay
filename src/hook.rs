@@ -47,8 +47,10 @@ fn parse_invocation(args: &[String]) -> Result<Invocation, String> {
     let id = a
         .unique_flag("session")?
         .ok_or("hook omp requires --session")?;
-    if !store::is_uuid(id) {
-        return Err(format!("--session must be a session UUID, got: {id}"));
+    if !store::is_session_id(id) {
+        return Err(format!(
+            "--session must be a session UUID (lowercase), got: {id}"
+        ));
     }
     let cwd = a.unique_flag("cwd")?.ok_or("hook omp requires --cwd")?;
     let session = (id.to_string(), cwd.to_string());
@@ -356,6 +358,16 @@ mod tests {
         .err()
         .expect("non-UUID session must be rejected");
         assert!(error.contains("session UUID"), "{error}");
+        let error = parse_invocation(&argv(&[
+            "omp",
+            "--session",
+            "01A081C6-19DA-737A-A863-9FB9D50AD5C2",
+            "--cwd",
+            "/tmp/p",
+        ]))
+        .err()
+        .expect("uppercase session must be rejected");
+        assert!(error.contains("session UUID (lowercase)"), "{error}");
     }
 
     #[test]

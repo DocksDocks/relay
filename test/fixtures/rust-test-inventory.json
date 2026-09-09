@@ -67,7 +67,12 @@
       ]
     },
     "watch": {
-      "tests": ["register_refuses_a_non_uuid_session_id", "watch_never_launches_a_tampered_non_uuid_target"]
+      "tests": [
+        "register_refuses_a_non_uuid_session_id",
+        "register_refuses_an_uppercase_session_id",
+        "watch_never_launches_a_tampered_non_uuid_target",
+        "watch_refuses_and_skips_an_uppercase_session_id"
+      ]
     }
   }
 }

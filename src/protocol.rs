@@ -159,7 +159,7 @@ fn validate_uuid(value: &str, label: &str) -> Result<(), String> {
 /// Omp runtime session ids may be UUIDv7. Accept any lowercase UUID shape;
 /// relay-generated ids stay strict v4.
 fn validate_session_id(value: &str, label: &str) -> Result<(), String> {
-    if store::is_uuid(value) && !value.bytes().any(|b| b.is_ascii_uppercase()) {
+    if store::is_session_id(value) {
         Ok(())
     } else {
         Err(format!("{label} is not a lowercase UUID"))

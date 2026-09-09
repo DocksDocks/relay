@@ -5,7 +5,7 @@ user-invocable: true
 metadata:
   pattern: tool-wrapper
   updated: "2026-09-09"
-  content_hash: "67d209dda7f905a755d64f8918e26950968c7943bd6e3e8c389daf52f8335214"
+  content_hash: "b226b90c65af2733bbb6106e5a7491f8db19f58085bdd3114e9e9458c38d3a78"
 ---
 
 # Session relay
@@ -227,7 +227,7 @@ For a two-phase CLI drain, use `session-relay inbox --hold [<seconds>] <id>`.
 It returns one JSON line with `token`, `expires_at`, `count`, and `messages`.
 Message elements keep the plain inbox shape. An empty inbox creates no hold:
 `{"token":null,"expires_at":null,"count":0,"messages":[]}`.
-Relay mints lowercase UUID-v4 tokens. The default hold lasts 30 s.
+Relay-generated record ids stay lowercase UUID-v4. The default hold lasts 30 s.
 Holds live in `holds/<token>.jsonl` and `holds/<token>.json` under the relay home.
 Run `session-relay ack <token>` to commit consumption.
 Run `session-relay rollback <token>` to restore held mail before later arrivals.

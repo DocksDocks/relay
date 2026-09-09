@@ -406,10 +406,10 @@ pub fn iso_now() -> String {
     iso_from_unix_ms(now_ms())
 }
 
-/// Session ids are RFC 9562 UUID text (8-4-4-4-12 hex, any version, any
-/// case): only the shape keeps planted values and injectable options off
-/// doorbell argv. Message-side session ids additionally require lowercase
-/// (`protocol::validate_session_id`); relay-generated record ids stay v4.
+/// RFC 9562 UUID text (8-4-4-4-12 hex, any version, any case): the shape
+/// keeps planted values and injectable options off doorbell argv. Session ids
+/// additionally require lowercase via `is_session_id`; relay-generated record
+/// ids stay v4.
 pub fn is_uuid(s: &str) -> bool {
     let b = s.as_bytes();
     b.len() == 36
@@ -417,6 +417,11 @@ pub fn is_uuid(s: &str) -> bool {
             8 | 13 | 18 | 23 => *c == b'-',
             _ => c.is_ascii_hexdigit(),
         })
+}
+
+/// Session ids are lowercase RFC 9562 UUID text, including UUIDv7.
+pub fn is_session_id(s: &str) -> bool {
+    is_uuid(s) && !s.bytes().any(|b| b.is_ascii_uppercase())
 }
 
 /// Days-since-epoch -> (year, month, day). Howard Hinnant's civil_from_days.
@@ -1274,8 +1279,10 @@ pub fn register(
     name: Option<&str>,
     tool: Option<&str>,
 ) -> Result<Entry, String> {
-    if !is_uuid(id) {
-        return Err(format!("register requires a session UUID id, got: {id}"));
+    if !is_session_id(id) {
+        return Err(format!(
+            "register requires a session UUID (lowercase) id, got: {id}"
+        ));
     }
     if tool.is_some_and(|tool| tool != "omp") {
         return Err("register supports only tool omp".to_string());
@@ -2153,6 +2160,20 @@ mod tests {
         assert_eq!(u.len(), 36);
         assert_eq!(&u[14..15], "4");
         assert!(matches!(&u[19..20], "8" | "9" | "a" | "b"));
+    }
+
+    #[test]
+    fn session_ids_require_lowercase_and_accept_v7() {
+        for id in [
+            "01A081C6-19DA-737A-A863-9FB9D50AD5C2",
+            "01a081c6-19da-737a-a863-9fb9d50ad5C2",
+        ] {
+            assert!(is_uuid(id), "generic UUIDs remain case-tolerant");
+            assert!(!is_session_id(id));
+            let error = register(id, None, None, None).unwrap_err();
+            assert!(error.contains("session UUID (lowercase)"), "{error}");
+        }
+        assert!(is_session_id("01a081c6-19da-737a-a863-9fb9d50ad5c2"));
     }
 
     #[test]
