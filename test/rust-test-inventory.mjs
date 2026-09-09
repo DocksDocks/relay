@@ -230,4 +230,9 @@ assert.ok(summary, `${name}: missing executable test summary`);
 assert.equal(Number(summary[1]), actual.length, `${name}: listed/executed test count differs`);
 assert.equal(Number(summary[2]), 0, `${name}: ignored required tests`);
 assert.equal(Number(summary[3]), 0, `${name}: filtered required tests`);
+// A test may skip one privileged subcase; surface that line so a gate log
+// never hides reduced coverage behind a PASS.
+for (const line of executed.stderr.split('\n')) {
+  if (line.startsWith('SKIP ')) console.log(`${line} (case=${name})`);
+}
 console.log(`PASS rust_test_inventory case=${name} tests=${actual.length} executed=${summary[1]}`);

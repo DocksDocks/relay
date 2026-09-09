@@ -108,5 +108,5 @@ jobs:
           (
             test_pid=$BASHPID
             sudo -n tee "$CGROUP/cgroup.procs" >/dev/null <<<"$test_pid"
-            SESSION_RELAY_TEST_CGROUP_ROOT="$CGROUP" node scripts/gate.mjs
+            SESSION_RELAY_TEST_CGROUP_ROOT="$CGROUP" SESSION_RELAY_REQUIRE_DEVICE_FIXTURE=1 node scripts/gate.mjs
           )

@@ -628,6 +628,12 @@ fn preserve_artifact_mode_round_trips_binary_and_untracked_pax() {
                 refusal_failures.push(format!("device type drift: {error}"));
             }
         } else {
+            // CI sets this so a lost sudo grant fails loudly instead of
+            // shrinking coverage.
+            assert!(
+                std::env::var_os("SESSION_RELAY_REQUIRE_DEVICE_FIXTURE").is_none(),
+                "device fixture is required on this host but no CAP_MKNOD or passwordless sudo is available"
+            );
             eprintln!(
                 "SKIP device type refusal subcase: no CAP_MKNOD and no passwordless sudo on this host"
             );
