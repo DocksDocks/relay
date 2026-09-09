@@ -161,6 +161,26 @@ fn watch_refuses_and_skips_an_uppercase_session_id() {
     );
     assert!(!log.exists(), "named watch launched the uppercase id");
 
+    // `--once` beside `--follow` is rejected after the id gate; on a regression the
+    // combination check exits without blocking and the message assertion fails.
+    for flag in ["--id", "--follow"] {
+        let flagged = relay(&home, &launcher, &["watch", flag, UPPER, "--once"]);
+        assert!(
+            !flagged.status.success(),
+            "watch {flag} {UPPER} must refuse"
+        );
+        assert!(
+            String::from_utf8_lossy(&flagged.stderr).contains("session UUID (lowercase)"),
+            "watch {flag} must name the refusal: {}",
+            String::from_utf8_lossy(&flagged.stderr)
+        );
+        assert!(!log.exists(), "watch {flag} launched the uppercase id");
+        assert!(
+            !home.join("watchers").exists(),
+            "watch {flag} must not create a watcher lock"
+        );
+    }
+
     let all = relay(&home, &launcher, &["watch", "--all", "--once"]);
     assert!(
         all.status.success(),
