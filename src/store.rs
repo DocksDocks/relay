@@ -1272,8 +1272,8 @@ pub fn register(
     name: Option<&str>,
     tool: Option<&str>,
 ) -> Result<Entry, String> {
-    if id.is_empty() {
-        return Err("register requires an id".to_string());
+    if !is_uuid(id) {
+        return Err(format!("register requires a session UUID id, got: {id}"));
     }
     if tool.is_some_and(|tool| tool != "omp") {
         return Err("register supports only tool omp".to_string());

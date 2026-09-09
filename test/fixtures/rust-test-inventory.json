@@ -65,6 +65,9 @@
         "typed_drain_preflights_unclaimed_suffix_before_consuming_valid_prefix",
         "typed_rows_without_authoritative_claims_are_never_surfaced"
       ]
+    },
+    "watch": {
+      "tests": ["register_refuses_a_non_uuid_session_id", "watch_never_launches_a_tampered_non_uuid_target"]
     }
   }
 }
