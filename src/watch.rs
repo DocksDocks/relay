@@ -77,8 +77,10 @@ fn validate_tool(tool: &str) {
 
 fn resolve_targets(args: &Args) -> Vec<Target> {
     if let Some(id) = args.flag("id") {
-        if !store::is_uuid(id) {
-            die(&format!("--id must be a session UUID, got: {id}"));
+        if !store::is_session_id(id) {
+            die(&format!(
+                "--id must be a session UUID (lowercase), got: {id}"
+            ));
         }
         let tool = args.flag("tool").unwrap_or("omp").to_string();
         return vec![Target {
@@ -91,9 +93,12 @@ fn resolve_targets(args: &Args) -> Vec<Target> {
         return store::roster()
             .into_iter()
             .filter(|e| {
-                let valid = store::is_uuid(&e.id);
+                let valid = store::is_session_id(&e.id);
                 if !valid {
-                    eprintln!("[relay watch] skip {}: not a session UUID", e.id);
+                    eprintln!(
+                        "[relay watch] skip {}: not a session UUID (lowercase)",
+                        e.id
+                    );
                 }
                 valid
             })
@@ -110,8 +115,11 @@ fn resolve_targets(args: &Args) -> Vec<Target> {
             let Some(e) = store::resolve(who) else {
                 die(&format!("unknown session: {who}"));
             };
-            if !store::is_uuid(&e.id) {
-                die(&format!("{who} is not a session UUID: {}", e.id));
+            if !store::is_session_id(&e.id) {
+                die(&format!(
+                    "{who} is not a session UUID (lowercase): {}",
+                    e.id
+                ));
             }
             Target {
                 id: e.id,
@@ -128,8 +136,10 @@ pub fn run(raw: Vec<String>) -> ! {
         validate_tool(tool);
     }
     if let Some(id) = args.flag("follow") {
-        if !store::is_uuid(id) {
-            die(&format!("--follow must be a session UUID, got: {id}"));
+        if !store::is_session_id(id) {
+            die(&format!(
+                "--follow must be a session UUID (lowercase), got: {id}"
+            ));
         }
         if args.has("all") || args.has("once") {
             die("--follow cannot be combined with --all or --once");

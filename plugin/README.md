@@ -62,8 +62,9 @@ Reply status defaults to `completed`.
 Use `failed` for a failed terminal answer.
 Use `/relay` for the roster and pending count without draining mail.
 
-A session ID is RFC 9562 UUID text in any version; `register`, `hook`, `wake`,
-and `watch` refuse every other shape before any write or launch.
+A session ID is lowercase RFC 9562 UUID text in any version; `register`, `hook`,
+and `watch` refuse every other shape before any write or launch. Relay-generated
+record IDs stay lowercase UUID v4.
 
 Discovery reads only the omp session root. The extension supplies
 `RELAY_OMP_SESSIONS`; set it explicitly for standalone commands using a
