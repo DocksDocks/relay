@@ -12,6 +12,21 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Mutex, MutexGuard};
+
+/// Every case here writes a file and executes it immediately. When the harness
+/// runs the cases on separate threads, a `fork` in one thread duplicates the
+/// write descriptor another thread still holds on its fresh file, and Linux
+/// refuses to execute a file with a writer open (`ETXTBSY`) until that child
+/// execs. Taking turns removes the window instead of tolerating it.
+static EXEC_SERIAL: Mutex<()> = Mutex::new(());
+
+/// A poisoned lock only means an earlier case failed; the rest still run.
+fn serialized() -> MutexGuard<'static, ()> {
+    EXEC_SERIAL
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+}
 
 /// A scratch directory of its own per case, so cases stay independent when the
 /// harness runs them on separate threads.
@@ -39,6 +54,7 @@ fn version_output(binary: &Path) -> String {
 
 #[test]
 fn replace_executable_swaps_the_target_in_place() {
+    let _serial = serialized();
     let dir = scratch("swap");
     let target = dir.join("relay");
     fs::copy(env!("CARGO_BIN_EXE_relay"), &target).unwrap();
@@ -62,6 +78,7 @@ fn replace_executable_refuses_an_unwritable_directory() {
         println!("skipped: root ignores directory mode bits");
         return;
     }
+    let _serial = serialized();
     let dir = scratch("unwritable");
     let target = dir.join("relay");
     fs::copy(env!("CARGO_BIN_EXE_relay"), &target).unwrap();
@@ -81,6 +98,7 @@ fn replace_executable_refuses_an_unwritable_directory() {
 
 #[test]
 fn verify_staged_removes_a_mismatching_binary() {
+    let _serial = serialized();
     let dir = scratch("verify");
     let staged = dir.join("relay.update-3");
 
