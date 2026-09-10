@@ -64,7 +64,7 @@ watcher, or child process across scenario modules.
 Scheduler declaration order controls launch, result records, and failure reports.
 The explicit production output order contains exactly 77 unique labels.
 Rendering each label as `  ok: <label>\n` has the reviewed SHA-256:
-`f547d79a23988ec5fd1f6e739f68bdc9ea5d6ccbe9aeb995411f734bfc404026`.
+`989a1626cf85a6caab5fc269880645e3d8554f6e8dbf344344519307735ae04d`.
 Jobs 1 and jobs 4 must produce byte-identical output.
 
 On ordinary scenario failure, stop later launches.
