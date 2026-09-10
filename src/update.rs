@@ -26,6 +26,10 @@ const USER_AGENT: &str = concat!("relay/", env!("CARGO_PKG_VERSION"));
 // Bound for one whole request, body included, so a stalled peer turns into an
 // error instead of a hang.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+// Byte budgets for the two downloads. A body over budget fails the update
+// instead of filling memory or the disk beside the installed binary.
+const ASSET_LIMIT: u64 = 64 * 1024 * 1024;
+const SUMS_LIMIT: u64 = 64 * 1024;
 
 // The release asset suffix for this build. Every target compiles; a target
 // without a published asset refuses at run time, so the gate and CI can build
@@ -59,7 +63,8 @@ pub struct Release {
 pub trait ReleaseSource {
     fn latest(&self) -> Result<Release, String>;
     fn tag(&self, name: &str) -> Result<Release, String>;
-    fn fetch(&self, url: &str, sink: &mut dyn Write) -> Result<(), String>;
+    /// Copy the body at `url` into `sink`; a body over `limit` bytes fails.
+    fn fetch(&self, url: &str, limit: u64, sink: &mut dyn Write) -> Result<(), String>;
 }
 
 /// What the running version and the selected version imply.
@@ -122,14 +127,14 @@ impl ReleaseSource for GithubSource {
         self.release(&format!("{API_TAGS}{name}"))
     }
 
-    fn fetch(&self, url: &str, mut sink: &mut dyn Write) -> Result<(), String> {
+    fn fetch(&self, url: &str, limit: u64, mut sink: &mut dyn Write) -> Result<(), String> {
         let mut response = self
             .agent
             .get(url)
             .header("User-Agent", USER_AGENT)
             .call()
             .map_err(|error| format!("GET {url} failed: {error}"))?;
-        let mut reader = response.body_mut().as_reader();
+        let mut reader = response.body_mut().with_config().limit(limit).reader();
         std::io::copy(&mut reader, &mut sink)
             .map_err(|error| format!("GET {url} failed: {error}"))?;
         Ok(())
@@ -411,13 +416,13 @@ fn stage(
             hasher: Sha256::new(),
             file,
         };
-        source.fetch(&asset.url, &mut sink)?;
+        source.fetch(&asset.url, ASSET_LIMIT, &mut sink)?;
         sink.flush().map_err(not_writable(staged))?;
         hex(&sink.hasher.digest())
     };
     file.sync_all().map_err(not_writable(staged))?;
     let mut manifest = Vec::new();
-    source.fetch(&sums.url, &mut manifest)?;
+    source.fetch(&sums.url, SUMS_LIMIT, &mut manifest)?;
     let text =
         String::from_utf8(manifest).map_err(|_| format!("{SUMS_ASSET} is not UTF-8 text"))?;
     verify(&text, asset_name, &digest)
@@ -535,10 +540,13 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::{Mutex, MutexGuard};
 
-    // Every case writes a file and then executes it. A `fork` on one test
-    // thread inherits the write descriptor another thread still holds on its
-    // fresh file, and Linux refuses to execute that file (`ETXTBSY`), so the
-    // cases take turns. A poisoned lock only means an earlier case failed.
+    // The installing cases execute a file they just wrote. A `fork` on one
+    // test thread inherits the write descriptor another thread still holds on
+    // its fresh file, and Linux refuses to execute that file (`ETXTBSY`), so
+    // every fixture takes the turn for its whole life and no sibling fork can
+    // hold a write descriptor across that exec. The lock is not reentrant: a
+    // case creates at most one fixture. A poisoned lock only means an earlier
+    // case failed.
     static EXEC_SERIAL: Mutex<()> = Mutex::new(());
 
     const TEST_TARGET: Option<&str> = Some("x86_64-unknown-linux-musl");
@@ -566,12 +574,15 @@ mod tests {
             })
         }
 
-        fn fetch(&self, url: &str, sink: &mut dyn Write) -> Result<(), String> {
+        fn fetch(&self, url: &str, limit: u64, sink: &mut dyn Write) -> Result<(), String> {
             self.fetched.borrow_mut().push(url.to_string());
             let body = self
                 .bodies
                 .get(url)
                 .ok_or_else(|| format!("no body for {url}"))?;
+            if u64::try_from(body.len()).map_or(true, |size| size > limit) {
+                return Err(format!("body for {url} exceeds {limit} bytes"));
+            }
             sink.write_all(body).map_err(|error| error.to_string())
         }
     }
