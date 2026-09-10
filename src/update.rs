@@ -381,12 +381,57 @@ impl Write for HashingSink<'_> {
     }
 }
 
-fn staged_path(exe: &Path) -> Result<PathBuf, String> {
-    let name = exe
-        .file_name()
+// Staged download name: `<exe name>` + STAGED_INFIX + `<pid>`.
+const STAGED_INFIX: &str = ".update-";
+
+fn exe_name(exe: &Path) -> Result<&str, String> {
+    exe.file_name()
         .and_then(|name| name.to_str())
-        .ok_or_else(|| format!("cannot stage beside {}", exe.display()))?;
-    Ok(exe.with_file_name(format!("{name}.update-{}", std::process::id())))
+        .ok_or_else(|| format!("cannot stage beside {}", exe.display()))
+}
+
+fn staged_path(exe: &Path) -> Result<PathBuf, String> {
+    let name = exe_name(exe)?;
+    Ok(exe.with_file_name(format!("{name}{STAGED_INFIX}{}", std::process::id())))
+}
+
+/// Whether the process named by a staged-file suffix is gone. Only `ESRCH`
+/// proves that; `EPERM` means the process is live but owned by someone else.
+/// The suffix must be plain digits: a signed value would name a process
+/// group, and zero is not a process.
+fn process_is_gone(pid: &str) -> bool {
+    if pid.is_empty() || !pid.bytes().all(|byte| byte.is_ascii_digit()) {
+        return false;
+    }
+    pid.parse::<u32>()
+        .ok()
+        .and_then(|pid| i32::try_from(pid).ok())
+        .and_then(rustix::process::Pid::from_raw)
+        .is_some_and(|pid| rustix::process::test_kill_process(pid) == Err(rustix::io::Errno::SRCH))
+}
+
+/// Remove staged files that an earlier `relay update` left behind when it was
+/// killed between the download and the rename. A sibling whose pid is still
+/// live belongs to a concurrent update and stays. A removal error is not
+/// fatal here; the create that follows reports a real permission problem.
+fn reap_stale_staged(exe: &Path, name: &str) {
+    let Some(dir) = exe.parent() else {
+        return;
+    };
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let prefix = format!("{name}{STAGED_INFIX}");
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let stale = file_name
+            .to_str()
+            .and_then(|file_name| file_name.strip_prefix(&prefix))
+            .is_some_and(process_is_gone);
+        if stale {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
 }
 
 fn find_asset<'a>(release: &'a Release, name: &str) -> Result<&'a Asset, String> {
@@ -453,6 +498,7 @@ fn install(
     check_host(&asset.url)?;
     check_host(&sums.url)?;
 
+    reap_stale_staged(exe, exe_name(exe)?);
     let staged = staged_path(exe)?;
     let mut file = File::create(&staged).map_err(not_writable(exe))?;
     let staged_result = mark_executable(&file, &staged)
@@ -574,14 +620,18 @@ mod tests {
             })
         }
 
+        // Like ureq's limit reader: copy `limit` bytes, then fail.
         fn fetch(&self, url: &str, limit: u64, sink: &mut dyn Write) -> Result<(), String> {
             self.fetched.borrow_mut().push(url.to_string());
             let body = self
                 .bodies
                 .get(url)
                 .ok_or_else(|| format!("no body for {url}"))?;
-            if u64::try_from(body.len()).map_or(true, |size| size > limit) {
-                return Err(format!("body for {url} exceeds {limit} bytes"));
+            let allowed = usize::try_from(limit).unwrap_or(usize::MAX);
+            if body.len() >= allowed {
+                sink.write_all(&body[..allowed])
+                    .map_err(|error| error.to_string())?;
+                return Err(format!("GET {url} failed: body exceeds {limit} bytes"));
             }
             sink.write_all(body).map_err(|error| error.to_string())
         }
@@ -739,6 +789,62 @@ mod tests {
             .expect_err("mismatch fails the update");
 
         assert!(error.starts_with("checksum mismatch for relay-"), "{error}");
+        assert_eq!(fs::read(&exe).expect("read fixture"), before);
+        assert!(!staged_path(&exe).expect("staged path").exists());
+    }
+
+    #[test]
+    fn stale_staged_files_are_reaped_but_live_ones_stay() {
+        let exe = fixture("reap");
+        let dead = std::process::Command::new("true")
+            .spawn()
+            .and_then(|mut child| child.wait().map(|_| child.id()))
+            .expect("spawn and reap a child");
+        let stale = exe.with_file_name(format!("relay{STAGED_INFIX}{dead}"));
+        let live = exe.with_file_name(format!("relay{STAGED_INFIX}1"));
+        let unrelated = exe.with_file_name(format!("relay{STAGED_INFIX}notes"));
+        let group = exe.with_file_name(format!("relay{STAGED_INFIX}-{dead}"));
+        let plus = exe.with_file_name(format!("relay{STAGED_INFIX}+{dead}"));
+        for path in [&stale, &live, &unrelated, &group, &plus] {
+            fs::write(path, b"leftover").expect("seed a sibling");
+        }
+        let body = payload("0.2.0");
+        let source = source("v0.2.0", &body, &hex_digest(&body), ASSET_HOST);
+        let mut out = Vec::new();
+
+        execute(&[], &source, "0.1.0", TEST_TARGET, &exe, &mut out).expect("update succeeds");
+
+        assert!(!stale.exists(), "dead pid sibling is reaped");
+        assert!(live.exists(), "live pid sibling stays");
+        assert!(unrelated.exists(), "non-pid suffix stays");
+        assert!(group.exists(), "signed suffix is not probed as a group");
+        assert!(plus.exists(), "plus-signed suffix is not a pid");
+        assert_eq!(fs::read(&exe).expect("read replaced file"), body);
+    }
+
+    #[test]
+    fn oversized_manifest_fails_the_update() {
+        let exe = fixture("budget");
+        let before = fs::read(&exe).expect("read fixture");
+        let body = payload("0.2.0");
+        let mut source = source("v0.2.0", &body, &hex_digest(&body), ASSET_HOST);
+        let sums_url = source.assets[1].url.clone();
+        // A manifest that would verify, padded past the budget with more
+        // valid lines, so only the byte budget can fail this update.
+        let manifest = source.bodies.get_mut(&sums_url).expect("manifest body");
+        let padding = format!("{}  relay-other-target\n", hex_digest(b"other"));
+        while u64::try_from(manifest.len()).expect("fits") <= SUMS_LIMIT {
+            manifest.extend_from_slice(padding.as_bytes());
+        }
+        let mut out = Vec::new();
+
+        let error = execute(&[], &source, "0.1.0", TEST_TARGET, &exe, &mut out)
+            .expect_err("over-budget manifest fails the update");
+
+        // The wording belongs to ureq; the test pins attribution to the
+        // manifest fetch and the observable state after the failure.
+        assert!(error.contains(SUMS_ASSET), "{error}");
+        assert_eq!(source.fetched.borrow().len(), 2, "asset then manifest");
         assert_eq!(fs::read(&exe).expect("read fixture"), before);
         assert!(!staged_path(&exe).expect("staged path").exists());
     }

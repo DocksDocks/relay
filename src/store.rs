@@ -2221,13 +2221,14 @@ mod tests {
         let token = hold_string(manifest, "token").unwrap();
         let payload = root.join("holds").join(format!("{token}.jsonl")).exists();
         let expired = hold_string(manifest, "expires_at").unwrap() <= iso_now().as_str();
-        let claims = [
+        let claims: Vec<HoldFailpoint> = [
             HoldFailpoint::AfterPhaseWrite,
             HoldFailpoint::BeforeClaimUpdates,
-            HoldFailpoint::AfterClaimUpdate(0),
-            HoldFailpoint::AfterClaimUpdate(1),
-            HoldFailpoint::AfterClaimUpdates,
-        ];
+        ]
+        .into_iter()
+        .chain((0..HOLD_MODEL_CLAIM_ROWS).map(HoldFailpoint::AfterClaimUpdate))
+        .chain([HoldFailpoint::AfterClaimUpdates])
+        .collect();
         match (hold_string(manifest, "phase").unwrap(), payload) {
             ("held", false) => vec![HoldFailpoint::BeforeManifestRemoval],
             ("committing", _) => claims
@@ -2254,19 +2255,38 @@ mod tests {
         }
     }
 
-    const ALL_HOLD_FAILPOINTS: [HoldFailpoint; 11] = [
-        HoldFailpoint::BeforeManifest,
-        HoldFailpoint::AfterManifest,
-        HoldFailpoint::AfterMailboxRename,
-        HoldFailpoint::AfterPhaseWrite,
-        HoldFailpoint::BeforeClaimUpdates,
-        HoldFailpoint::AfterClaimUpdate(0),
-        HoldFailpoint::AfterClaimUpdate(1),
-        HoldFailpoint::AfterClaimUpdates,
-        HoldFailpoint::AfterRestoreRename,
-        HoldFailpoint::BeforePayloadRemoval,
-        HoldFailpoint::BeforeManifestRemoval,
-    ];
+    /// Claim rows in the model fixture: the legacy JSON row and the typed
+    /// request row.
+    const HOLD_MODEL_CLAIM_ROWS: usize = 2;
+
+    /// The failpoint after `point` in operation order. The match is
+    /// exhaustive, so a new `HoldFailpoint` variant fails to compile until it
+    /// joins the model.
+    fn next_hold_failpoint(point: HoldFailpoint) -> Option<HoldFailpoint> {
+        Some(match point {
+            HoldFailpoint::BeforeManifest => HoldFailpoint::AfterManifest,
+            HoldFailpoint::AfterManifest => HoldFailpoint::AfterMailboxRename,
+            HoldFailpoint::AfterMailboxRename => HoldFailpoint::AfterPhaseWrite,
+            HoldFailpoint::AfterPhaseWrite => HoldFailpoint::BeforeClaimUpdates,
+            HoldFailpoint::BeforeClaimUpdates => HoldFailpoint::AfterClaimUpdate(0),
+            HoldFailpoint::AfterClaimUpdate(row) if row + 1 < HOLD_MODEL_CLAIM_ROWS => {
+                HoldFailpoint::AfterClaimUpdate(row + 1)
+            }
+            HoldFailpoint::AfterClaimUpdate(_) => HoldFailpoint::AfterClaimUpdates,
+            HoldFailpoint::AfterClaimUpdates => HoldFailpoint::AfterRestoreRename,
+            HoldFailpoint::AfterRestoreRename => HoldFailpoint::BeforePayloadRemoval,
+            HoldFailpoint::BeforePayloadRemoval => HoldFailpoint::BeforeManifestRemoval,
+            HoldFailpoint::BeforeManifestRemoval => return None,
+        })
+    }
+
+    /// Every failpoint the model injects, in operation order.
+    fn all_hold_failpoints() -> Vec<HoldFailpoint> {
+        std::iter::successors(Some(HoldFailpoint::BeforeManifest), |point| {
+            next_hold_failpoint(*point)
+        })
+        .collect()
+    }
 
     /// Runs the outcome with `first` injected and returns whether the
     /// operation reached that point (crashed) or completed without it.
@@ -2364,6 +2384,19 @@ mod tests {
 
     #[test]
     fn hold_recovery_model_survives_repeated_crashes() {
+        let points = all_hold_failpoints();
+        // The claim-row bound must match the fixture: the last modeled claim
+        // index is reachable and the next one is not.
+        for (index, expected) in [
+            (HOLD_MODEL_CLAIM_ROWS - 1, true),
+            (HOLD_MODEL_CLAIM_ROWS, false),
+        ] {
+            let (root, session, _) = hold_model_fixture();
+            let point = HoldFailpoint::AfterClaimUpdate(index);
+            let reached = crash_first(&root, &session, HoldOutcome::Ack, point);
+            fs::remove_dir_all(&root).unwrap();
+            assert_eq!(reached, expected, "{point:?} reachability");
+        }
         let later = b"{\"text\":\"later\"}\n";
         let mut legal_pairs = 0usize;
         for outcome in [
@@ -2372,14 +2405,14 @@ mod tests {
             HoldOutcome::ExpiredCreation,
             HoldOutcome::ExpiredSettle,
         ] {
-            for first in ALL_HOLD_FAILPOINTS {
+            for first in points.iter().copied() {
                 let (probe_root, probe_session, _) = hold_model_fixture();
                 let reached = crash_first(&probe_root, &probe_session, outcome, first);
                 fs::remove_dir_all(&probe_root).unwrap();
                 if !reached {
                     continue;
                 }
-                for recovery in ALL_HOLD_FAILPOINTS {
+                for recovery in points.iter().copied() {
                     let label = format!("{outcome:?} first={first:?} recovery={recovery:?}");
                     let (root, session, correlation_id) = hold_model_fixture();
                     let mailbox = root.join("mailbox").join(format!("{session}.jsonl"));
