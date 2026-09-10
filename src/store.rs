@@ -2161,6 +2161,266 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    /// The four hold endings the model drives (ack, rollback, an expiry crash
+    /// during creation, and an expiry settled through rollback) and the
+    /// mailbox bytes each one must leave behind once recovery has reached
+    /// quiescence.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum HoldOutcome {
+        Ack,
+        Rollback,
+        ExpiredCreation,
+        ExpiredSettle,
+    }
+
+    /// Fixture root with a plain row, a malformed line, and one typed request
+    /// row whose claim is readable through the protocol store. Returns the
+    /// root, the held session, and the claim correlation id.
+    fn hold_model_fixture() -> (PathBuf, String, String) {
+        let (root, session, _) = hold_fixture();
+        let requester = uuid_v4();
+        let entry = |id: &str, name: &str| {
+            JsonValue::from(HashMap::from([
+                ("id".to_string(), JsonValue::from(id.to_string())),
+                ("dir".to_string(), JsonValue::from(format!("/tmp/{name}"))),
+                ("name".to_string(), JsonValue::from(name.to_string())),
+                ("tool".to_string(), JsonValue::from("omp".to_string())),
+                ("lastSeen".to_string(), JsonValue::from(iso_now())),
+            ]))
+        };
+        let registry = JsonValue::from(HashMap::from([
+            (
+                "agents".to_string(),
+                JsonValue::from(HashMap::from([
+                    (session.clone(), entry(&session, "responder")),
+                    (requester.clone(), entry(&requester, "requester")),
+                ])),
+            ),
+            (
+                "names".to_string(),
+                JsonValue::from(HashMap::from([
+                    ("responder".to_string(), JsonValue::from(session.clone())),
+                    ("requester".to_string(), JsonValue::from(requester.clone())),
+                ])),
+            ),
+        ]));
+        fs::write(root.join("registry.json"), registry.format().unwrap()).unwrap();
+        let message = crate::protocol::ProtocolStore::new(root.clone())
+            .request(&requester, &session, "model request")
+            .unwrap();
+        (root, session, message.correlation_id)
+    }
+
+    /// Recovery failpoints that fire for a manifest in the given state.
+    fn reachable_recovery_points(root: &Path, store: &HoldStore) -> Vec<HoldFailpoint> {
+        let manifests = store.manifests().unwrap();
+        assert!(manifests.len() <= 1, "one hold per session");
+        let Some(manifest) = manifests.first() else {
+            return Vec::new();
+        };
+        let token = hold_string(manifest, "token").unwrap();
+        let payload = root.join("holds").join(format!("{token}.jsonl")).exists();
+        let expired = hold_string(manifest, "expires_at").unwrap() <= iso_now().as_str();
+        let claims = [
+            HoldFailpoint::AfterPhaseWrite,
+            HoldFailpoint::BeforeClaimUpdates,
+            HoldFailpoint::AfterClaimUpdate(0),
+            HoldFailpoint::AfterClaimUpdate(1),
+            HoldFailpoint::AfterClaimUpdates,
+        ];
+        match (hold_string(manifest, "phase").unwrap(), payload) {
+            ("held", false) => vec![HoldFailpoint::BeforeManifestRemoval],
+            ("committing", _) => claims
+                .into_iter()
+                .chain([
+                    HoldFailpoint::BeforePayloadRemoval,
+                    HoldFailpoint::BeforeManifestRemoval,
+                ])
+                .collect(),
+            ("held", true) if !expired => Vec::new(),
+            ("held" | "restoring", true) => claims
+                .into_iter()
+                .chain([
+                    HoldFailpoint::AfterRestoreRename,
+                    HoldFailpoint::BeforePayloadRemoval,
+                    HoldFailpoint::BeforeManifestRemoval,
+                ])
+                .collect(),
+            ("restoring", false) => claims
+                .into_iter()
+                .chain([HoldFailpoint::BeforeManifestRemoval])
+                .collect(),
+            (phase, _) => panic!("unexpected phase {phase}"),
+        }
+    }
+
+    const ALL_HOLD_FAILPOINTS: [HoldFailpoint; 11] = [
+        HoldFailpoint::BeforeManifest,
+        HoldFailpoint::AfterManifest,
+        HoldFailpoint::AfterMailboxRename,
+        HoldFailpoint::AfterPhaseWrite,
+        HoldFailpoint::BeforeClaimUpdates,
+        HoldFailpoint::AfterClaimUpdate(0),
+        HoldFailpoint::AfterClaimUpdate(1),
+        HoldFailpoint::AfterClaimUpdates,
+        HoldFailpoint::AfterRestoreRename,
+        HoldFailpoint::BeforePayloadRemoval,
+        HoldFailpoint::BeforeManifestRemoval,
+    ];
+
+    /// Runs the outcome with `first` injected and returns whether the
+    /// operation reached that point (crashed) or completed without it.
+    fn crash_first(root: &Path, session: &str, outcome: HoldOutcome, first: HoldFailpoint) -> bool {
+        let broken = HoldStore::new(root.to_path_buf()).with_failpoint(first);
+        let hold = |seconds: u64| {
+            with_lock_at(root, || {
+                HoldStore::new(root.to_path_buf()).hold_locked(session, "prompt", seconds)
+            })
+            .unwrap()
+        };
+        let expected = format!("hold failpoint {first:?}");
+        match outcome {
+            HoldOutcome::ExpiredCreation => {
+                let result = with_lock_at(root, || {
+                    broken.hold_locked(session, "prompt", 0).map(|_| ())
+                });
+                match result {
+                    Err(message) => {
+                        assert_eq!(message, expected);
+                        true
+                    }
+                    Ok(()) => false,
+                }
+            }
+            HoldOutcome::Ack | HoldOutcome::Rollback | HoldOutcome::ExpiredSettle => {
+                let receipt = hold(if outcome == HoldOutcome::ExpiredSettle {
+                    0
+                } else {
+                    30
+                });
+                let token = receipt.token.unwrap();
+                let result = if outcome == HoldOutcome::Ack {
+                    broken.ack_hold(&token)
+                } else {
+                    broken.rollback_hold(&token)
+                };
+                match result {
+                    Err(HoldError::Other(message)) => {
+                        assert_eq!(message, expected);
+                        true
+                    }
+                    Ok(()) | Err(HoldError::Expired) => false,
+                    Err(error) => panic!("{outcome:?} {first:?}: {error:?}"),
+                }
+            }
+        }
+    }
+
+    fn check_hold_invariants(
+        root: &Path,
+        session: &str,
+        correlation_id: &str,
+        outcome: HoldOutcome,
+        raw: &[u8],
+        later: &[u8],
+        label: &str,
+    ) {
+        let store = HoldStore::new(root.to_path_buf());
+        assert!(
+            store.manifests().unwrap().is_empty(),
+            "{label}: manifest left"
+        );
+        let leftovers: Vec<_> = fs::read_dir(root.join("holds"))
+            .map(|entries| entries.map(|entry| entry.unwrap().path()).collect())
+            .unwrap_or_default();
+        assert!(
+            leftovers.is_empty(),
+            "{label}: orphan hold files {leftovers:?}"
+        );
+        let mailbox = root.join("mailbox").join(format!("{session}.jsonl"));
+        let mut expected = if outcome == HoldOutcome::Ack {
+            Vec::new()
+        } else {
+            raw.to_vec()
+        };
+        expected.extend_from_slice(later);
+        assert_eq!(
+            fs::read(&mailbox).unwrap(),
+            expected,
+            "{label}: mailbox bytes"
+        );
+        let claim = crate::protocol::ProtocolStore::new(root.to_path_buf())
+            .read_claim(correlation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(claim.state, crate::protocol::ClaimState::Open, "{label}");
+        let delivery = if outcome == HoldOutcome::Ack {
+            crate::protocol::DeliveryState::Consumed
+        } else {
+            crate::protocol::DeliveryState::Enqueued
+        };
+        assert_eq!(claim.request_delivery, delivery, "{label}: claim delivery");
+    }
+
+    #[test]
+    fn hold_recovery_model_survives_repeated_crashes() {
+        let later = b"{\"text\":\"later\"}\n";
+        let mut legal_pairs = 0usize;
+        for outcome in [
+            HoldOutcome::Ack,
+            HoldOutcome::Rollback,
+            HoldOutcome::ExpiredCreation,
+            HoldOutcome::ExpiredSettle,
+        ] {
+            for first in ALL_HOLD_FAILPOINTS {
+                let (probe_root, probe_session, _) = hold_model_fixture();
+                let reached = crash_first(&probe_root, &probe_session, outcome, first);
+                fs::remove_dir_all(&probe_root).unwrap();
+                if !reached {
+                    continue;
+                }
+                for recovery in ALL_HOLD_FAILPOINTS {
+                    let label = format!("{outcome:?} first={first:?} recovery={recovery:?}");
+                    let (root, session, correlation_id) = hold_model_fixture();
+                    let mailbox = root.join("mailbox").join(format!("{session}.jsonl"));
+                    let raw = fs::read(&mailbox).unwrap();
+                    assert!(crash_first(&root, &session, outcome, first), "{label}");
+                    let mut current = fs::read(&mailbox).unwrap_or_default();
+                    current.extend_from_slice(later);
+                    fs::write(&mailbox, &current).unwrap();
+
+                    let broken = HoldStore::new(root.clone()).with_failpoint(recovery);
+                    let expected_points = reachable_recovery_points(&root, &broken);
+                    let result = with_lock_at(&root, || broken.recover_locked());
+                    if expected_points.contains(&recovery) {
+                        assert_eq!(
+                            result,
+                            Err(format!("hold failpoint {recovery:?}")),
+                            "{label}: legal pair must crash"
+                        );
+                        legal_pairs += 1;
+                    } else {
+                        assert_eq!(result, Ok(()), "{label}: unreachable pair must complete");
+                    }
+
+                    with_lock_at(&root, || recover_holds_locked(&root)).unwrap();
+                    check_hold_invariants(
+                        &root,
+                        &session,
+                        &correlation_id,
+                        outcome,
+                        &raw,
+                        later,
+                        &label,
+                    );
+                    fs::remove_dir_all(root).unwrap();
+                }
+            }
+        }
+        println!("hold recovery model: {legal_pairs} legal pairs");
+        assert_eq!(legal_pairs, 166);
+    }
+
     #[test]
     fn private_atomic_write_replaces_with_0600_and_cleans_failed_temp() {
         let root = std::env::temp_dir().join(format!("relay-atomic-write-{}", uuid_v4()));
