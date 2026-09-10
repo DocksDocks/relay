@@ -1,5 +1,6 @@
 #!/bin/sh
-# relay — compatibility launcher for the externally installed session-relay CLI.
+# relay — launcher for the externally installed relay CLI.
+# Skip this launcher during PATH and HOME lookup; reject it in RELAY_BIN.
 
 canonical_path() {
   path=$1
@@ -31,54 +32,72 @@ canonical_path() {
 }
 
 fail_invalid() {
-  printf 'session-relay launcher: SESSION_RELAY_BIN is not an executable file: %s\n' "$1" >&2
+  printf 'relay launcher: RELAY_BIN is not an executable file: %s\n' "$1" >&2
   exit 1
 }
 
 fail_recursion() {
-  printf 'session-relay launcher: refusing to execute itself recursively: %s\n' "$1" >&2
+  printf 'relay launcher: refusing to execute itself recursively: %s\n' "$1" >&2
   exit 1
 }
 
 launcher=$(canonical_path "$0") || {
-  printf 'session-relay launcher: cannot resolve launcher path: %s\n' "$0" >&2
+  printf 'relay launcher: cannot resolve launcher path: %s\n' "$0" >&2
   exit 1
 }
 
 candidate=
-if [ -n "${SESSION_RELAY_BIN:-}" ]; then
-  candidate=$SESSION_RELAY_BIN
+if [ -n "${RELAY_BIN:-}" ]; then
+  candidate=$RELAY_BIN
   if [ ! -f "$candidate" ] || [ ! -x "$candidate" ]; then
     fail_invalid "$candidate"
   fi
 else
-  candidate=$(command -v session-relay 2>/dev/null || :)
+  candidate=$(command -v relay 2>/dev/null || :)
   if [ -n "$candidate" ] && { [ ! -f "$candidate" ] || [ ! -x "$candidate" ]; }; then
     candidate=
   fi
+  if [ -n "$candidate" ]; then
+    if [ "$(canonical_path "$candidate")" = "$launcher" ]; then
+      candidate=
+    else
+      case "$("$candidate" --version 2>/dev/null)" in
+        'relay '*) ;;
+        *) candidate= ;;
+      esac
+    fi
+  fi
 
   if [ -z "$candidate" ]; then
-    home_candidate=${HOME:-}/.local/bin/session-relay
+    home_candidate=${HOME:-}/.local/bin/relay
     if [ -n "${HOME:-}" ] && [ -f "$home_candidate" ] && [ -x "$home_candidate" ]; then
       candidate=$home_candidate
+      if [ "$(canonical_path "$candidate")" = "$launcher" ]; then
+        candidate=
+      else
+        case "$("$candidate" --version 2>/dev/null)" in
+          'relay '*) ;;
+          *) candidate= ;;
+        esac
+      fi
     fi
   fi
 
   if [ -z "$candidate" ]; then
     printf '%s\n' \
-      'session-relay executable not found.' \
-      "Download session-relay-$(uname -m)-unknown-linux-musl from" \
-      'https://github.com/DocksDocks/session-relay/releases/latest' \
-      'and install it as ~/.local/bin/session-relay' >&2
+      'relay executable not found.' \
+      "Download relay-$(uname -m)-unknown-linux-musl from" \
+      'https://github.com/DocksDocks/relay/releases/latest' \
+      'and install it as ~/.local/bin/relay' >&2
     exit 1
   fi
 fi
 
 resolved=$(canonical_path "$candidate") || {
-  if [ -n "${SESSION_RELAY_BIN:-}" ]; then
+  if [ -n "${RELAY_BIN:-}" ]; then
     fail_invalid "$candidate"
   fi
-  printf 'session-relay launcher: cannot resolve executable path: %s\n' "$candidate" >&2
+  printf 'relay launcher: cannot resolve executable path: %s\n' "$candidate" >&2
   exit 1
 }
 

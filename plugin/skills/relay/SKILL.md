@@ -1,14 +1,14 @@
 ---
-name: session-relay
+name: relay
 description: "Use when an omp session must discover, message, request a reply from, wake, or attach to another omp session, including sessions in another project. Also use to receive durable mail, hold and acknowledge delivery, diagnose delayed mail, or watch an inactive recipient. Not for helpers inside the current session or canonical plan review."
 user-invocable: true
 metadata:
   pattern: tool-wrapper
-  updated: "2026-09-09"
-  content_hash: "c715f7fe5cc85049613154fe48ab131aa9be36fecd0b97bfcc64f22fc03f39c7"
+  updated: "2026-09-10"
+  content_hash: "e320b01b77860b5c57120b69753c70ca5b23c931f230649ab9b32dc20ae9f06d"
 ---
 
-# Session relay
+# Relay
 
 Send mail between separate omp sessions through a shared local store.
 Address the recipient by its registered name or session ID.
@@ -33,30 +33,30 @@ Do not pass a service tier to omp launches.
 Install the plugin:
 
 ```bash
-omp plugin marketplace add https://github.com/DocksDocks/session-relay.git
-omp plugin install session-relay@session-relay --scope project
+omp plugin marketplace add https://github.com/DocksDocks/relay.git
+omp plugin install relay@relay --scope project
 ```
 
 Restart the omp session after installation.
-Install the executable from the [latest release](https://github.com/DocksDocks/session-relay/releases/latest):
+Install the executable from the [latest release](https://github.com/DocksDocks/relay/releases/latest):
 
 ```bash
 # Use aarch64-unknown-linux-musl on arm64.
 target=x86_64-unknown-linux-musl
-curl -fLO "https://github.com/DocksDocks/session-relay/releases/latest/download/session-relay-$target"
-install -Dm755 "session-relay-$target" "$HOME/.local/bin/session-relay"
-session-relay --version
+curl -fLO "https://github.com/DocksDocks/relay/releases/latest/download/relay-$target"
+install -Dm755 "relay-$target" "$HOME/.local/bin/relay"
+relay --version
 ```
 
 The plugin includes a launcher, not the compiled executable.
-The launcher resolves a non-empty `SESSION_RELAY_BIN` first.
-It then checks `session-relay` on `PATH` and `$HOME/.local/bin/session-relay`.
+The launcher resolves a non-empty `RELAY_BIN` first.
+It then checks `relay` on `PATH` and `$HOME/.local/bin/relay`.
 An invalid non-empty override fails without fallback.
 An override that points to the launcher fails as recursion.
-Correct a broken override or unset `SESSION_RELAY_BIN`.
+Correct a broken override or unset `RELAY_BIN`.
 The launcher never builds or downloads an executable at startup.
 
-Session Relay distributes Linux x86-64 and arm64 musl binaries.
+Relay distributes Linux x86-64 and arm64 musl binaries.
 
 ## Pick the transport deliberately
 
@@ -68,8 +68,8 @@ It does not add model access, authentication, or a host-policy bypass.
 | Helper inside this session | Native subagent |
 | Note to another open session | `relay` action `send` |
 | One authoritative terminal answer | `relay` actions `request` and `reply` |
-| Resume an idle recipient now | `relay` action `wake` or `session-relay wake` |
-| Human takeover of an idle worker | `session-relay attach` |
+| Resume an idle recipient now | `relay` action `wake` or `relay wake` |
+| Human takeover of an idle worker | `relay attach` |
 
 ### BAD
 
@@ -138,7 +138,7 @@ Tool failures return `isError: true` with diagnostic text.
 ## Store hygiene
 
 The store defaults to `~/.agent-relay`.
-`AGENT_RELAY_HOME` overrides it before `SESSION_RELAY_HOME`.
+`AGENT_RELAY_HOME` overrides the default.
 Hook and bus activity can sweep the store at most once every six hours.
 The shared-store inactivity threshold defaults to 14 days.
 Set `AGENT_RELAY_GC_DAYS` to another non-negative day count or `0` to disable GC.
@@ -167,7 +167,7 @@ An unregistered session has no Relay inbox registration.
 If it is idle, resume it directly with an explicit message:
 
 ```bash
-session-relay wake --id <id> --dir <cwd> --tool omp \
+relay wake --id <id> --dir <cwd> --tool omp \
   --model <model> --effort <effort> -- "<message>"
 ```
 
@@ -223,7 +223,7 @@ Dropped injections remain pending and are injected again. No mail is lost.
 Use `/relay` to inspect the roster and pending count without draining mail.
 Live delivery does not run `omp -p` and does not need an external watcher.
 
-For a two-phase CLI drain, use `session-relay inbox --hold [<seconds>] <id>`.
+For a two-phase CLI drain, use `relay inbox --hold [<seconds>] <id>`.
 It returns one JSON line with `token`, `expires_at`, `count`, and `messages`.
 Message elements keep the plain inbox shape. An empty inbox creates no hold:
 `{"token":null,"expires_at":null,"count":0,"messages":[]}`.
@@ -231,18 +231,18 @@ Relay-generated record ids stay lowercase UUID-v4. Session ids are lowercase RFC
 9562 UUID text at writers and readers; any other shape in the registry or marker
 is ignored. The default hold lasts 30 s.
 Holds live in `holds/<token>.jsonl` and `holds/<token>.json` under the relay home.
-Run `session-relay ack <token>` to commit consumption.
-Run `session-relay rollback <token>` to restore held mail before later arrivals.
+Run `relay ack <token>` to commit consumption.
+Run `relay rollback <token>` to restore held mail before later arrivals.
 Both exit 0 on success and are safe to repeat during recovery.
 Unknown or expired tokens exit 1 with `unknown_hold` or `expired_hold` on stderr.
 A second live hold for one session exits 1 with `hold_conflict`.
 The next drain, peek, or GC restores expired holds.
 Plain CLI `inbox` and `peek` JSON stay unchanged. Held mail is outside the live mailbox.
 
-## Receive-path health (`session-relay doctor`)
+## Receive-path health (`relay doctor`)
 
 ```bash
-session-relay doctor --id <session-id-or-name>
+relay doctor --id <session-id-or-name>
 ```
 
 Use an explicit ID in a shared project directory.
@@ -257,7 +257,7 @@ Check the extension, the session root, and the pending count when mail is delaye
 ## Attach to a session
 
 ```bash
-session-relay attach worker
+relay attach worker
 ```
 
 Attach launches `omp --resume <id>` directly in the target directory.
@@ -297,8 +297,8 @@ Batch related messages before a necessary wake; resuming a saved transcript
 can incur model charges. Never wake a live interactive session externally.
 
 ```bash
-session-relay wake worker --model <model> --effort <effort> -- "Read the pending request."
-session-relay watch worker --once
+relay wake worker --model <model> --effort <effort> -- "Read the pending request."
+relay watch worker --once
 ```
 
 Watch polls pending mail and uses wake as its fallback, with no push mode.

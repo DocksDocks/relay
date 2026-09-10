@@ -1,6 +1,6 @@
-# Session Relay repository
+# Relay repository
 
-This repository holds the Session Relay Rust crate for durable mail between omp sessions, its Node harness, and its release infrastructure. The separate `plugin/` directory contains only the shipped payload.
+This repository holds the Relay Rust crate for durable mail between omp sessions, its Node harness, and its release infrastructure. The separate `plugin/` directory contains only the shipped payload.
 
 ## Commands
 
@@ -135,8 +135,8 @@ Move all three pins together. `test/distribution-contract.mjs` asserts their loc
 
 Push a `v<X.Y.Z>` tag. `.github/workflows/release.yml` builds these Linux musl targets:
 
-- `x86_64-unknown-linux-musl` as `session-relay-x86_64-unknown-linux-musl`
-- `aarch64-unknown-linux-musl` as `session-relay-aarch64-unknown-linux-musl`
+- `x86_64-unknown-linux-musl` as `relay-x86_64-unknown-linux-musl`
+- `aarch64-unknown-linux-musl` as `relay-aarch64-unknown-linux-musl`
 
 The workflow aggregates attestations and `SHA256SUMS`. It publishes exactly three assets: two binaries and the checksum file.
 
@@ -144,7 +144,7 @@ The release has no prerelease step. It has no promotion step.
 
 ## Platform support
 
-Session Relay distributes Linux x86-64 and arm64 musl binaries.
+Relay distributes Linux x86-64 and arm64 musl binaries.
 
 ## Provenance
 

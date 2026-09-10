@@ -78,7 +78,7 @@ assert.ok(caseIndex >= 0 && process.argv[caseIndex + 1], 'usage: node rust-test-
 const name = process.argv[caseIndex + 1];
 assert.ok(runnableTargets.includes(name) || name === UNIT_CASE, `unknown rust test inventory case: ${name}`);
 // Widen the Rust poll-wait deadlines for this whole case.
-process.env.SESSION_RELAY_TEST_TIME_FACTOR ||= '4';
+process.env.RELAY_TEST_TIME_FACTOR ||= '4';
 
 if (name === UNIT_CASE) {
   const actual = listTests(UNIT_CASE);

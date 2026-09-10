@@ -75,7 +75,7 @@ fn registry_entry(id: &str, name: &str) -> JsonValue {
     entry.insert("id".into(), JsonValue::from(id.to_string()));
     entry.insert(
         "dir".into(),
-        JsonValue::from(format!("/tmp/session-relay-protocol-{name}")),
+        JsonValue::from(format!("/tmp/relay-protocol-{name}")),
     );
     entry.insert("name".into(), JsonValue::from(name.to_string()));
     entry.insert("tool".into(), JsonValue::from("omp".to_string()));

@@ -6,7 +6,7 @@ Read `docs/PLAN.md` before you file, read, or update a plan issue. It is the
 complete plan record standard: the v3 body contract, the label set, the derived
 state table, the lifecycle commands, the review-record grammar, and the landing
 rules. No plan markdown is tracked in this repository; the record is a GitHub
-issue in `DocksDocks/session-relay`.
+issue in `DocksDocks/relay`.
 
 ## Reference
 

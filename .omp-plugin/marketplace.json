@@ -1,13 +1,13 @@
 {
-  "name": "session-relay",
+  "name": "relay",
   "owner": {
     "name": "DocksDocks"
   },
   "plugins": [
     {
-      "name": "session-relay",
+      "name": "relay",
       "source": "./plugin",
-      "version": "0.18.1",
+      "version": "0.19.0",
       "description": "Cross-session mail for omp sessions"
     }
   ]

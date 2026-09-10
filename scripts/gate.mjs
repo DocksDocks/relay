@@ -11,7 +11,7 @@ import path from 'node:path';
 const REPO = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..');
 process.chdir(REPO);
 
-const SKILL_PATH = 'plugin/skills/session-relay/SKILL.md';
+const SKILL_PATH = 'plugin/skills/relay/SKILL.md';
 const SKILL_DESCRIPTION_LIMIT = 1024;
 const SKILL_BODY_LINE_LIMIT = 500;
 
@@ -83,13 +83,13 @@ section('manifests');
   if (!Array.isArray(entries) || entries.length !== 1) {
     fail(`${catalogPath} must list exactly one plugin (found ${Array.isArray(entries) ? entries.length : 'no array'})`);
   }
-  if (entries[0]?.name !== 'session-relay') {
-    fail(`${catalogPath} plugin name must be 'session-relay' (found ${JSON.stringify(entries[0]?.name)})`);
+  if (entries[0]?.name !== 'relay') {
+    fail(`${catalogPath} plugin name must be 'relay' (found ${JSON.stringify(entries[0]?.name)})`);
   }
   if (entries[0].source !== './plugin') {
     fail(`${catalogPath} source must be './plugin' (found ${JSON.stringify(entries[0].source)})`);
   }
-  ok(`${catalogPath} lists session-relay at source './plugin'`);
+  ok(`${catalogPath} lists relay at source './plugin'`);
 }
 
 // ── 2. skill ────────────────────────────────────────────────────────────────────────
@@ -134,7 +134,7 @@ section('skill');
 
   const name = fields.get('name');
   const directory = path.basename(path.dirname(SKILL_PATH));
-  if (name !== 'session-relay') fail(`${SKILL_PATH} name must be 'session-relay' (found ${JSON.stringify(name)})`);
+  if (name !== 'relay') fail(`${SKILL_PATH} name must be 'relay' (found ${JSON.stringify(name)})`);
   if (name !== directory) fail(`${SKILL_PATH} name '${name}' does not equal its directory name '${directory}'`);
   ok(`skill name '${name}' equals its directory name`);
 
@@ -252,7 +252,7 @@ const RUST_BINARY = (() => {
 section('checks');
 {
   const cases = [...Object.keys(readJSON('test/fixtures/rust-test-inventory.json').cases), 'unit'];
-  const childEnv = { ...process.env, SESSION_RELAY_TEST_BIN: RUST_BINARY };
+  const childEnv = { ...process.env, RELAY_TEST_BIN: RUST_BINARY };
   const invocations = [
     ...cases.map((name) => ['test/rust-test-inventory.mjs', '--case', name]),
     ['test/distribution-contract.mjs'],
@@ -268,11 +268,11 @@ section('checks');
 // ── 7. selftest ───────────────────────────────────────────────────────────────────
 section('selftest');
 {
-  const baseEnv = { ...process.env, SESSION_RELAY_TEST_BIN: RUST_BINARY };
+  const baseEnv = { ...process.env, RELAY_TEST_BIN: RUST_BINARY };
   const selftest = (jobs) =>
     run(['node', 'test/selftest.mjs'], {
       encoding: 'utf8',
-      env: { ...baseEnv, SESSION_RELAY_TEST_JOBS: jobs },
+      env: { ...baseEnv, RELAY_TEST_JOBS: jobs },
     });
   const jobsOne = selftest('1');
   const jobsFour = selftest('4');
@@ -287,7 +287,7 @@ section('selftest');
     }
     fail(
       `self-test failed (${crashed.map(([label]) => label).join(', ')}) ` +
-        `(run twice with SESSION_RELAY_TEST_BIN=${RUST_BINARY} and SESSION_RELAY_TEST_JOBS=1|4)`,
+        `(run twice with RELAY_TEST_BIN=${RUST_BINARY} and RELAY_TEST_JOBS=1|4)`,
     );
   }
   if (jobsOne.stdout !== jobsFour.stdout) {

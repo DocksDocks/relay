@@ -6,7 +6,7 @@ use tinyjson::JsonValue;
 fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     match argv.first().map(String::as_str) {
-        Some("--version") => println!("session-relay {}", env!("CARGO_PKG_VERSION")),
+        Some("--version") => println!("relay {}", env!("CARGO_PKG_VERSION")),
         Some("bus") => relay::bus::run(),
         Some("hook") => relay::hook::run(&argv[1..]),
         Some(

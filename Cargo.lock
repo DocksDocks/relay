@@ -31,6 +31,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
+name = "relay"
+version = "0.19.0"
+dependencies = [
+ "libc",
+ "rustix",
+ "tinyjson",
+]
+
+[[package]]
 name = "rustix"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -41,15 +50,6 @@ dependencies = [
  "libc",
  "linux-raw-sys",
  "windows-sys",
-]
-
-[[package]]
-name = "session-relay"
-version = "0.18.1"
-dependencies = [
- "libc",
- "rustix",
- "tinyjson",
 ]
 
 [[package]]

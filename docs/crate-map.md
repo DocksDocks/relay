@@ -1,6 +1,6 @@
-# Session Relay Rust crate map
+# Relay Rust crate map
 
-Session Relay is a local durable message bus for omp sessions. A session ID
+Relay is a local durable message bus for omp sessions. A session ID
 outlives its process; registration, queued mail, holds, and correlated claims
 persist in the shared store. The shipped omp extension connects a running
 session to that store through the CLI.

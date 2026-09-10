@@ -1,4 +1,4 @@
-// cli.rs — session-relay CLI (port of scripts/relay.mjs). The "doorbell" that
+// cli.rs — relay CLI (port of scripts/relay.mjs). The "doorbell" that
 // wakes an idle session, plus manual registry/inbox ops over the shared store.
 //
 //   relay discover [--within <min>] [--tool omp] [--exclude <id>] [--cwd <path>] [--json]
@@ -24,7 +24,7 @@ use std::os::unix::process::ExitStatusExt;
 use std::process::{Command, ExitStatus};
 use tinyjson::JsonValue;
 
-pub(crate) const DEFAULT_NUDGE: &str = "You have new session-relay mail. Use the session-relay skill: call inbox to read your pending messages and act on them.";
+pub(crate) const DEFAULT_NUDGE: &str = "You have new relay mail. Use the relay skill: call inbox to read your pending messages and act on them.";
 const BOOL_FLAGS: [&str; 4] = ["dry", "json", "once", "all"];
 
 fn die(msg: &str) -> ! {
