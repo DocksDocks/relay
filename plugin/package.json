@@ -1,6 +1,6 @@
 {
-  "name": "session-relay",
-  "version": "0.18.1",
+  "name": "relay",
+  "version": "0.19.0",
   "description": "Cross-session mail for omp sessions",
   "license": "MIT",
   "omp": {

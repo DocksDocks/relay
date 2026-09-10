@@ -1,4 +1,4 @@
-// store.rs — shared on-disk state for the session-relay bus (port of lib/store.mjs).
+// store.rs — shared on-disk state for the relay bus (port of lib/store.mjs).
 // Holds shared session state under one fixed home so every component agrees:
 //   registry.json      id -> { id, dir, name, tool, lastSeen } + a name -> id index
 //   mailbox/<id>.jsonl one append-only inbox per recipient session id
@@ -6,7 +6,7 @@
 //
 // Home is a FIXED, TOOL-NEUTRAL path (~/.agent-relay, never under the plugin
 // root — the install dir is replaced on every plugin update). Override with
-// AGENT_RELAY_HOME; SESSION_RELAY_HOME is a back-compat alias.
+// AGENT_RELAY_HOME.
 //
 // Cross-process safety: every mutation runs under a kernel flock(2) on
 // <home>/.lock (rustix; auto-released on crash — no stale-reclaim dance).
@@ -35,14 +35,10 @@ const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
 pub const WATCH_PROGRESS_STALE_MS: i64 = 300_000;
 
 fn home_override() -> Option<PathBuf> {
-    for var in ["AGENT_RELAY_HOME", "SESSION_RELAY_HOME"] {
-        if let Ok(v) = std::env::var(var) {
-            if !v.is_empty() {
-                return Some(PathBuf::from(v));
-            }
-        }
-    }
-    None
+    std::env::var("AGENT_RELAY_HOME")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
 }
 
 pub fn home_dir() -> PathBuf {
@@ -544,7 +540,7 @@ pub(crate) fn with_lock_at<T>(
             Ok(()) => break,
             Err(e) if e == rustix::io::Errno::AGAIN || e == rustix::io::Errno::INTR => {
                 if Instant::now() > deadline {
-                    return Err("session-relay: lock busy (held > 3s)".to_string());
+                    return Err("relay: lock busy (held > 3s)".to_string());
                 }
                 std::thread::sleep(Duration::from_millis(25));
             }
@@ -1049,7 +1045,7 @@ fn with_gc_lock<T>(root_fd: &OwnedFd, f: impl FnOnce() -> Result<T, String>) -> 
             Ok(()) => break,
             Err(e) if e == rustix::io::Errno::AGAIN || e == rustix::io::Errno::INTR => {
                 if Instant::now() > deadline {
-                    return Err("session-relay: lock busy (held > 3s)".to_string());
+                    return Err("relay: lock busy (held > 3s)".to_string());
                 }
                 std::thread::sleep(Duration::from_millis(25));
             }

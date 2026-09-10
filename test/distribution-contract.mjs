@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Distribution contract for the standalone session-relay repository.
+// Distribution contract for the standalone relay repository.
 //
 // This file replaces the large monorepo contract suite that guarded release
 // evidence, promotion, and publication records. Those records no longer exist
@@ -46,6 +46,10 @@ function writeStub(file, marker) {
     file,
     [
       '#!/bin/sh',
+      'if [ "$1" = "--version" ]; then',
+      "  printf 'relay 0.0.0-stub\\n'",
+      '  exit 0',
+      'fi',
       `printf 'MARKER=%s\\n' ${JSON.stringify(marker)}`,
       'for argument in "$@"; do',
       `  printf 'ARG=%s\\n' "$argument"`,
@@ -56,11 +60,12 @@ function writeStub(file, marker) {
   );
 }
 
-function runLauncher(env, args = []) {
+function runLauncher(env, args = [], options = {}) {
   return spawnSync('sh', [LAUNCHER, ...args], {
     cwd: REPO,
     encoding: 'utf8',
     env,
+    ...options,
   });
 }
 
@@ -77,8 +82,8 @@ function checkLauncher() {
     }
 
     const explicit = path.join(explicitDir, 'explicit-relay');
-    const onPath = path.join(pathDir, 'session-relay');
-    const inHome = path.join(homeBin, 'session-relay');
+    const onPath = path.join(pathDir, 'relay');
+    const inHome = path.join(homeBin, 'relay');
     writeStub(explicit, 'explicit');
     writeStub(onPath, 'path');
     writeStub(inHome, 'home');
@@ -86,44 +91,51 @@ function checkLauncher() {
     const fullPath = `${pathDir}${path.delimiter}${BASE_PATH}`;
     const barePath = `${emptyDir}${path.delimiter}${BASE_PATH}`;
 
-    // (a) An executable SESSION_RELAY_BIN wins, and argv passes through verbatim.
+    // (a) An executable RELAY_BIN wins, and argv passes through verbatim.
     const argv = ['send', 'agent', '--', 'a b', '--flag'];
-    const explicitRun = runLauncher({ HOME: home, PATH: fullPath, SESSION_RELAY_BIN: explicit }, argv);
+    const explicitRun = runLauncher({ HOME: home, PATH: fullPath, RELAY_BIN: explicit }, argv);
     assert.equal(explicitRun.status, 0, explicitRun.stderr);
     assert.deepEqual(
       explicitRun.stdout.split('\n').filter(Boolean),
       ['MARKER=explicit', ...argv.map((argument) => `ARG=${argument}`)],
-      'SESSION_RELAY_BIN must win and receive argv verbatim',
+      'RELAY_BIN must win and receive argv verbatim',
     );
-    pass('launcher-explicit-override', 'SESSION_RELAY_BIN wins and passes argv verbatim');
+    pass('launcher-explicit-override', 'RELAY_BIN wins and passes argv verbatim');
 
-    // (b) A non-executable SESSION_RELAY_BIN is a hard failure with no fallback.
+    // (b) A non-executable RELAY_BIN is a hard failure with no fallback.
     const notExecutable = path.join(explicitDir, 'not-executable');
     fs.writeFileSync(notExecutable, '#!/bin/sh\nprintf MARKER=bad\n', { mode: 0o644 });
-    const invalidRun = runLauncher({ HOME: home, PATH: fullPath, SESSION_RELAY_BIN: notExecutable });
+    const invalidRun = runLauncher({ HOME: home, PATH: fullPath, RELAY_BIN: notExecutable });
     assert.equal(invalidRun.status, 1, 'a non-executable override must exit 1');
-    assert.match(invalidRun.stderr, /SESSION_RELAY_BIN is not an executable file/);
+    assert.match(invalidRun.stderr, /RELAY_BIN is not an executable file/);
     assert.equal(invalidRun.stdout, '', 'a non-executable override must not fall back to PATH or to HOME');
-    pass('launcher-invalid-override', 'a non-executable SESSION_RELAY_BIN fails hard without fallback');
+    pass('launcher-invalid-override', 'a non-executable RELAY_BIN fails hard without fallback');
 
     // (c) Without an override, PATH resolves the executable.
     const pathRun = runLauncher({ HOME: home, PATH: fullPath });
     assert.equal(pathRun.status, 0, pathRun.stderr);
     assert.match(pathRun.stdout, /^MARKER=path\n/);
-    pass('launcher-path-resolution', 'PATH resolves session-relay when no override exists');
+    pass('launcher-path-resolution', 'PATH resolves relay when no override exists');
 
     // (d) Without an override and with nothing on PATH, HOME resolves it.
     const homeRun = runLauncher({ HOME: home, PATH: barePath });
     assert.equal(homeRun.status, 0, homeRun.stderr);
     assert.match(homeRun.stdout, /^MARKER=home\n/);
-    pass('launcher-home-resolution', '$HOME/.local/bin/session-relay resolves as the last candidate');
+    pass('launcher-home-resolution', '$HOME/.local/bin/relay resolves as the last candidate');
+
+    const selfPathRun = runLauncher({ HOME: home, PATH: `${path.dirname(LAUNCHER)}${path.delimiter}${BASE_PATH}` }, [
+      '--version',
+    ]);
+    assert.equal(selfPathRun.status, 0, selfPathRun.stderr);
+    assert.equal(selfPathRun.stdout, 'relay 0.0.0-stub\n');
+    pass('launcher-self-on-path-skipped', 'the launcher on PATH is skipped in favor of the HOME executable');
 
     // (e) A launcher that resolves to itself is refused.
     const firstLink = path.join(root, 'relay-link-1');
     const secondLink = path.join(root, 'relay-link-2');
     fs.symlinkSync(LAUNCHER, firstLink);
     fs.symlinkSync(firstLink, secondLink);
-    const recursionRun = runLauncher({ HOME: home, PATH: fullPath, SESSION_RELAY_BIN: secondLink });
+    const recursionRun = runLauncher({ HOME: home, PATH: fullPath, RELAY_BIN: secondLink });
     assert.notEqual(recursionRun.status, 0, 'a self-resolving launcher must fail');
     assert.match(recursionRun.stderr, /refusing to execute itself recursively/);
     pass('launcher-recursion-refusal', 'a symlink chain back to the launcher is refused');
@@ -132,8 +144,33 @@ function checkLauncher() {
     fs.rmSync(inHome);
     const missingRun = runLauncher({ HOME: home, PATH: barePath });
     assert.equal(missingRun.status, 1, 'a missing executable must exit 1');
-    assert.match(missingRun.stderr, /session-relay executable not found\./);
+    assert.match(missingRun.stderr, /relay executable not found\./);
     pass('launcher-not-found', 'an unresolvable executable exits 1 with the not-found message');
+
+    fs.writeFileSync(onPath, '#!/bin/sh\nprintf "other 1.0\\n"\n', { mode: 0o755 });
+    const impostorRun = runLauncher({ HOME: home, PATH: fullPath }, ['--version']);
+    assert.notEqual(impostorRun.status, 0, 'an unrelated executable must not be selected');
+    assert.match(impostorRun.stderr, /relay executable not found\./);
+    pass('launcher-impostor-rejected', 'a PATH executable without the relay identity is rejected');
+
+    // (g) A rejected PATH entry does not end the PATH scan; a later valid entry wins.
+    // The impostor drains stdin, so the real invocation must still receive it.
+    const laterDir = path.join(root, 'later-bin');
+    fs.mkdirSync(laterDir);
+    fs.writeFileSync(
+      path.join(laterDir, 'relay'),
+      '#!/bin/sh\nif [ "$1" = --version ]; then printf "relay 0.0.0-stub\\n"; exit 0; fi\nprintf "STDIN=%s\\n" "$(cat)"\n',
+      { mode: 0o755 },
+    );
+    fs.writeFileSync(onPath, '#!/bin/sh\ncat >/dev/null\nprintf "other 1.0\\n"\n', { mode: 0o755 });
+    const laterRun = runLauncher(
+      { HOME: home, PATH: `${pathDir}${path.delimiter}${laterDir}${path.delimiter}${BASE_PATH}` },
+      ['hook'],
+      { input: 'stdin payload\n', timeout: 5000 },
+    );
+    assert.equal(laterRun.status, 0, laterRun.stderr);
+    assert.equal(laterRun.stdout, 'STDIN=stdin payload\n');
+    pass('launcher-path-scan-continues', 'a rejected PATH entry is skipped and a later valid entry is used');
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
@@ -144,9 +181,7 @@ function checkLauncher() {
 function checkVersionLockstep() {
   const shipped = resolveShippedRelayVersion(REPO);
   const cargo = fs.readFileSync(path.join(REPO, 'Cargo.toml'), 'utf8').match(/^version\s*=\s*"([^"]+)"/m)?.[1];
-  const marketplace = readJson('.omp-plugin/marketplace.json').plugins.find(
-    ({ name }) => name === 'session-relay',
-  )?.version;
+  const marketplace = readJson('.omp-plugin/marketplace.json').plugins.find(({ name }) => name === 'relay')?.version;
   const declarations = [
     { file: 'Cargo.toml', version: cargo },
     { file: 'plugin/package.json', version: shipped.version },
@@ -199,10 +234,10 @@ function checkAssetSet() {
   );
 
   const publish = jobSection(document, 'publish');
-  const assets = [...new Set(publish.match(/session-relay-(?:x86_64|aarch64)[A-Za-z0-9_.-]*/g) ?? [])].sort();
+  const assets = [...new Set(publish.match(/relay-(?:x86_64|aarch64)[A-Za-z0-9_.-]*/g) ?? [])].sort();
   assert.deepEqual(
     assets,
-    ['session-relay-aarch64-unknown-linux-musl', 'session-relay-x86_64-unknown-linux-musl'],
+    ['relay-aarch64-unknown-linux-musl', 'relay-x86_64-unknown-linux-musl'],
     'the publish job must stage exactly the two binary assets',
   );
   assert.match(publish, /\bSHA256SUMS\b/, 'the publish job must stage SHA256SUMS beside the two binaries');

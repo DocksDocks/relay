@@ -63,7 +63,6 @@ fn register_identity(home: &Path, name: &str, id: &str, dir: &Path) {
         .arg("--dir")
         .arg(dir)
         .env("AGENT_RELAY_HOME", home)
-        .env_remove("SESSION_RELAY_HOME")
         .output()
         .expect("run relay register");
     assert!(
@@ -86,7 +85,6 @@ fn bus_messaging_tools_and_whoami() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_relay"))
         .arg("bus")
         .env("AGENT_RELAY_HOME", &home)
-        .env_remove("SESSION_RELAY_HOME")
         .env("RELAY_PROJECT_DIR", &pdir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -118,7 +116,7 @@ fn bus_messaging_tools_and_whoami() {
     );
     assert_eq!(
         obj(&result["serverInfo"])["name"].get::<String>().unwrap(),
-        "session-relay-bus"
+        "relay-bus"
     );
 
     // notifications/initialized gets NO reply — verify by pinging right after
@@ -349,7 +347,6 @@ fn bus_discover_omp_schema_and_session() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_relay"))
         .arg("bus")
         .env("AGENT_RELAY_HOME", &home)
-        .env_remove("SESSION_RELAY_HOME")
         .env("RELAY_PROJECT_DIR", &pdir)
         .env("RELAY_OMP_SESSIONS", &sessions)
         .stdin(Stdio::piped())
@@ -466,7 +463,6 @@ fn bus_request_reply_contract_and_domain_errors() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_relay"))
         .arg("bus")
         .env("AGENT_RELAY_HOME", &home)
-        .env_remove("SESSION_RELAY_HOME")
         .env("RELAY_PROJECT_DIR", &requester_dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -720,7 +716,6 @@ fn bus_request_maps_protocol_store_failure_to_closed_domain_error() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_relay"))
         .arg("bus")
         .env("AGENT_RELAY_HOME", &home)
-        .env_remove("SESSION_RELAY_HOME")
         .env("RELAY_PROJECT_DIR", &requester_dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -848,7 +843,6 @@ fn gc_keeps_lenient_evidence_for_uppercase_ids() {
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .env("AGENT_RELAY_HOME", &home)
-        .env_remove("SESSION_RELAY_HOME")
         .env("AGENT_RELAY_GC_DAYS", "14")
         .env("RELAY_NO_WATCH", "1")
         .env("RELAY_PROJECT_DIR", &project)

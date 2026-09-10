@@ -1,40 +1,41 @@
-# Session Relay
+# Relay
 
-Session Relay provides durable cross-session and cross-project mail for omp only.
-The plugin ships an omp extension, a `session-relay` skill, and a POSIX launcher.
-Install the Rust CLI separately as `session-relay`.
+Relay provides durable cross-session and cross-project mail for omp only.
+The plugin ships an omp extension, a `relay` skill, and a POSIX launcher.
+Install the Rust CLI separately as `relay`.
 The plugin's `bin/relay` resolves that installed CLI.
 
 ## Install
 
 Download the binary for this machine from the
-[latest release](https://github.com/DocksDocks/session-relay/releases/latest).
+[latest release](https://github.com/DocksDocks/relay/releases/latest).
 Install the binary.
 Verify its version.
 
 ```bash
 target=x86_64-unknown-linux-musl   # Use aarch64-unknown-linux-musl on arm64.
-curl -fLO "https://github.com/DocksDocks/session-relay/releases/latest/download/session-relay-$target"
-install -Dm755 "session-relay-$target" "$HOME/.local/bin/session-relay"
-session-relay --version
+curl -fLO "https://github.com/DocksDocks/relay/releases/latest/download/relay-$target"
+install -Dm755 "relay-$target" "$HOME/.local/bin/relay"
+relay --version
 ```
 
 Add the marketplace.
 Install the plugin in the project scope.
 
 ```bash
-omp plugin marketplace add https://github.com/DocksDocks/session-relay.git
-omp plugin install session-relay@session-relay --scope project
+omp plugin marketplace add https://github.com/DocksDocks/relay.git
+omp plugin install relay@relay --scope project
 ```
 
 Restart the omp session.
 Use `/relay` to show the roster and pending mail count.
 
-The launcher checks `SESSION_RELAY_BIN`, then `session-relay` on `PATH`, then
-`~/.local/bin/session-relay`.
-It rejects recursive launcher resolution.
+The launcher checks `RELAY_BIN`, then each `relay` on `PATH`, then
+`~/.local/bin/relay`.
+A `PATH` or home candidate is accepted only when its `--version` output starts with `relay `; the launcher skips itself during lookup.
+A `RELAY_BIN` that points at the launcher fails as recursion.
 
-Session Relay distributes Linux x86-64 and arm64 musl binaries.
+Relay distributes Linux x86-64 and arm64 musl binaries.
 
 ## Plugin interface
 
@@ -74,8 +75,8 @@ Discovery reads only the omp session root. The extension supplies
 different omp session root. Discovery recency is not proof of a live or idle
 process. Registry and discovery records retain `tool: "omp"`.
 
-The store defaults to `~/.agent-relay`; `AGENT_RELAY_HOME` overrides it before
-`SESSION_RELAY_HOME`. Hook and bus activity collect inactive relay-owned
+The store defaults to `~/.agent-relay`; `AGENT_RELAY_HOME` overrides it.
+Hook and bus activity collect inactive relay-owned
 state at most once every six hours, preserving held locks and the invoking
 session; there is no separate `gc` verb. The inactivity threshold defaults to 14 days;
 `AGENT_RELAY_GC_DAYS` changes it, and `0` disables GC.
@@ -105,8 +106,8 @@ It is not the live delivery mechanism.
 Never wake a live interactive session from another process.
 
 ```bash
-session-relay wake worker --model <model> --effort <level> -- "Read the pending relay request."
-session-relay wake --id <id> --dir <cwd> --tool omp --model <model> --effort <level> -- "Read the pending relay request."
+relay wake worker --model <model> --effort <level> -- "Read the pending relay request."
+relay wake --id <id> --dir <cwd> --tool omp --model <model> --effort <level> -- "Read the pending relay request."
 ```
 
 Relay maps `--effort` to omp `--thinking`.
@@ -117,8 +118,8 @@ Do not use a service-tier option for omp.
 Attach to an inactive registered session:
 
 ```bash
-session-relay attach worker
-session-relay doctor --id <session>
+relay attach worker
+relay doctor --id <session>
 ```
 
 
@@ -133,7 +134,7 @@ Both launch paths hold `locks/resume-<id>.lock` for the child lifetime.
 A live holder causes exit 3 with the resume-lock diagnostic.
 Child stdout and stderr pass through; Relay returns the child's exit status.
 
-`session-relay watch` polls pending mail and uses wake as its fallback.
+`relay watch` polls pending mail and uses wake as its fallback.
 It has no push mode. Prefer the running extension for live delivery.
 
 Run doctor with an explicit session identity after a crash or delayed mail.
@@ -150,9 +151,9 @@ Use `doctor --id <session>`, not `doctor --help`, for this diagnostic.
 Keep the existing send and drain interfaces:
 
 ```bash
-session-relay send <to> [--from <session>] -- <message>
-session-relay inbox <nameOrId>
-session-relay peek <nameOrId>
+relay send <to> [--from <session>] -- <message>
+relay inbox <nameOrId>
+relay peek <nameOrId>
 ```
 
 Existing `send`, `inbox`, and `peek` syntax, JSON, and human-readable output
@@ -165,10 +166,10 @@ The omp tool supplies identity instead.
 Opt in to a two-phase CLI drain:
 
 ```text
-session-relay inbox --hold [<seconds>] <id>
-session-relay ack <token>
-session-relay rollback <token>
-session-relay hook omp --session <id> --cwd <dir> [--event prompt] --hold [<seconds>]
+relay inbox --hold [<seconds>] <id>
+relay ack <token>
+relay rollback <token>
+relay hook omp --session <id> --cwd <dir> [--event prompt] --hold [<seconds>]
 ```
 
 The default hold lasts 30 s. Relay mints a lowercase UUID-v4 token.
@@ -191,8 +192,8 @@ Plain inbox and peek output remain unchanged; held mail is outside the live mail
 Use `request` for one authoritative terminal answer tied to a message.
 
 ```bash
-session-relay request <to> [--from <session>] -- <message>
-session-relay request <to> [--from <session>] --json -- <message>
+relay request <to> [--from <session>] -- <message>
+relay request <to> [--from <session>] --json -- <message>
 ```
 
 Human-readable output reports the request message ID and correlation ID.
@@ -201,8 +202,8 @@ Human-readable output reports the request message ID and correlation ID.
 Reply as the exact registered responder.
 
 ```bash
-session-relay reply <correlation-id> [--from <session>] --status completed -- <message>
-session-relay reply <correlation-id> [--from <session>] --status failed -- <message>
+relay reply <correlation-id> [--from <session>] --status completed -- <message>
+relay reply <correlation-id> [--from <session>] --status failed -- <message>
 ```
 
 The first valid terminal claim wins.
@@ -247,13 +248,13 @@ Legacy mail keeps its original rendering.
 
 ## Release discipline
 
-Session Relay has an independent version and repository.
+Relay has an independent version and repository.
 Push a `v<X.Y.Z>` tag to release it.
 `.github/workflows/release.yml` builds `x86_64-unknown-linux-musl` and
 `aarch64-unknown-linux-musl` natively.
 It hashes both binaries.
-It publishes exactly three assets: `session-relay-x86_64-unknown-linux-musl`,
-`session-relay-aarch64-unknown-linux-musl`, and `SHA256SUMS`.
+It publishes exactly three assets: `relay-x86_64-unknown-linux-musl`,
+`relay-aarch64-unknown-linux-musl`, and `SHA256SUMS`.
 Keep generated binaries outside the tracked plugin payload.
 
 ## Trust boundary

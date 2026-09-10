@@ -29,7 +29,7 @@ const RESULT_KEYS = ['count', 'labels', 'scenario', 'schema', 'status'];
 const SUN_PATH_LIMIT_BYTES = 108;
 const LONGEST_SOCKET_BASENAME = 'bus.sock';
 
-export const PRODUCTION_STDOUT_SHA256 = 'f547d79a23988ec5fd1f6e739f68bdc9ea5d6ccbe9aeb995411f734bfc404026';
+export const PRODUCTION_STDOUT_SHA256 = '989a1626cf85a6caab5fc269880645e3d8554f6e8dbf344344519307735ae04d';
 
 function scenario(name, expectedLabels) {
   return Object.freeze({
@@ -78,11 +78,11 @@ export function parseScenarioJobs(value, availableParallelism = os.availablePara
   const maximum = parallelismCap(availableParallelism);
   if (value === undefined) return maximum;
   if (typeof value !== 'string' || !/^[1-9]\d*$/.test(value)) {
-    throw new Error(`SESSION_RELAY_TEST_JOBS must be a strict integer in 1..${maximum}`);
+    throw new Error(`RELAY_TEST_JOBS must be a strict integer in 1..${maximum}`);
   }
   const jobs = Number(value);
   if (!Number.isSafeInteger(jobs) || jobs < 1 || jobs > maximum) {
-    throw new Error(`SESSION_RELAY_TEST_JOBS must be a strict integer in 1..${maximum}`);
+    throw new Error(`RELAY_TEST_JOBS must be a strict integer in 1..${maximum}`);
   }
   return jobs;
 }
@@ -184,22 +184,22 @@ export function validateScenarioResult(value, definition) {
 
 function requireTestBinary(configuredBin) {
   if (configuredBin === undefined) {
-    throw new Error('SESSION_RELAY_TEST_BIN is required; set it to a freshly built host executable');
+    throw new Error('RELAY_TEST_BIN is required; set it to a freshly built host executable');
   }
   if (typeof configuredBin !== 'string' || configuredBin.trim() === '') {
-    throw new Error('SESSION_RELAY_TEST_BIN must be nonempty');
+    throw new Error('RELAY_TEST_BIN must be nonempty');
   }
-  if (!path.isAbsolute(configuredBin)) throw new Error('SESSION_RELAY_TEST_BIN must be an absolute path');
+  if (!path.isAbsolute(configuredBin)) throw new Error('RELAY_TEST_BIN must be an absolute path');
   let bin;
   try {
     bin = fs.realpathSync(configuredBin);
     if (!fs.statSync(bin).isFile()) throw new Error('not a file');
     fs.accessSync(bin, fs.constants.X_OK);
   } catch {
-    throw new Error('SESSION_RELAY_TEST_BIN must resolve to an executable file');
+    throw new Error('RELAY_TEST_BIN must resolve to an executable file');
   }
   const launcher = fs.realpathSync(path.join(ROOT, 'plugin', 'bin', 'relay'));
-  if (bin === launcher) throw new Error('SESSION_RELAY_TEST_BIN must not resolve to the plugin launcher');
+  if (bin === launcher) throw new Error('RELAY_TEST_BIN must not resolve to the plugin launcher');
   return bin;
 }
 
@@ -408,9 +408,9 @@ function launchScenarioProcess(spec) {
     env: {
       ...process.env,
       ...spec.scenario.env,
-      SESSION_RELAY_TEST_BIN: spec.bin,
-      SESSION_RELAY_SCENARIO_HOME: spec.home,
-      SESSION_RELAY_SCENARIO_RESULT: spec.resultPath,
+      RELAY_TEST_BIN: spec.bin,
+      RELAY_SCENARIO_HOME: spec.home,
+      RELAY_SCENARIO_RESULT: spec.resultPath,
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -627,7 +627,7 @@ export async function runScenarioScheduler({
   }
   if (typeof launchScenario !== 'function') throw new TypeError('launchScenario must be a function');
   const bin = requireTestBinary(configuredBin);
-  const root = fs.mkdtempSync(path.join(path.resolve(rootParent), 'session-relay-selftest-'));
+  const root = fs.mkdtempSync(path.join(path.resolve(rootParent), 'relay-selftest-'));
   // Only the production catalog launches scenarios that bind unix sockets
   // beneath the root. Suites drive this scheduler with synthetic catalogs (and
   // sometimes a fake launcher) to exercise scheduling alone; holding those to
@@ -818,24 +818,24 @@ export async function runScenarioScheduler({
 
 function validateProductionCatalog() {
   const expectedOrder = ['core', 'discovery-hardening', 'hooks-identity', 'gc', 'follow-doctor-mailbox'];
-  if (SCENARIOS.length !== expectedOrder.length) throw new Error('session-relay scenario catalog is incomplete');
+  if (SCENARIOS.length !== expectedOrder.length) throw new Error('relay scenario catalog is incomplete');
   for (const [index, expected] of expectedOrder.entries()) {
-    if (SCENARIOS[index].name !== expected) throw new Error('session-relay scenario catalog order changed');
+    if (SCENARIOS[index].name !== expected) throw new Error('relay scenario catalog order changed');
   }
   const labels = SCENARIOS.flatMap(({ expectedLabels }) => expectedLabels);
   if (labels.length !== 77 || new Set(labels).size !== 77) {
-    throw new Error('session-relay scenario catalog must contain exactly 77 unique labels');
+    throw new Error('relay scenario catalog must contain exactly 77 unique labels');
   }
   if (
     PRODUCTION_OUTPUT_LABELS.length !== 77 ||
     new Set(PRODUCTION_OUTPUT_LABELS).size !== 77 ||
     PRODUCTION_OUTPUT_LABELS.some((label) => !labels.includes(label))
   ) {
-    throw new Error('session-relay production output must contain the exact 77-label scenario union');
+    throw new Error('relay production output must contain the exact 77-label scenario union');
   }
   const rendered = PRODUCTION_OUTPUT_LABELS.map((label) => `  ok: ${label}\n`).join('');
   if (createHash('sha256').update(rendered).digest('hex') !== PRODUCTION_STDOUT_SHA256) {
-    throw new Error('session-relay production output changed from the reviewed catalog');
+    throw new Error('relay production output changed from the reviewed catalog');
   }
 }
 
@@ -845,7 +845,7 @@ function writeFailure(error, stderr) {
     const scenarioName = failure?.scenario ? ` in ${failure.scenario}` : '';
     const category = failure?.infrastructure === true ? ' infrastructure failure' : ' failed';
     stderr.write(
-      `session-relay self-test${category}${scenarioName}: ${failure instanceof Error ? failure.message : String(failure)}\n`,
+      `relay self-test${category}${scenarioName}: ${failure instanceof Error ? failure.message : String(failure)}\n`,
     );
     if (failure?.stdout) {
       stderr.write(`--- retained stdout ---\n${failure.stdout}${failure.stdout.endsWith('\n') ? '' : '\n'}`);
@@ -859,19 +859,19 @@ function writeFailure(error, stderr) {
 export async function main({ env = process.env, stdout = process.stdout, stderr = process.stderr } = {}) {
   try {
     validateProductionCatalog();
-    const jobs = parseScenarioJobs(env.SESSION_RELAY_TEST_JOBS);
+    const jobs = parseScenarioJobs(env.RELAY_TEST_JOBS);
     const result = await runScenarioScheduler({
       scenarios: SCENARIOS,
       jobs,
-      bin: env.SESSION_RELAY_TEST_BIN,
+      bin: env.RELAY_TEST_BIN,
       outputLabels: PRODUCTION_OUTPUT_LABELS,
     });
     if (result.count !== 77 || result.labels.length !== 77) {
-      throw new Error('session-relay scenario aggregation did not produce exactly 77 checks');
+      throw new Error('relay scenario aggregation did not produce exactly 77 checks');
     }
     stdout.write(result.stdout);
-    const bin = fs.realpathSync(env.SESSION_RELAY_TEST_BIN);
-    stdout.write(`\nPASS: session-relay self-test — 77 checks (binary: ${path.relative(ROOT, bin)})\n`);
+    const bin = fs.realpathSync(env.RELAY_TEST_BIN);
+    stdout.write(`\nPASS: relay self-test — 77 checks (binary: ${path.relative(ROOT, bin)})\n`);
     return 0;
   } catch (error) {
     writeFailure(error, stderr);

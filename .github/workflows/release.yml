@@ -1,6 +1,6 @@
 name: release
 
-# Produces the Session Relay release assets. Validation-only dispatches prove a
+# Produces the Relay release assets. Validation-only dispatches prove a
 # reviewed commit without publishing; tag pushes and publish-existing-tag
 # dispatches stage a release from artifacts created by this exact run.
 
@@ -65,15 +65,15 @@ jobs:
 
           const plugin = JSON.parse(fs.readFileSync('plugin/package.json', 'utf8'));
           const marketplace = JSON.parse(fs.readFileSync('.omp-plugin/marketplace.json', 'utf8'));
-          const listed = marketplace.plugins.find(({ name }) => name === 'session-relay');
+          const listed = marketplace.plugins.find(({ name }) => name === 'relay');
           const cargoText = fs.readFileSync('Cargo.toml', 'utf8');
           const cargo = /^version\s*=\s*"([^"]+)"/m.exec(cargoText)?.[1];
           const versions = [plugin.version, listed?.version, cargo];
           if (!versions.every((value) => value === versions[0])) {
-            throw new Error(`Session Relay versions are not synchronized: ${versions.join(', ')}`);
+            throw new Error(`Relay versions are not synchronized: ${versions.join(', ')}`);
           }
           if (!/^\d+\.\d+\.\d+$/.test(versions[0])) {
-            throw new Error(`invalid Session Relay version: ${versions[0]}`);
+            throw new Error(`invalid Relay version: ${versions[0]}`);
           }
           process.stdout.write(versions[0]);
           NODE
@@ -135,12 +135,12 @@ jobs:
             runner_os: Linux
             runner_arch: X64
             target: x86_64-unknown-linux-musl
-            asset: session-relay-x86_64-unknown-linux-musl
+            asset: relay-x86_64-unknown-linux-musl
           - runner: ubuntu-24.04-arm
             runner_os: Linux
             runner_arch: ARM64
             target: aarch64-unknown-linux-musl
-            asset: session-relay-aarch64-unknown-linux-musl
+            asset: relay-aarch64-unknown-linux-musl
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -182,17 +182,17 @@ jobs:
           test "$RUNNER_OS_VALUE" = "$EXPECTED_RUNNER_OS"
           test "$RUNNER_ARCH_VALUE" = "$EXPECTED_RUNNER_ARCH"
           cargo build --release --locked --target "$TARGET"
-          out="$RUNNER_TEMP/session-relay/$TARGET"
+          out="$RUNNER_TEMP/relay/$TARGET"
           mkdir -p "$out"
           cp "target/$TARGET/release/relay" "$out/$ASSET_NAME"
           chmod 0755 "$out/$ASSET_NAME"
-          test "$("$out/$ASSET_NAME" --version)" = "session-relay $EXPECTED_VERSION"
+          test "$("$out/$ASSET_NAME" --version)" = "relay $EXPECTED_VERSION"
       - name: selftest built x86-64 release binary
         if: matrix.target == 'x86_64-unknown-linux-musl'
         env:
           ASSET_NAME: ${{ matrix.asset }}
           TARGET: ${{ matrix.target }}
-        run: SESSION_RELAY_TEST_BIN="$RUNNER_TEMP/session-relay/$TARGET/$ASSET_NAME" SESSION_RELAY_TEST_JOBS=4 node test/selftest.mjs
+        run: RELAY_TEST_BIN="$RUNNER_TEMP/relay/$TARGET/$ASSET_NAME" RELAY_TEST_JOBS=4 node test/selftest.mjs
       - name: attest native release binary
         env:
           ASSET_NAME: ${{ matrix.asset }}
@@ -208,9 +208,9 @@ jobs:
           WORKFLOW_RUN_ID: ${{ github.run_id }}
         run: |
           set -euo pipefail
-          out="$RUNNER_TEMP/session-relay/$TARGET"
+          out="$RUNNER_TEMP/relay/$TARGET"
           version_stdout="$("$out/$ASSET_NAME" --version)"
-          test "$version_stdout" = "session-relay $VERSION"
+          test "$version_stdout" = "relay $VERSION"
           sha256="$(shasum -a 256 "$out/$ASSET_NAME" | cut -d ' ' -f 1)"
           [[ "$sha256" =~ ^[0-9a-f]{64}$ ]]
           export ATTESTATION_OUT="$out/attestation-$TARGET.json"
@@ -241,10 +241,10 @@ jobs:
       - name: upload stable executable and canonical attestation
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: session-relay-binary-${{ matrix.target }}
+          name: relay-binary-${{ matrix.target }}
           path: |
-            ${{ runner.temp }}/session-relay/${{ matrix.target }}/${{ matrix.asset }}
-            ${{ runner.temp }}/session-relay/${{ matrix.target }}/attestation-${{ matrix.target }}.json
+            ${{ runner.temp }}/relay/${{ matrix.target }}/${{ matrix.asset }}
+            ${{ runner.temp }}/relay/${{ matrix.target }}/attestation-${{ matrix.target }}.json
           if-no-files-found: error
           retention-days: 7
           compression-level: 0
@@ -260,12 +260,12 @@ jobs:
       - name: download same-run native artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          pattern: session-relay-binary-*
-          path: ${{ runner.temp }}/session-relay-collected
+          pattern: relay-binary-*
+          path: ${{ runner.temp }}/relay-collected
           merge-multiple: true
       - name: validate closed attestations and generate SHA256SUMS
         env:
-          ARTIFACT_DIR: ${{ runner.temp }}/session-relay-collected
+          ARTIFACT_DIR: ${{ runner.temp }}/relay-collected
           EXPECTED_VERSION: ${{ needs.identity.outputs.version }}
           INPUT_EXPECTED_COMMIT: ${{ inputs.expected_commit }}
           INPUT_EXPECTED_TAG: ${{ inputs.expected_tag }}
@@ -293,7 +293,7 @@ jobs:
           const expectedFiles = [];
 
           for (const [target, runner] of Object.entries(targets)) {
-            const assetName = `session-relay-${target}`;
+            const assetName = `relay-${target}`;
             const attestationName = `attestation-${target}.json`;
             expectedFiles.push(assetName, attestationName);
             const asset = fs.readFileSync(path.join(process.env.ARTIFACT_DIR, assetName));
@@ -313,7 +313,7 @@ jobs:
             assert.equal(record.sha256, crypto.createHash('sha256').update(asset).digest('hex'));
             assert.equal(record.source_commit, process.env.SOURCE_COMMIT);
             assert.equal(record.target, target);
-            assert.equal(record.version_stdout, `session-relay ${process.env.EXPECTED_VERSION}`);
+            assert.equal(record.version_stdout, `relay ${process.env.EXPECTED_VERSION}`);
             assert.equal(record.workflow_run_attempt, Number(process.env.WORKFLOW_RUN_ATTEMPT));
             assert.equal(record.workflow_run_id, Number(process.env.WORKFLOW_RUN_ID));
           }
@@ -324,15 +324,15 @@ jobs:
 
           cd "$ARTIFACT_DIR"
           sha256sum \
-            session-relay-aarch64-unknown-linux-musl \
-            session-relay-x86_64-unknown-linux-musl \
+            relay-aarch64-unknown-linux-musl \
+            relay-x86_64-unknown-linux-musl \
             > SHA256SUMS
           test "$(wc -l < SHA256SUMS)" -eq 2
       - name: upload same-run checksum manifest
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: session-relay-checksums
-          path: ${{ runner.temp }}/session-relay-collected/SHA256SUMS
+          name: relay-checksums
+          path: ${{ runner.temp }}/relay-collected/SHA256SUMS
           if-no-files-found: error
           retention-days: 7
 
@@ -351,14 +351,14 @@ jobs:
       - name: download same-run native assets
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          pattern: session-relay-binary-*
-          path: ${{ runner.temp }}/session-relay-publish
+          pattern: relay-binary-*
+          path: ${{ runner.temp }}/relay-publish
           merge-multiple: true
       - name: download same-run checksum manifest
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: session-relay-checksums
-          path: ${{ runner.temp }}/session-relay-publish
+          name: relay-checksums
+          path: ${{ runner.temp }}/relay-publish
       - name: validate and stage exactly three release assets
         env:
           EXPECTED_COMMIT: ${{ needs.identity.outputs.source_commit }}
@@ -369,12 +369,12 @@ jobs:
           test "$EXPECTED_TAG" = "v$EXPECTED_VERSION"
           test "$(git rev-parse "refs/tags/$EXPECTED_TAG^{commit}")" = "$EXPECTED_COMMIT"
 
-          collected="$RUNNER_TEMP/session-relay-publish"
-          release="$RUNNER_TEMP/session-relay-release"
+          collected="$RUNNER_TEMP/relay-publish"
+          release="$RUNNER_TEMP/relay-release"
           mkdir -p "$release"
           assets=(
-            session-relay-aarch64-unknown-linux-musl
-            session-relay-x86_64-unknown-linux-musl
+            relay-aarch64-unknown-linux-musl
+            relay-x86_64-unknown-linux-musl
           )
           for asset in "${assets[@]}"; do
             test -f "$collected/$asset"
@@ -395,11 +395,11 @@ jobs:
           VERSION: ${{ needs.identity.outputs.version }}
         run: |
           set -euo pipefail
-          release="$RUNNER_TEMP/session-relay-release"
-          title="session-relay $VERSION"
+          release="$RUNNER_TEMP/relay-release"
+          title="relay $VERSION"
           assets=(
-            session-relay-aarch64-unknown-linux-musl
-            session-relay-x86_64-unknown-linux-musl
+            relay-aarch64-unknown-linux-musl
+            relay-x86_64-unknown-linux-musl
             SHA256SUMS
           )
 
@@ -499,7 +499,7 @@ jobs:
             fi
           }
 
-          initial="$RUNNER_TEMP/session-relay-release-initial.json"
+          initial="$RUNNER_TEMP/relay-release-initial.json"
           release_id=''
           query_status=0
           query_release "$initial" || query_status=$?
@@ -523,6 +523,6 @@ jobs:
               ;;
           esac
 
-          final="$RUNNER_TEMP/session-relay-release-final.json"
+          final="$RUNNER_TEMP/relay-release-final.json"
           query_release "$final"
           validate_release "$final" true "$release_id"

@@ -271,7 +271,7 @@ export default function (pi: ExtensionAPI): void {
     const pending = pendingMail(ctx);
     if (!pending.size) return;
     doorbell = { generation: current.generation, sentAt: Date.now() };
-    pi.sendUserMessage(`[session-relay] ${pending.size} new message(s)`);
+    pi.sendUserMessage(`[relay] ${pending.size} new message(s)`);
   }
 
   async function poll(current: Live): Promise<void> {

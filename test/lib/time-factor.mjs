@@ -7,7 +7,7 @@
 // Deliberately NOT applied to durations that are themselves the assertion - ordering windows,
 // two-sided ranges, product-configured budgets. Only helper bodies that compute a give-up deadline
 // consult this.
-const VARIABLE = 'SESSION_RELAY_TEST_TIME_FACTOR';
+const VARIABLE = 'RELAY_TEST_TIME_FACTOR';
 const MAX_FACTOR = 100;
 
 function readFactor() {

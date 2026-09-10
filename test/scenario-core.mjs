@@ -625,7 +625,7 @@ export const EXPECTED_LABELS = [
   'non-attach verbs still treat --exec as a value flag',
   'send to an unknown recipient returns isError',
   'registry pins explicit and default tools to omp',
-  'AGENT_RELAY_HOME takes precedence over SESSION_RELAY_HOME',
+  'AGENT_RELAY_HOME is the only store home variable',
   'wake --dry resumes omp with model and thinking before the prompt fence',
   'attach directly resumes omp under the resume lock without printing a command',
   'attach --exec inherits stdin/stdout/stderr and holds the resume lock',
@@ -668,7 +668,7 @@ export async function run({ bin, home, emit }) {
     check('--version prints the exact Cargo package version', () => {
       const result = relay(['--version']);
       assert.equal(result.status, 0, `relay --version exited ${result.status}: ${result.stderr}`);
-      assert.equal(result.stdout, `session-relay ${CARGO_VERSION}\n`);
+      assert.equal(result.stdout, `relay ${CARGO_VERSION}\n`);
       assert.equal(result.stderr, '');
     });
 
@@ -709,7 +709,7 @@ export async function run({ bin, home, emit }) {
 
     check('initialize negotiates protocol + serverInfo', () => {
       assert.equal(res.get(1).result.protocolVersion, '2025-06-18');
-      assert.equal(res.get(1).result.serverInfo.name, 'session-relay-bus');
+      assert.equal(res.get(1).result.serverInfo.name, 'relay-bus');
       assert.ok(res.get(1).result.capabilities.tools);
     });
     check('bus catalog and request/reply preserve correlated delivery contracts', () => {
@@ -816,19 +816,21 @@ export async function run({ bin, home, emit }) {
       assert.equal(byName['omp-C'], 'omp');
       assert.equal(byName['agent-A'], 'omp');
     });
-    check('AGENT_RELAY_HOME takes precedence over SESSION_RELAY_HOME', () => {
-      const alternateHome = path.join(HOME, 'alt-home');
+    check('AGENT_RELAY_HOME is the only store home variable', () => {
+      const isolatedHome = path.join(HOME, 'isolated-home');
+      const legacyHome = path.join(HOME, 'legacy-home');
+      fs.mkdirSync(isolatedHome, { recursive: true });
       const precedenceId = '77777777-7777-7777-7777-777777777777';
       assert.equal(
         relay(['register', 'prec', '--id', precedenceId, '--dir', dirA], {
-          env: { AGENT_RELAY_HOME: alternateHome },
+          env: { HOME: isolatedHome, AGENT_RELAY_HOME: '', SESSION_RELAY_HOME: legacyHome },
         }).status,
         0,
       );
-      const alternateRegistry = JSON.parse(fs.readFileSync(path.join(alternateHome, 'registry.json'), 'utf8'));
-      assert.ok(alternateRegistry.agents[precedenceId], 'registered into the AGENT_RELAY_HOME store');
-      const registry = JSON.parse(fs.readFileSync(path.join(HOME, 'registry.json'), 'utf8'));
-      assert.ok(!registry.agents[precedenceId], 'legacy-alias store untouched');
+      const defaultStore = path.join(isolatedHome, '.agent-relay', 'registry.json');
+      const registry = JSON.parse(fs.readFileSync(defaultStore, 'utf8'));
+      assert.ok(registry.agents[precedenceId], 'registered into the default $HOME/.agent-relay store');
+      assert.ok(!fs.existsSync(legacyHome), 'the removed store home variable never creates a store');
     });
     check('wake --dry resumes omp with model and thinking before the prompt fence', () => {
       const dryRun = relayJSON([

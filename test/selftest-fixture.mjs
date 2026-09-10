@@ -45,8 +45,8 @@ const CLOSE_KILL_MS = 15_000;
 const TREE_POLL_INTERVAL_MS = 20;
 
 function failTestBin(reason) {
-  const error = new Error(`SESSION_RELAY_TEST_BIN ${reason}`);
-  error.code = 'SESSION_RELAY_TEST_BIN';
+  const error = new Error(`RELAY_TEST_BIN ${reason}`);
+  error.code = 'RELAY_TEST_BIN';
   throw error;
 }
 
@@ -61,7 +61,7 @@ function validateBinary(configuredBin) {
     if (!fs.statSync(bin).isFile()) failTestBin('must resolve to a regular file');
     fs.accessSync(bin, fs.constants.X_OK);
   } catch (error) {
-    if (error?.code === 'SESSION_RELAY_TEST_BIN') throw error;
+    if (error?.code === 'RELAY_TEST_BIN') throw error;
     failTestBin('must resolve to an executable file');
   }
 
@@ -221,7 +221,6 @@ export function createFixture({ bin: configuredBin, home }) {
       ...env,
       RELAY_OMP_SESSIONS: ompSessions,
       ...extra,
-      SESSION_RELAY_HOME: home,
       AGENT_RELAY_HOME: extra.AGENT_RELAY_HOME ?? home,
     };
   }
@@ -387,11 +386,11 @@ export async function runScenarioCli({ scenario, run }) {
     if (typeof scenario !== 'string' || scenario.length === 0) throw new TypeError('scenario must be nonempty');
     if (typeof run !== 'function') throw new TypeError('scenario run must be a function');
 
-    const bin = requiredAbsoluteEnv('SESSION_RELAY_TEST_BIN');
-    const home = requiredAbsoluteEnv('SESSION_RELAY_SCENARIO_HOME');
-    resultPath = requiredAbsoluteEnv('SESSION_RELAY_SCENARIO_RESULT');
+    const bin = requiredAbsoluteEnv('RELAY_TEST_BIN');
+    const home = requiredAbsoluteEnv('RELAY_SCENARIO_HOME');
+    resultPath = requiredAbsoluteEnv('RELAY_SCENARIO_RESULT');
     if (pathIsInside(home, resultPath)) {
-      throw new Error('SESSION_RELAY_SCENARIO_RESULT must be outside SESSION_RELAY_SCENARIO_HOME');
+      throw new Error('RELAY_SCENARIO_RESULT must be outside RELAY_SCENARIO_HOME');
     }
 
     fs.rmSync(resultPath, { force: true });

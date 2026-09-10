@@ -1,4 +1,4 @@
-// bus.rs — MCP stdio server for the session-relay bus (port of mcp/bus.mjs).
+// bus.rs — MCP stdio server for the relay bus (port of mcp/bus.mjs).
 // Speaks newline-delimited JSON-RPC 2.0 on stdin/stdout. STDOUT PURITY IS A
 // SPEC MUST: nothing but JSON-RPC frames goes to stdout (MCP stdio transport,
 // 2025-06-18) — every diagnostic goes through log() to stderr. Implements the
@@ -114,7 +114,7 @@ const TOOLS_JSON: &str = r#"[
 ]"#;
 
 fn log(msg: &str) {
-    eprintln!("[session-relay/bus] {msg}");
+    eprintln!("[relay/bus] {msg}");
 }
 
 // Resolve the project dir from the explicit override or launch cwd.
@@ -550,10 +550,7 @@ fn handle(msg: &JsonValue, pdir: &str) {
                     ("capabilities", obj(vec![("tools", obj(vec![]))])),
                     (
                         "serverInfo",
-                        obj(vec![
-                            ("name", js("session-relay-bus")),
-                            ("version", js("0.1.0")),
-                        ]),
+                        obj(vec![("name", js("relay-bus")), ("version", js("0.1.0"))]),
                     ),
                     (
                         "instructions",

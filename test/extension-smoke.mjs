@@ -111,7 +111,7 @@ function runtime() {
     sendUserMessage(content, options) {
       assert.equal(idle, true, 'streaming mail must never become a steer');
       assert.equal(options?.deliverAs, undefined);
-      assert.match(content, /^\[session-relay\] \d+ new message\(s\)$/);
+      assert.match(content, /^\[relay\] \d+ new message\(s\)$/);
       doorbells.push(content);
       // Real sendUserMessage is fire-and-forget; scenarios explicitly run or drop its prompt.
       queuedPrompts.push(content);
