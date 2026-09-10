@@ -138,8 +138,13 @@ impl Sha256 {
 pub(crate) fn hex_digest(input: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(input);
+    hex(&hasher.digest())
+}
+
+/// Lowercase hex of a finished digest.
+pub(crate) fn hex(digest: &[u8; 32]) -> String {
     let mut hex = String::with_capacity(64);
-    for byte in hasher.digest() {
+    for byte in digest {
         hex.push(HEX_DIGITS[usize::from(byte >> 4)]);
         hex.push(HEX_DIGITS[usize::from(byte & 0x0f)]);
     }

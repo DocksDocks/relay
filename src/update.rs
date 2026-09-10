@@ -11,7 +11,7 @@
 // it, because one redirected value would point both the artifact and its
 // checksum at the same attacker and defeat the only integrity control.
 
-use crate::sha256::{Sha256, constant_time_eq};
+use crate::sha256::{Sha256, constant_time_eq, hex};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -23,7 +23,6 @@ const API_TAGS: &str = "https://api.github.com/repos/DocksDocks/relay/releases/t
 const ASSET_HOST: &str = "github.com";
 const SUMS_ASSET: &str = "SHA256SUMS";
 const USER_AGENT: &str = concat!("relay/", env!("CARGO_PKG_VERSION"));
-const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
 // Bound for one whole request, body included, so a stalled peer turns into an
 // error instead of a hang.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
@@ -338,10 +337,14 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
             "--check" => options.check = true,
             "--force" => options.force = true,
             "--version" => {
+                if options.version.is_some() {
+                    return Err("duplicate --version".to_string());
+                }
                 index += 1;
-                let Some(tag) = args.get(index) else {
-                    return Err("--version needs a release tag".to_string());
-                };
+                let tag = args
+                    .get(index)
+                    .filter(|value| !value.is_empty() && !value.starts_with("--"))
+                    .ok_or_else(|| "--version needs a release tag".to_string())?;
                 options.version = Some(tag.clone());
             }
             other => return Err(format!("unknown update option: {other}")),
@@ -371,15 +374,6 @@ impl Write for HashingSink<'_> {
     fn flush(&mut self) -> std::io::Result<()> {
         self.file.flush()
     }
-}
-
-fn hex(bytes: &[u8; 32]) -> String {
-    let mut text = String::with_capacity(64);
-    for byte in bytes {
-        text.push(char::from(HEX_DIGITS[usize::from(byte >> 4)]));
-        text.push(char::from(HEX_DIGITS[usize::from(byte & 0x0f)]));
-    }
-    text
 }
 
 fn staged_path(exe: &Path) -> Result<PathBuf, String> {
@@ -539,6 +533,13 @@ mod tests {
     use crate::store::uuid_v4;
     use std::cell::RefCell;
     use std::collections::HashMap;
+    use std::sync::{Mutex, MutexGuard};
+
+    // Every case writes a file and then executes it. A `fork` on one test
+    // thread inherits the write descriptor another thread still holds on its
+    // fresh file, and Linux refuses to execute that file (`ETXTBSY`), so the
+    // cases take turns. A poisoned lock only means an earlier case failed.
+    static EXEC_SERIAL: Mutex<()> = Mutex::new(());
 
     const TEST_TARGET: Option<&str> = Some("x86_64-unknown-linux-musl");
     const ASSET_NAME: &str = "relay-x86_64-unknown-linux-musl";
@@ -609,36 +610,43 @@ mod tests {
 
     // A stand-in for the running executable in its own directory. The
     // directory goes away with the value, so a test run leaves no scratch.
-    struct Fixture(PathBuf);
+    // Holding the fixture holds the exec turn; the guard is only dropped.
+    struct Fixture {
+        exe: PathBuf,
+        _turn: MutexGuard<'static, ()>,
+    }
 
     impl std::ops::Deref for Fixture {
         type Target = Path;
 
         fn deref(&self) -> &Path {
-            &self.0
+            &self.exe
         }
     }
 
     impl AsRef<Path> for Fixture {
         fn as_ref(&self) -> &Path {
-            &self.0
+            &self.exe
         }
     }
 
     impl Drop for Fixture {
         fn drop(&mut self) {
-            if let Some(root) = self.0.parent() {
+            if let Some(root) = self.exe.parent() {
                 let _ = fs::remove_dir_all(root);
             }
         }
     }
 
     fn fixture(label: &str) -> Fixture {
+        let turn = EXEC_SERIAL
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let root = std::env::temp_dir().join(format!("relay-update-{label}-{}", uuid_v4()));
         fs::create_dir_all(&root).expect("create update fixture");
         let exe = root.join("relay");
         fs::write(&exe, payload("0.1.0")).expect("write fixture executable");
-        Fixture(exe)
+        Fixture { exe, _turn: turn }
     }
 
     fn text(out: &[u8]) -> String {
