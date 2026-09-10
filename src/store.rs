@@ -2161,8 +2161,10 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    /// The three ways a hold can end, and the mailbox bytes each one must
-    /// leave behind once recovery has reached quiescence.
+    /// The four hold endings the model drives (ack, rollback, an expiry crash
+    /// during creation, and an expiry settled through rollback) and the
+    /// mailbox bytes each one must leave behind once recovery has reached
+    /// quiescence.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum HoldOutcome {
         Ack,
@@ -2218,6 +2220,7 @@ mod tests {
         };
         let token = hold_string(manifest, "token").unwrap();
         let payload = root.join("holds").join(format!("{token}.jsonl")).exists();
+        let expired = hold_string(manifest, "expires_at").unwrap() <= iso_now().as_str();
         let claims = [
             HoldFailpoint::AfterPhaseWrite,
             HoldFailpoint::BeforeClaimUpdates,
@@ -2234,6 +2237,7 @@ mod tests {
                     HoldFailpoint::BeforeManifestRemoval,
                 ])
                 .collect(),
+            ("held", true) if !expired => Vec::new(),
             ("held" | "restoring", true) => claims
                 .into_iter()
                 .chain([
