@@ -60,11 +60,12 @@ function writeStub(file, marker) {
   );
 }
 
-function runLauncher(env, args = []) {
+function runLauncher(env, args = [], options = {}) {
   return spawnSync('sh', [LAUNCHER, ...args], {
     cwd: REPO,
     encoding: 'utf8',
     env,
+    ...options,
   });
 }
 
@@ -151,6 +152,25 @@ function checkLauncher() {
     assert.notEqual(impostorRun.status, 0, 'an unrelated executable must not be selected');
     assert.match(impostorRun.stderr, /relay executable not found\./);
     pass('launcher-impostor-rejected', 'a PATH executable without the relay identity is rejected');
+
+    // (g) A rejected PATH entry does not end the PATH scan; a later valid entry wins.
+    // The impostor drains stdin, so the real invocation must still receive it.
+    const laterDir = path.join(root, 'later-bin');
+    fs.mkdirSync(laterDir);
+    fs.writeFileSync(
+      path.join(laterDir, 'relay'),
+      '#!/bin/sh\nif [ "$1" = --version ]; then printf "relay 0.0.0-stub\\n"; exit 0; fi\nprintf "STDIN=%s\\n" "$(cat)"\n',
+      { mode: 0o755 },
+    );
+    fs.writeFileSync(onPath, '#!/bin/sh\ncat >/dev/null\nprintf "other 1.0\\n"\n', { mode: 0o755 });
+    const laterRun = runLauncher(
+      { HOME: home, PATH: `${pathDir}${path.delimiter}${laterDir}${path.delimiter}${BASE_PATH}` },
+      ['hook'],
+      { input: 'stdin payload\n', timeout: 5000 },
+    );
+    assert.equal(laterRun.status, 0, laterRun.stderr);
+    assert.equal(laterRun.stdout, 'STDIN=stdin payload\n');
+    pass('launcher-path-scan-continues', 'a rejected PATH entry is skipped and a later valid entry is used');
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

@@ -1,6 +1,8 @@
 #!/bin/sh
 # relay — launcher for the externally installed relay CLI.
-# Skip this launcher during PATH and HOME lookup; reject it in RELAY_BIN.
+# PATH and HOME lookup skip this launcher and any relay that fails the
+# --version identity probe; an explicit RELAY_BIN is trusted and a RELAY_BIN
+# that points at the launcher fails as recursion.
 
 canonical_path() {
   path=$1
@@ -46,6 +48,18 @@ launcher=$(canonical_path "$0") || {
   exit 1
 }
 
+# Accept a lookup candidate only when it is an executable file, is not this
+# launcher, and answers --version with the relay prefix. stdin is closed for
+# the probe so an unrelated relay cannot block or drain the session stream.
+accept_candidate() {
+  [ -f "$1" ] && [ -x "$1" ] || return 1
+  [ "$(canonical_path "$1" 2>/dev/null)" != "$launcher" ] || return 1
+  case "$("$1" --version </dev/null 2>/dev/null)" in
+    'relay '*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 candidate=
 if [ -n "${RELAY_BIN:-}" ]; then
   candidate=$RELAY_BIN
@@ -53,34 +67,23 @@ if [ -n "${RELAY_BIN:-}" ]; then
     fail_invalid "$candidate"
   fi
 else
-  candidate=$(command -v relay 2>/dev/null || :)
-  if [ -n "$candidate" ] && { [ ! -f "$candidate" ] || [ ! -x "$candidate" ]; }; then
-    candidate=
-  fi
-  if [ -n "$candidate" ]; then
-    if [ "$(canonical_path "$candidate")" = "$launcher" ]; then
-      candidate=
+  path_list=${PATH:-}
+  while [ -n "$path_list" ]; do
+    entry=${path_list%%:*}
+    if [ "$entry" = "$path_list" ]; then
+      path_list=
     else
-      case "$("$candidate" --version 2>/dev/null)" in
-        'relay '*) ;;
-        *) candidate= ;;
-      esac
+      path_list=${path_list#*:}
     fi
-  fi
+    [ -n "$entry" ] || entry=.
+    if accept_candidate "$entry/relay"; then
+      candidate=$entry/relay
+      break
+    fi
+  done
 
-  if [ -z "$candidate" ]; then
-    home_candidate=${HOME:-}/.local/bin/relay
-    if [ -n "${HOME:-}" ] && [ -f "$home_candidate" ] && [ -x "$home_candidate" ]; then
-      candidate=$home_candidate
-      if [ "$(canonical_path "$candidate")" = "$launcher" ]; then
-        candidate=
-      else
-        case "$("$candidate" --version 2>/dev/null)" in
-          'relay '*) ;;
-          *) candidate= ;;
-        esac
-      fi
-    fi
+  if [ -z "$candidate" ] && [ -n "${HOME:-}" ] && accept_candidate "$HOME/.local/bin/relay"; then
+    candidate=$HOME/.local/bin/relay
   fi
 
   if [ -z "$candidate" ]; then

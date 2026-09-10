@@ -5,7 +5,7 @@ user-invocable: true
 metadata:
   pattern: tool-wrapper
   updated: "2026-09-10"
-  content_hash: "e320b01b77860b5c57120b69753c70ca5b23c931f230649ab9b32dc20ae9f06d"
+  content_hash: "eefb0b5b7a7f03189bcba8560f94203cad6ea5ad6c2373ff0ce252990fb63ed0"
 ---
 
 # Relay
@@ -50,7 +50,8 @@ relay --version
 
 The plugin includes a launcher, not the compiled executable.
 The launcher resolves a non-empty `RELAY_BIN` first.
-It then checks `relay` on `PATH` and `$HOME/.local/bin/relay`.
+It then checks each `relay` on `PATH` and `$HOME/.local/bin/relay`.
+A lookup candidate is accepted only when `--version` starts with `relay `; the launcher skips itself.
 An invalid non-empty override fails without fallback.
 An override that points to the launcher fails as recursion.
 Correct a broken override or unset `RELAY_BIN`.

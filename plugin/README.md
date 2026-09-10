@@ -30,9 +30,10 @@ omp plugin install relay@relay --scope project
 Restart the omp session.
 Use `/relay` to show the roster and pending mail count.
 
-The launcher checks `RELAY_BIN`, then `relay` on `PATH`, then
+The launcher checks `RELAY_BIN`, then each `relay` on `PATH`, then
 `~/.local/bin/relay`.
-It rejects recursive launcher resolution.
+A `PATH` or home candidate is accepted only when its `--version` output starts with `relay `; the launcher skips itself during lookup.
+A `RELAY_BIN` that points at the launcher fails as recursion.
 
 Relay distributes Linux x86-64 and arm64 musl binaries.
 

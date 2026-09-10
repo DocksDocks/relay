@@ -9,7 +9,7 @@ Relay provides cross-session and cross-project mail for omp. This directory cont
 | repository root, outside this payload | Rust sources in `../src/`, `../rust-toolchain.toml`, `../Cargo.lock`, and the `../test/` harness. The harness owns scenarios, Rust inventories, and distribution contracts. These files do not ship in the plugin cache. |
 | `package.json` | Plugin name, version, license, and `omp.extensions` entry for `./extension/index.ts`. Keep the version aligned with the crate and marketplace metadata. |
 | `extension/index.ts` | The `relay` tool, `/relay` command, session hooks, polling, and `relay_mail` rendering. |
-| `bin/relay` | POSIX launcher. Resolve `RELAY_BIN`, then `relay` on `PATH`, then `~/.local/bin/relay`. Reject recursion. Report the release download when no binary exists. |
+| `bin/relay` | POSIX launcher. Resolve `RELAY_BIN`, then each `relay` on `PATH`, then `~/.local/bin/relay`. Accept a lookup candidate only when `--version` starts with `relay `; skip the launcher itself. Reject a recursive `RELAY_BIN`. Report the release download when no binary exists. |
 | `skills/relay/` | The omp messaging skill. |
 | `README.md`, `AGENTS.md`, `LICENSE` | Installation, payload rules, and license. |
 
