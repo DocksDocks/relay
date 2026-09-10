@@ -7,4 +7,5 @@ pub mod jcs;
 pub mod protocol;
 pub(crate) mod sha256;
 pub mod store;
+pub mod update;
 pub mod watch;

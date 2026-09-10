@@ -1,6 +1,6 @@
 [package]
 name = "relay"
-version = "0.19.0"
+version = "0.20.0"
 edition = "2024"
 rust-version = "1.85"
 description = "relay: durable messaging between omp sessions, single static binary"
@@ -33,6 +33,10 @@ name = "protocol"
 path = "src/tests/protocol.rs"
 
 [[test]]
+name = "update"
+path = "src/tests/update.rs"
+
+[[test]]
 name = "watch"
 path = "src/tests/watch.rs"
 
@@ -40,6 +44,7 @@ path = "src/tests/watch.rs"
 tinyjson = "2.5"
 libc = "0.2"
 rustix = { version = "1.1", features = ["fs", "net", "process"] }
+ureq = { version = "=3.4.1", default-features = false, features = ["rustls"] }
 
 # Lint policy. `scripts/gate.mjs` runs clippy with `-D warnings`, so every `warn`
 # below fails the gate. Tests are exempt from the panic-family lints through

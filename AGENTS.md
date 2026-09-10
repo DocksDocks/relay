@@ -40,7 +40,7 @@ The tracked top-level inventory and current working tree define this layout:
 ├── .omp/lsp.json                      rust-analyzer launch for the harness lsp tool
 ├── deny.toml                          cargo-deny supply-chain policy
 ├── src/                               crate sources
-│   └── tests/                         five explicit [[test]] integration targets
+│   └── tests/                         six explicit [[test]] integration targets
 ├── test/                              Node scenario and contract harness
 ├── plugin/                            shipped plugin payload
 ├── .omp-plugin/marketplace.json       omp marketplace catalog
@@ -55,7 +55,7 @@ The tracked top-level inventory and current working tree define this layout:
 └── LICENSE                            repository license
 ```
 
-`Cargo.toml` sets `autotests = false`. It declares five integration targets with explicit `[[test]]` entries under `src/tests/`: `bus_smoke`, `protocol`, `lock_race`, `holds`, and `watch`.
+`Cargo.toml` sets `autotests = false`. It declares six integration targets with explicit `[[test]]` entries under `src/tests/`: `bus_smoke`, `protocol`, `lock_race`, `holds`, `watch`, and `update`.
 
 
 ## Rust code
@@ -71,14 +71,14 @@ When a rule below has a lint, the lint is the rule. The text explains the intent
 ### Toolchain and dependencies
 
 - Keep the toolchain and the crate `rust-version` on one channel. Move `rust-toolchain.toml` and `Cargo.toml` `rust-version` together.
-- The crate has three runtime dependencies: `tinyjson`, `libc`, and `rustix`.
+- The crate has four direct dependencies: `tinyjson`, `libc`, `rustix`, and `ureq`.
 - Before you add a dependency, get an `ask` decision.
-- A new dependency must pass `cargo deny --locked --offline check`. The policy allows MIT or Apache-2.0 licenses, crates.io only, no wildcard versions, and no duplicate versions.
+- A new dependency must pass `cargo deny --locked --offline check`. The policy allows the MIT, Apache-2.0, ISC, BSD-3-Clause, and CDLA-Permissive-2.0 licenses, crates.io only, no wildcard versions, and no duplicate versions.
 
 ### Suppressions
 
 - Do not write `#[allow(...)]`.
-- The five integration test roots under `src/tests/` carry the only crate-level `allow`.
+- The six integration test roots under `src/tests/` carry the only crate-level `allow`.
 - For a justified exception, use `#[expect(lint, reason = "...")]`. The compiler reports the attribute when it becomes unnecessary.
 
 ### Panics
@@ -101,7 +101,7 @@ When a rule below has a lint, the lint is the rule. The text explains the intent
 
 - Borrow what you do not consume. Take `&T` unless the function stores or moves the value.
 - Use the `lsp` tool for definitions, references, and renames. Text search misses shadowed and re-exported symbols.
-- Tests live in the five explicit `[[test]]` targets and in inline `#[cfg(test)]` modules.
+- Tests live in the six explicit `[[test]]` targets and in inline `#[cfg(test)]` modules.
 - After you add or remove a test in an integration target, run `node test/rust-test-inventory.mjs --generate`. Commit the fixture. Inline unit tests are discovered live and need no fixture change.
 - Run `cargo fmt` before the gate. The gate runs `cargo fmt --check` first and fails on any difference.
 
