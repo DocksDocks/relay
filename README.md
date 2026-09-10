@@ -38,3 +38,24 @@ omp plugin install relay@relay --scope project
 ```
 
 The repository ships its catalog at `.omp-plugin/marketplace.json`. omp copies the directory named by the catalog `source`, which is `plugin/`.
+
+## Migrate from session-relay
+
+Version 0.19.0 renamed the project from `session-relay` to `relay`. The store under `~/.agent-relay` and the `AGENT_RELAY_HOME` variable did not change, so existing mail and registrations stay in place. Do not keep both plugin identities installed: the two extensions register the same tool and command.
+
+1. Uninstall the old plugin from each scope where it is installed, then remove the old marketplace entry:
+
+   ```bash
+   omp plugin uninstall session-relay --scope project
+   omp plugin uninstall session-relay
+   omp plugin marketplace remove session-relay
+   ```
+
+2. Remove the old binary, then install the new one as `~/.local/bin/relay` with the commands above:
+
+   ```bash
+   rm -f "$HOME/.local/bin/session-relay"
+   ```
+
+3. Replace `SESSION_RELAY_BIN` with `RELAY_BIN` in any launcher override. The `SESSION_RELAY_HOME` alias no longer exists; set `AGENT_RELAY_HOME` when the store must live elsewhere.
+4. Add the marketplace at the new URL and install `relay@relay` as shown above. The old marketplace name does not resolve to the new plugin.
