@@ -40,6 +40,7 @@ path = "src/tests/watch.rs"
 tinyjson = "2.5"
 libc = "0.2"
 rustix = { version = "1.1", features = ["fs", "net", "process"] }
+ureq = { version = "=3.4.1", default-features = false, features = ["rustls"] }
 
 # Lint policy. `scripts/gate.mjs` runs clippy with `-D warnings`, so every `warn`
 # below fails the gate. Tests are exempt from the panic-family lints through
