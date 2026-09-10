@@ -27,6 +27,32 @@ install -Dm755 "relay-$target" "$HOME/.local/bin/relay"
 
 Each release publishes `SHA256SUMS` alongside both binaries.
 
+## Update
+
+`relay update` replaces the running binary with the latest release for its own
+target. It checks the download against the release `SHA256SUMS` before it
+replaces the binary.
+
+```bash
+relay update
+relay update --check
+relay update --version v0.19.0
+relay update --version v0.19.0 --force
+```
+
+`relay update --check` prints the running version and the latest tag and changes
+nothing. `relay update --version <tag>` selects one release instead of the
+latest. `--force` is accepted only together with `--version`, and that pair is
+the only way to install an older release.
+
+These limits apply:
+
+- The checksum manifest is not signed. The command verifies the checksum only.
+- HTTPS uses the Mozilla root store.
+- The command needs write access to the directory that holds the binary.
+- Only the two Linux musl targets have release assets. Every other build prints
+  `no release asset for this target`.
+
 ## Add the marketplace
 
 Add the omp marketplace from the repository URL or from a local checkout. Then install the plugin into the current project and restart the omp session.

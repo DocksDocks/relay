@@ -33,6 +33,10 @@ name = "protocol"
 path = "src/tests/protocol.rs"
 
 [[test]]
+name = "update"
+path = "src/tests/update.rs"
+
+[[test]]
 name = "watch"
 path = "src/tests/watch.rs"
 

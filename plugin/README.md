@@ -37,6 +37,9 @@ A `RELAY_BIN` that points at the launcher fails as recursion.
 
 Relay distributes Linux x86-64 and arm64 musl binaries.
 
+Run `relay update` to replace the installed binary with the latest release for
+its target; `relay update --check` reports the running and latest versions only.
+
 ## Plugin interface
 
 Use the `relay` tool for session mail.

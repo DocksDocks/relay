@@ -1,6 +1,6 @@
 # relay payload (`plugin/`)
 
-Relay provides cross-session and cross-project mail for omp. This directory contains the shipped plugin payload. The repository Rust crate produces the installed `relay` CLI. The POSIX launcher `bin/relay` resolves that external command. Rust owns the store, protocol, CLI commands, hooks, and watcher. The omp extension owns plugin integration. Verify CLI verbs against `src/main.rs` in the repository.
+Relay provides cross-session and cross-project mail for omp. This directory contains the shipped plugin payload. The repository Rust crate produces the installed `relay` CLI. The POSIX launcher `bin/relay` resolves that external command. Rust owns the store, protocol, CLI commands, hooks, and watcher. The omp extension owns plugin integration. Verify CLI verbs against `src/main.rs` in the repository. `relay update` replaces the resolved binary, not the launcher.
 
 ## Layout
 
@@ -171,7 +171,8 @@ Never add a target beyond the two Linux musl legs.
 Run `node scripts/gate.mjs` from the repository root.
 Treat it as the authoritative gate: manifests, skill, extension, shell, Rust,
 checks, selftest, and JavaScript. Execute the full frozen Rust inventories:
-`unit` (`--lib`), `bus_smoke`, `protocol`, `lock_race`, and `holds`.
+`unit` (`--lib`), `bus_smoke`, `protocol`, `lock_race`, `holds`, `watch`, and
+`update`.
 Never accept ignored or filtered tests or an ambient binary for selftest parity.
 Do not run the repository gate from an installed plugin cache.
 

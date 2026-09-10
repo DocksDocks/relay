@@ -67,6 +67,13 @@
         "typed_rows_without_authoritative_claims_are_never_surfaced"
       ]
     },
+    "update": {
+      "tests": [
+        "replace_executable_refuses_an_unwritable_directory",
+        "replace_executable_swaps_the_target_in_place",
+        "verify_staged_removes_a_mismatching_binary"
+      ]
+    },
     "watch": {
       "tests": [
         "readers_ignore_an_uppercase_registry_entry",

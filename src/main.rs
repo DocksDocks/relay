@@ -14,6 +14,7 @@ fn main() {
             | "ack" | "rollback" | "peek" | "attach" | "wake" | "doctor"),
         ) => relay::cli::run(cmd, argv.clone()),
         Some("watch") => relay::watch::run(argv.clone()),
+        Some("update") => relay::update::run(&argv[1..]),
         // __stress <recipient-id> <who> <k> — mirrors test/selftest.mjs's
         // stress worker: race k enqueues against k register upserts, plus one
         // unique-id register per iteration so a lost read-modify-write shows
@@ -51,7 +52,7 @@ fn main() {
         _ => die(USAGE),
     }
 }
-const USAGE: &str = "usage: relay bus | hook omp --session <id> --cwd <dir> [--event prompt] [--hold [<seconds>]] | discover [--within min] [--tool omp] | list | register <name> --id <uuid> [--dir <path>] | send <to> [--] <msg> | request <to> [--from <registered>] [--json] [--] <msg> | reply <correlation-id> [--from <registered>] --status completed|failed [--] <msg> | inbox [--hold [<seconds>]] <who> | ack <token> | rollback <token> | peek <who> | attach <who> [--exec] | wake <who> [--effort e] [msg] | doctor [--id <session>] | watch <who>...|--all [--once]";
+const USAGE: &str = "usage: relay bus | hook omp --session <id> --cwd <dir> [--event prompt] [--hold [<seconds>]] | discover [--within min] [--tool omp] | list | register <name> --id <uuid> [--dir <path>] | send <to> [--] <msg> | request <to> [--from <registered>] [--json] [--] <msg> | reply <correlation-id> [--from <registered>] --status completed|failed [--] <msg> | inbox [--hold [<seconds>]] <who> | ack <token> | rollback <token> | peek <who> | attach <who> [--exec] | wake <who> [--effort e] [msg] | doctor [--id <session>] | watch <who>...|--all [--once] | update [--check] [--version <tag>] [--force]";
 
 fn die(msg: &str) -> ! {
     eprintln!("{msg}");

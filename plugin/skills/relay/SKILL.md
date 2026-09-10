@@ -5,7 +5,7 @@ user-invocable: true
 metadata:
   pattern: tool-wrapper
   updated: "2026-09-10"
-  content_hash: "eefb0b5b7a7f03189bcba8560f94203cad6ea5ad6c2373ff0ce252990fb63ed0"
+  content_hash: "9f13bb7231485633295c90a528f9afd15940d80b9ef41408f3db03e6ff0c80fa"
 ---
 
 # Relay
@@ -58,6 +58,11 @@ Correct a broken override or unset `RELAY_BIN`.
 The launcher never builds or downloads an executable at startup.
 
 Relay distributes Linux x86-64 and arm64 musl binaries.
+
+Run `relay update` to replace the installed binary with the latest release for
+its target; the command verifies the download against the release `SHA256SUMS`.
+Run `relay update --check` to compare the running version with the latest tag
+without any change.
 
 ## Pick the transport deliberately
 
@@ -319,7 +324,7 @@ The extension is the delivery path for a running interactive session.
 ## Anti-hallucination
 
 Use only the nine documented `relay` tool actions.
-Use CLI verbs for `attach`, `watch`, `ack`, `rollback`, and `doctor`.
+Use CLI verbs for `attach`, `watch`, `ack`, `rollback`, `doctor`, and `update`.
 Do not invent tool actions for these CLI-only operations.
 The tool `wake` exposes only a target and text, not model or effort controls.
 Use the CLI when a wake needs explicit model or effort settings.

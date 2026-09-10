@@ -21,6 +21,7 @@ Coding rules for the crate (lint policy, panics, unsafe, casts, dependencies) li
 | `src/gc.rs` | Opportunistic collection (from hook and bus activity) of inactive relay-owned state. |
 | `src/cli.rs` | Argument parsing, registry and mail commands, request/reply, holds, direct omp wake/attach, and doctor diagnostics. |
 | `src/sha256.rs` | SHA-256 primitives used for durable content integrity. |
+| `src/update.rs` | Self-update of the running binary: release lookup over fixed GitHub hosts, checksum verification against the release `SHA256SUMS`, staged identity check, and atomic replacement. |
 | `src/main.rs` | Binary dispatch for public commands and selftest helpers. |
 | `src/lib.rs` | Public library module declarations. |
 
@@ -48,7 +49,7 @@ Coding rules for the crate (lint policy, panics, unsafe, casts, dependencies) li
 
 ## Test topology
 
-`Cargo.toml` disables automatic test discovery and declares exactly five
+`Cargo.toml` disables automatic test discovery and declares exactly six
 integration targets:
 
 | Target | Source | Observable boundary |
@@ -58,6 +59,7 @@ integration targets:
 | `lock_race` | `src/tests/lock_race.rs` | Store serialization under concurrent operations. |
 | `holds` | `src/tests/holds.rs` | Held and ordinary drains, ack, rollback, and expiry. |
 | `watch` | `src/tests/watch.rs` | Registration and watch target validation: no launcher receives a non-UUID session id. |
+| `update` | `src/tests/update.rs` | Replacement of the running binary and the staged identity check. |
 
 Inline unit tests run through `--lib`. `test/rust-test-inventory.mjs` compares
 live names against `test/fixtures/rust-test-inventory.json` and executes each
