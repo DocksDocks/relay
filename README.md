@@ -41,9 +41,10 @@ relay update --version v0.19.0 --force
 ```
 
 `relay update --check` prints the running version and the latest tag and changes
-nothing. `relay update --version <tag>` selects one release instead of the
-latest. `--force` is accepted only together with `--version`, and that pair is
-the only way to install an older release.
+nothing. With `--version <tag>` it prints that tag as `selected:` instead.
+`relay update --version <tag>` selects one release instead of the latest.
+`--force` is accepted only together with `--version`, and that pair is the only
+way to install an older release.
 
 These limits apply:
 

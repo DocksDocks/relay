@@ -15,6 +15,7 @@ use crate::sha256::{Sha256, constant_time_eq};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use tinyjson::JsonValue;
 
 const API_LATEST: &str = "https://api.github.com/repos/DocksDocks/relay/releases/latest";
@@ -23,6 +24,9 @@ const ASSET_HOST: &str = "github.com";
 const SUMS_ASSET: &str = "SHA256SUMS";
 const USER_AGENT: &str = concat!("relay/", env!("CARGO_PKG_VERSION"));
 const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
+// Bound for one whole request, body included, so a stalled peer turns into an
+// error instead of a hang.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 // The release asset suffix for this build. Every target compiles; a target
 // without a published asset refuses at run time, so the gate and CI can build
@@ -68,14 +72,18 @@ pub enum Decision {
 }
 
 /// The GitHub REST source. The agent is built with `proxy(None)` because
-/// `Config::default` reads `HTTPS_PROXY` and friends from the environment.
+/// `Config::default` reads `HTTPS_PROXY` and friends from the environment,
+/// and with a global timeout because the default has none.
 pub struct GithubSource {
     agent: ureq::Agent,
 }
 
 impl Default for GithubSource {
     fn default() -> Self {
-        let config = ureq::config::Config::builder().proxy(None).build();
+        let config = ureq::config::Config::builder()
+            .proxy(None)
+            .timeout_global(Some(REQUEST_TIMEOUT))
+            .build();
         Self {
             agent: ureq::Agent::new_with_config(config),
         }
@@ -419,6 +427,18 @@ fn stage(
     verify(&text, asset_name, &digest)
 }
 
+#[cfg(unix)]
+fn mark_executable(file: &File, staged: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    file.set_permissions(fs::Permissions::from_mode(0o755))
+        .map_err(not_writable(staged))
+}
+
+#[cfg(not(unix))]
+fn mark_executable(_file: &File, _staged: &Path) -> Result<(), String> {
+    Ok(())
+}
+
 fn install(
     source: &dyn ReleaseSource,
     release: &Release,
@@ -434,13 +454,8 @@ fn install(
 
     let staged = staged_path(exe)?;
     let mut file = File::create(&staged).map_err(not_writable(exe))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(fs::Permissions::from_mode(0o755))
-            .map_err(not_writable(&staged))?;
-    }
-    let staged_result = stage(source, asset, sums, &asset_name, &mut file, &staged);
+    let staged_result = mark_executable(&file, &staged)
+        .and_then(|()| stage(source, asset, sums, &asset_name, &mut file, &staged));
     drop(file);
     let outcome = staged_result
         .and_then(|()| verify_staged(&staged, &release.tag))
@@ -473,8 +488,13 @@ pub fn execute(
         None => source.latest()?,
     };
     if options.check {
+        let label = if options.version.is_some() {
+            "selected"
+        } else {
+            "latest"
+        };
         write_line(out, &format!("relay {running}"))?;
-        return write_line(out, &format!("latest: {}", release.tag));
+        return write_line(out, &format!("{label}: {}", release.tag));
     }
     match plan_update(running, &release.tag, options.force)? {
         Decision::Current => write_line(out, &format!("relay {running} is current")),
