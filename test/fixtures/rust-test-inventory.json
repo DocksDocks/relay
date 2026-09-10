@@ -7,7 +7,8 @@
         "bus_discover_omp_schema_and_session",
         "bus_messaging_tools_and_whoami",
         "bus_request_maps_protocol_store_failure_to_closed_domain_error",
-        "bus_request_reply_contract_and_domain_errors"
+        "bus_request_reply_contract_and_domain_errors",
+        "gc_keeps_lenient_evidence_for_uppercase_ids"
       ]
     },
     "holds": {

@@ -763,3 +763,114 @@ fn bus_request_maps_protocol_store_failure_to_closed_domain_error() {
     assert!(status.success());
     fs::remove_dir_all(&home).ok();
 }
+
+/// Age a file so GC treats it as an old surface.
+fn age_file(path: &Path, age: std::time::Duration) {
+    let old = std::time::SystemTime::now() - age;
+    let file = fs::OpenOptions::new().write(true).open(path).unwrap();
+    file.set_times(fs::FileTimes::new().set_accessed(old).set_modified(old))
+        .unwrap();
+}
+
+/// GC reads registry entries and the cwd marker through the lenient readers,
+/// so an uppercase id keeps its `lastSeen` and self-exclusion protection.
+#[test]
+fn gc_keeps_lenient_evidence_for_uppercase_ids() {
+    let home = std::env::temp_dir().join(format!(
+        "relay-bus-gc-upper-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::remove_dir_all(&home).ok();
+    fs::create_dir_all(&home).unwrap();
+    let old = std::time::Duration::from_secs(20 * 86_400);
+    let recent_lower = "01a081c6-19da-737a-a863-9fb9d50ad5c2";
+    let recent_upper = "01A081C6-19DA-737A-A863-9FB9D50AD5C2";
+    let self_lower = "02b192d7-2aeb-747b-b974-0ac0e61be6d3";
+    let self_upper = "02B192D7-2AEB-747B-B974-0AC0E61BE6D3";
+    let orphan = "03c2a3e8-3bfc-457c-8a85-1bd1f72cf7e4";
+
+    // Seed through the binary, then rewrite ids to uppercase as a tampered
+    // registry and marker would.
+    let project = home.join("project");
+    fs::create_dir_all(&project).unwrap();
+    register_identity(&home, "recent", recent_lower, &home);
+    register_identity(&home, "self", self_lower, &project);
+    let registry_path = home.join("registry.json");
+    let registry = fs::read_to_string(&registry_path)
+        .unwrap()
+        .replace(recent_lower, recent_upper)
+        .replace(self_lower, self_upper);
+    fs::write(&registry_path, registry).unwrap();
+    // Only the self entry loses its recent lastSeen.
+    let registry_json: JsonValue = fs::read_to_string(&registry_path).unwrap().parse().unwrap();
+    let mut agents = obj(&registry_json)["agents"].clone();
+    {
+        let agents_map = agents.get_mut::<HashMap<String, JsonValue>>().unwrap();
+        let self_entry = agents_map
+            .get_mut(self_upper)
+            .unwrap()
+            .get_mut::<HashMap<String, JsonValue>>()
+            .unwrap();
+        self_entry.insert(
+            "lastSeen".into(),
+            JsonValue::from("2020-01-01T00:00:00.000Z".to_string()),
+        );
+    }
+    let mut root = obj(&registry_json).clone();
+    root.insert("agents".into(), agents);
+    fs::write(&registry_path, JsonValue::from(root).stringify().unwrap()).unwrap();
+
+    let marker = home
+        .join("markers")
+        .join(relay::store::encode_dir(&project.to_string_lossy()));
+    fs::write(&marker, format!("{self_upper}\n")).unwrap();
+    let mailbox = home.join("mailbox");
+    fs::create_dir_all(&mailbox).unwrap();
+    for dir in ["watchers", "locks"] {
+        fs::create_dir_all(home.join(dir)).unwrap();
+    }
+    let recent_mail = mailbox.join(format!("{recent_upper}.jsonl"));
+    let self_mail = mailbox.join(format!("{self_upper}.jsonl"));
+    let orphan_mail = mailbox.join(format!("{orphan}.jsonl"));
+    for path in [&recent_mail, &self_mail, &orphan_mail] {
+        fs::write(path, "{}\n").unwrap();
+        age_file(path, old);
+    }
+    age_file(&marker, old);
+
+    let status = Command::new(env!("CARGO_BIN_EXE_relay"))
+        .arg("bus")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .env("AGENT_RELAY_HOME", &home)
+        .env_remove("SESSION_RELAY_HOME")
+        .env("AGENT_RELAY_GC_DAYS", "14")
+        .env("RELAY_NO_WATCH", "1")
+        .env("RELAY_PROJECT_DIR", &project)
+        .output()
+        .expect("run relay bus");
+    assert!(
+        status.status.success(),
+        "bus failed: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+
+    assert!(
+        !orphan_mail.exists(),
+        "GC did not run: the aged orphan mailbox survived"
+    );
+    assert!(
+        recent_mail.exists(),
+        "recent uppercase registry lastSeen must protect the aged mailbox"
+    );
+    assert!(
+        self_mail.exists() && marker.exists(),
+        "uppercase cwd marker must keep self exclusion for the invoking session"
+    );
+    fs::remove_dir_all(&home).ok();
+}
