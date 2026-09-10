@@ -281,7 +281,9 @@ fn not_writable(path: &Path) -> impl Fn(std::io::Error) -> String + '_ {
 }
 
 /// Move the staged file over the running executable. On Unix the rename is
-/// atomic and the running process keeps its old inode.
+/// atomic and the running process keeps its old inode. The mode is set here
+/// as well as before the download, so a direct caller gets an executable
+/// target without staging one.
 #[cfg(unix)]
 pub fn replace_executable(target: &Path, staged: &Path) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
@@ -740,6 +742,31 @@ mod tests {
         .expect("check succeeds");
 
         assert_eq!(text(&out), "relay 0.1.0\nlatest: v0.2.0\n");
+        assert!(source.fetched.borrow().is_empty());
+    }
+
+    #[test]
+    fn check_labels_a_selected_tag() {
+        let exe = fixture("check-selected");
+        let body = payload("0.2.0");
+        let source = source("v0.2.0", &body, &hex_digest(&body), ASSET_HOST);
+        let mut out = Vec::new();
+
+        execute(
+            &[
+                "--check".to_string(),
+                "--version".to_string(),
+                "v0.2.0".to_string(),
+            ],
+            &source,
+            "0.1.0",
+            TEST_TARGET,
+            &exe,
+            &mut out,
+        )
+        .expect("check succeeds");
+
+        assert_eq!(text(&out), "relay 0.1.0\nselected: v0.2.0\n");
         assert!(source.fetched.borrow().is_empty());
     }
 
