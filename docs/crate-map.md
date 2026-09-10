@@ -11,7 +11,7 @@ Coding rules for the crate (lint policy, panics, unsafe, casts, dependencies) li
 
 | Module | Responsibility |
 |---|---|
-| `src/store.rs` | Relay home, omp registry and names, mailboxes, markers, store and resume locks, durable holds, ack/rollback, expiry recovery, and inactive-state collection. `Entry::from_json` and `id_for_dir` are strict readers; GC uses lenient `from_json_any` and `raw_id_for_dir`. |
+| `src/store.rs` | Relay home, omp registry and names, mailboxes, markers, store and resume locks, durable holds, ack/rollback, expiry recovery, and inactive-state collection. `Entry::from_json` and `id_for_dir` are strict readers; GC uses lenient `from_json_any` and `raw_id_for_dir`. The inline `hold_recovery_model_survives_repeated_crashes` test crashes every hold outcome at every failpoint, then crashes recovery again at every reachable point, and checks mailbox bytes, claim delivery, and an empty `holds/` directory only after recovery reaches quiescence. |
 | `src/protocol.rs` | Closed request and terminal-reply envelopes, correlated claims, validation, canonical digests, crash recovery, and typed delivery state. |
 | `src/jcs.rs` | Public canonical JSON values, parsing, serialization, secure file reads, lowercase UUID-v4 record-id and SHA-256 digest primitives. |
 | `src/bus.rs` | MCP stdio transport and messaging tool dispatch. The omp extension uses its own tool interface instead. |
