@@ -397,9 +397,12 @@ fn staged_path(exe: &Path) -> Result<PathBuf, String> {
 
 /// Whether the process named by a staged-file suffix is gone. Only `ESRCH`
 /// proves that; `EPERM` means the process is live but owned by someone else.
+/// The suffix must be an unsigned number: a signed value would name a
+/// process group, and zero is not a process.
 fn process_is_gone(pid: &str) -> bool {
-    pid.parse::<i32>()
+    pid.parse::<u32>()
         .ok()
+        .and_then(|pid| i32::try_from(pid).ok())
         .and_then(rustix::process::Pid::from_raw)
         .is_some_and(|pid| rustix::process::test_kill_process(pid) == Err(rustix::io::Errno::SRCH))
 }
@@ -797,7 +800,8 @@ mod tests {
         let stale = exe.with_file_name(format!("relay{STAGED_INFIX}{dead}"));
         let live = exe.with_file_name(format!("relay{STAGED_INFIX}1"));
         let unrelated = exe.with_file_name(format!("relay{STAGED_INFIX}notes"));
-        for path in [&stale, &live, &unrelated] {
+        let group = exe.with_file_name(format!("relay{STAGED_INFIX}-{dead}"));
+        for path in [&stale, &live, &unrelated, &group] {
             fs::write(path, b"leftover").expect("seed a sibling");
         }
         let body = payload("0.2.0");
@@ -809,6 +813,7 @@ mod tests {
         assert!(!stale.exists(), "dead pid sibling is reaped");
         assert!(live.exists(), "live pid sibling stays");
         assert!(unrelated.exists(), "non-pid suffix stays");
+        assert!(group.exists(), "signed suffix is not probed as a group");
         assert_eq!(fs::read(&exe).expect("read replaced file"), body);
     }
 

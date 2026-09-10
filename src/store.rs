@@ -2385,6 +2385,18 @@ mod tests {
     #[test]
     fn hold_recovery_model_survives_repeated_crashes() {
         let points = all_hold_failpoints();
+        // The claim-row bound must match the fixture: the last modeled claim
+        // index is reachable and the next one is not.
+        for (index, expected) in [
+            (HOLD_MODEL_CLAIM_ROWS - 1, true),
+            (HOLD_MODEL_CLAIM_ROWS, false),
+        ] {
+            let (root, session, _) = hold_model_fixture();
+            let point = HoldFailpoint::AfterClaimUpdate(index);
+            let reached = crash_first(&root, &session, HoldOutcome::Ack, point);
+            fs::remove_dir_all(&root).unwrap();
+            assert_eq!(reached, expected, "{point:?} reachability");
+        }
         let later = b"{\"text\":\"later\"}\n";
         let mut legal_pairs = 0usize;
         for outcome in [
