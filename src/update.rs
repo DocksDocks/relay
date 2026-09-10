@@ -622,7 +622,7 @@ mod tests {
                 .get(url)
                 .ok_or_else(|| format!("no body for {url}"))?;
             let allowed = usize::try_from(limit).unwrap_or(usize::MAX);
-            if body.len() > allowed {
+            if body.len() >= allowed {
                 sink.write_all(&body[..allowed])
                     .map_err(|error| error.to_string())?;
                 return Err(format!("GET {url} failed: body exceeds {limit} bytes"));
@@ -831,10 +831,10 @@ mod tests {
         let error = execute(&[], &source, "0.1.0", TEST_TARGET, &exe, &mut out)
             .expect_err("over-budget manifest fails the update");
 
-        assert!(
-            error.contains(SUMS_ASSET) && error.contains(&format!("exceeds {SUMS_LIMIT} bytes")),
-            "{error}"
-        );
+        // The wording belongs to ureq; the test pins attribution to the
+        // manifest fetch and the observable state after the failure.
+        assert!(error.contains(SUMS_ASSET), "{error}");
+        assert_eq!(source.fetched.borrow().len(), 2, "asset then manifest");
         assert_eq!(fs::read(&exe).expect("read fixture"), before);
         assert!(!staged_path(&exe).expect("staged path").exists());
     }
