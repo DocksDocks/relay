@@ -530,7 +530,9 @@ jobs:
   upgrade-smoke:
     name: upgrade smoke from the previous release
     needs: [identity, publish]
-    if: needs.identity.outputs.publish == 'true'
+    # The updater inside the binary is pinned to DocksDocks/relay, so a fork's
+    # release cannot be the source it upgrades from.
+    if: github.repository == 'DocksDocks/relay' && needs.identity.outputs.publish == 'true'
     runs-on: ubuntu-24.04
     steps:
       - name: upgrade the previous release binary to the published tag
