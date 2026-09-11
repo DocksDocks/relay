@@ -579,9 +579,19 @@ jobs:
           echo "before: $before"
           test "$before" = "relay $previous_version"
 
-          check="$(./relay update --check)"
-          printf 'check:\n%s\n' "$check"
-          latest_line="$(printf '%s\n' "$check" | grep '^latest: ' || true)"
+          # The release API may lag the publish step or rate-limit the
+          # unauthenticated updater. Three attempts, ten seconds apart, bound
+          # that transient state; a wrong answer after that is a real failure.
+          latest_line=''
+          for attempt in 1 2 3; do
+            check="$(./relay update --check || true)"
+            printf 'check (attempt %s):\n%s\n' "$attempt" "$check"
+            latest_line="$(printf '%s\n' "$check" | grep '^latest: ' || true)"
+            if test "$latest_line" = "latest: $TAG"; then
+              break
+            fi
+            sleep 10
+          done
           test "$latest_line" = "latest: $TAG"
 
           updated="$(./relay update)"
