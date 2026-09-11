@@ -549,7 +549,7 @@ jobs:
           # The previous release is the newest published release with another tag.
           previous_tag="$(
             gh api "repos/$GITHUB_REPOSITORY/releases" --paginate \
-              --jq '.[] | select(.draft == false and .prerelease == false and .tag_name != env.TAG) | [.created_at, .tag_name] | @tsv' \
+              --jq '.[] | select(.draft == false and .prerelease == false and .tag_name != env.TAG) | [.published_at, .tag_name] | @tsv' \
               | sort | tail -n 1 | cut -f 2
           )"
           if test -z "$previous_tag"; then
