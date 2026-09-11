@@ -526,3 +526,76 @@ jobs:
           final="$RUNNER_TEMP/relay-release-final.json"
           query_release "$final"
           validate_release "$final" true "$release_id"
+
+  upgrade-smoke:
+    name: upgrade smoke from the previous release
+    needs: [identity, publish]
+    if: needs.identity.outputs.publish == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: upgrade the previous release binary to the published tag
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.identity.outputs.tag }}
+          VERSION: ${{ needs.identity.outputs.version }}
+        run: |
+          set -euo pipefail
+          asset=relay-x86_64-unknown-linux-musl
+          base="https://github.com/$GITHUB_REPOSITORY/releases/download"
+
+          # The previous release is the newest published release with another tag.
+          previous_tag="$(
+            gh api "repos/$GITHUB_REPOSITORY/releases" --paginate \
+              --jq '.[] | select(.draft == false and .prerelease == false and .tag_name != env.TAG) | [.created_at, .tag_name] | @tsv' \
+              | sort | tail -n 1 | cut -f 2
+          )"
+          if test -z "$previous_tag"; then
+            echo 'skip: no previous release'
+            exit 0
+          fi
+          previous_version="${previous_tag#v}"
+          echo "previous release: $previous_tag"
+
+          # Releases before 0.20.0 carry no relay update command.
+          if test "$(printf '%s\n' 0.20.0 "$previous_version" | sort -V | head -n 1)" != 0.20.0; then
+            echo "skip: $previous_tag predates relay update"
+            exit 0
+          fi
+
+          smoke="$RUNNER_TEMP/smoke"
+          mkdir -p "$smoke"
+          cd "$smoke"
+
+          # Install the previous release exactly as a user does.
+          curl -fsSLo relay "$base/$previous_tag/$asset"
+          curl -fsSLo SHA256SUMS "$base/$previous_tag/SHA256SUMS"
+          grep "$asset" SHA256SUMS | sed "s/$asset/relay/" | sha256sum -c -
+          chmod +x relay
+
+          before="$(./relay --version)"
+          echo "before: $before"
+          test "$before" = "relay $previous_version"
+
+          check="$(./relay update --check)"
+          printf 'check:\n%s\n' "$check"
+          latest_line="$(printf '%s\n' "$check" | grep '^latest: ' || true)"
+          test "$latest_line" = "latest: $TAG"
+
+          updated="$(./relay update)"
+          echo "update: $updated"
+          test "$updated" = "relay updated to $VERSION"
+
+          after="$(./relay --version)"
+          echo "after: $after"
+          test "$after" = "relay $VERSION"
+
+          # The replaced executable must be the published x86-64 asset.
+          curl -fsSLo SHA256SUMS.published "$base/$TAG/SHA256SUMS"
+          expected_digest="$(awk -v name="$asset" '{ sub(/^[*]/, "", $2) } $2 == name { print $1 }' SHA256SUMS.published)"
+          actual_digest="$(sha256sum relay | cut -d ' ' -f 1)"
+          echo "expected digest: $expected_digest"
+          echo "actual digest: $actual_digest"
+          test -n "$expected_digest"
+          test "$actual_digest" = "$expected_digest"
+          echo "upgrade smoke passed: $previous_tag -> $TAG"

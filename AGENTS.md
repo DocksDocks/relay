@@ -142,6 +142,16 @@ The workflow aggregates attestations and `SHA256SUMS`. It publishes exactly thre
 
 The release has no prerelease step. It has no promotion step.
 
+After publish, the `upgrade-smoke` job downloads the previous release's x86-64 binary and runs its `relay update` against the new tag. A failure there does not roll the release back; it reports a broken upgrade path.
+
+To build a musl binary on a host without `musl-tools`, point the target C compiler at `gcc`:
+
+```bash
+CC_x86_64_unknown_linux_musl=gcc cargo build --release --locked --target x86_64-unknown-linux-musl
+```
+
+`ring` needs a C compiler for that target, and `cargo` does not fall back to the host compiler. CI installs `musl-tools` and does not need the override.
+
 ## Platform support
 
 Relay distributes Linux x86-64 and arm64 musl binaries.
