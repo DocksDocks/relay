@@ -2173,10 +2173,20 @@ mod tests {
         ExpiredSettle,
     }
 
-    /// Fixture root with a plain row, a malformed line, and one typed request
-    /// row whose claim is readable through the protocol store. Returns the
-    /// root, the held session, and the claim correlation id.
-    fn hold_model_fixture() -> (PathBuf, String, String) {
+    /// The model fixture: the hold root, the held session, and the two
+    /// correlation ids whose claims the model checks.
+    struct HoldModel {
+        root: PathBuf,
+        session: String,
+        request_id: String,
+        reply_id: String,
+    }
+
+    /// Fixture root with a plain row, a malformed line, one typed request row,
+    /// and one typed reply row whose claims are readable through the protocol
+    /// store. The held session is the responder of the request and the
+    /// requester of the reply, so both claim halves sit in the held mailbox.
+    fn hold_model_fixture() -> HoldModel {
         let (root, session, _) = hold_fixture();
         let requester = uuid_v4();
         let entry = |id: &str, name: &str| {
@@ -2205,10 +2215,27 @@ mod tests {
             ),
         ]));
         fs::write(root.join("registry.json"), registry.format().unwrap()).unwrap();
-        let message = crate::protocol::ProtocolStore::new(root.clone())
+        let protocol = crate::protocol::ProtocolStore::new(root.clone());
+        let message = protocol
             .request(&requester, &session, "model request")
             .unwrap();
-        (root, session, message.correlation_id)
+        let second = protocol
+            .request(&session, &requester, "model reply request")
+            .unwrap();
+        protocol
+            .reply(
+                &second.correlation_id,
+                &requester,
+                crate::protocol::TerminalStatus::Completed,
+                "model reply",
+            )
+            .unwrap();
+        HoldModel {
+            root,
+            session,
+            request_id: message.correlation_id,
+            reply_id: second.correlation_id,
+        }
     }
 
     /// Recovery failpoints that fire for a manifest in the given state.
@@ -2255,9 +2282,9 @@ mod tests {
         }
     }
 
-    /// Claim rows in the model fixture: the legacy JSON row and the typed
-    /// request row.
-    const HOLD_MODEL_CLAIM_ROWS: usize = 2;
+    /// Claim rows in the model fixture: the legacy JSON row, the typed
+    /// request row, and the typed reply row.
+    const HOLD_MODEL_CLAIM_ROWS: usize = 3;
 
     /// The failpoint after `point` in operation order. The match is
     /// exhaustive, so a new `HoldFailpoint` variant fails to compile until it
@@ -2337,14 +2364,14 @@ mod tests {
     }
 
     fn check_hold_invariants(
-        root: &Path,
-        session: &str,
-        correlation_id: &str,
+        model: &HoldModel,
         outcome: HoldOutcome,
         raw: &[u8],
         later: &[u8],
         label: &str,
     ) {
+        let root = model.root.as_path();
+        let session = model.session.as_str();
         let store = HoldStore::new(root.to_path_buf());
         assert!(
             store.manifests().unwrap().is_empty(),
@@ -2369,10 +2396,8 @@ mod tests {
             expected,
             "{label}: mailbox bytes"
         );
-        let claim = crate::protocol::ProtocolStore::new(root.to_path_buf())
-            .read_claim(correlation_id)
-            .unwrap()
-            .unwrap();
+        let protocol = crate::protocol::ProtocolStore::new(root.to_path_buf());
+        let claim = protocol.read_claim(&model.request_id).unwrap().unwrap();
         assert_eq!(claim.state, crate::protocol::ClaimState::Open, "{label}");
         let delivery = if outcome == HoldOutcome::Ack {
             crate::protocol::DeliveryState::Consumed
@@ -2380,6 +2405,26 @@ mod tests {
             crate::protocol::DeliveryState::Enqueued
         };
         assert_eq!(claim.request_delivery, delivery, "{label}: claim delivery");
+        // The held mailbox also owns a reply row, so the acknowledged hold must
+        // consume that claim half and the rolled back hold must leave it queued.
+        let reply_claim = protocol.read_claim(&model.reply_id).unwrap().unwrap();
+        let (reply_state, reply_delivery) = if outcome == HoldOutcome::Ack {
+            (
+                crate::protocol::ClaimState::ReplyConsumed,
+                crate::protocol::DeliveryState::Consumed,
+            )
+        } else {
+            (
+                crate::protocol::ClaimState::ReplyEnqueued,
+                crate::protocol::DeliveryState::Enqueued,
+            )
+        };
+        assert_eq!(reply_claim.state, reply_state, "{label}: reply claim state");
+        assert_eq!(
+            reply_claim.reply_delivery,
+            Some(reply_delivery),
+            "{label}: reply claim delivery"
+        );
     }
 
     #[test]
@@ -2391,10 +2436,10 @@ mod tests {
             (HOLD_MODEL_CLAIM_ROWS - 1, true),
             (HOLD_MODEL_CLAIM_ROWS, false),
         ] {
-            let (root, session, _) = hold_model_fixture();
+            let model = hold_model_fixture();
             let point = HoldFailpoint::AfterClaimUpdate(index);
-            let reached = crash_first(&root, &session, HoldOutcome::Ack, point);
-            fs::remove_dir_all(&root).unwrap();
+            let reached = crash_first(&model.root, &model.session, HoldOutcome::Ack, point);
+            fs::remove_dir_all(&model.root).unwrap();
             assert_eq!(reached, expected, "{point:?} reachability");
         }
         let later = b"{\"text\":\"later\"}\n";
@@ -2406,15 +2451,17 @@ mod tests {
             HoldOutcome::ExpiredSettle,
         ] {
             for first in points.iter().copied() {
-                let (probe_root, probe_session, _) = hold_model_fixture();
-                let reached = crash_first(&probe_root, &probe_session, outcome, first);
-                fs::remove_dir_all(&probe_root).unwrap();
+                let probe = hold_model_fixture();
+                let reached = crash_first(&probe.root, &probe.session, outcome, first);
+                fs::remove_dir_all(&probe.root).unwrap();
                 if !reached {
                     continue;
                 }
                 for recovery in points.iter().copied() {
                     let label = format!("{outcome:?} first={first:?} recovery={recovery:?}");
-                    let (root, session, correlation_id) = hold_model_fixture();
+                    let model = hold_model_fixture();
+                    let root = model.root.clone();
+                    let session = model.session.clone();
                     let mailbox = root.join("mailbox").join(format!("{session}.jsonl"));
                     let raw = fs::read(&mailbox).unwrap();
                     assert!(crash_first(&root, &session, outcome, first), "{label}");
@@ -2437,21 +2484,13 @@ mod tests {
                     }
 
                     with_lock_at(&root, || recover_holds_locked(&root)).unwrap();
-                    check_hold_invariants(
-                        &root,
-                        &session,
-                        &correlation_id,
-                        outcome,
-                        &raw,
-                        later,
-                        &label,
-                    );
+                    check_hold_invariants(&model, outcome, &raw, later, &label);
                     fs::remove_dir_all(root).unwrap();
                 }
             }
         }
         println!("hold recovery model: {legal_pairs} legal pairs");
-        assert_eq!(legal_pairs, 166);
+        assert_eq!(legal_pairs, 212);
     }
 
     #[test]
